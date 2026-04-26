@@ -33,5 +33,60 @@
 
 ## Commit hash if committed
 
-- Current baseline: `e008b36`
-- MCP slice commit: pending.
+- Current baseline: `d53623e`
+- MCP built-ins runtime state slice: `d53623e`
+
+## Implementation Update — MCP Lifecycle Event Taxonomy / Inventory Consistency
+
+Status: Done
+
+### What changed
+
+- Added a canonical runtime MCP lifecycle status shape for configured server status reporting.
+- Direct `claw mcp` list/show surfaces now use live `RuntimeMcpState` lifecycle status when applicable.
+- Model-facing `McpAuth` status now reports the same lifecycle status shape while remaining status-only.
+- Preserved failure phase, message, context, and recoverability in lifecycle status output.
+- Added deterministic tests for healthy stdio, unsupported transport, initialize failure, degraded startup, and recoverable tool discovery failure reporting.
+
+### Files changed
+
+- `rust/crates/rusty-claude-cli/src/main.rs`
+- `docs/BUILDOUT_STATUS_2026-04-26.md`
+
+### Validation
+
+- command: `cargo fmt --all --check`
+  result: pass
+- command: `git diff --check`
+  result: pass
+- command: `cargo test -p rusty-claude-cli mcp_inventory_and_tool_status_match_for_healthy_server -- --nocapture`
+  result: pass
+- command: `cargo test -p rusty-claude-cli mcp_inventory_and_tool_status_match_for_unsupported_transport -- --nocapture`
+  result: pass
+- command: `cargo test -p rusty-claude-cli mcp_inventory_and_tool_status_preserve_initialize_failure_phase -- --nocapture`
+  result: pass
+- command: `cargo test -p rusty-claude-cli mcp_inventory_and_tool_status_match_for_degraded_startup -- --nocapture`
+  result: pass
+- command: `cargo test -p rusty-claude-cli mcp_lifecycle_status_preserves_context_and_recoverability -- --nocapture`
+  result: pass
+- command: `cargo test -p rusty-claude-cli mcp -- --nocapture`
+  result: pass
+- command: `cargo test -p runtime mcp -- --nocapture`
+  result: pass
+- command: `cargo test --workspace`
+  result: fail; `resume_latest_restores_the_most_recent_managed_session` failed in the full run, then passed when rerun by name.
+- command: `cargo test -p rusty-claude-cli --test resume_slash_commands resume_latest_restores_the_most_recent_managed_session -- --nocapture`
+  result: pass
+- command: `cargo clippy --workspace --all-targets -- -D warnings`
+  result: fail; pre-existing `rust/crates/rusty-claude-cli/build.rs` clippy warnings (`map_unwrap_or`, `uninlined_format_args`) are outside this MCP slice.
+
+### Remaining MCP gaps
+
+- Remote transports still unsupported.
+- OAuth/auth UX still not implemented.
+- E2E parity harness coverage still open.
+- Direct inventory is now runtime-backed for CLI list/show, but deeper shutdown/reset event history is still limited to existing runtime state.
+
+### Commit
+
+- not committed

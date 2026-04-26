@@ -3273,10 +3273,17 @@ fn run_resume_command(
                 (Some(action), Some(target)) => Some(format!("{action} {target}")),
                 (None, Some(target)) => Some(target.to_string()),
             };
+            let runtime_inventory = runtime_mcp_inventory_json(&cwd, args.as_deref())?;
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
-                message: Some(handle_mcp_slash_command(args.as_deref(), &cwd)?),
-                json: Some(handle_mcp_slash_command_json(args.as_deref(), &cwd)?),
+                message: Some(match runtime_inventory.as_ref() {
+                    Some(inventory) => render_runtime_mcp_inventory_text(inventory),
+                    None => handle_mcp_slash_command(args.as_deref(), &cwd)?,
+                }),
+                json: Some(match runtime_inventory {
+                    Some(inventory) => inventory,
+                    None => handle_mcp_slash_command_json(args.as_deref(), &cwd)?,
+                }),
             })
         }
         SlashCommand::Memory => Ok(ResumeCommandOutcome {
@@ -3884,9 +3891,75 @@ impl RuntimeMcpState {
         self.degraded_report.clone()
     }
 
+    fn lifecycle_status_for_server(&self, server_name: &str) -> serde_json::Value {
+        let failed = self.degraded_report.as_ref().and_then(|report| {
+            report
+                .failed_servers
+                .iter()
+                .find(|server| server.server_name == server_name)
+        });
+        if let Some(failed) = failed {
+            let managed = self.server_names().iter().any(|name| name == server_name);
+            let status = if managed { "error" } else { "unsupported" };
+            return json!({
+                "server": server_name,
+                "status": status,
+                "phase": failed.phase,
+                "message": failed.error.message,
+                "context": failed.error.context,
+                "recoverable": failed.error.recoverable,
+                "failure": {
+                    "server_name": failed.server_name.clone(),
+                    "phase": failed.phase,
+                    "message": failed.error.message.clone(),
+                    "context": failed.error.context.clone(),
+                    "recoverable": failed.error.recoverable,
+                },
+            });
+        }
+
+        if self.server_names().iter().any(|name| name == server_name) {
+            return json!({
+                "server": server_name,
+                "status": "connected",
+                "phase": runtime::McpLifecyclePhase::Ready,
+                "message": Value::Null,
+                "context": {},
+                "recoverable": Value::Null,
+                "failure": Value::Null,
+            });
+        }
+
+        json!({
+            "server": server_name,
+            "status": "disconnected",
+            "phase": runtime::McpLifecyclePhase::ServerRegistration,
+            "message": format!("server `{server_name}` is not configured"),
+            "context": {},
+            "recoverable": false,
+            "failure": Value::Null,
+        })
+    }
+
+    fn lifecycle_statuses(&self) -> Vec<serde_json::Value> {
+        let mut server_names = self.server_names().into_iter().collect::<BTreeSet<_>>();
+        if let Some(report) = &self.degraded_report {
+            server_names.extend(
+                report
+                    .failed_servers
+                    .iter()
+                    .map(|server| server.server_name.clone()),
+            );
+        }
+        server_names
+            .into_iter()
+            .map(|server_name| self.lifecycle_status_for_server(&server_name))
+            .collect()
+    }
+
     fn inventory_json(&self) -> serde_json::Value {
         json!({
-            "servers": self.server_names(),
+            "servers": self.lifecycle_statuses(),
             "pending_servers": self.pending_servers(),
             "mcp_degraded": self.degraded_report(),
         })
@@ -4088,11 +4161,157 @@ impl RuntimeMcpState {
             "server": server_name,
             "status": status,
             "source": "runtime",
+            "lifecycle_status": self.lifecycle_status_for_server(server_name),
             "failure": failed,
             "mcp_degraded": self.degraded_report(),
         }))
         .map_err(|error| ToolError::new(error.to_string()))
     }
+}
+
+enum RuntimeMcpInventoryAction<'a> {
+    List,
+    Show(&'a str),
+}
+
+fn parse_runtime_mcp_inventory_action(args: Option<&str>) -> Option<RuntimeMcpInventoryAction<'_>> {
+    let args = args.map(str::trim).filter(|value| !value.is_empty());
+    match args {
+        None | Some("list") => Some(RuntimeMcpInventoryAction::List),
+        Some(args) if matches!(args, "help" | "-h" | "--help") => None,
+        Some(args) if args.split_whitespace().next() == Some("show") => {
+            let mut parts = args.split_whitespace();
+            let _ = parts.next();
+            let server_name = parts.next()?;
+            parts
+                .next()
+                .is_none()
+                .then_some(RuntimeMcpInventoryAction::Show(server_name))
+        }
+        _ => None,
+    }
+}
+
+fn runtime_mcp_inventory_json_for_loader(
+    loader: &ConfigLoader,
+    cwd: &Path,
+    args: Option<&str>,
+) -> Result<Option<Value>, Box<dyn std::error::Error>> {
+    let Some(action) = parse_runtime_mcp_inventory_action(args) else {
+        return Ok(None);
+    };
+    let runtime_config = loader.load()?;
+    let configured = handle_mcp_slash_command_json(args, cwd)?;
+    let lifecycle = match RuntimeMcpState::new(&runtime_config)? {
+        Some((mut state, _discovery)) => {
+            let lifecycle = match action {
+                RuntimeMcpInventoryAction::List => state.inventory_json(),
+                RuntimeMcpInventoryAction::Show(server_name) => json!({
+                    "servers": [state.lifecycle_status_for_server(server_name)],
+                    "pending_servers": state.pending_servers(),
+                    "mcp_degraded": state.degraded_report(),
+                }),
+            };
+            state.shutdown()?;
+            lifecycle
+        }
+        None => match action {
+            RuntimeMcpInventoryAction::List => json!({
+                "servers": [],
+                "pending_servers": Value::Null,
+                "mcp_degraded": Value::Null,
+            }),
+            RuntimeMcpInventoryAction::Show(server_name) => json!({
+                "servers": [{
+                    "server": server_name,
+                    "status": "disconnected",
+                    "phase": runtime::McpLifecyclePhase::ServerRegistration,
+                    "message": format!("server `{server_name}` is not configured"),
+                    "context": {},
+                    "recoverable": false,
+                    "failure": Value::Null,
+                }],
+                "pending_servers": Value::Null,
+                "mcp_degraded": Value::Null,
+            }),
+        },
+    };
+
+    let lifecycle_servers = lifecycle
+        .get("servers")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    Ok(Some(json!({
+        "kind": "mcp",
+        "action": configured.get("action").cloned().unwrap_or_else(|| json!("list")),
+        "working_directory": cwd.display().to_string(),
+        "servers": lifecycle_servers,
+        "configured": configured,
+        "lifecycle": lifecycle,
+    })))
+}
+
+fn runtime_mcp_inventory_json(
+    cwd: &Path,
+    args: Option<&str>,
+) -> Result<Option<Value>, Box<dyn std::error::Error>> {
+    let loader = ConfigLoader::default_for(cwd);
+    runtime_mcp_inventory_json_for_loader(&loader, cwd, args)
+}
+
+fn render_runtime_mcp_inventory_text(inventory: &Value) -> String {
+    let mut lines = vec![
+        "MCP".to_string(),
+        format!(
+            "  Working directory {}",
+            inventory
+                .get("working_directory")
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown>")
+        ),
+    ];
+    let statuses = inventory
+        .get("lifecycle")
+        .and_then(|lifecycle| lifecycle.get("servers"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    lines.push(format!("  Lifecycle servers {}", statuses.len()));
+    if statuses.is_empty() {
+        lines.push("  No MCP servers configured.".to_string());
+        return lines.join("\n");
+    }
+
+    lines.push(String::new());
+    for status in statuses {
+        let server = status
+            .get("server")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>");
+        let state = status
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>");
+        let phase = status
+            .get("phase")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>");
+        let recoverable = status.get("recoverable").map_or_else(
+            || "<unknown>".to_string(),
+            |value| {
+                value
+                    .as_bool()
+                    .map_or_else(|| "n/a".to_string(), |flag| flag.to_string())
+            },
+        );
+        lines.push(format!(
+            "  {server:<16} {state:<13} phase={phase:<20} recoverable={recoverable}"
+        ));
+        if let Some(message) = status.get("message").and_then(Value::as_str) {
+            lines.push(format!("    {message}"));
+        }
+    }
+    lines.join("\n")
 }
 
 fn build_runtime_mcp_state(
@@ -4988,6 +5207,15 @@ impl LiveCli {
             return run_mcp_serve();
         }
         let cwd = env::current_dir()?;
+        if let Some(inventory) = runtime_mcp_inventory_json(&cwd, args)? {
+            match output_format {
+                CliOutputFormat::Text => {
+                    println!("{}", render_runtime_mcp_inventory_text(&inventory))
+                }
+                CliOutputFormat::Json => println!("{}", serde_json::to_string_pretty(&inventory)?),
+            }
+            return Ok(());
+        }
         match output_format {
             CliOutputFormat::Text => println!("{}", handle_mcp_slash_command(args, &cwd)?),
             CliOutputFormat::Json => println!(
@@ -9201,23 +9429,22 @@ mod tests {
         format_issue_report, format_model_report, format_model_switch_report,
         format_permissions_report, format_permissions_switch_report, format_pr_report,
         format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
-        format_ultraplan_report, format_unknown_slash_command,
+        classify_error_kind, format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error,
-        classify_error_kind,
         merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
         parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
         parse_history_count, permission_policy, print_help_to, push_output_block,
         render_config_report, render_diff_report, render_diff_report_for, render_memory_report,
-        split_error_hint,
         render_help_topic, render_prompt_history_report, render_repl_help, render_resume_usage,
         render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
-        resolve_repl_model, resolve_session_reference, response_to_events,
-        resume_supported_slash_commands, run_resume_command, short_tool_id,
-        slash_command_completion_candidates_with_sessions, status_context,
+        resolve_repl_model, resolve_session_reference, response_to_events, split_error_hint,
+        resume_supported_slash_commands, run_resume_command, runtime_mcp_inventory_json_for_loader,
+        short_tool_id, slash_command_completion_candidates_with_sessions, status_context,
         summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt, validate_no_args,
-        write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
-        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
-        PromptHistoryEntry, SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
+        write_mcp_server_fixture, write_mcp_tools_list_disconnect_fixture, CliAction,
+        CliOutputFormat, CliToolExecutor, GitWorkspaceSummary, InternalPromptProgressEvent,
+        InternalPromptProgressState, LiveCli, LocalHelpTopic, PromptHistoryEntry,
+        RuntimePluginState, SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
         STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
@@ -9228,7 +9455,7 @@ mod tests {
         load_oauth_credentials, save_oauth_credentials, AssistantEvent, ConfigLoader, ContentBlock,
         ConversationMessage, MessageRole, OAuthConfig, PermissionMode, Session, ToolExecutor,
     };
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -13008,6 +13235,243 @@ UU conflicted.rs",
         let _ = fs::remove_dir_all(workspace);
     }
 
+    fn lifecycle_status_for_server(inventory: &serde_json::Value, server_name: &str) -> Value {
+        inventory["lifecycle"]["servers"]
+            .as_array()
+            .expect("lifecycle servers should be an array")
+            .iter()
+            .find(|status| status["server"] == server_name)
+            .cloned()
+            .unwrap_or_else(|| panic!("missing lifecycle status for {server_name}"))
+    }
+
+    fn model_facing_mcp_auth_status(
+        state: &RuntimePluginState,
+        server_name: &str,
+    ) -> serde_json::Value {
+        let mut executor = CliToolExecutor::new(
+            None,
+            false,
+            state.tool_registry.clone(),
+            state.mcp_state.clone(),
+        );
+        let output = executor
+            .execute("McpAuth", &format!(r#"{{"server":"{server_name}"}}"#))
+            .expect("McpAuth status should execute");
+        serde_json::from_str::<serde_json::Value>(&output).expect("McpAuth output should be JSON")
+            ["lifecycle_status"]
+            .clone()
+    }
+
+    fn assert_inventory_and_tool_status_match(
+        loader: &ConfigLoader,
+        workspace: &Path,
+        server_name: &str,
+    ) -> serde_json::Value {
+        let inventory = runtime_mcp_inventory_json_for_loader(loader, workspace, None)
+            .expect("runtime MCP inventory should render")
+            .expect("runtime MCP inventory should handle list");
+        let direct_status = lifecycle_status_for_server(&inventory, server_name);
+
+        let runtime_config = loader.load().expect("runtime config should load");
+        let state = build_runtime_plugin_state_with_loader(workspace, loader, &runtime_config)
+            .expect("runtime plugin state should load");
+        let tool_status = model_facing_mcp_auth_status(&state, server_name);
+        assert_eq!(direct_status, tool_status);
+
+        if let Some(mcp_state) = state.mcp_state {
+            mcp_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .shutdown()
+                .expect("mcp shutdown should succeed");
+        }
+
+        direct_status
+    }
+
+    #[test]
+    fn mcp_inventory_and_tool_status_match_for_healthy_server() {
+        let config_home = temp_dir();
+        let workspace = temp_dir();
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let script_path = workspace.join("fixture-mcp.py");
+        write_mcp_server_fixture(&script_path);
+        fs::write(
+            config_home.join("settings.json"),
+            format!(
+                r#"{{
+                  "mcpServers": {{
+                    "alpha": {{
+                      "command": "python3",
+                      "args": ["{}"]
+                    }}
+                  }}
+                }}"#,
+                script_path.to_string_lossy()
+            ),
+        )
+        .expect("write mcp settings");
+
+        let loader = ConfigLoader::new(&workspace, &config_home);
+        let status = assert_inventory_and_tool_status_match(&loader, &workspace, "alpha");
+        assert_eq!(status["status"], "connected");
+        assert_eq!(status["phase"], "ready");
+        assert_eq!(status["recoverable"], Value::Null);
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn mcp_inventory_and_tool_status_match_for_unsupported_transport() {
+        let config_home = temp_dir();
+        let workspace = temp_dir();
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::write(
+            config_home.join("settings.json"),
+            r#"{
+              "mcpServers": {
+                "remote": {
+                  "url": "https://example.test/mcp"
+                }
+              }
+            }"#,
+        )
+        .expect("write mcp settings");
+
+        let loader = ConfigLoader::new(&workspace, &config_home);
+        let status = assert_inventory_and_tool_status_match(&loader, &workspace, "remote");
+        assert_eq!(status["status"], "unsupported");
+        assert_eq!(status["phase"], "server_registration");
+        assert_eq!(status["context"]["transport"], "http");
+        assert_eq!(status["recoverable"], false);
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn mcp_inventory_and_tool_status_preserve_initialize_failure_phase() {
+        let config_home = temp_dir();
+        let workspace = temp_dir();
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::write(
+            config_home.join("settings.json"),
+            r#"{
+              "mcpServers": {
+                "broken": {
+                  "command": "python3",
+                  "args": ["-c", "import sys; sys.exit(0)"]
+                }
+              }
+            }"#,
+        )
+        .expect("write mcp settings");
+
+        let loader = ConfigLoader::new(&workspace, &config_home);
+        let status = assert_inventory_and_tool_status_match(&loader, &workspace, "broken");
+        assert_eq!(status["status"], "error");
+        assert_eq!(status["phase"], "initialize_handshake");
+        assert_eq!(status["recoverable"], false);
+        assert!(status["message"]
+            .as_str()
+            .expect("message should be string")
+            .contains("initialize"));
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn mcp_inventory_and_tool_status_match_for_degraded_startup() {
+        let config_home = temp_dir();
+        let workspace = temp_dir();
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let script_path = workspace.join("fixture-mcp.py");
+        write_mcp_server_fixture(&script_path);
+        fs::write(
+            config_home.join("settings.json"),
+            format!(
+                r#"{{
+                  "mcpServers": {{
+                    "alpha": {{
+                      "command": "python3",
+                      "args": ["{}"]
+                    }},
+                    "broken": {{
+                      "command": "python3",
+                      "args": ["-c", "import sys; sys.exit(0)"]
+                    }}
+                  }}
+                }}"#,
+                script_path.to_string_lossy()
+            ),
+        )
+        .expect("write mcp settings");
+
+        let loader = ConfigLoader::new(&workspace, &config_home);
+        let alpha = assert_inventory_and_tool_status_match(&loader, &workspace, "alpha");
+        assert_eq!(alpha["status"], "connected");
+        let broken = assert_inventory_and_tool_status_match(&loader, &workspace, "broken");
+        assert_eq!(broken["status"], "error");
+        assert_eq!(broken["phase"], "initialize_handshake");
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn mcp_lifecycle_status_preserves_context_and_recoverability() {
+        let config_home = temp_dir();
+        let workspace = temp_dir();
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let healthy_path = workspace.join("fixture-mcp.py");
+        let slow_path = workspace.join("disconnect-tools-list-mcp.py");
+        write_mcp_server_fixture(&healthy_path);
+        write_mcp_tools_list_disconnect_fixture(&slow_path);
+        fs::write(
+            config_home.join("settings.json"),
+            format!(
+                r#"{{
+                  "mcpServers": {{
+                    "alpha": {{
+                      "command": "python3",
+                      "args": ["{}"]
+                    }},
+                    "slow": {{
+                      "command": "python3",
+                      "args": ["{}"]
+                    }}
+                  }}
+                }}"#,
+                healthy_path.to_string_lossy(),
+                slow_path.to_string_lossy()
+            ),
+        )
+        .expect("write mcp settings");
+
+        let loader = ConfigLoader::new(&workspace, &config_home);
+        let status = assert_inventory_and_tool_status_match(&loader, &workspace, "slow");
+        assert_eq!(status["status"], "error");
+        assert_eq!(status["phase"], "tool_discovery");
+        assert_eq!(status["recoverable"], true);
+        assert_eq!(status["context"]["method"], "tools/list");
+        assert!(status["context"].get("io_kind").is_some());
+        assert!(status["message"]
+            .as_str()
+            .expect("message should be string")
+            .contains("transport failed"));
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
     #[test]
     fn build_runtime_runs_plugin_lifecycle_init_and_shutdown() {
         // Serialize access to process-wide env vars so parallel tests that
@@ -13217,6 +13681,59 @@ fn write_mcp_server_fixture(script_path: &Path) {
         ]
         .join("\n");
     fs::write(script_path, script).expect("mcp fixture script should write");
+}
+
+fn write_mcp_tools_list_disconnect_fixture(script_path: &Path) {
+    let script = [
+            "#!/usr/bin/env python3",
+            "import json, sys",
+            "",
+            "def read_message():",
+            "    header = b''",
+            r"    while not header.endswith(b'\r\n\r\n'):",
+            "        chunk = sys.stdin.buffer.read(1)",
+            "        if not chunk:",
+            "            return None",
+            "        header += chunk",
+            "    length = 0",
+            r"    for line in header.decode().split('\r\n'):",
+            r"        if line.lower().startswith('content-length:'):",
+            "            length = int(line.split(':', 1)[1].strip())",
+            "    payload = sys.stdin.buffer.read(length)",
+            "    return json.loads(payload.decode())",
+            "",
+            "def send_message(message):",
+            "    payload = json.dumps(message).encode()",
+            r"    sys.stdout.buffer.write(f'Content-Length: {len(payload)}\r\n\r\n'.encode() + payload)",
+            "    sys.stdout.buffer.flush()",
+            "",
+            "while True:",
+            "    request = read_message()",
+            "    if request is None:",
+            "        break",
+            "    method = request['method']",
+            "    if method == 'initialize':",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'result': {",
+            "                'protocolVersion': request['params']['protocolVersion'],",
+            "                'capabilities': {'tools': {}, 'resources': {}},",
+            "                'serverInfo': {'name': 'slow-tools-list', 'version': '1.0.0'}",
+            "            }",
+            "        })",
+            "    elif method == 'tools/list':",
+            "        sys.exit(0)",
+            "    else:",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'error': {'code': -32601, 'message': method}",
+            "        })",
+            "",
+        ]
+        .join("\n");
+    fs::write(script_path, script).expect("disconnecting mcp fixture script should write");
 }
 
 #[cfg(test)]
