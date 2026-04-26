@@ -41,6 +41,7 @@ use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
+use runtime::mcp_tool_name;
 use runtime::{
     check_base_commit, format_stale_base_warning, format_usd, load_oauth_credentials,
     load_system_prompt, pricing_for_model, resolve_expected_base, resolve_sandbox_status,
@@ -3760,6 +3761,7 @@ struct ToolSearchRequest {
 
 #[derive(Debug, Deserialize)]
 struct McpToolRequest {
+    server: Option<String>,
     #[serde(rename = "qualifiedName")]
     qualified_name: Option<String>,
     tool: Option<String>,
@@ -3775,6 +3777,11 @@ struct ListMcpResourcesRequest {
 struct ReadMcpResourceRequest {
     server: String,
     uri: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct McpAuthRequest {
+    server: String,
 }
 
 impl RuntimeMcpState {
@@ -3818,13 +3825,13 @@ impl RuntimeMcpState {
                 .iter()
                 .map(|failure| runtime::McpFailedServer {
                     server_name: failure.server_name.clone(),
-                    phase: runtime::McpLifecyclePhase::ToolDiscovery,
+                    phase: failure.phase,
                     error: runtime::McpErrorSurface::new(
-                        runtime::McpLifecyclePhase::ToolDiscovery,
+                        failure.phase,
                         Some(failure.server_name.clone()),
                         failure.error.clone(),
-                        std::collections::BTreeMap::new(),
-                        true,
+                        failure.context.clone(),
+                        failure.recoverable,
                     ),
                 })
                 .chain(discovery.unsupported_servers.iter().map(|server| {
@@ -3877,6 +3884,14 @@ impl RuntimeMcpState {
         self.degraded_report.clone()
     }
 
+    fn inventory_json(&self) -> serde_json::Value {
+        json!({
+            "servers": self.server_names(),
+            "pending_servers": self.pending_servers(),
+            "mcp_degraded": self.degraded_report(),
+        })
+    }
+
     fn server_names(&self) -> Vec<String> {
         self.manager.server_names()
     }
@@ -3905,6 +3920,24 @@ impl RuntimeMcpState {
         serde_json::to_string_pretty(&result).map_err(|error| ToolError::new(error.to_string()))
     }
 
+    fn call_legacy_tool(
+        &mut self,
+        server_name: &str,
+        tool_name: &str,
+        arguments: Option<serde_json::Value>,
+    ) -> Result<String, ToolError> {
+        let result = self.call_tool(&mcp_tool_name(server_name, tool_name), arguments)?;
+        let parsed = serde_json::from_str::<serde_json::Value>(&result)
+            .map_err(|error| ToolError::new(error.to_string()))?;
+        serde_json::to_string_pretty(&json!({
+            "server": server_name,
+            "tool": tool_name,
+            "result": parsed,
+            "status": "success"
+        }))
+        .map_err(|error| ToolError::new(error.to_string()))
+    }
+
     fn list_resources_for_server(&mut self, server_name: &str) -> Result<String, ToolError> {
         let result = self
             .runtime
@@ -3913,6 +3946,21 @@ impl RuntimeMcpState {
         serde_json::to_string_pretty(&json!({
             "server": server_name,
             "resources": result.resources,
+        }))
+        .map_err(|error| ToolError::new(error.to_string()))
+    }
+
+    fn list_resources_for_server_legacy(&mut self, server_name: &str) -> Result<String, ToolError> {
+        let result = self
+            .runtime
+            .block_on(self.manager.list_resources(server_name))
+            .map_err(|error| ToolError::new(error.to_string()))?;
+        let count = result.resources.len();
+        serde_json::to_string_pretty(&json!({
+            "server": server_name,
+            "resources": result.resources,
+            "count": count,
+            "source": "runtime"
         }))
         .map_err(|error| ToolError::new(error.to_string()))
     }
@@ -3953,6 +4001,48 @@ impl RuntimeMcpState {
         .map_err(|error| ToolError::new(error.to_string()))
     }
 
+    fn list_resources_for_all_servers_legacy(&mut self) -> Result<String, ToolError> {
+        let mut resources = Vec::new();
+        let mut failures = Vec::new();
+        let mut count = 0;
+
+        for server_name in self.server_names() {
+            match self
+                .runtime
+                .block_on(self.manager.list_resources(&server_name))
+            {
+                Ok(result) => {
+                    count += result.resources.len();
+                    resources.push(json!({
+                        "server": server_name,
+                        "resources": result.resources,
+                    }));
+                }
+                Err(error) => failures.push(json!({
+                    "server": server_name,
+                    "error": error.to_string(),
+                })),
+            }
+        }
+
+        if resources.is_empty() && !failures.is_empty() {
+            let message = failures
+                .iter()
+                .filter_map(|failure| failure.get("error").and_then(serde_json::Value::as_str))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(ToolError::new(message));
+        }
+
+        serde_json::to_string_pretty(&json!({
+            "resources": resources,
+            "failures": failures,
+            "count": count,
+            "source": "runtime"
+        }))
+        .map_err(|error| ToolError::new(error.to_string()))
+    }
+
     fn read_resource(&mut self, server_name: &str, uri: &str) -> Result<String, ToolError> {
         let result = self
             .runtime
@@ -3961,6 +4051,45 @@ impl RuntimeMcpState {
         serde_json::to_string_pretty(&json!({
             "server": server_name,
             "contents": result.contents,
+        }))
+        .map_err(|error| ToolError::new(error.to_string()))
+    }
+
+    fn read_resource_legacy(&mut self, server_name: &str, uri: &str) -> Result<String, ToolError> {
+        let result = self
+            .runtime
+            .block_on(self.manager.read_resource(server_name, uri))
+            .map_err(|error| ToolError::new(error.to_string()))?;
+        serde_json::to_string_pretty(&json!({
+            "server": server_name,
+            "uri": uri,
+            "contents": result.contents,
+            "source": "runtime"
+        }))
+        .map_err(|error| ToolError::new(error.to_string()))
+    }
+
+    fn auth_status(&self, server_name: &str) -> Result<String, ToolError> {
+        let failed = self.degraded_report.as_ref().and_then(|report| {
+            report
+                .failed_servers
+                .iter()
+                .find(|server| server.server_name == server_name)
+        });
+        let status = if failed.is_some() {
+            "error"
+        } else if self.server_names().iter().any(|name| name == server_name) {
+            "connected"
+        } else {
+            "disconnected"
+        };
+
+        serde_json::to_string_pretty(&json!({
+            "server": server_name,
+            "status": status,
+            "source": "runtime",
+            "failure": failed,
+            "mcp_degraded": self.degraded_report(),
         }))
         .map_err(|error| ToolError::new(error.to_string()))
     }
@@ -8732,6 +8861,61 @@ impl CliToolExecutor {
             _ => mcp_state.call_tool(tool_name, Some(value)),
         }
     }
+
+    fn execute_legacy_mcp_builtin(
+        &self,
+        tool_name: &str,
+        value: serde_json::Value,
+    ) -> Option<Result<String, ToolError>> {
+        if !matches!(
+            tool_name,
+            "ListMcpResources" | "ReadMcpResource" | "McpAuth" | "MCP"
+        ) {
+            return None;
+        }
+        let mcp_state = self.mcp_state.as_ref()?.clone();
+        let mut mcp_state = mcp_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        Some(match tool_name {
+            "ListMcpResources" => {
+                let input = match serde_json::from_value::<ListMcpResourcesRequest>(value) {
+                    Ok(input) => input,
+                    Err(error) => {
+                        return Some(Err(ToolError::new(format!(
+                            "invalid tool input JSON: {error}"
+                        ))));
+                    }
+                };
+                match input.server {
+                    Some(server_name) => mcp_state.list_resources_for_server_legacy(&server_name),
+                    None => mcp_state.list_resources_for_all_servers_legacy(),
+                }
+            }
+            "ReadMcpResource" => serde_json::from_value::<ReadMcpResourceRequest>(value)
+                .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))
+                .and_then(|input| mcp_state.read_resource_legacy(&input.server, &input.uri)),
+            "McpAuth" => serde_json::from_value::<McpAuthRequest>(value)
+                .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))
+                .and_then(|input| mcp_state.auth_status(&input.server)),
+            "MCP" => serde_json::from_value::<McpToolRequest>(value)
+                .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))
+                .and_then(|input| {
+                    if let Some(qualified_name) = input.qualified_name {
+                        return mcp_state.call_tool(&qualified_name, input.arguments);
+                    }
+                    let server = input.server.ok_or_else(|| {
+                        ToolError::new("missing required field `server` or `qualifiedName`")
+                    })?;
+                    let tool = input
+                        .tool
+                        .ok_or_else(|| ToolError::new("missing required field `tool`"))?;
+                    mcp_state.call_legacy_tool(&server, &tool, input.arguments)
+                }),
+            _ => unreachable!("legacy MCP built-in names are matched above"),
+        })
+    }
 }
 
 impl ToolExecutor for CliToolExecutor {
@@ -8751,6 +8935,8 @@ impl ToolExecutor for CliToolExecutor {
             self.execute_search_tool(value)
         } else if self.tool_registry.has_runtime_tool(tool_name) {
             self.execute_runtime_tool(tool_name, value)
+        } else if let Some(result) = self.execute_legacy_mcp_builtin(tool_name, value.clone()) {
+            result
         } else {
             self.tool_registry
                 .execute(tool_name, &value)
@@ -12669,11 +12855,23 @@ UU conflicted.rs",
         );
         assert_eq!(
             search_json["mcp_degraded"]["failed_servers"][0]["phase"],
-            "tool_discovery"
+            "initialize_handshake"
         );
         assert_eq!(
             search_json["mcp_degraded"]["available_tools"][0],
             "mcp__alpha__echo"
+        );
+        let inventory_json = state
+            .mcp_state
+            .as_ref()
+            .expect("mcp state should exist")
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .inventory_json();
+        assert_eq!(
+            inventory_json["mcp_degraded"],
+            search_json["mcp_degraded"],
+            "direct runtime MCP inventory and model-facing search should report the same degraded state"
         );
 
         let listed = executor
@@ -12682,6 +12880,17 @@ UU conflicted.rs",
         let listed_json: serde_json::Value =
             serde_json::from_str(&listed).expect("resource output should be json");
         assert_eq!(listed_json["resources"][0]["uri"], "file://guide.txt");
+        let legacy_listed = executor
+            .execute("ListMcpResources", r#"{"server":"alpha"}"#)
+            .expect("legacy resources tool should use live runtime state");
+        let legacy_listed_json: serde_json::Value =
+            serde_json::from_str(&legacy_listed).expect("legacy resource output should be json");
+        assert_eq!(legacy_listed_json["source"], "runtime");
+        assert_eq!(legacy_listed_json["count"], 1);
+        assert_eq!(
+            legacy_listed_json["resources"][0]["uri"],
+            listed_json["resources"][0]["uri"]
+        );
 
         let read = executor
             .execute(
@@ -12694,6 +12903,45 @@ UU conflicted.rs",
         assert_eq!(
             read_json["contents"][0]["text"],
             "contents for file://guide.txt"
+        );
+        let legacy_read = executor
+            .execute(
+                "ReadMcpResource",
+                r#"{"server":"alpha","uri":"file://guide.txt"}"#,
+            )
+            .expect("legacy resource read should use live runtime state");
+        let legacy_read_json: serde_json::Value =
+            serde_json::from_str(&legacy_read).expect("legacy read output should be json");
+        assert_eq!(legacy_read_json["source"], "runtime");
+        assert_eq!(
+            legacy_read_json["contents"][0]["text"],
+            read_json["contents"][0]["text"]
+        );
+
+        let legacy_mcp = executor
+            .execute(
+                "MCP",
+                r#"{"server":"alpha","tool":"echo","arguments":{"text":"legacy"}}"#,
+            )
+            .expect("legacy MCP tool should use live runtime state");
+        let legacy_mcp_json: serde_json::Value =
+            serde_json::from_str(&legacy_mcp).expect("legacy mcp output should be json");
+        assert_eq!(legacy_mcp_json["status"], "success");
+        assert_eq!(
+            legacy_mcp_json["result"]["structuredContent"]["echoed"],
+            "legacy"
+        );
+
+        let legacy_auth = executor
+            .execute("McpAuth", r#"{"server":"broken"}"#)
+            .expect("legacy MCP auth/status should use live runtime state");
+        let legacy_auth_json: serde_json::Value =
+            serde_json::from_str(&legacy_auth).expect("legacy mcp auth output should be json");
+        assert_eq!(legacy_auth_json["source"], "runtime");
+        assert_eq!(legacy_auth_json["status"], "error");
+        assert_eq!(
+            legacy_auth_json["mcp_degraded"], search_json["mcp_degraded"],
+            "legacy model-facing MCP status should preserve the direct degraded report"
         );
 
         if let Some(mcp_state) = state.mcp_state {

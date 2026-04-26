@@ -2,38 +2,36 @@
 
 ## Done
 
-- Priority 1, item 1 session compaction parity slice started and implemented.
-- Auto-compaction now reports deterministic event payload fields: removed message count, kept message count, and compaction count.
-- Auto-compaction emits a `session_auto_compacted` session trace event before `turn_completed`.
-- Auto-compaction persists the compacted session snapshot when the runtime session has a persistence path.
-- Mock parity `auto_compact_triggered` now performs a deterministic multi-iteration turn that actually crosses the auto-compaction path and asserts the JSON event payload.
+- Priority 1, item 1 session compaction parity slice closed at commit `e008b36`.
+- MCP runtime lifecycle depth slice started.
+- CLI model-facing legacy MCP built-ins now prefer live `RuntimeMcpState` when the CLI has MCP runtime state.
+- The legacy global MCP registry remains the fallback path when no CLI runtime MCP state exists.
+- CLI MCP degraded reports now preserve discovery failure phase, context, and recoverability from `McpServerManager`.
+- Deterministic CLI tests assert live runtime behavior for legacy `ListMcpResources`, `ReadMcpResource`, `MCP`, and `McpAuth`.
 
 ## In Progress
 
-- Session compaction parity remains the active buildout slice pending review and broader CI.
+- MCP runtime lifecycle parity remains the active buildout slice pending review.
 
 ## Blocked
 
-- None for this scoped slice.
+- Remote transports, OAuth/auth UX, and deeper direct CLI inventory lifecycle work remain out of scope for this slice.
 - Full CI green is not claimed; only the validation commands below were run.
 
 ## Files changed
 
-- `rust/crates/runtime/src/conversation.rs`
 - `rust/crates/rusty-claude-cli/src/main.rs`
-- `rust/crates/mock-anthropic-service/src/lib.rs`
-- `rust/crates/rusty-claude-cli/tests/mock_parity_harness.rs`
 - `docs/BUILDOUT_STATUS_2026-04-26.md`
 
 ## Validation commands
 
 - `cargo fmt --all --check`
 - `git diff --check`
-- `cargo test -p runtime auto_compaction`
-- `cargo test -p runtime auto_compacts_when_cumulative_input_threshold_is_crossed`
-- `cargo test -p rusty-claude-cli --test mock_parity_harness clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios`
+- `cargo test -p rusty-claude-cli build_runtime_plugin_state_discovers_mcp_tools_and_surfaces_pending_servers`
+- `cargo test -p rusty-claude-cli build_runtime_plugin_state_surfaces_unsupported_mcp_servers_structurally`
+- `cargo test -p rusty-claude-cli mcp`
 
 ## Commit hash if committed
 
-- Pending closeout commit; final hash reported by session closeout.
-- Current pre-change HEAD: `7587f2c`
+- Current baseline: `e008b36`
+- MCP slice commit: pending.
