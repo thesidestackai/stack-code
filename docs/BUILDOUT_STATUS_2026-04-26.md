@@ -89,4 +89,48 @@ Status: Done
 
 ### Commit
 
-- not committed
+- committed locally; no push performed
+
+## Implementation Update — E2E MCP Parity Harness Coverage
+
+Status: Done
+
+### What changed
+
+- Added scripted mock Anthropic scenarios that exercise external MCP lifecycle behavior through the real CLI harness.
+- Covered configured stdio MCP startup, `tools/list` discovery, dynamic model-facing `mcp__server__tool` exposure, server-routed tool calls, `resources/list`, and `resources/read`.
+- Added degraded lifecycle coverage for a healthy server alongside an initialize failure and unsupported remote transport.
+- Added deterministic harness assertions for request tool inventory, dynamic MCP tool results, direct MCP inventory, degraded startup reporting, and unsupported transport status.
+
+### Files changed
+
+- `rust/crates/mock-anthropic-service/src/lib.rs`
+- `rust/crates/rusty-claude-cli/tests/mock_parity_harness.rs`
+- `rust/mock_parity_scenarios.json`
+- `docs/BUILDOUT_STATUS_2026-04-26.md`
+
+### Validation
+
+- command: `cargo fmt --all --check`
+  result: pass
+- command: `git diff --check`
+  result: pass
+- command: `cargo test -p rusty-claude-cli --test mock_parity_harness clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios -- --nocapture`
+  result: pass
+- command: `cargo test -p mock-anthropic-service`
+  result: pass
+- command: `cargo test -p rusty-claude-cli mcp -- --nocapture`
+  result: pass
+- command: `cargo test -p runtime mcp -- --nocapture`
+  result: pass
+
+### Remaining MCP gaps
+
+- Remote transports still unsupported.
+- OAuth/auth UX still not implemented.
+- Direct inventory shutdown/reset event history remains limited to existing runtime state.
+- Full workspace CI was not rerun for this slice.
+
+### Commit
+
+- committed locally; no push performed

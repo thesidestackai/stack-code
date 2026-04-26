@@ -100,6 +100,8 @@ enum Scenario {
     PluginToolRoundtrip,
     AutoCompactTriggered,
     TokenCostReporting,
+    McpStdioLifecycleRoundtrip,
+    McpDegradedLifecycleStatus,
 }
 
 impl Scenario {
@@ -117,6 +119,8 @@ impl Scenario {
             "plugin_tool_roundtrip" => Some(Self::PluginToolRoundtrip),
             "auto_compact_triggered" => Some(Self::AutoCompactTriggered),
             "token_cost_reporting" => Some(Self::TokenCostReporting),
+            "mcp_stdio_lifecycle_roundtrip" => Some(Self::McpStdioLifecycleRoundtrip),
+            "mcp_degraded_lifecycle_status" => Some(Self::McpDegradedLifecycleStatus),
             _ => None,
         }
     }
@@ -135,6 +139,8 @@ impl Scenario {
             Self::PluginToolRoundtrip => "plugin_tool_roundtrip",
             Self::AutoCompactTriggered => "auto_compact_triggered",
             Self::TokenCostReporting => "token_cost_reporting",
+            Self::McpStdioLifecycleRoundtrip => "mcp_stdio_lifecycle_roundtrip",
+            Self::McpDegradedLifecycleStatus => "mcp_degraded_lifecycle_status",
         }
     }
 }
@@ -483,6 +489,46 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
         Scenario::TokenCostReporting => {
             final_text_sse_with_usage("token cost reporting parity complete.", 1_000, 500)
         }
+        Scenario::McpStdioLifecycleRoundtrip => match tool_result_count(request) {
+            0 => tool_uses_sse(&[
+                ToolUseSse {
+                    tool_id: "toolu_mcp_beta_echo",
+                    tool_name: "mcp__beta__echo",
+                    partial_json_chunks: &[r#"{"text":"hello from mcp parity"}"#],
+                },
+                ToolUseSse {
+                    tool_id: "toolu_mcp_list_resources",
+                    tool_name: "ListMcpResourcesTool",
+                    partial_json_chunks: &[r#"{"server":"alpha"}"#],
+                },
+                ToolUseSse {
+                    tool_id: "toolu_mcp_read_resource",
+                    tool_name: "ReadMcpResourceTool",
+                    partial_json_chunks: &[r#"{"server":"alpha","uri":"mcp://alpha/guide"}"#],
+                },
+            ]),
+            _ => final_text_sse("mcp stdio lifecycle roundtrip complete."),
+        },
+        Scenario::McpDegradedLifecycleStatus => match tool_result_count(request) {
+            0 => tool_use_sse(
+                "toolu_mcp_tool_search",
+                "ToolSearch",
+                &[r#"{"query":"mcp remote broken alpha echo","max_results":10}"#],
+            ),
+            1 => tool_uses_sse(&[
+                ToolUseSse {
+                    tool_id: "toolu_mcp_auth_remote",
+                    tool_name: "McpAuth",
+                    partial_json_chunks: &[r#"{"server":"remote"}"#],
+                },
+                ToolUseSse {
+                    tool_id: "toolu_mcp_auth_broken",
+                    tool_name: "McpAuth",
+                    partial_json_chunks: &[r#"{"server":"broken"}"#],
+                },
+            ]),
+            _ => final_text_sse("mcp degraded lifecycle status complete."),
+        },
     }
 }
 
@@ -667,6 +713,59 @@ fn build_message_response(request: &MessageRequest, scenario: Scenario) -> Messa
             1_000,
             500,
         ),
+        Scenario::McpStdioLifecycleRoundtrip => match tool_result_count(request) {
+            0 => tool_message_response_many(
+                "msg_mcp_stdio_lifecycle_tools",
+                &[
+                    ToolUseMessage {
+                        tool_id: "toolu_mcp_beta_echo",
+                        tool_name: "mcp__beta__echo",
+                        input: json!({"text": "hello from mcp parity"}),
+                    },
+                    ToolUseMessage {
+                        tool_id: "toolu_mcp_list_resources",
+                        tool_name: "ListMcpResourcesTool",
+                        input: json!({"server": "alpha"}),
+                    },
+                    ToolUseMessage {
+                        tool_id: "toolu_mcp_read_resource",
+                        tool_name: "ReadMcpResourceTool",
+                        input: json!({"server": "alpha", "uri": "mcp://alpha/guide"}),
+                    },
+                ],
+            ),
+            _ => text_message_response(
+                "msg_mcp_stdio_lifecycle_final",
+                "mcp stdio lifecycle roundtrip complete.",
+            ),
+        },
+        Scenario::McpDegradedLifecycleStatus => match tool_result_count(request) {
+            0 => tool_message_response(
+                "msg_mcp_degraded_tool_search",
+                "toolu_mcp_tool_search",
+                "ToolSearch",
+                json!({"query": "mcp remote broken alpha echo", "max_results": 10}),
+            ),
+            1 => tool_message_response_many(
+                "msg_mcp_degraded_auth",
+                &[
+                    ToolUseMessage {
+                        tool_id: "toolu_mcp_auth_remote",
+                        tool_name: "McpAuth",
+                        input: json!({"server": "remote"}),
+                    },
+                    ToolUseMessage {
+                        tool_id: "toolu_mcp_auth_broken",
+                        tool_name: "McpAuth",
+                        input: json!({"server": "broken"}),
+                    },
+                ],
+            ),
+            _ => text_message_response(
+                "msg_mcp_degraded_lifecycle_final",
+                "mcp degraded lifecycle status complete.",
+            ),
+        },
     }
 }
 
@@ -684,6 +783,8 @@ fn request_id_for(scenario: Scenario) -> &'static str {
         Scenario::PluginToolRoundtrip => "req_plugin_tool_roundtrip",
         Scenario::AutoCompactTriggered => "req_auto_compact_triggered",
         Scenario::TokenCostReporting => "req_token_cost_reporting",
+        Scenario::McpStdioLifecycleRoundtrip => "req_mcp_stdio_lifecycle_roundtrip",
+        Scenario::McpDegradedLifecycleStatus => "req_mcp_degraded_lifecycle_status",
     }
 }
 

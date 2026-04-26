@@ -105,5 +105,23 @@
     "parity_refs": [
       "Token counting / cost tracking accuracy"
     ]
+  },
+  {
+    "name": "mcp_stdio_lifecycle_roundtrip",
+    "category": "mcp-runtime",
+    "description": "Starts configured stdio MCP servers, discovers dynamic tools, routes a dynamic tool call, and exercises resources/list plus resources/read.",
+    "parity_refs": [
+      "MCP runtime lifecycle depth beyond registry bridge",
+      "E2E MCP parity harness coverage"
+    ]
+  },
+  {
+    "name": "mcp_degraded_lifecycle_status",
+    "category": "mcp-runtime",
+    "description": "Verifies degraded MCP startup and unsupported remote transport status through model-facing tools and direct inventory.",
+    "parity_refs": [
+      "MCP lifecycle event taxonomy + direct inventory consistency",
+      "E2E MCP parity harness coverage"
+    ]
   }
 ]

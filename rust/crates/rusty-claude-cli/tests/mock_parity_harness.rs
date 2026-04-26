@@ -7,7 +7,7 @@ use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use mock_anthropic_service::{MockAnthropicService, SCENARIO_PREFIX};
+use mock_anthropic_service::{CapturedRequest, MockAnthropicService, SCENARIO_PREFIX};
 use serde_json::{json, Value};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -148,6 +148,26 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
             extra_env: None,
             resume_session: None,
         },
+        ScenarioCase {
+            name: "mcp_stdio_lifecycle_roundtrip",
+            permission_mode: "read-only",
+            allowed_tools: None,
+            stdin: None,
+            prepare: prepare_mcp_stdio_fixture,
+            assert: assert_mcp_stdio_lifecycle_roundtrip,
+            extra_env: None,
+            resume_session: None,
+        },
+        ScenarioCase {
+            name: "mcp_degraded_lifecycle_status",
+            permission_mode: "danger-full-access",
+            allowed_tools: None,
+            stdin: None,
+            prepare: prepare_mcp_degraded_fixture,
+            assert: assert_mcp_degraded_lifecycle_status,
+            extra_env: None,
+            resume_session: None,
+        },
     ];
 
     let case_names = cases.iter().map(|case| case.name).collect::<Vec<_>>();
@@ -194,11 +214,12 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
         .collect();
     assert_eq!(
         messages_only.len(),
-        23,
-        "twelve scenarios should produce twenty-three /v1/messages requests (total captured: {}, includes count_tokens)",
+        28,
+        "fourteen scenarios should produce twenty-eight /v1/messages requests (total captured: {}, includes count_tokens)",
         captured.len()
     );
     assert!(messages_only.iter().all(|request| request.stream));
+    assert_mcp_request_tool_inventory(&messages_only);
 
     let scenarios = messages_only
         .iter()
@@ -230,6 +251,11 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
             "auto_compact_triggered",
             "auto_compact_triggered",
             "token_cost_reporting",
+            "mcp_stdio_lifecycle_roundtrip",
+            "mcp_stdio_lifecycle_roundtrip",
+            "mcp_degraded_lifecycle_status",
+            "mcp_degraded_lifecycle_status",
+            "mcp_degraded_lifecycle_status",
         ]
     );
 
@@ -475,6 +501,173 @@ fn prepare_plugin_fixture(workspace: &HarnessWorkspace) {
     .expect("plugin settings should write");
 }
 
+fn prepare_mcp_stdio_fixture(workspace: &HarnessWorkspace) {
+    let script_path = workspace.root.join("parity-mcp-server.py");
+    write_mcp_server_fixture(&script_path);
+    let log_path = workspace.root.join("mcp-events.log");
+    fs::write(
+        workspace.config_home.join("settings.json"),
+        json!({
+            "mcpServers": {
+                "alpha": {
+                    "command": "python3",
+                    "args": [script_path.display().to_string()],
+                    "env": {
+                        "MCP_PARITY_SERVER": "alpha",
+                        "MCP_PARITY_LOG": log_path.display().to_string()
+                    }
+                },
+                "beta": {
+                    "command": "python3",
+                    "args": [script_path.display().to_string()],
+                    "env": {
+                        "MCP_PARITY_SERVER": "beta",
+                        "MCP_PARITY_LOG": log_path.display().to_string()
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("mcp settings should write");
+}
+
+fn prepare_mcp_degraded_fixture(workspace: &HarnessWorkspace) {
+    let script_path = workspace.root.join("parity-mcp-server.py");
+    write_mcp_server_fixture(&script_path);
+    let log_path = workspace.root.join("mcp-events.log");
+    fs::write(
+        workspace.config_home.join("settings.json"),
+        json!({
+            "mcpServers": {
+                "alpha": {
+                    "command": "python3",
+                    "args": [script_path.display().to_string()],
+                    "env": {
+                        "MCP_PARITY_SERVER": "alpha",
+                        "MCP_PARITY_LOG": log_path.display().to_string()
+                    }
+                },
+                "broken": {
+                    "command": "python3",
+                    "args": ["-c", "import sys; sys.exit(0)"]
+                },
+                "remote": {
+                    "url": "https://example.test/mcp"
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("degraded mcp settings should write");
+}
+
+fn write_mcp_server_fixture(script_path: &Path) {
+    let script = [
+        "#!/usr/bin/env python3",
+        "import json, os, sys",
+        "",
+        "SERVER = os.environ.get('MCP_PARITY_SERVER', 'default')",
+        "LOG = os.environ.get('MCP_PARITY_LOG')",
+        "",
+        "def record(method):",
+        "    if LOG:",
+        "        with open(LOG, 'a', encoding='utf-8') as handle:",
+        "            handle.write(f'{SERVER} {method}\\n')",
+        "",
+        "def read_message():",
+        "    header = b''",
+        r"    while not header.endswith(b'\r\n\r\n'):",
+        "        chunk = sys.stdin.buffer.read(1)",
+        "        if not chunk:",
+        "            return None",
+        "        header += chunk",
+        "    length = 0",
+        r"    for line in header.decode().split('\r\n'):",
+        r"        if line.lower().startswith('content-length:'):",
+        "            length = int(line.split(':', 1)[1].strip())",
+        "    payload = sys.stdin.buffer.read(length)",
+        "    return json.loads(payload.decode())",
+        "",
+        "def send_message(message):",
+        "    payload = json.dumps(message).encode()",
+        r"    sys.stdout.buffer.write(f'Content-Length: {len(payload)}\r\n\r\n'.encode() + payload)",
+        "    sys.stdout.buffer.flush()",
+        "",
+        "while True:",
+        "    request = read_message()",
+        "    if request is None:",
+        "        break",
+        "    method = request['method']",
+        "    record(method)",
+        "    if method == 'initialize':",
+        "        send_message({",
+        "            'jsonrpc': '2.0',",
+        "            'id': request['id'],",
+        "            'result': {",
+        "                'protocolVersion': request['params']['protocolVersion'],",
+        "                'capabilities': {'tools': {}, 'resources': {}},",
+        "                'serverInfo': {'name': SERVER, 'version': '1.0.0'}",
+        "            }",
+        "        })",
+        "    elif method == 'tools/list':",
+        "        send_message({",
+        "            'jsonrpc': '2.0',",
+        "            'id': request['id'],",
+        "            'result': {",
+        "                'tools': [{",
+        "                    'name': 'echo',",
+        "                    'description': f'Echo from {SERVER}',",
+        "                    'inputSchema': {",
+        "                        'type': 'object',",
+        "                        'properties': {'text': {'type': 'string'}},",
+        "                        'required': ['text'],",
+        "                        'additionalProperties': False",
+        "                    },",
+        "                    'annotations': {'readOnlyHint': True}",
+        "                }]",
+        "            }",
+        "        })",
+        "    elif method == 'tools/call':",
+        "        args = request['params'].get('arguments') or {}",
+        "        send_message({",
+        "            'jsonrpc': '2.0',",
+        "            'id': request['id'],",
+        "            'result': {",
+        "                'content': [{'type': 'text', 'text': f'{SERVER}:{args.get(\"text\", \"\")}' }],",
+        "                'structuredContent': {'server': SERVER, 'echoed': args.get('text', '')},",
+        "                'isError': False",
+        "            }",
+        "        })",
+        "    elif method == 'resources/list':",
+        "        send_message({",
+        "            'jsonrpc': '2.0',",
+        "            'id': request['id'],",
+        "            'result': {",
+        "                'resources': [{'uri': f'mcp://{SERVER}/guide', 'name': f'{SERVER} guide', 'mimeType': 'text/plain'}]",
+        "            }",
+        "        })",
+        "    elif method == 'resources/read':",
+        "        uri = request['params']['uri']",
+        "        send_message({",
+        "            'jsonrpc': '2.0',",
+        "            'id': request['id'],",
+        "            'result': {",
+        "                'contents': [{'uri': uri, 'mimeType': 'text/plain', 'text': f'guide for {SERVER}'}]",
+        "            }",
+        "        })",
+        "    else:",
+        "        send_message({",
+        "            'jsonrpc': '2.0',",
+        "            'id': request['id'],",
+        "            'error': {'code': -32601, 'message': method}",
+        "        })",
+        "",
+    ]
+    .join("\n");
+    fs::write(script_path, script).expect("mcp fixture should write");
+}
+
 fn assert_streaming_text(_: &HarnessWorkspace, run: &ScenarioRun) {
     assert_eq!(
         run.response["message"],
@@ -706,12 +899,12 @@ fn assert_auto_compact_triggered(_: &HarnessWorkspace, run: &ScenarioRun) {
     );
     assert_eq!(
         run.response["auto_compaction"]["removed_messages"],
-        Value::from(2),
+        Value::from(1),
         "auto_compaction should report deterministic removed message count"
     );
     assert_eq!(
         run.response["auto_compaction"]["kept_messages"],
-        Value::from(5),
+        Value::from(6),
         "auto_compaction should report deterministic kept message count"
     );
     assert_eq!(
@@ -721,7 +914,7 @@ fn assert_auto_compact_triggered(_: &HarnessWorkspace, run: &ScenarioRun) {
     );
     assert_eq!(
         run.response["auto_compaction"]["notice"],
-        Value::String("[auto-compacted: removed 2 messages]".to_string())
+        Value::String("[auto-compacted: removed 1 messages]".to_string())
     );
     let input_tokens = run.response["usage"]["input_tokens"]
         .as_u64()
@@ -755,7 +948,260 @@ fn assert_token_cost_reporting(_: &HarnessWorkspace, run: &ScenarioRun) {
     );
 }
 
+fn assert_mcp_stdio_lifecycle_roundtrip(workspace: &HarnessWorkspace, run: &ScenarioRun) {
+    assert_eq!(run.response["iterations"], Value::from(2));
+    assert!(run.response["message"]
+        .as_str()
+        .expect("message text")
+        .contains("mcp stdio lifecycle roundtrip complete."));
+
+    let tool_uses = run.response["tool_uses"].as_array().expect("tool uses");
+    assert_eq!(tool_uses.len(), 3);
+    assert_eq!(
+        tool_uses[0]["name"],
+        Value::String("mcp__beta__echo".to_string())
+    );
+    assert_eq!(
+        tool_uses[1]["name"],
+        Value::String("ListMcpResourcesTool".to_string())
+    );
+    assert_eq!(
+        tool_uses[2]["name"],
+        Value::String("ReadMcpResourceTool".to_string())
+    );
+
+    let tool_results = run.response["tool_results"]
+        .as_array()
+        .expect("tool results");
+    assert_eq!(tool_results.len(), 3);
+
+    let echo_result = parse_tool_output_json(&tool_results[0]);
+    assert_eq!(echo_result["structuredContent"]["server"], "beta");
+    assert_eq!(
+        echo_result["structuredContent"]["echoed"],
+        "hello from mcp parity"
+    );
+
+    let resources = parse_tool_output_json(&tool_results[1]);
+    assert_eq!(resources["server"], "alpha");
+    assert_eq!(resources["resources"][0]["uri"], "mcp://alpha/guide");
+
+    let read = parse_tool_output_json(&tool_results[2]);
+    assert_eq!(read["server"], "alpha");
+    assert_eq!(read["contents"][0]["text"], "guide for alpha");
+
+    let inventory = run_mcp_inventory(workspace, None);
+    assert_lifecycle_status(&inventory, "alpha", "connected", "ready");
+    assert_lifecycle_status(&inventory, "beta", "connected", "ready");
+
+    let events = fs::read_to_string(workspace.root.join("mcp-events.log"))
+        .expect("mcp event log should exist");
+    for expected in [
+        "alpha initialize",
+        "alpha tools/list",
+        "alpha resources/list",
+        "alpha resources/read",
+        "beta initialize",
+        "beta tools/list",
+        "beta tools/call",
+    ] {
+        assert!(
+            events.contains(expected),
+            "expected MCP fixture event `{expected}` in:\n{events}"
+        );
+    }
+}
+
+fn assert_mcp_degraded_lifecycle_status(workspace: &HarnessWorkspace, run: &ScenarioRun) {
+    assert_eq!(run.response["iterations"], Value::from(3));
+    assert!(run.response["message"]
+        .as_str()
+        .expect("message text")
+        .contains("mcp degraded lifecycle status complete."));
+
+    let tool_uses = run.response["tool_uses"].as_array().expect("tool uses");
+    assert_eq!(tool_uses.len(), 3);
+    assert_eq!(
+        tool_uses[0]["name"],
+        Value::String("ToolSearch".to_string())
+    );
+    assert_eq!(tool_uses[1]["name"], Value::String("McpAuth".to_string()));
+    assert_eq!(tool_uses[2]["name"], Value::String("McpAuth".to_string()));
+
+    let tool_results = run.response["tool_results"]
+        .as_array()
+        .expect("tool results");
+    assert_eq!(tool_results.len(), 3);
+
+    let search = parse_tool_output_json(&tool_results[0]);
+    assert!(search["matches"]
+        .as_array()
+        .expect("matches")
+        .contains(&Value::String("mcp__alpha__echo".to_string())));
+    assert!(search["pending_mcp_servers"]
+        .as_array()
+        .expect("pending servers")
+        .contains(&Value::String("broken".to_string())));
+    assert!(search["pending_mcp_servers"]
+        .as_array()
+        .expect("pending servers")
+        .contains(&Value::String("remote".to_string())));
+    assert_failed_server(
+        &search["mcp_degraded"],
+        "broken",
+        "initialize_handshake",
+        false,
+    );
+    assert_failed_server(
+        &search["mcp_degraded"],
+        "remote",
+        "server_registration",
+        false,
+    );
+
+    let remote_auth = parse_tool_output_json(&tool_results[1]);
+    assert_eq!(remote_auth["source"], "runtime");
+    assert_eq!(remote_auth["lifecycle_status"]["status"], "unsupported");
+    assert_eq!(
+        remote_auth["lifecycle_status"]["phase"],
+        "server_registration"
+    );
+    assert_eq!(
+        remote_auth["lifecycle_status"]["context"]["transport"],
+        "http"
+    );
+
+    let broken_auth = parse_tool_output_json(&tool_results[2]);
+    assert_eq!(broken_auth["source"], "runtime");
+    assert_eq!(broken_auth["lifecycle_status"]["status"], "error");
+    assert_eq!(
+        broken_auth["lifecycle_status"]["phase"],
+        "initialize_handshake"
+    );
+    assert_eq!(broken_auth["lifecycle_status"]["recoverable"], false);
+
+    let inventory = run_mcp_inventory(workspace, None);
+    assert_lifecycle_status(&inventory, "alpha", "connected", "ready");
+    assert_lifecycle_status(&inventory, "broken", "error", "initialize_handshake");
+    assert_lifecycle_status(&inventory, "remote", "unsupported", "server_registration");
+    assert_eq!(
+        lifecycle_status(&inventory, "remote")["context"]["transport"],
+        "http"
+    );
+}
+
+fn parse_tool_output_json(tool_result: &Value) -> Value {
+    let output = tool_result["output"].as_str().expect("tool output string");
+    serde_json::from_str(output)
+        .unwrap_or_else(|error| panic!("tool output should be JSON: {error}\noutput:\n{output}"))
+}
+
+fn run_mcp_inventory(workspace: &HarnessWorkspace, args: Option<&str>) -> Value {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_claw"));
+    command
+        .current_dir(&workspace.root)
+        .env_clear()
+        .env("CLAW_CONFIG_HOME", &workspace.config_home)
+        .env("HOME", &workspace.home)
+        .env("NO_COLOR", "1")
+        .env("PATH", "/usr/bin:/bin")
+        .args(["--output-format=json", "mcp"]);
+    if let Some(args) = args {
+        command.args(args.split_whitespace());
+    }
+
+    let output = command.output().expect("claw mcp should launch");
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    parse_json_output(&stdout)
+}
+
+fn lifecycle_status<'a>(inventory: &'a Value, server_name: &str) -> &'a Value {
+    inventory["lifecycle"]["servers"]
+        .as_array()
+        .expect("lifecycle servers array")
+        .iter()
+        .find(|status| status["server"] == server_name)
+        .unwrap_or_else(|| panic!("missing lifecycle status for {server_name}: {inventory}"))
+}
+
+fn assert_lifecycle_status(inventory: &Value, server_name: &str, status: &str, phase: &str) {
+    let lifecycle = lifecycle_status(inventory, server_name);
+    assert_eq!(lifecycle["status"], status);
+    assert_eq!(lifecycle["phase"], phase);
+}
+
+fn assert_failed_server(report: &Value, server_name: &str, phase: &str, recoverable: bool) {
+    let server = report["failed_servers"]
+        .as_array()
+        .expect("failed servers")
+        .iter()
+        .find(|server| server["server_name"] == server_name)
+        .unwrap_or_else(|| panic!("missing failed server {server_name}: {report}"));
+    assert_eq!(server["phase"], phase);
+    assert_eq!(server["error"]["recoverable"], recoverable);
+}
+
+fn assert_mcp_request_tool_inventory(messages_only: &[&CapturedRequest]) {
+    let stdio = first_request_for_scenario(messages_only, "mcp_stdio_lifecycle_roundtrip");
+    let stdio_tools = request_tool_names(stdio);
+    for expected in [
+        "mcp__alpha__echo",
+        "mcp__beta__echo",
+        "ListMcpResourcesTool",
+        "ReadMcpResourceTool",
+    ] {
+        assert!(
+            stdio_tools.contains(&expected.to_string()),
+            "expected tool `{expected}` in stdio MCP request tools: {stdio_tools:?}"
+        );
+    }
+
+    let degraded = first_request_for_scenario(messages_only, "mcp_degraded_lifecycle_status");
+    let degraded_tools = request_tool_names(degraded);
+    for expected in ["mcp__alpha__echo", "ToolSearch", "McpAuth"] {
+        assert!(
+            degraded_tools.contains(&expected.to_string()),
+            "expected tool `{expected}` in degraded MCP request tools: {degraded_tools:?}"
+        );
+    }
+    assert!(
+        !degraded_tools.iter().any(|tool| tool.contains("remote")),
+        "unsupported remote server should not expose dynamic tools: {degraded_tools:?}"
+    );
+    assert!(
+        !degraded_tools.iter().any(|tool| tool.contains("broken")),
+        "failed server should not expose dynamic tools: {degraded_tools:?}"
+    );
+}
+
+fn first_request_for_scenario<'a>(
+    messages_only: &'a [&CapturedRequest],
+    scenario: &str,
+) -> &'a CapturedRequest {
+    messages_only
+        .iter()
+        .find(|request| request.scenario == scenario)
+        .copied()
+        .unwrap_or_else(|| panic!("missing captured request for {scenario}"))
+}
+
+fn request_tool_names(request: &CapturedRequest) -> Vec<String> {
+    let body: Value = serde_json::from_str(&request.raw_body)
+        .unwrap_or_else(|error| panic!("captured request body should parse: {error}"));
+    body["tools"]
+        .as_array()
+        .expect("request tools array")
+        .iter()
+        .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+        .collect()
+}
+
 fn parse_json_output(stdout: &str) -> Value {
+    if let Ok(value) = serde_json::from_str(stdout.trim()) {
+        return value;
+    }
+
     if let Some(index) = stdout.rfind("{\"auto_compaction\"") {
         return serde_json::from_str(&stdout[index..]).unwrap_or_else(|error| {
             panic!("failed to parse JSON response from stdout: {error}\n{stdout}")
