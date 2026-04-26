@@ -4364,6 +4364,8 @@ impl LiveCli {
                 "iterations": summary.iterations,
                 "auto_compaction": summary.auto_compaction.map(|event| json!({
                     "removed_messages": event.removed_message_count,
+                    "kept_messages": event.kept_message_count,
+                    "compaction_count": event.compaction_count,
                     "notice": format_auto_compaction_notice(event.removed_message_count),
                 })),
                 "tool_uses": collect_tool_uses(&summary),

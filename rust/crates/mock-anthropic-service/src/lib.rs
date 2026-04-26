@@ -264,6 +264,15 @@ fn latest_tool_result(request: &MessageRequest) -> Option<(String, bool)> {
     })
 }
 
+fn tool_result_count(request: &MessageRequest) -> usize {
+    request
+        .messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter(|block| matches!(block, InputContentBlock::ToolResult { .. }))
+        .count()
+}
+
 fn tool_results_by_name(request: &MessageRequest) -> HashMap<String, (String, bool)> {
     let mut tool_names_by_id = HashMap::new();
     for message in &request.messages {
@@ -458,9 +467,19 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
                 &[r#"{"message":"hello from plugin parity"}"#],
             ),
         },
-        Scenario::AutoCompactTriggered => {
-            final_text_sse_with_usage("auto compact parity complete.", 50_000, 200)
-        }
+        Scenario::AutoCompactTriggered => match tool_result_count(request) {
+            0 => tool_use_sse(
+                "toolu_auto_compact_read_1",
+                "read_file",
+                &[r#"{"path":"fixture.txt"}"#],
+            ),
+            1 => tool_use_sse(
+                "toolu_auto_compact_read_2",
+                "read_file",
+                &[r#"{"path":"fixture.txt"}"#],
+            ),
+            _ => final_text_sse_with_usage("auto compact parity complete.", 50_000, 200),
+        },
         Scenario::TokenCostReporting => {
             final_text_sse_with_usage("token cost reporting parity complete.", 1_000, 500)
         }
@@ -622,12 +641,26 @@ fn build_message_response(request: &MessageRequest, scenario: Scenario) -> Messa
                 json!({"message": "hello from plugin parity"}),
             ),
         },
-        Scenario::AutoCompactTriggered => text_message_response_with_usage(
-            "msg_auto_compact_triggered",
-            "auto compact parity complete.",
-            50_000,
-            200,
-        ),
+        Scenario::AutoCompactTriggered => match tool_result_count(request) {
+            0 => tool_message_response(
+                "msg_auto_compact_tool_1",
+                "toolu_auto_compact_read_1",
+                "read_file",
+                json!({"path": "fixture.txt"}),
+            ),
+            1 => tool_message_response(
+                "msg_auto_compact_tool_2",
+                "toolu_auto_compact_read_2",
+                "read_file",
+                json!({"path": "fixture.txt"}),
+            ),
+            _ => text_message_response_with_usage(
+                "msg_auto_compact_triggered",
+                "auto compact parity complete.",
+                50_000,
+                200,
+            ),
+        },
         Scenario::TokenCostReporting => text_message_response_with_usage(
             "msg_token_cost_reporting",
             "token cost reporting parity complete.",

@@ -131,11 +131,11 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
         ScenarioCase {
             name: "auto_compact_triggered",
             permission_mode: "read-only",
-            allowed_tools: None,
+            allowed_tools: Some("read_file"),
             stdin: None,
-            prepare: prepare_noop,
+            prepare: prepare_read_fixture,
             assert: assert_auto_compact_triggered,
-            extra_env: None,
+            extra_env: Some(("CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS", "1000")),
             resume_session: None,
         },
         ScenarioCase {
@@ -194,8 +194,8 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
         .collect();
     assert_eq!(
         messages_only.len(),
-        21,
-        "twelve scenarios should produce twenty-one /v1/messages requests (total captured: {}, includes count_tokens)",
+        23,
+        "twelve scenarios should produce twenty-three /v1/messages requests (total captured: {}, includes count_tokens)",
         captured.len()
     );
     assert!(messages_only.iter().all(|request| request.stream));
@@ -226,6 +226,8 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
             "bash_permission_prompt_denied",
             "plugin_tool_roundtrip",
             "plugin_tool_roundtrip",
+            "auto_compact_triggered",
+            "auto_compact_triggered",
             "auto_compact_triggered",
             "token_cost_reporting",
         ]
@@ -689,10 +691,12 @@ fn assert_plugin_tool_roundtrip(_: &HarnessWorkspace, run: &ScenarioRun) {
 }
 
 fn assert_auto_compact_triggered(_: &HarnessWorkspace, run: &ScenarioRun) {
-    // Validates that the auto_compaction field is present in JSON output (format parity).
-    // Trigger behavior is covered by conversation::tests::auto_compacts_when_cumulative_input_threshold_is_crossed.
-    assert_eq!(run.response["iterations"], Value::from(1));
-    assert_eq!(run.response["tool_uses"], Value::Array(Vec::new()));
+    assert_eq!(run.response["iterations"], Value::from(3));
+    let tool_uses = run.response["tool_uses"].as_array().expect("tool uses");
+    assert_eq!(tool_uses.len(), 2);
+    assert!(tool_uses
+        .iter()
+        .all(|tool_use| tool_use["name"] == Value::String("read_file".to_string())));
     assert!(
         run.response["message"]
             .as_str()
@@ -700,15 +704,25 @@ fn assert_auto_compact_triggered(_: &HarnessWorkspace, run: &ScenarioRun) {
             .contains("auto compact parity complete."),
         "expected auto compact message in response"
     );
-    // auto_compaction key must be present in JSON (may be null for below-threshold sessions)
-    assert!(
-        run.response
-            .as_object()
-            .expect("response object")
-            .contains_key("auto_compaction"),
-        "auto_compaction key must be present in JSON output"
+    assert_eq!(
+        run.response["auto_compaction"]["removed_messages"],
+        Value::from(2),
+        "auto_compaction should report deterministic removed message count"
     );
-    // Verify input_tokens field reflects the large mock token counts
+    assert_eq!(
+        run.response["auto_compaction"]["kept_messages"],
+        Value::from(5),
+        "auto_compaction should report deterministic kept message count"
+    );
+    assert_eq!(
+        run.response["auto_compaction"]["compaction_count"],
+        Value::from(1),
+        "auto_compaction should report deterministic compaction count"
+    );
+    assert_eq!(
+        run.response["auto_compaction"]["notice"],
+        Value::String("[auto-compacted: removed 2 messages]".to_string())
+    );
     let input_tokens = run.response["usage"]["input_tokens"]
         .as_u64()
         .expect("input_tokens should be present");

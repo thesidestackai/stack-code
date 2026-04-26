@@ -120,6 +120,8 @@ pub struct TurnSummary {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AutoCompactionEvent {
     pub removed_message_count: usize,
+    pub kept_message_count: usize,
+    pub compaction_count: u32,
 }
 
 /// Coordinates the model loop, tool execution, hooks, and session updates.
@@ -499,7 +501,7 @@ where
             }
         }
 
-        let auto_compaction = self.maybe_auto_compact();
+        let auto_compaction = self.maybe_auto_compact()?;
 
         let summary = TurnSummary {
             assistant_messages,
@@ -552,11 +554,11 @@ where
         self.session
     }
 
-    fn maybe_auto_compact(&mut self) -> Option<AutoCompactionEvent> {
+    fn maybe_auto_compact(&mut self) -> Result<Option<AutoCompactionEvent>, RuntimeError> {
         if self.usage_tracker.cumulative_usage().input_tokens
             < self.auto_compaction_input_tokens_threshold
         {
-            return None;
+            return Ok(None);
         }
 
         let result = compact_session(
@@ -568,13 +570,27 @@ where
         );
 
         if result.removed_message_count == 0 {
-            return None;
+            return Ok(None);
         }
 
         self.session = result.compacted_session;
-        Some(AutoCompactionEvent {
+        if let Some(path) = self.session.persistence_path().map(ToOwned::to_owned) {
+            self.session
+                .save_to_path(path)
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+        }
+
+        let event = AutoCompactionEvent {
             removed_message_count: result.removed_message_count,
-        })
+            kept_message_count: self.session.messages.len(),
+            compaction_count: self
+                .session
+                .compaction
+                .as_ref()
+                .map_or(0, |compaction| compaction.count),
+        };
+        self.record_auto_compacted(event);
+        Ok(Some(event))
     }
 
     fn record_turn_started(&self, user_input: &str) {
@@ -671,6 +687,27 @@ where
             Value::from(summary.prompt_cache_events.len() as u64),
         );
         session_tracer.record("turn_completed", attributes);
+    }
+
+    fn record_auto_compacted(&self, event: AutoCompactionEvent) {
+        let Some(session_tracer) = &self.session_tracer else {
+            return;
+        };
+
+        let mut attributes = Map::new();
+        attributes.insert(
+            "removed_message_count".to_string(),
+            Value::from(event.removed_message_count as u64),
+        );
+        attributes.insert(
+            "kept_message_count".to_string(),
+            Value::from(event.kept_message_count as u64),
+        );
+        attributes.insert(
+            "compaction_count".to_string(),
+            Value::from(u64::from(event.compaction_count)),
+        );
+        session_tracer.record("session_auto_compacted", attributes);
     }
 
     fn record_turn_failed(&self, iteration: usize, error: &RuntimeError) {
@@ -1535,8 +1572,9 @@ mod tests {
             }]),
         ];
 
+        let path = temp_session_path("auto-compacted-turn");
         let mut runtime = ConversationRuntime::new(
-            session,
+            session.with_persistence_path(path.clone()),
             SimpleApi,
             StaticToolExecutor::new(),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
@@ -1552,9 +1590,112 @@ mod tests {
             summary.auto_compaction,
             Some(AutoCompactionEvent {
                 removed_message_count: 2,
+                kept_message_count: 5,
+                compaction_count: 1,
             })
         );
         assert_eq!(runtime.session().messages[0].role, MessageRole::System);
+
+        let restored = Session::load_from_path(&path).expect("compacted session should persist");
+        fs::remove_file(&path).expect("temp session file should be removable");
+        assert_eq!(restored.messages.len(), runtime.session().messages.len());
+        assert_eq!(restored.messages[0].role, MessageRole::System);
+        assert_eq!(
+            restored
+                .compaction
+                .as_ref()
+                .map(|compaction| compaction.count),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn records_deterministic_auto_compaction_trace_event() {
+        struct SimpleApi;
+        impl ApiClient for SimpleApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::Usage(TokenUsage {
+                        input_tokens: 120_000,
+                        output_tokens: 4,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    }),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let sink = Arc::new(MemoryTelemetrySink::default());
+        let tracer = SessionTracer::new("session-auto-compact", sink.clone());
+        let mut session = Session::new();
+        session.messages = vec![
+            crate::session::ConversationMessage::user_text("one"),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "two".to_string(),
+            }]),
+            crate::session::ConversationMessage::user_text("three"),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "four".to_string(),
+            }]),
+        ];
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            SimpleApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(100_000)
+        .with_session_tracer(tracer);
+
+        runtime
+            .run_turn("trigger", None)
+            .expect("turn should succeed");
+
+        let trace_events = sink
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                TelemetryEvent::SessionTrace(trace) => Some(trace),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let trace_names = trace_events
+            .iter()
+            .map(|trace| trace.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            trace_names,
+            vec![
+                "turn_started",
+                "assistant_iteration_completed",
+                "session_auto_compacted",
+                "turn_completed",
+            ]
+        );
+
+        let compaction_trace = trace_events
+            .iter()
+            .find(|trace| trace.name == "session_auto_compacted")
+            .expect("auto compaction trace should exist");
+        assert_eq!(
+            compaction_trace.attributes["removed_message_count"],
+            serde_json::Value::from(2_u64)
+        );
+        assert_eq!(
+            compaction_trace.attributes["kept_message_count"],
+            serde_json::Value::from(5_u64)
+        );
+        assert_eq!(
+            compaction_trace.attributes["compaction_count"],
+            serde_json::Value::from(1_u64)
+        );
     }
 
     #[test]
