@@ -234,6 +234,27 @@ export ANTHROPIC_AUTH_TOKEN="anthropic-oauth-or-proxy-bearer-token"
 
 `claw` can talk to local servers and provider gateways through either Anthropic-compatible or OpenAI-compatible endpoints. Use `ANTHROPIC_BASE_URL` with `ANTHROPIC_AUTH_TOKEN` for Anthropic-compatible services, or `OPENAI_BASE_URL` with `OPENAI_API_KEY` for OpenAI-compatible services.
 
+### SideStackAI broker (local-first)
+
+If you are running the SideStackAI local stack, route `claw` through the broker on `127.0.0.1:11435` rather than talking to the underlying app inference port directly. This keeps every call observable in the broker logs and lets the gateway apply its quotas, retries, and routing rules.
+
+```bash
+export OPENAI_BASE_URL="http://127.0.0.1:11435/v1"
+export OPENAI_API_KEY="local-dev-token"
+
+cd rust
+./target/debug/claw \
+  --permission-mode read-only \
+  --model "openai/qwen3.5:9b" \
+  prompt "reply with the word ready"
+```
+
+Notes:
+
+- Use the `openai/<model>` prefix (for example `openai/qwen3.5:9b`). Bare model names like `qwen3.5:9b` fail CLI validation because the prefix router cannot disambiguate them from a cloud provider.
+- `claw` now defaults to `read-only` when neither `RUSTY_CLAUDE_PERMISSION_MODE` nor a project-level `.claw/settings.json` overrides it. Passing `--permission-mode read-only` explicitly is still recommended as defense-in-depth — it makes the intent visible at the call site and survives accidental env-var changes.
+- Need writes? Use `--permission-mode workspace-write` for that single invocation, or set `RUSTY_CLAUDE_PERMISSION_MODE=workspace-write` in the shell where you intend to do work.
+
 ### Anthropic-compatible endpoint
 
 ```bash
