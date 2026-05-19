@@ -270,6 +270,13 @@ export RUSTY_CLAUDE_MODEL_ALIAS__FAST="qwen3:14b"
 export RUSTY_CLAUDE_MODEL_ALIAS__DEEP="qwen3.5:27b"
 ```
 
+These same exports are also shipped as a sourceable file at [`examples/sidestack-local.env`](examples/sidestack-local.env), so a typical SideStackAI session is just:
+
+```bash
+source examples/sidestack-local.env
+claw --model fast prompt "reply with the word ready"
+```
+
 **Broker caller headers (`RUSTY_CLAUDE_LLM_CALLER`, `RUSTY_CLAUDE_TASK_TYPE`)**
 
 - When set to a non-empty, non-whitespace value, these env vars are forwarded on every OpenAI-compatible request as the `X-LLM-Caller` and `X-Task-Type` headers. The broker uses them to attribute traffic in its logs and dashboards.
