@@ -274,6 +274,37 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
     maybe_write_report(&scenario_reports);
 }
 
+#[test]
+fn default_read_only_blocks_write_tool() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+    let server = runtime
+        .block_on(MockAnthropicService::spawn())
+        .expect("mock service should start");
+    let base_url = server.base_url();
+    let workspace = HarnessWorkspace::new(unique_temp_dir("default_read_only_blocks_write_tool"));
+    workspace.create().expect("workspace should exist");
+
+    assert!(
+        !workspace.root.join(".claw").join("settings.json").exists(),
+        "project settings must be absent so the CLI uses its default permission mode"
+    );
+
+    let run = run_default_permission_write_probe(&workspace, &base_url);
+    assert_write_file_denied(&workspace, &run);
+    let tool_output = run.response["tool_results"][0]["output"]
+        .as_str()
+        .expect("tool output");
+    assert!(tool_output.contains("read-only"));
+
+    let captured = runtime.block_on(server.captured_requests());
+    assert!(
+        captured.iter().any(
+            |request| request.path == "/v1/messages" && request.scenario == "write_file_denied"
+        ),
+        "write_file_denied scenario should execute through the mock CLI/provider path"
+    );
+}
+
 #[derive(Clone, Copy)]
 struct ScenarioCase {
     name: &'static str,
@@ -385,6 +416,36 @@ fn run_case(case: ScenarioCase, workspace: &HarnessWorkspace, base_url: &str) ->
         command.output().expect("claw should launch")
     };
 
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    ScenarioRun {
+        response: parse_json_output(&stdout),
+        stdout,
+    }
+}
+
+fn run_default_permission_write_probe(workspace: &HarnessWorkspace, base_url: &str) -> ScenarioRun {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_claw"));
+    command
+        .current_dir(&workspace.root)
+        .env_clear()
+        .env("ANTHROPIC_API_KEY", "test-parity-key")
+        .env("ANTHROPIC_BASE_URL", base_url)
+        .env("CLAW_CONFIG_HOME", &workspace.config_home)
+        .env("HOME", &workspace.home)
+        .env("NO_COLOR", "1")
+        .env("PATH", "/usr/bin:/bin")
+        .args([
+            "--model",
+            "sonnet",
+            "--allowedTools",
+            "write_file",
+            "--output-format=json",
+        ]);
+
+    command.arg(format!("{SCENARIO_PREFIX}write_file_denied"));
+
+    let output = command.output().expect("claw should launch");
     assert_success(&output);
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     ScenarioRun {
