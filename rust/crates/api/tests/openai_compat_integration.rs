@@ -452,6 +452,129 @@ async fn openai_compat_omits_blank_broker_caller_headers() {
     );
 }
 
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn openai_compat_resolves_model_alias_from_env() {
+    let _lock = env_lock();
+    let _alias = ScopedEnvVar::set("RUSTY_CLAUDE_MODEL_ALIAS__FAST", "qwen3:14b");
+
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let body = concat!(
+        "{",
+        "\"id\":\"chatcmpl_alias_resolved\",",
+        "\"model\":\"qwen3:14b\",",
+        "\"choices\":[{",
+        "\"message\":{\"role\":\"assistant\",\"content\":\"ok\",\"tool_calls\":[]},",
+        "\"finish_reason\":\"stop\"",
+        "}],",
+        "\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}",
+        "}"
+    );
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response("200 OK", "application/json", body)],
+    )
+    .await;
+
+    let client = OpenAiCompatClient::new("xai-test-key", OpenAiCompatConfig::xai())
+        .with_base_url(server.base_url());
+    client
+        .send_message(&aliased_request("fast"))
+        .await
+        .expect("request should succeed");
+
+    let captured = state.lock().await;
+    let request = captured.first().expect("captured request");
+    let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
+    assert_eq!(
+        body["model"],
+        json!("qwen3:14b"),
+        "alias `fast` should be rewritten to `qwen3:14b` on the wire"
+    );
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn openai_compat_leaves_model_unchanged_without_alias() {
+    let _lock = env_lock();
+    let _alias = ScopedEnvVar::remove("RUSTY_CLAUDE_MODEL_ALIAS__FAST");
+
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let body = concat!(
+        "{",
+        "\"id\":\"chatcmpl_alias_absent\",",
+        "\"model\":\"fast\",",
+        "\"choices\":[{",
+        "\"message\":{\"role\":\"assistant\",\"content\":\"ok\",\"tool_calls\":[]},",
+        "\"finish_reason\":\"stop\"",
+        "}],",
+        "\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}",
+        "}"
+    );
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response("200 OK", "application/json", body)],
+    )
+    .await;
+
+    let client = OpenAiCompatClient::new("xai-test-key", OpenAiCompatConfig::xai())
+        .with_base_url(server.base_url());
+    client
+        .send_message(&aliased_request("fast"))
+        .await
+        .expect("request should succeed");
+
+    let captured = state.lock().await;
+    let request = captured.first().expect("captured request");
+    let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
+    assert_eq!(
+        body["model"],
+        json!("fast"),
+        "model string must be preserved when no alias env var is set"
+    );
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn openai_compat_ignores_blank_alias_value() {
+    let _lock = env_lock();
+    let _alias = ScopedEnvVar::set("RUSTY_CLAUDE_MODEL_ALIAS__FAST", "  ");
+
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let body = concat!(
+        "{",
+        "\"id\":\"chatcmpl_alias_blank\",",
+        "\"model\":\"fast\",",
+        "\"choices\":[{",
+        "\"message\":{\"role\":\"assistant\",\"content\":\"ok\",\"tool_calls\":[]},",
+        "\"finish_reason\":\"stop\"",
+        "}],",
+        "\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}",
+        "}"
+    );
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response("200 OK", "application/json", body)],
+    )
+    .await;
+
+    let client = OpenAiCompatClient::new("xai-test-key", OpenAiCompatConfig::xai())
+        .with_base_url(server.base_url());
+    client
+        .send_message(&aliased_request("fast"))
+        .await
+        .expect("request should succeed");
+
+    let captured = state.lock().await;
+    let request = captured.first().expect("captured request");
+    let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
+    assert_eq!(
+        body["model"],
+        json!("fast"),
+        "whitespace-only alias value must be treated as unset"
+    );
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CapturedRequest {
     path: String,
@@ -580,6 +703,24 @@ fn http_response_with_headers(
     )
 }
 
+fn aliased_request(model: &str) -> MessageRequest {
+    MessageRequest {
+        model: model.to_string(),
+        max_tokens: 64,
+        messages: vec![InputMessage {
+            role: "user".to_string(),
+            content: vec![InputContentBlock::Text {
+                text: "Say hello".to_string(),
+            }],
+        }],
+        system: Some("Use tools when needed".to_string()),
+        tools: None,
+        tool_choice: None,
+        stream: false,
+        ..Default::default()
+    }
+}
+
 fn sample_request(stream: bool) -> MessageRequest {
     MessageRequest {
         model: "grok-3".to_string(),
@@ -622,6 +763,12 @@ impl ScopedEnvVar {
     fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
         let previous = std::env::var_os(key);
         std::env::set_var(key, value);
+        Self { key, previous }
+    }
+
+    fn remove(key: &'static str) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::remove_var(key);
         Self { key, previous }
     }
 }
