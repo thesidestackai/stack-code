@@ -294,6 +294,22 @@ Alias matching rules:
 - A blank or whitespace-only alias value is ignored, and the requested model passes through unchanged.
 - Only bare, ASCII-alphanumeric/underscore model strings are eligible for alias lookup. Anything with a slash, colon, dot, or dash (for example `openai/gpt-4.1-mini`, `qwen3.5:9b`, `claude-sonnet-4-6`) is treated as an explicit upstream model and forwarded verbatim, so existing routing keeps working.
 
+###### Even easier: the `claw-sidestack-local` wrapper
+
+For local sessions you can skip the `source` step entirely and use the opt-in wrapper at [`scripts/claw-sidestack-local`](scripts/claw-sidestack-local):
+
+```bash
+./scripts/claw-sidestack-local --model fast prompt "reply with the word ready"
+```
+
+The wrapper:
+
+- sources [`examples/sidestack-local.env`](examples/sidestack-local.env) so every invocation starts from the canonical broker profile, even if the surrounding shell had a stale `OPENAI_BASE_URL`;
+- validates the final effective `OPENAI_BASE_URL` against an allowlist of local SideStackAI broker URLs (`http://127.0.0.1:11435` or `http://localhost:11435`, optionally with a path);
+- refuses to launch `claw` if `OPENAI_BASE_URL` contains the raw Ollama port `:11434` — this is the wrapper's LAW 1 and trips even if the profile itself is edited to point there;
+- prints the active non-secret profile (`OPENAI_BASE_URL`, `RUSTY_CLAUDE_LLM_CALLER`, `RUSTY_CLAUDE_TASK_TYPE`, and the names of any `RUSTY_CLAUDE_MODEL_ALIAS__*` exports) to stderr before exec'ing `claw`;
+- does not probe the broker for liveness. Use `claw doctor` or a separate runtime check (for example a small `curl` against the broker's health endpoint) when you need that signal.
+
 ### Anthropic-compatible endpoint
 
 ```bash
