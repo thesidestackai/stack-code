@@ -1,0 +1,135 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Claw: Doctor (JSON)",
+      "type": "process",
+      "command": "${workspaceFolder}/scripts/claw-sidestack-local",
+      "args": ["doctor", "--output-format", "json"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true,
+        "showReuseMessage": false
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Claw: Status (JSON)",
+      "type": "process",
+      "command": "${workspaceFolder}/scripts/claw-sidestack-local",
+      "args": ["status", "--output-format", "json"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true,
+        "showReuseMessage": false
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Claw: Sandbox (JSON)",
+      "type": "process",
+      "command": "${workspaceFolder}/scripts/claw-sidestack-local",
+      "args": ["sandbox", "--output-format", "json"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true,
+        "showReuseMessage": false
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Claw: State (JSON)",
+      "type": "process",
+      "command": "${workspaceFolder}/scripts/claw-sidestack-local",
+      "args": ["state", "--output-format", "json"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true,
+        "showReuseMessage": false
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Claw: Init Project (JSON)",
+      "type": "process",
+      "command": "${workspaceFolder}/scripts/claw-sidestack-local",
+      "args": ["init", "--output-format", "json"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true,
+        "showReuseMessage": false
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Claw: Prompt (read-only, FAST)",
+      "type": "process",
+      "command": "${workspaceFolder}/scripts/claw-sidestack-local",
+      "args": [
+        "--model", "fast",
+        "--permission-mode", "read-only",
+        "prompt", "${input:promptText}",
+        "--output-format", "json"
+      ],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true,
+        "showReuseMessage": false
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Claw: Prompt (read-only, DEEP)",
+      "type": "process",
+      "command": "${workspaceFolder}/scripts/claw-sidestack-local",
+      "args": [
+        "--model", "deep",
+        "--permission-mode", "read-only",
+        "prompt", "${input:promptText}",
+        "--output-format", "json"
+      ],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true,
+        "showReuseMessage": false
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Claw: Resume Latest (REPL)",
+      "type": "process",
+      "command": "${workspaceFolder}/scripts/claw-sidestack-local",
+      "args": ["--resume", "latest"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": false,
+        "showReuseMessage": false,
+        "echo": true
+      },
+      "problemMatcher": []
+    }
+  ],
+  "inputs": [
+    {
+      "id": "promptText",
+      "type": "promptString",
+      "description": "Read-only prompt to send to Stack-Code via the SideStackAI broker."
+    }
+  ]
+}

@@ -310,6 +310,10 @@ The wrapper:
 - prints the active non-secret profile (`OPENAI_BASE_URL`, `RUSTY_CLAUDE_LLM_CALLER`, `RUSTY_CLAUDE_TASK_TYPE`, and the names of any `RUSTY_CLAUDE_MODEL_ALIAS__*` exports) to stderr before exec'ing `claw`;
 - does not probe the broker for liveness. Use `claw doctor` or a separate runtime check (for example a small `curl` against the broker's health endpoint) when you need that signal.
 
+###### Editor integration: VS Code task wrapper
+
+A committed `.vscode/tasks.json` exposes the broker-routed wrapper through VS Code's Command Palette (`Tasks: Run Task`). Tasks are read-only by default and delegate every invocation to `scripts/claw-sidestack-local`, so LAW 1 stays centralized in one place. See [`docs/editor-vscode.md`](docs/editor-vscode.md) for the task list, offline validation, and the live-broker validation gate.
+
 ### Anthropic-compatible endpoint
 
 ```bash
