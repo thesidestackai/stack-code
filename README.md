@@ -212,6 +212,7 @@ cargo test --workspace
 - [`rust/MOCK_PARITY_HARNESS.md`](./rust/MOCK_PARITY_HARNESS.md) — deterministic mock-service harness details
 - [`ROADMAP.md`](./ROADMAP.md) — active roadmap and open cleanup work
 - [`PHILOSOPHY.md`](./PHILOSOPHY.md) — why the project exists and how it is operated
+- [`docs/editor-vscode.md`](./docs/editor-vscode.md) — read-only VS Code task wrapper (Command Palette entry points; no extension required)
 
 ## Ecosystem
 
