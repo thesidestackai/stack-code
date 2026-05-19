@@ -310,6 +310,23 @@ The wrapper:
 - prints the active non-secret profile (`OPENAI_BASE_URL`, `RUSTY_CLAUDE_LLM_CALLER`, `RUSTY_CLAUDE_TASK_TYPE`, and the names of any `RUSTY_CLAUDE_MODEL_ALIAS__*` exports) to stderr before exec'ing `claw`;
 - does not probe the broker for liveness. Use `claw doctor` or a separate runtime check (for example a small `curl` against the broker's health endpoint) when you need that signal.
 
+###### Manual smoke helper: `claw-sidestack-smoke`
+
+A separate, manual-only helper lives at [`scripts/claw-sidestack-smoke`](scripts/claw-sidestack-smoke) for the cases where you want to verify the wrapper end-to-end without typing the prompt yourself. It is **not** part of CI and has no default live behaviour.
+
+```bash
+# Print usage. No broker calls.
+./scripts/claw-sidestack-smoke
+
+# Print the checks that --live would run. Still no broker calls.
+./scripts/claw-sidestack-smoke --dry-run
+
+# Actually run the smoke. Manual-only — only invoke when broker/model state is acceptable.
+./scripts/claw-sidestack-smoke --live
+```
+
+`--live` performs, in order: a `curl` PATH check, an executable check on `scripts/claw-sidestack-local`, a LAW 1 / allowlist check on the `OPENAI_BASE_URL` from [`examples/sidestack-local.env`](examples/sidestack-local.env) (refusing raw `:11434` and any non-broker URL), a `GET <base>/models` reachability probe, and finally one trivial `--model fast prompt "reply with the word ready"` invocation through the wrapper. It sends exactly one prompt — no loops, no retries — and is intended to be run by hand. It is **not** wired into CI.
+
 ### Anthropic-compatible endpoint
 
 ```bash
