@@ -347,6 +347,111 @@ async fn provider_client_dispatches_xai_requests_from_env() {
     );
 }
 
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn openai_compat_sends_optional_broker_caller_headers() {
+    let _lock = env_lock();
+    let _caller = ScopedEnvVar::set("RUSTY_CLAUDE_LLM_CALLER", "stack-code");
+    let _task = ScopedEnvVar::set("RUSTY_CLAUDE_TASK_TYPE", "code");
+
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let body = concat!(
+        "{",
+        "\"id\":\"chatcmpl_broker_headers\",",
+        "\"model\":\"grok-3\",",
+        "\"choices\":[{",
+        "\"message\":{\"role\":\"assistant\",\"content\":\"ok\",\"tool_calls\":[]},",
+        "\"finish_reason\":\"stop\"",
+        "}],",
+        "\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}",
+        "}"
+    );
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response("200 OK", "application/json", body)],
+    )
+    .await;
+
+    let client = OpenAiCompatClient::new("xai-test-key", OpenAiCompatConfig::xai())
+        .with_base_url(server.base_url());
+    client
+        .send_message(&sample_request(false))
+        .await
+        .expect("request should succeed");
+
+    let captured = state.lock().await;
+    let request = captured.first().expect("captured request");
+    assert_eq!(
+        request.headers.get("x-llm-caller").map(String::as_str),
+        Some("stack-code"),
+        "X-LLM-Caller header should be forwarded when env var is set"
+    );
+    assert_eq!(
+        request.headers.get("x-task-type").map(String::as_str),
+        Some("code"),
+        "X-Task-Type header should be forwarded when env var is set"
+    );
+    assert_eq!(
+        request.headers.get("authorization").map(String::as_str),
+        Some("Bearer xai-test-key"),
+        "existing bearer auth must remain"
+    );
+    assert_eq!(
+        request.headers.get("content-type").map(String::as_str),
+        Some("application/json"),
+        "existing content-type must remain"
+    );
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn openai_compat_omits_blank_broker_caller_headers() {
+    let _lock = env_lock();
+    let _caller = ScopedEnvVar::set("RUSTY_CLAUDE_LLM_CALLER", "");
+    let _task = ScopedEnvVar::set("RUSTY_CLAUDE_TASK_TYPE", "   ");
+
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let body = concat!(
+        "{",
+        "\"id\":\"chatcmpl_broker_blank\",",
+        "\"model\":\"grok-3\",",
+        "\"choices\":[{",
+        "\"message\":{\"role\":\"assistant\",\"content\":\"ok\",\"tool_calls\":[]},",
+        "\"finish_reason\":\"stop\"",
+        "}],",
+        "\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}",
+        "}"
+    );
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response("200 OK", "application/json", body)],
+    )
+    .await;
+
+    let client = OpenAiCompatClient::new("xai-test-key", OpenAiCompatConfig::xai())
+        .with_base_url(server.base_url());
+    client
+        .send_message(&sample_request(false))
+        .await
+        .expect("request should succeed");
+
+    let captured = state.lock().await;
+    let request = captured.first().expect("captured request");
+    assert!(
+        !request.headers.contains_key("x-llm-caller"),
+        "blank RUSTY_CLAUDE_LLM_CALLER must not produce a header"
+    );
+    assert!(
+        !request.headers.contains_key("x-task-type"),
+        "whitespace-only RUSTY_CLAUDE_TASK_TYPE must not produce a header"
+    );
+    assert_eq!(
+        request.headers.get("authorization").map(String::as_str),
+        Some("Bearer xai-test-key"),
+        "existing bearer auth must remain even with broker env vars blank"
+    );
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CapturedRequest {
     path: String,

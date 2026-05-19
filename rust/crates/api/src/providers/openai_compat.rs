@@ -21,6 +21,10 @@ pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_DASHSCOPE_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
+const BROKER_CALLER_HEADER: &str = "X-LLM-Caller";
+const BROKER_TASK_HEADER: &str = "X-Task-Type";
+const BROKER_CALLER_ENV: &str = "RUSTY_CLAUDE_LLM_CALLER";
+const BROKER_TASK_ENV: &str = "RUSTY_CLAUDE_TASK_TYPE";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(128);
 const DEFAULT_MAX_RETRIES: u32 = 8;
@@ -270,10 +274,18 @@ impl OpenAiCompatClient {
         check_request_body_size(request, self.config())?;
 
         let request_url = chat_completions_endpoint(&self.base_url);
-        self.http
+        let mut builder = self
+            .http
             .post(&request_url)
             .header("content-type", "application/json")
-            .bearer_auth(&self.api_key)
+            .bearer_auth(&self.api_key);
+        if let Some(caller) = broker_header_value(BROKER_CALLER_ENV) {
+            builder = builder.header(BROKER_CALLER_HEADER, caller);
+        }
+        if let Some(task) = broker_header_value(BROKER_TASK_ENV) {
+            builder = builder.header(BROKER_TASK_HEADER, task);
+        }
+        builder
             .json(&build_chat_completion_request(request, self.config()))
             .send()
             .await
@@ -1307,6 +1319,16 @@ fn read_env_non_empty(key: &str) -> Result<Option<String>, ApiError> {
         Ok(value) if !value.is_empty() => Ok(Some(value)),
         Ok(_) | Err(std::env::VarError::NotPresent) => Ok(super::dotenv_value(key)),
         Err(error) => Err(ApiError::from(error)),
+    }
+}
+
+fn broker_header_value(key: &str) -> Option<String> {
+    let value = std::env::var(key).ok()?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }
 
