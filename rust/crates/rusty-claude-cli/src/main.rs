@@ -1435,14 +1435,51 @@ fn resolve_model_alias(model: &str) -> &str {
 /// user-supplied model string is about to be dispatched to a provider.
 fn resolve_model_alias_with_config(model: &str) -> String {
     let trimmed = model.trim();
+    // Env-level aliases (e.g. `RUSTY_CLAUDE_MODEL_ALIAS__FAST=qwen3:14b` from
+    // an opt-in profile like `examples/sidestack-local.env`) win over both the
+    // repo-level config aliases and the built-in table: an operator who set an
+    // env var in their current shell expects that override to be authoritative.
+    if let Some(resolved) = resolve_model_env_alias(trimmed) {
+        return resolve_model_alias(&resolved).to_string();
+    }
     if let Some(resolved) = config_alias_for_current_dir(trimmed) {
         return resolve_model_alias(&resolved).to_string();
     }
     resolve_model_alias(trimmed).to_string()
 }
 
+/// Look up an opt-in env model alias for `model`.
+///
+/// Mirrors the provider-layer logic in `api::providers::openai_compat`:
+/// only bare alias names (ASCII alphanumeric + `_`) trigger a lookup, the
+/// key is `RUSTY_CLAUDE_MODEL_ALIAS__` + uppercased input, blank values are
+/// treated as absent. Keeping the two implementations in lockstep is what
+/// lets `claw --model fast` reach the provider with the same effective
+/// model the provider would have computed on its own.
+fn resolve_model_env_alias(model: &str) -> Option<String> {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    let key = format!("RUSTY_CLAUDE_MODEL_ALIAS__{}", trimmed.to_ascii_uppercase());
+    let value = std::env::var(&key).ok()?;
+    let trimmed_value = value.trim();
+    if trimmed_value.is_empty() {
+        None
+    } else {
+        Some(trimmed_value.to_string())
+    }
+}
+
 /// Validate model syntax at parse time.
-/// Accepts: known aliases (opus, sonnet, haiku) or provider/model pattern.
+/// Accepts: known aliases (opus, sonnet, haiku), env-defined aliases
+/// (`RUSTY_CLAUDE_MODEL_ALIAS__*`), or `provider/model` patterns.
 /// Rejects: empty, whitespace-only, strings with spaces, or invalid chars.
 fn validate_model_syntax(model: &str) -> Result<(), String> {
     let trimmed = model.trim();
@@ -1453,6 +1490,15 @@ fn validate_model_syntax(model: &str) -> Result<(), String> {
     match trimmed {
         "opus" | "sonnet" | "haiku" => return Ok(()),
         _ => {}
+    }
+    // Opt-in env aliases unlock bare names like `--model fast` so the CLI
+    // accepts what the operator's broker profile exports. If the env value
+    // is blank or absent, validation falls through to the strict
+    // provider/model checks below — typos like `--model fast` without a
+    // profile loaded still surface the helpful `invalid_model_syntax`
+    // error.
+    if resolve_model_env_alias(trimmed).is_some() {
+        return Ok(());
     }
     // Check for spaces (malformed)
     if trimmed.contains(' ') {
@@ -9444,15 +9490,15 @@ mod tests {
         render_config_report, render_diff_report, render_diff_report_for, render_help_topic,
         render_memory_report, render_prompt_history_report, render_repl_help, render_resume_usage,
         render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
-        resolve_repl_model, resolve_session_reference, response_to_events,
+        resolve_model_env_alias, resolve_repl_model, resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command, runtime_mcp_inventory_json_for_loader,
         short_tool_id, slash_command_completion_candidates_with_sessions, split_error_hint,
         status_context, summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt,
-        validate_no_args, write_mcp_server_fixture, write_mcp_tools_list_disconnect_fixture,
-        CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
-        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
-        PromptHistoryEntry, RuntimePluginState, SlashCommand, StatusUsage, DEFAULT_MODEL,
-        LATEST_SESSION_REFERENCE, STUB_COMMANDS,
+        validate_model_syntax, validate_no_args, write_mcp_server_fixture,
+        write_mcp_tools_list_disconnect_fixture, CliAction, CliOutputFormat, CliToolExecutor,
+        GitWorkspaceSummary, InternalPromptProgressEvent, InternalPromptProgressState, LiveCli,
+        LocalHelpTopic, PromptHistoryEntry, RuntimePluginState, SlashCommand, StatusUsage,
+        DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -10143,6 +10189,135 @@ mod tests {
         assert_eq!(cross_provider, "grok-3-mini");
         assert_eq!(unknown, "unknown-model");
         assert_eq!(builtin, "claude-haiku-4-5-20251213");
+    }
+
+    #[test]
+    fn env_model_alias_substitutes_in_args() {
+        // given an operator profile that exported a bare env model alias
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        std::env::set_var("RUSTY_CLAUDE_MODEL_ALIAS__FAST", "qwen3:14b");
+        let args = vec![
+            "--model".to_string(),
+            "fast".to_string(),
+            "explain".to_string(),
+            "this".to_string(),
+        ];
+
+        // when the CLI parses `--model fast`
+        let parsed = parse_args(&args);
+
+        // cleanup before assertions so an assertion failure does not leak env state
+        std::env::remove_var("RUSTY_CLAUDE_MODEL_ALIAS__FAST");
+
+        // then the alias is accepted and its env value flows to the provider layer
+        assert_eq!(
+            parsed.expect("env-aliased `--model fast` should parse"),
+            CliAction::Prompt {
+                prompt: "explain this".to_string(),
+                model: "qwen3:14b".to_string(),
+                output_format: CliOutputFormat::Text,
+                allowed_tools: None,
+                permission_mode: PermissionMode::ReadOnly,
+                compact: false,
+                base_commit: None,
+                reasoning_effort: None,
+                allow_broad_cwd: false,
+            }
+        );
+    }
+
+    #[test]
+    fn env_model_alias_blank_falls_back_to_strict_validation() {
+        // given an env alias key set to a blank value
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        std::env::set_var("RUSTY_CLAUDE_MODEL_ALIAS__FAST", "   ");
+        let args = vec![
+            "prompt".to_string(),
+            "test".to_string(),
+            "--model".to_string(),
+            "fast".to_string(),
+        ];
+
+        // when the CLI parses `--model fast`
+        let parsed = parse_args(&args);
+
+        std::env::remove_var("RUSTY_CLAUDE_MODEL_ALIAS__FAST");
+
+        // then blank env values are treated as absent and strict validation fires
+        let err = parsed.expect_err("blank env alias should not satisfy validation");
+        assert!(
+            err.contains("invalid model syntax: 'fast'"),
+            "blank env alias should fall through to strict invalid_model_syntax: {err}"
+        );
+    }
+
+    #[test]
+    fn env_model_alias_absent_yields_strict_invalid_model_syntax() {
+        // given no env alias key for `fast`
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        std::env::remove_var("RUSTY_CLAUDE_MODEL_ALIAS__FAST");
+        let args = vec![
+            "prompt".to_string(),
+            "test".to_string(),
+            "--model".to_string(),
+            "fast".to_string(),
+        ];
+
+        // when the CLI parses `--model fast`
+        let parsed = parse_args(&args);
+
+        // then the existing strict-validation error still triggers
+        let err = parsed.expect_err("absent env alias should fail strict validation");
+        assert!(
+            err.contains("invalid model syntax: 'fast'"),
+            "absent env alias should fall through to strict invalid_model_syntax: {err}"
+        );
+    }
+
+    #[test]
+    fn env_model_alias_lookup_only_triggers_for_bare_alias_names() {
+        // given an env key whose name happens to match a provider prefix
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        std::env::set_var("RUSTY_CLAUDE_MODEL_ALIAS__OPENAI", "should-never-resolve");
+        let args = vec![
+            "--model".to_string(),
+            "openai/gpt-4".to_string(),
+            "ping".to_string(),
+        ];
+
+        // when the CLI parses a provider/model string
+        let parsed = parse_args(&args);
+
+        std::env::remove_var("RUSTY_CLAUDE_MODEL_ALIAS__OPENAI");
+
+        // then the env-alias lookup is NOT consulted (`/` disqualifies the key)
+        let action = parsed.expect("provider/model input should still parse");
+        match action {
+            CliAction::Prompt { model, .. } => assert_eq!(model, "openai/gpt-4"),
+            other => panic!("expected Prompt action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_model_alias_with_config_honors_env_alias() {
+        let _guard = env_lock();
+        std::env::set_var("RUSTY_CLAUDE_MODEL_ALIAS__DEEP", "qwen3.5:27b");
+        let resolved = resolve_model_alias_with_config("deep");
+        std::env::remove_var("RUSTY_CLAUDE_MODEL_ALIAS__DEEP");
+        assert_eq!(resolved, "qwen3.5:27b");
+    }
+
+    #[test]
+    fn resolve_model_alias_with_config_treats_blank_env_alias_as_absent() {
+        let _guard = env_lock();
+        std::env::set_var("RUSTY_CLAUDE_MODEL_ALIAS__DEEP", "");
+        let resolved = resolve_model_alias_with_config("deep");
+        std::env::remove_var("RUSTY_CLAUDE_MODEL_ALIAS__DEEP");
+        assert_eq!(resolved, "deep");
     }
 
     #[test]
