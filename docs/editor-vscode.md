@@ -52,6 +52,18 @@ Do not run prompt tasks during offline validation — they hit the broker.
 
 Live broker validation (running a real `Claw: Prompt` against `:11435`) is a separate gated lane and requires explicit operator approval. See the next-lane note in the lane handoff for the smoke-gate prompt.
 
+## FAST/DEEP task version requirement
+
+The `Claw: Prompt (read-only, FAST)` and `Claw: Prompt (read-only, DEEP)` tasks require an installed `claw` binary built from commit `7e6fcaf` (`fix(cli): honor env model aliases during validation`) or later. The wrapper sets `RUSTY_CLAUDE_MODEL_ALIAS__FAST` / `__DEEP` from `examples/sidestack-local.env` and then execs `claw --model fast …` / `claw --model deep …` directly; older binaries reject those flags at CLI parse time with:
+
+```
+{"error":"invalid model syntax: 'fast'. Expected provider/model … or known alias (opus, sonnet, haiku)","kind":"invalid_model_syntax"}
+```
+
+This is a **client-side binary/version failure**, not a LAW 1 violation or a broker-routing failure — the request never reaches `:11435`. The wrapper's broker allowlist, the env profile, and the sandbox are all unaffected; only the alias resolution depends on the newer binary.
+
+To check the installed binary's git SHA, run `Claw: Doctor (JSON)` and look at the `system` check's `git_sha` field. If it is older than `7e6fcaf`, rebuild or reinstall `claw` from this repo's current tip before using the FAST or DEEP prompt tasks. The non-prompt tasks (Doctor, Status, Sandbox, State, Init Project, Resume Latest) do not depend on alias resolution and work against older binaries.
+
 ## Why no extension
 
 A VS Code extension would force ongoing maintenance of a TypeScript scaffold, a publisher identity, and a marketplace presence for a surface that is currently three Command Palette buttons. Tasks already give us labels, inputs, terminal integration, and per-workspace scoping with zero install steps beyond opening the folder.
