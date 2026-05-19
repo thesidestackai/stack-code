@@ -255,6 +255,36 @@ Notes:
 - `claw` now defaults to `read-only` when neither `RUSTY_CLAUDE_PERMISSION_MODE` nor a project-level `.claw/settings.json` overrides it. Passing `--permission-mode read-only` explicitly is still recommended as defense-in-depth — it makes the intent visible at the call site and survives accidental env-var changes.
 - Need writes? Use `--permission-mode workspace-write` for that single invocation, or set `RUSTY_CLAUDE_PERMISSION_MODE=workspace-write` in the shell where you intend to do work.
 
+#### Optional broker ergonomics
+
+When `OPENAI_BASE_URL` points at the SideStackAI broker, `claw` will additionally honour a few opt-in environment variables that make local usage more observable and ergonomic. None of them are required — omit any line below and the corresponding feature simply stays off.
+
+```bash
+export OPENAI_BASE_URL="http://127.0.0.1:11435/v1"
+export OPENAI_API_KEY="local"
+export RUSTY_CLAUDE_LLM_CALLER="stack-code"
+export RUSTY_CLAUDE_TASK_TYPE="code"
+export RUSTY_CLAUDE_MODEL_ALIAS__FAST="qwen3:14b"
+export RUSTY_CLAUDE_MODEL_ALIAS__DEEP="qwen3.5:27b"
+```
+
+**Broker caller headers (`RUSTY_CLAUDE_LLM_CALLER`, `RUSTY_CLAUDE_TASK_TYPE`)**
+
+- When set to a non-empty, non-whitespace value, these env vars are forwarded on every OpenAI-compatible request as the `X-LLM-Caller` and `X-Task-Type` headers. The broker uses them to attribute traffic in its logs and dashboards.
+- Both are optional metadata. Blank or whitespace-only values are dropped so the headers are not sent.
+- They have no effect on routing or model selection — they are purely observational.
+
+**Local model aliases (`RUSTY_CLAUDE_MODEL_ALIAS__<NAME>`)**
+
+Define short aliases for the upstream model strings your local broker actually serves. For the example above, `--model fast` resolves to `qwen3:14b` and `--model deep` resolves to `qwen3.5:27b`. The model values shown are illustrative for a SideStackAI setup — substitute whatever your broker has loaded.
+
+Alias matching rules:
+
+- The env-var suffix after `RUSTY_CLAUDE_MODEL_ALIAS__` may contain ASCII letters, digits, and underscores.
+- Alias lookup is case-insensitive: `--model fast`, `--model Fast`, and `--model FAST` all resolve through `RUSTY_CLAUDE_MODEL_ALIAS__FAST`. Define the env var with the uppercase suffix.
+- A blank or whitespace-only alias value is ignored, and the requested model passes through unchanged.
+- Only bare, ASCII-alphanumeric/underscore model strings are eligible for alias lookup. Anything with a slash, colon, dot, or dash (for example `openai/gpt-4.1-mini`, `qwen3.5:9b`, `claude-sonnet-4-6`) is treated as an explicit upstream model and forwarded verbatim, so existing routing keeps working.
+
 ### Anthropic-compatible endpoint
 
 ```bash
