@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# claw-sidestack-local — opt-in wrapper that routes `claw` through the
+# SideStackAI local broker by sourcing `examples/sidestack-local.env`.
+#
+# LAW 1: this wrapper MUST NOT execute `claw` if the final effective
+# `OPENAI_BASE_URL` points at the raw Ollama port (`:11434`) or otherwise
+# fails the broker allowlist below. The check runs *after* sourcing the
+# profile, so the profile's value is what is validated.
+#
+# Liveness of the broker is NOT checked here — use `claw doctor` or a
+# separate runtime check for that.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+ENV_FILE="${REPO_ROOT}/examples/sidestack-local.env"
+
+if [[ ! -f "${ENV_FILE}" ]]; then
+  printf 'claw-sidestack-local: env file not found: %s\n' "${ENV_FILE}" >&2
+  printf '  expected the SideStackAI broker profile at examples/sidestack-local.env\n' >&2
+  exit 2
+fi
+
+# shellcheck source=/dev/null
+source "${ENV_FILE}"
+
+EFFECTIVE_BASE_URL="${OPENAI_BASE_URL:-}"
+
+if [[ -z "${EFFECTIVE_BASE_URL}" ]]; then
+  printf 'claw-sidestack-local: LAW 1 refusal — OPENAI_BASE_URL is empty after sourcing %s\n' "${ENV_FILE}" >&2
+  exit 3
+fi
+
+if [[ "${EFFECTIVE_BASE_URL}" == *11434* ]]; then
+  printf 'claw-sidestack-local: LAW 1 refusal — OPENAI_BASE_URL must not point at :11434 (raw Ollama).\n' >&2
+  printf '  offending value: %s\n' "${EFFECTIVE_BASE_URL}" >&2
+  printf '  expected the SideStackAI broker on :11435.\n' >&2
+  exit 3
+fi
+
+BROKER_ALLOWLIST_REGEX='^http://(127\.0\.0\.1|localhost):11435(/.*)?$'
+if [[ ! "${EFFECTIVE_BASE_URL}" =~ ${BROKER_ALLOWLIST_REGEX} ]]; then
+  printf 'claw-sidestack-local: LAW 1 refusal — OPENAI_BASE_URL is not an allowed SideStackAI broker URL.\n' >&2
+  printf '  offending value: %s\n' "${EFFECTIVE_BASE_URL}" >&2
+  printf '  allowlist regex: %s\n' "${BROKER_ALLOWLIST_REGEX}" >&2
+  exit 3
+fi
+
+{
+  printf 'claw-sidestack-local: active profile\n'
+  printf '  OPENAI_BASE_URL=%s\n' "${OPENAI_BASE_URL}"
+  printf '  RUSTY_CLAUDE_LLM_CALLER=%s\n' "${RUSTY_CLAUDE_LLM_CALLER:-}"
+  printf '  RUSTY_CLAUDE_TASK_TYPE=%s\n' "${RUSTY_CLAUDE_TASK_TYPE:-}"
+  alias_names="$(compgen -e | grep -E '^RUSTY_CLAUDE_MODEL_ALIAS__' | sort | tr '\n' ' ' || true)"
+  if [[ -n "${alias_names}" ]]; then
+    printf '  model alias env names: %s\n' "${alias_names% }"
+  else
+    printf '  model alias env names: (none)\n'
+  fi
+} >&2
+
+if ! command -v claw >/dev/null 2>&1; then
+  # shellcheck disable=SC2016  # backticks in user-facing message are literal
+  printf 'claw-sidestack-local: `claw` not found on PATH.\n' >&2
+  printf '  install Stack-Code (see install.sh / USAGE.md) or add its install dir to PATH.\n' >&2
+  exit 4
+fi
+
+exec claw "$@"
