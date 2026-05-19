@@ -17,6 +17,9 @@ on:
       - ROADMAP.md
       - docs/**
       - rust/**
+      - scripts/claw-sidestack-local
+      - tests/shell/**
+      - examples/sidestack-local.env
   pull_request:
     branches:
       - main
@@ -31,6 +34,9 @@ on:
       - ROADMAP.md
       - docs/**
       - rust/**
+      - scripts/claw-sidestack-local
+      - tests/shell/**
+      - examples/sidestack-local.env
   workflow_dispatch:
 
 concurrency:
@@ -98,3 +104,24 @@ jobs:
           workspaces: rust -> target
       - name: Run workspace clippy
         run: cargo clippy --workspace
+
+  shell-tests:
+    name: shell tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell syntax
+        run: |
+          bash -n scripts/claw-sidestack-local
+          bash -n tests/shell/test_claw_sidestack_local.sh
+      - name: Shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          shellcheck scripts/claw-sidestack-local
+          shellcheck tests/shell/test_claw_sidestack_local.sh
+      - name: Run shell tests
+        run: bash tests/shell/test_claw_sidestack_local.sh
