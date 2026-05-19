@@ -65,14 +65,14 @@ cargo build --workspace
 export ANTHROPIC_API_KEY="sk-ant-..."
 
 # 3. Verify everything is wired correctly
-./target/debug/claw doctor
+cargo run -p rusty-claude-cli -- doctor
 
 # 4. Run a prompt
-./target/debug/claw prompt "say hello"
+cargo run -p rusty-claude-cli -- prompt "say hello"
 ```
 
 > [!NOTE]
-> **Windows (PowerShell):** the binary is `claw.exe`, not `claw`. Use `.\target\debug\claw.exe` or run `cargo run -- prompt "say hello"` to skip the path lookup.
+> **Windows (PowerShell):** the binary is `claw.exe`, not `claw`. Run `cargo run -- prompt "say hello"` to skip direct binary path lookup.
 
 ### Windows setup
 
@@ -93,28 +93,37 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 4. **Run** (PowerShell — note `.exe` and backslash):
    ```powershell
    $env:ANTHROPIC_API_KEY = "sk-ant-..."
-   .\target\debug\claw.exe prompt "say hello"
+   cargo run -p rusty-claude-cli -- prompt "say hello"
    ```
 
 **Git Bash / WSL** are optional alternatives, not requirements. If you prefer bash-style paths (`/c/Users/you/...` instead of `C:\Users\you\...`), Git Bash (ships with Git for Windows) works well. In Git Bash, the `MINGW64` prompt is expected and normal — not a broken install.
 
 ## Post-build: locate the binary and verify
 
-After running `cargo build --workspace`, the `claw` binary is built but **not** automatically installed to your system. Here's where to find it and how to verify the build succeeded.
+After running `cargo build --workspace`, the `claw` binary is built but **not** automatically installed to your system. Do not assume Cargo wrote it under `rust/target`; local config, `CARGO_TARGET_DIR`, or `--target-dir` may redirect build artifacts.
 
 ### Binary location
 
-After `cargo build --workspace` in `claw-code/rust/`:
+After `cargo build --workspace` in `claw-code/rust/`, ask Cargo for the active target directory:
+
+```bash
+TARGET_DIR="$(
+  cargo metadata --format-version 1 --no-deps |
+  python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])'
+)"
+```
 
 **Debug build (default, faster compile):**
-- **macOS/Linux:** `rust/target/debug/claw`
-- **Windows:** `rust/target/debug/claw.exe`
+- **macOS/Linux:** `$TARGET_DIR/debug/claw`
+- **Windows:** `$TARGET_DIR/debug/claw.exe`
 
 **Release build (optimized, slower compile):**
-- **macOS/Linux:** `rust/target/release/claw`
-- **Windows:** `rust/target/release/claw.exe`
+- **macOS/Linux:** `$TARGET_DIR/release/claw`
+- **Windows:** `$TARGET_DIR/release/claw.exe`
 
 If you ran `cargo build` without `--release`, the binary is in the `debug/` folder.
+
+On Suki's workstation, `rust/.cargo/config.toml` redirects Cargo build artifacts to the 18TB build-artifacts drive. Use `cargo metadata --format-version 1 --no-deps` to confirm `target_directory` instead of assuming a workspace-local target directory.
 
 ### Verify the build succeeded
 
@@ -122,12 +131,12 @@ Test the binary directly using its path:
 
 ```bash
 # macOS/Linux (debug build)
-./rust/target/debug/claw --help
-./rust/target/debug/claw doctor
+"$TARGET_DIR/debug/claw" --help
+"$TARGET_DIR/debug/claw" doctor
 
 # Windows PowerShell (debug build)
-.\rust\target\debug\claw.exe --help
-.\rust\target\debug\claw.exe doctor
+cargo run -p rusty-claude-cli -- --help
+cargo run -p rusty-claude-cli -- doctor
 ```
 
 If these commands succeed, the build is working. `claw doctor` is your first health check — it validates your API key, model access, and tool configuration.
@@ -136,9 +145,14 @@ If these commands succeed, the build is working. `claw doctor` is your first hea
 
 If you want to run `claw` from any directory without the full path, choose one of these approaches:
 
-**Option 1: Symlink (macOS/Linux)**
+**Option 1: Link the active Cargo-built binary (macOS/Linux)**
 ```bash
-ln -s $(pwd)/rust/target/debug/claw /usr/local/bin/claw
+TARGET_DIR="$(
+  cd rust &&
+  cargo metadata --format-version 1 --no-deps |
+  python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])'
+)"
+ln -s "$TARGET_DIR/debug/claw" /usr/local/bin/claw
 ```
 Then reload your shell and test:
 ```bash
@@ -160,7 +174,12 @@ claw --help
 
 Add this line to `~/.bashrc` or `~/.zshrc`:
 ```bash
-export PATH="$(pwd)/rust/target/debug:$PATH"
+TARGET_DIR="$(
+  cd /path/to/claw-code/rust &&
+  cargo metadata --format-version 1 --no-deps |
+  python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])'
+)"
+export PATH="$TARGET_DIR/debug:$PATH"
 ```
 
 Reload your shell:
@@ -171,8 +190,8 @@ claw --help
 
 ### Troubleshooting
 
-- **"command not found: claw"** — The binary is in `rust/target/debug/claw`, but it's not on your PATH. Use the full path `./rust/target/debug/claw` or symlink/install as above.
-- **"permission denied"** — On macOS/Linux, you may need `chmod +x rust/target/debug/claw` if the executable bit isn't set (rare).
+- **"command not found: claw"** — Ask Cargo for `target_directory`, then use `$TARGET_DIR/debug/claw` or link/install as above.
+- **"permission denied"** — On macOS/Linux, you may need `chmod +x "$TARGET_DIR/debug/claw"` if the executable bit isn't set (rare).
 - **Debug vs. release** — If the build is slow, you're in debug mode (default). Add `--release` to `cargo build` for faster runtime, but the build itself will take 5–10 minutes.
 
 > [!NOTE]

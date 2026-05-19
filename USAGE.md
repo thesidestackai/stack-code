@@ -9,12 +9,12 @@ Run this before prompts, sessions, or automation:
 ```bash
 cd rust
 cargo build --workspace
-./target/debug/claw
+cargo run -p rusty-claude-cli --
 # first command inside the REPL
 /doctor
 ```
 
-`/doctor` is the built-in setup and preflight diagnostic. Once you have a saved session, you can rerun it with `./target/debug/claw --resume latest /doctor`.
+`/doctor` is the built-in setup and preflight diagnostic. Once you have a saved session, you can rerun it with `cargo run -p rusty-claude-cli -- --resume latest /doctor`.
 
 ## Prerequisites
 
@@ -31,7 +31,9 @@ cd rust
 cargo build --workspace
 ```
 
-The CLI binary is available at `rust/target/debug/claw` after a debug build. Make the doctor check above your first post-build step.
+The CLI binary is available under Cargo's active `target_directory` after a debug build. Make the doctor check above your first post-build step.
+
+On this workstation, `rust/.cargo/config.toml` may redirect Cargo build artifacts to the 18TB build-artifacts drive. Use `cargo metadata --format-version 1 --no-deps` to confirm `target_directory` instead of assuming `rust/target`.
 
 ## Quick start
 
@@ -39,7 +41,7 @@ The CLI binary is available at `rust/target/debug/claw` after a debug build. Mak
 
 ```bash
 cd rust
-./target/debug/claw
+cargo run -p rusty-claude-cli --
 /doctor
 ```
 
@@ -47,7 +49,7 @@ Or run doctor directly with JSON output for scripting:
 
 ```bash
 cd rust
-./target/debug/claw doctor --output-format json
+cargo run -p rusty-claude-cli -- doctor --output-format json
 ```
 
 **Note:** Diagnostic verbs (`doctor`, `status`, `sandbox`, `version`) support `--output-format json` for machine-readable output. Invalid suffix arguments (e.g., `--json`) are now rejected at parse time rather than falling through to prompt dispatch.
@@ -58,14 +60,14 @@ Set up a new repository with `.claw` config, `.claw.json`, `.gitignore` entries,
 
 ```bash
 cd /path/to/your/repo
-./target/debug/claw init
+cargo run --manifest-path /path/to/claw-code/rust/Cargo.toml -p rusty-claude-cli -- init
 ```
 
 Text mode (human-readable) shows artifact creation summary with project path and next steps. Idempotent — running multiple times in the same repo marks already-created files as "skipped".
 
 JSON mode for scripting:
 ```bash
-./target/debug/claw init --output-format json
+cargo run --manifest-path /path/to/claw-code/rust/Cargo.toml -p rusty-claude-cli -- init --output-format json
 ```
 
 Returns structured output with `project_path`, `created[]`, `updated[]`, `skipped[]` arrays (one per artifact), and `artifacts[]` carrying each file's `name` and machine-stable `status` tag. The legacy `message` field preserves backward compatibility.
@@ -76,28 +78,28 @@ Returns structured output with `project_path`, `created[]`, `updated[]`, `skippe
 
 ```bash
 cd rust
-./target/debug/claw
+cargo run -p rusty-claude-cli --
 ```
 
 ### One-shot prompt
 
 ```bash
 cd rust
-./target/debug/claw prompt "summarize this repository"
+cargo run -p rusty-claude-cli -- prompt "summarize this repository"
 ```
 
 ### Shorthand prompt mode
 
 ```bash
 cd rust
-./target/debug/claw "explain rust/crates/runtime/src/lib.rs"
+cargo run -p rusty-claude-cli -- "explain rust/crates/runtime/src/lib.rs"
 ```
 
 ### JSON output for scripting
 
 ```bash
 cd rust
-./target/debug/claw --output-format json prompt "status"
+cargo run -p rusty-claude-cli -- --output-format json prompt "status"
 ```
 
 ### Inspect worker state
@@ -108,12 +110,12 @@ Prerequisite: You must run `claw` (interactive REPL) or `claw prompt <text>` at 
 
 ```bash
 cd rust
-./target/debug/claw state
+cargo run -p rusty-claude-cli -- state
 ```
 
 JSON mode:
 ```bash
-./target/debug/claw state --output-format json
+cargo run -p rusty-claude-cli -- state --output-format json
 ```
 
 If you run `claw state` before any worker has executed, you will see a helpful error:
@@ -183,10 +185,10 @@ Output: A list of suspicious patterns with explanations (e.g., "unchecked unwrap
 
 ```bash
 cd rust
-./target/debug/claw --model sonnet prompt "review this diff"
-./target/debug/claw --permission-mode read-only prompt "summarize Cargo.toml"
-./target/debug/claw --permission-mode workspace-write prompt "update README.md"
-./target/debug/claw --allowedTools read,glob "inspect the runtime crate"
+cargo run -p rusty-claude-cli -- --model sonnet prompt "review this diff"
+cargo run -p rusty-claude-cli -- --permission-mode read-only prompt "summarize Cargo.toml"
+cargo run -p rusty-claude-cli -- --permission-mode workspace-write prompt "update README.md"
+cargo run -p rusty-claude-cli -- --allowedTools read,glob "inspect the runtime crate"
 ```
 
 Supported permission modes:
@@ -292,7 +294,7 @@ export ANTHROPIC_BASE_URL="http://127.0.0.1:8080"
 export ANTHROPIC_AUTH_TOKEN="local-dev-token"
 
 cd rust
-./target/debug/claw --model "claude-sonnet-4-6" prompt "reply with the word ready"
+cargo run -p rusty-claude-cli -- --model "claude-sonnet-4-6" prompt "reply with the word ready"
 ```
 
 ### OpenAI-compatible endpoint
@@ -302,7 +304,7 @@ export OPENAI_BASE_URL="http://127.0.0.1:8000/v1"
 export OPENAI_API_KEY="local-dev-token"
 
 cd rust
-./target/debug/claw --model "qwen2.5-coder" prompt "reply with the word ready"
+cargo run -p rusty-claude-cli -- --model "qwen2.5-coder" prompt "reply with the word ready"
 ```
 
 ### Ollama
@@ -312,7 +314,7 @@ export OPENAI_BASE_URL="http://127.0.0.1:11434/v1"
 unset OPENAI_API_KEY
 
 cd rust
-./target/debug/claw --model "llama3.2" prompt "summarize this repository in one sentence"
+cargo run -p rusty-claude-cli -- --model "llama3.2" prompt "summarize this repository in one sentence"
 ```
 
 ### OpenRouter
@@ -322,7 +324,7 @@ export OPENAI_BASE_URL="https://openrouter.ai/api/v1"
 export OPENAI_API_KEY="sk-or-v1-..."
 
 cd rust
-./target/debug/claw --model "openai/gpt-4.1-mini" prompt "summarize this repository in one sentence"
+cargo run -p rusty-claude-cli -- --model "openai/gpt-4.1-mini" prompt "summarize this repository in one sentence"
 ```
 
 ### Alibaba DashScope (Qwen)
@@ -333,9 +335,9 @@ For Qwen models via Alibaba's native DashScope API (higher rate limits than Open
 export DASHSCOPE_API_KEY="sk-..."
 
 cd rust
-./target/debug/claw --model "qwen/qwen-max" prompt "hello"
+cargo run -p rusty-claude-cli -- --model "qwen/qwen-max" prompt "hello"
 # or bare:
-./target/debug/claw --model "qwen-plus" prompt "hello"
+cargo run -p rusty-claude-cli -- --model "qwen-plus" prompt "hello"
 ```
 
 Model names starting with `qwen/` or `qwen-` are automatically routed to the DashScope compatible-mode endpoint (`https://dashscope.aliyuncs.com/compatible-mode/v1`). You do **not** need to set `OPENAI_BASE_URL` or unset `ANTHROPIC_API_KEY` — the model prefix wins over the ambient credential sniffer.
@@ -421,7 +423,7 @@ export HTTP_PROXY="http://proxy.corp.example:3128"
 export NO_PROXY="localhost,127.0.0.1,.corp.example"
 
 cd rust
-./target/debug/claw prompt "hello via the corporate proxy"
+cargo run -p rusty-claude-cli -- prompt "hello via the corporate proxy"
 ```
 
 ### Programmatic `proxy_url` config option
@@ -456,12 +458,12 @@ let client = build_http_client_with(&config).expect("proxy client");
 
 ```bash
 cd rust
-./target/debug/claw status
-./target/debug/claw sandbox
-./target/debug/claw agents
-./target/debug/claw mcp
-./target/debug/claw skills
-./target/debug/claw system-prompt --cwd .. --date 2026-04-04
+cargo run -p rusty-claude-cli -- status
+cargo run -p rusty-claude-cli -- sandbox
+cargo run -p rusty-claude-cli -- agents
+cargo run -p rusty-claude-cli -- mcp
+cargo run -p rusty-claude-cli -- skills
+cargo run -p rusty-claude-cli -- system-prompt --cwd .. --date 2026-04-04
 ```
 
 ## Session management
@@ -470,8 +472,8 @@ REPL turns are persisted under `.claw/sessions/` in the current workspace.
 
 ```bash
 cd rust
-./target/debug/claw --resume latest
-./target/debug/claw --resume latest /status /diff
+cargo run -p rusty-claude-cli -- --resume latest
+cargo run -p rusty-claude-cli -- --resume latest /status /diff
 ```
 
 Useful interactive commands include `/help`, `/status`, `/cost`, `/config`, `/session`, `/model`, `/permissions`, and `/export`.

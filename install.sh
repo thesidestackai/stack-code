@@ -164,9 +164,9 @@ ${COLOR_DIM}---------------${COLOR_RESET}
      If the failure mentions ring/openssl, double check step 2.
 
   ${COLOR_BOLD}6. 'claw' not found after install${COLOR_RESET}
-     The binary lives at:
-       rust/target/${BUILD_PROFILE}/claw
-     Add it to your PATH or invoke it with the full path.
+     The installer resolves the binary from Cargo's target_directory.
+     Check the active directory with:
+       cd rust && cargo metadata --format-version 1 --no-deps --offline
 
 EOF
 }
@@ -179,6 +179,25 @@ trap 'rc=$?; if [ "$rc" -ne 0 ]; then error "installation failed (exit ${rc})"; 
 
 require_cmd() {
     command -v "$1" >/dev/null 2>&1
+}
+
+resolve_cargo_target_dir() {
+    local resolved
+    if ! resolved="$(
+        cd "${RUST_DIR}" &&
+        cargo metadata --format-version 1 --no-deps --offline |
+        python3 -c 'import json, sys; print(json.load(sys.stdin).get("target_directory", ""))'
+    )"; then
+        error "Could not resolve Cargo target_directory via cargo metadata."
+        exit 1
+    fi
+
+    if [ -z "${resolved}" ]; then
+        error "Cargo metadata did not report target_directory."
+        exit 1
+    fi
+
+    printf '%s\n' "${resolved}"
 }
 
 # ---------------------------------------------------------------------------
@@ -276,6 +295,14 @@ else
     MISSING_PREREQS=1
 fi
 
+if require_cmd python3; then
+    PYTHON_VERSION="$(python3 --version 2>/dev/null || echo 'unknown')"
+    ok "python3 found: ${PYTHON_VERSION}"
+else
+    error "python3 not found in PATH"
+    MISSING_PREREQS=1
+fi
+
 if require_cmd git; then
     ok "git found:  $(git --version 2>/dev/null || echo 'unknown')"
 else
@@ -307,6 +334,9 @@ fi
 
 step "Building the claw workspace (${BUILD_PROFILE})"
 
+CARGO_TARGET_DIR_RESOLVED="$(resolve_cargo_target_dir)"
+ok "Cargo target directory: ${CARGO_TARGET_DIR_RESOLVED}"
+
 CARGO_FLAGS=("build" "--workspace")
 if [ "${BUILD_PROFILE}" = "release" ]; then
     CARGO_FLAGS+=("--release")
@@ -320,7 +350,7 @@ info "this may take a few minutes on the first build"
     CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-always}" cargo "${CARGO_FLAGS[@]}"
 )
 
-CLAW_BIN="${RUST_DIR}/target/${BUILD_PROFILE}/claw"
+CLAW_BIN="${CARGO_TARGET_DIR_RESOLVED}/${BUILD_PROFILE}/claw"
 
 if [ ! -x "${CLAW_BIN}" ]; then
     error "Expected binary not found at ${CLAW_BIN}"
