@@ -25,6 +25,7 @@ const BROKER_CALLER_HEADER: &str = "X-LLM-Caller";
 const BROKER_TASK_HEADER: &str = "X-Task-Type";
 const BROKER_CALLER_ENV: &str = "RUSTY_CLAUDE_LLM_CALLER";
 const BROKER_TASK_ENV: &str = "RUSTY_CLAUDE_TASK_TYPE";
+const MODEL_ALIAS_ENV_PREFIX: &str = "RUSTY_CLAUDE_MODEL_ALIAS__";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(128);
 const DEFAULT_MAX_RETRIES: u32 = 8;
@@ -865,8 +866,13 @@ pub fn build_chat_completion_request(
             "content": system,
         }));
     }
+    // Resolve opt-in local model alias (e.g. `fast` → `qwen3:14b`) before
+    // any wire-model decisions so reasoning detection, max-tokens key, and
+    // the payload `model` field all see the same effective string.
+    let aliased_model = resolve_model_alias(&request.model);
+    let effective_model = aliased_model.as_deref().unwrap_or(&request.model);
     // Strip routing prefix (e.g., "openai/gpt-4" → "gpt-4") for the wire.
-    let wire_model = strip_routing_prefix(&request.model);
+    let wire_model = strip_routing_prefix(effective_model);
     for message in &request.messages {
         messages.extend(translate_message(message, wire_model));
     }
@@ -910,7 +916,7 @@ pub fn build_chat_completion_request(
     // OpenAI-compatible tuning parameters — only included when explicitly set.
     // Reasoning models (o1/o3/o4/grok-3-mini) reject these params with 400;
     // silently strip them to avoid cryptic provider errors.
-    if !is_reasoning_model(&request.model) {
+    if !is_reasoning_model(effective_model) {
         if let Some(temperature) = request.temperature {
             payload["temperature"] = json!(temperature);
         }
@@ -1329,6 +1335,32 @@ fn broker_header_value(key: &str) -> Option<String> {
         None
     } else {
         Some(trimmed.to_string())
+    }
+}
+
+/// Resolve an opt-in local model alias from the environment.
+///
+/// Only rewrites bare alias names (ASCII alphanumeric + `_`); strings that
+/// could be provider-prefixed routes (e.g. `openai/gpt-4`) or contain other
+/// characters are returned unchanged so existing routing keeps working.
+fn resolve_model_alias(model: &str) -> Option<String> {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    let key = format!("{MODEL_ALIAS_ENV_PREFIX}{}", trimmed.to_ascii_uppercase());
+    let value = std::env::var(&key).ok()?;
+    let trimmed_value = value.trim();
+    if trimmed_value.is_empty() {
+        None
+    } else {
+        Some(trimmed_value.to_string())
     }
 }
 
