@@ -10,6 +10,8 @@ name = "claw"
 path = "src/main.rs"
 
 [dependencies]
+a2-plan-runner = { path = "../a2-plan-runner" }
+a2-plan-schema = { path = "../a2-plan-schema" }
 api = { path = "../api" }
 commands = { path = "../commands" }
 compat-harness = { path = "../compat-harness" }
