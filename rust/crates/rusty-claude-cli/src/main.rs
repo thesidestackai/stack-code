@@ -9259,6 +9259,33 @@ fn permission_policy(
     ))
 }
 
+/// Reclassify a pre-stringified tool-result `output` into a parsed JSON
+/// envelope when it matches a shape the OpenAI-compatible flattener
+/// (`api::providers::openai_compat::flatten_tool_result_content`) knows how
+/// to extract. Returns `None` for plain text and any unrecognized JSON shape
+/// so the caller falls back to a verbatim `ToolResultContentBlock::Text`
+/// emission. Without this reclassification, the `OpenAI` flattener's `Text`
+/// arm passes the stringified envelope through verbatim and Ollama-routed
+/// models reject it with `"Value looks like object, but can't find closing
+/// '}' symbol"`.
+fn maybe_parse_tool_result_json_envelope(output: &str) -> Option<Value> {
+    let value: Value = serde_json::from_str(output).ok()?;
+    let obj = value.as_object()?;
+    if let Some(file) = obj.get("file").and_then(Value::as_object) {
+        if file.get("content").and_then(Value::as_str).is_some()
+            || file.get("text").and_then(Value::as_str).is_some()
+        {
+            return Some(value);
+        }
+    }
+    for key in ["text", "content", "output", "result", "message", "error"] {
+        if obj.get(key).and_then(Value::as_str).is_some() {
+            return Some(value);
+        }
+    }
+    None
+}
+
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
     messages
         .iter()
@@ -9283,13 +9310,21 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                         output,
                         is_error,
                         ..
-                    } => InputContentBlock::ToolResult {
-                        tool_use_id: tool_use_id.clone(),
-                        content: vec![ToolResultContentBlock::Text {
-                            text: output.clone(),
-                        }],
-                        is_error: *is_error,
-                    },
+                    } => {
+                        let content_block =
+                            if let Some(value) = maybe_parse_tool_result_json_envelope(output) {
+                                ToolResultContentBlock::Json { value }
+                            } else {
+                                ToolResultContentBlock::Text {
+                                    text: output.clone(),
+                                }
+                            };
+                        InputContentBlock::ToolResult {
+                            tool_use_id: tool_use_id.clone(),
+                            content: vec![content_block],
+                            is_error: *is_error,
+                        }
+                    }
                 })
                 .collect::<Vec<_>>();
             (!content.is_empty()).then(|| InputMessage {
@@ -9484,23 +9519,27 @@ mod tests {
         format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
         format_tool_result, format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error,
-        merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
-        parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
-        parse_history_count, permission_policy, print_help_to, push_output_block,
-        render_config_report, render_diff_report, render_diff_report_for, render_help_topic,
-        render_memory_report, render_prompt_history_report, render_repl_help, render_resume_usage,
-        render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
-        resolve_model_env_alias, resolve_repl_model, resolve_session_reference, response_to_events,
-        resume_supported_slash_commands, run_resume_command, runtime_mcp_inventory_json_for_loader,
-        short_tool_id, slash_command_completion_candidates_with_sessions, split_error_hint,
-        status_context, summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt,
-        validate_model_syntax, validate_no_args, write_mcp_server_fixture,
-        write_mcp_tools_list_disconnect_fixture, CliAction, CliOutputFormat, CliToolExecutor,
-        GitWorkspaceSummary, InternalPromptProgressEvent, InternalPromptProgressState, LiveCli,
-        LocalHelpTopic, PromptHistoryEntry, RuntimePluginState, SlashCommand, StatusUsage,
-        DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
+        maybe_parse_tool_result_json_envelope, merge_prompt_with_stdin, normalize_permission_mode,
+        parse_args, parse_export_args, parse_git_status_branch, parse_git_status_metadata_for,
+        parse_git_workspace_summary, parse_history_count, permission_policy, print_help_to,
+        push_output_block, render_config_report, render_diff_report, render_diff_report_for,
+        render_help_topic, render_memory_report, render_prompt_history_report, render_repl_help,
+        render_resume_usage, render_session_markdown, resolve_model_alias,
+        resolve_model_alias_with_config, resolve_model_env_alias, resolve_repl_model,
+        resolve_session_reference, response_to_events, resume_supported_slash_commands,
+        run_resume_command, runtime_mcp_inventory_json_for_loader, short_tool_id,
+        slash_command_completion_candidates_with_sessions, split_error_hint, status_context,
+        summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt, validate_model_syntax,
+        validate_no_args, write_mcp_server_fixture, write_mcp_tools_list_disconnect_fixture,
+        CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
+        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
+        PromptHistoryEntry, RuntimePluginState, SlashCommand, StatusUsage, DEFAULT_MODEL,
+        LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
-    use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
+    use api::{
+        ApiError, InputContentBlock, MessageResponse, OutputContentBlock, ToolResultContentBlock,
+        Usage,
+    };
     use plugins::{
         PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
     };
@@ -12745,6 +12784,208 @@ UU conflicted.rs",
         assert_eq!(converted[1].role, "assistant");
         assert_eq!(converted[2].role, "user");
     }
+
+    // ========================================================================
+    // CLI tool-result envelope reclassification (post-PR16 RCA 2026-05-20)
+    //
+    // Pre-fix the CLI emit path always built `ToolResultContentBlock::Text`
+    // even when `output` was a pre-stringified JSON envelope. PR #16 only
+    // flattens the `Json` arm, so on Ollama-routed models the embedded `{}`
+    // caused turn-3 to fail with
+    //   "Value looks like object, but can't find closing '}' symbol".
+    // These tests exercise the live `convert_messages` path so the
+    // PR #16 helper actually becomes reachable.
+    // ========================================================================
+
+    const SMOKE_FILE_READ_ENVELOPE: &str = concat!(
+        "{\"type\":\"text\",",
+        "\"file\":{",
+        "\"filePath\":\"smoke_target.txt\",",
+        "\"content\":\"a1-smoke-ok\",",
+        "\"numLines\":1,",
+        "\"startLine\":1,",
+        "\"totalLines\":1",
+        "}}",
+    );
+
+    #[test]
+    fn envelope_helper_extracts_file_read_envelope() {
+        let parsed = maybe_parse_tool_result_json_envelope(SMOKE_FILE_READ_ENVELOPE)
+            .expect("file-read envelope must be recognized");
+        let inner = parsed
+            .pointer("/file/content")
+            .and_then(Value::as_str)
+            .expect("inner file.content must remain accessible");
+        assert_eq!(inner, "a1-smoke-ok");
+    }
+
+    #[test]
+    fn envelope_helper_returns_none_for_plain_text() {
+        assert!(maybe_parse_tool_result_json_envelope("a1-smoke-ok").is_none());
+        assert!(maybe_parse_tool_result_json_envelope("").is_none());
+        assert!(maybe_parse_tool_result_json_envelope("ok\n").is_none());
+    }
+
+    #[test]
+    fn envelope_helper_returns_none_for_unrecognized_object() {
+        let arbitrary = r#"{"unexpected":{"nested":true}}"#;
+        assert!(maybe_parse_tool_result_json_envelope(arbitrary).is_none());
+        let array = r#"[1, 2, 3]"#;
+        assert!(maybe_parse_tool_result_json_envelope(array).is_none());
+        let primitive = r#"42"#;
+        assert!(maybe_parse_tool_result_json_envelope(primitive).is_none());
+    }
+
+    #[test]
+    fn envelope_helper_extracts_error_envelope() {
+        let err = r#"{"error":"command failed"}"#;
+        let parsed =
+            maybe_parse_tool_result_json_envelope(err).expect("error envelope must be recognized");
+        assert_eq!(
+            parsed.get("error").and_then(Value::as_str),
+            Some("command failed"),
+        );
+    }
+
+    #[test]
+    fn envelope_helper_extracts_other_string_keys() {
+        for key in ["text", "content", "output", "result", "message"] {
+            let payload = format!(r#"{{"{key}":"payload-{key}"}}"#);
+            let parsed = maybe_parse_tool_result_json_envelope(&payload)
+                .unwrap_or_else(|| panic!("key {key} must be recognized"));
+            assert_eq!(
+                parsed.get(key).and_then(Value::as_str),
+                Some(format!("payload-{key}").as_str()),
+            );
+        }
+    }
+
+    #[test]
+    fn convert_messages_emits_json_block_for_file_read_envelope() {
+        let messages = vec![ConversationMessage {
+            role: MessageRole::Tool,
+            blocks: vec![ContentBlock::ToolResult {
+                tool_use_id: "call_smoke".to_string(),
+                tool_name: "read_file".to_string(),
+                output: SMOKE_FILE_READ_ENVELOPE.to_string(),
+                is_error: false,
+            }],
+            usage: None,
+        }];
+
+        let converted = super::convert_messages(&messages);
+        assert_eq!(converted.len(), 1);
+        let tool_result = match &converted[0].content[0] {
+            InputContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => {
+                assert_eq!(tool_use_id, "call_smoke");
+                assert!(!is_error);
+                content
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        };
+        assert_eq!(tool_result.len(), 1);
+        match &tool_result[0] {
+            ToolResultContentBlock::Json { value } => {
+                assert_eq!(
+                    value.pointer("/file/content").and_then(Value::as_str),
+                    Some("a1-smoke-ok"),
+                );
+            }
+            ToolResultContentBlock::Text { text } => panic!(
+                "envelope-shaped output must become Json, got Text({:?})",
+                text
+            ),
+        }
+    }
+
+    #[test]
+    fn convert_messages_preserves_text_block_for_plain_output() {
+        let messages = vec![ConversationMessage {
+            role: MessageRole::Tool,
+            blocks: vec![ContentBlock::ToolResult {
+                tool_use_id: "call_plain".to_string(),
+                tool_name: "bash".to_string(),
+                output: "a1-smoke-ok".to_string(),
+                is_error: false,
+            }],
+            usage: None,
+        }];
+
+        let converted = super::convert_messages(&messages);
+        let content = match &converted[0].content[0] {
+            InputContentBlock::ToolResult { content, .. } => content,
+            other => panic!("expected ToolResult, got {other:?}"),
+        };
+        match &content[0] {
+            ToolResultContentBlock::Text { text } => assert_eq!(text, "a1-smoke-ok"),
+            ToolResultContentBlock::Json { value } => {
+                panic!("plain text must stay Text, got Json({value:?})")
+            }
+        }
+    }
+
+    #[test]
+    fn convert_messages_preserves_text_block_for_unrecognized_json() {
+        let arbitrary = r#"{"unexpected":{"nested":true}}"#;
+        let messages = vec![ConversationMessage {
+            role: MessageRole::Tool,
+            blocks: vec![ContentBlock::ToolResult {
+                tool_use_id: "call_arb".to_string(),
+                tool_name: "bash".to_string(),
+                output: arbitrary.to_string(),
+                is_error: false,
+            }],
+            usage: None,
+        }];
+
+        let converted = super::convert_messages(&messages);
+        let content = match &converted[0].content[0] {
+            InputContentBlock::ToolResult { content, .. } => content,
+            other => panic!("expected ToolResult, got {other:?}"),
+        };
+        match &content[0] {
+            ToolResultContentBlock::Text { text } => assert_eq!(text, arbitrary),
+            ToolResultContentBlock::Json { value } => {
+                panic!("unrecognized JSON must stay Text, got Json({value:?})")
+            }
+        }
+    }
+
+    #[test]
+    fn convert_messages_emits_flat_string_through_openai_flattener() {
+        // End-to-end live-path check: after `convert_messages` the
+        // file-read envelope must flatten to a bare string when run through
+        // `api::flatten_tool_result_content`, the same helper the
+        // OpenAI-compatible provider invokes when translating to
+        // `role:"tool".content`. This is the contract that broke turn-3 in
+        // the post-PR16 RCA wire capture.
+        let messages = vec![ConversationMessage {
+            role: MessageRole::Tool,
+            blocks: vec![ContentBlock::ToolResult {
+                tool_use_id: "call_smoke".to_string(),
+                tool_name: "read_file".to_string(),
+                output: SMOKE_FILE_READ_ENVELOPE.to_string(),
+                is_error: false,
+            }],
+            usage: None,
+        }];
+        let converted = super::convert_messages(&messages);
+        let content = match &converted[0].content[0] {
+            InputContentBlock::ToolResult { content, .. } => content,
+            other => panic!("expected ToolResult, got {other:?}"),
+        };
+        let flat = api::flatten_tool_result_content(content);
+        assert_eq!(flat, "a1-smoke-ok");
+        assert!(
+            !flat.contains('{') && !flat.contains('}'),
+            "flat content must not contain JSON braces; got {flat:?}"
+        );
+    }
+
     #[test]
     fn repl_help_mentions_history_completion_and_multiline() {
         let help = render_repl_help();
