@@ -172,6 +172,13 @@ steps:
         // Two disallowed tools across two steps; precheck must return the
         // FIRST one encountered (walk order: step order, then tool order)
         // so operator output is deterministic.
+        //
+        // Note: after A2-L2a, a read-only step declaring `Write` is
+        // refused at the schema layer (WRITE_TOOL_ON_READONLY) and never
+        // reaches the runner's ToolDisallowed walk. To exercise the
+        // runner-layer determinism in isolation, both disallowed tools
+        // chosen here are tools the schema validator still accepts
+        // (Edit and Bash) so the offending pair surfaces deterministically.
         let yaml = r"
 name: multi-disallowed
 mode: read-only
@@ -182,7 +189,7 @@ steps:
     tools: [Read, Edit]
   - id: s2
     description: second
-    tools: [Write]
+    tools: [Bash]
 ";
         match run(yaml) {
             Err(PrecheckRefusal::ToolDisallowed { step_id, tool }) => {
@@ -216,9 +223,22 @@ steps:
     #[test]
     fn precheck_refuses_explicitly_disallowed_examples() {
         // Make the operator carry-forward concrete: every common write or
-        // shell tool is refused at the precheck layer, never reaching the
-        // runner's subprocess path.
-        for forbidden in ["Edit", "Write", "Bash", "NotebookEdit", "WebFetch"] {
+        // shell tool is refused before the runner's subprocess path can run.
+        //
+        // After A2-L2a there are two refusal layers that BOTH count as
+        // "refused before execution":
+        //
+        //   - schema validator (`ValidatorRefused`): a read-only step that
+        //     declares `Write` is invalid at the schema layer
+        //     (`WRITE_TOOL_ON_READONLY`).
+        //   - runner precheck (`ToolDisallowed`): a schema-valid plan that
+        //     declares a tool outside the runner allowlist
+        //     (Edit / Bash / NotebookEdit / WebFetch on a read-only step).
+        //
+        // Both refusal kinds halt before execution, which is what the
+        // operator carry-forward actually requires. The test below asserts
+        // exactly that split.
+        for forbidden in ["Edit", "Bash", "NotebookEdit", "WebFetch"] {
             let yaml = format!(
                 "
 name: forbidden-{forbidden}
@@ -234,7 +254,26 @@ steps:
                 Err(PrecheckRefusal::ToolDisallowed { tool, .. }) => {
                     assert_eq!(tool, forbidden);
                 }
-                other => panic!("expected {forbidden} refused, got {other:?}"),
+                other => panic!("expected {forbidden} refused via ToolDisallowed, got {other:?}"),
+            }
+        }
+
+        // Write on a read-only step is now schema-invalid, so the schema
+        // validator refuses it first and the runner sees
+        // `ValidatorRefused`. This is still "refused before execution".
+        let write_yaml = r"
+name: forbidden-Write
+mode: read-only
+model_tier: FAST
+steps:
+  - id: s
+    description: uses Write
+    tools: [Write]
+";
+        match run(write_yaml) {
+            Err(PrecheckRefusal::ValidatorRefused) => {}
+            other => {
+                panic!("expected Write on read-only refused via ValidatorRefused, got {other:?}")
             }
         }
     }
