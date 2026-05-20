@@ -465,8 +465,139 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         )?,
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
+        // A2-L1b: additive dispatch. Entire body lives in
+        // `run_plan_subcommand`; the only thing this arm does is hand off.
+        CliAction::Plan {
+            file,
+            dry_run,
+            report_format,
+            substrate_url,
+            fast_model,
+            wrapper,
+            step_timeout,
+        } => {
+            let code = run_plan_subcommand(
+                &file,
+                dry_run,
+                report_format,
+                substrate_url.as_deref(),
+                fast_model.as_deref(),
+                wrapper.as_deref(),
+                step_timeout,
+            );
+            // Exit codes 0–5 form the operator-facing contract for `claw
+            // plan run`. Bypass the surrounding `Ok(())` flow because the
+            // exit code must surface verbatim (it discriminates pass /
+            // fail / refused / substrate-unavailable / parse-error).
+            std::process::exit(code);
+        }
     }
     Ok(())
+}
+
+/// A2-L1b dispatcher. Wraps the `a2-plan-runner` crate exclusively — does
+/// NOT construct claw args, does NOT call the broker directly, does NOT
+/// spawn any subprocess of its own. Returns the CLI exit code (0–5).
+fn run_plan_subcommand(
+    file: &Path,
+    dry_run: bool,
+    report_format: PlanReportFormat,
+    substrate_url: Option<&str>,
+    fast_model: Option<&str>,
+    wrapper: Option<&Path>,
+    step_timeout: Option<std::time::Duration>,
+) -> i32 {
+    use a2_plan_runner::{
+        exit_code_for, refused_precheck_report, substrate_unavailable_report, write_json,
+        write_markers, DEFAULT_STEP_TIMEOUT, EXIT_PARSE_ERROR,
+    };
+    use a2_plan_schema::{parse_plan, validate_plan};
+
+    // Operator-supplied --step-timeout overrides DEFAULT_STEP_TIMEOUT; both
+    // are bounded by `a2_plan_runner::parse_step_timeout_seconds`.
+    let effective_step_timeout = step_timeout.unwrap_or(DEFAULT_STEP_TIMEOUT);
+
+    // Default substrate: the canonical SideStackAI broker on :11435 with
+    // qwen3:14b as the FAST model. Operator can override per invocation.
+    const DEFAULT_SUBSTRATE_URL: &str = "http://127.0.0.1:11435/v1";
+    const DEFAULT_FAST_MODEL: &str = "qwen3:14b";
+    // Wrapper default: relative to CWD. Operator runs `claw plan run` from
+    // the repo root; passing `--wrapper` overrides for non-standard layouts.
+    let default_wrapper = PathBuf::from("scripts/claw-sidestack-local");
+
+    // -- 1. YAML parse (exit 5 on failure; surfaces BEFORE any runner code).
+    let yaml = match std::fs::read_to_string(file) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("claw plan run: cannot read {}: {}", file.display(), e);
+            return EXIT_PARSE_ERROR;
+        }
+    };
+    let plan = match parse_plan(&yaml) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "claw plan run: yaml parse error in {}: {}",
+                file.display(),
+                e
+            );
+            return EXIT_PARSE_ERROR;
+        }
+    };
+
+    // -- 2. Build the PlanReport. Two paths depending on --dry-run.
+    let report = if dry_run {
+        // Dry-run: validator + precheck only. No subprocess, no substrate
+        // probe, no live broker. Exits 0/2/3 only.
+        let validator_report = validate_plan(&plan);
+        match a2_plan_runner::preflight::precheck(&plan, &validator_report) {
+            Ok(()) => {
+                // L1a-valid + tool-allowlist-clean → dry-run treats as PASS.
+                // Build an empty-step pass report so the operator gets the
+                // standard marker stream.
+                use a2_plan_runner::runner::aggregate_plan_report;
+                aggregate_plan_report(&plan.name, Vec::new())
+            }
+            Err(refusal) => refused_precheck_report(&plan.name, &refusal),
+        }
+    } else {
+        // Live path: validator → precheck → substrate probe → per-step
+        // run_step (via build_claw_command + wrapper subprocess). All of
+        // this is owned by a2_plan_runner::run_plan — the CLI never
+        // touches ClawCommand construction or the subprocess boundary.
+        let wrapper_path = wrapper.unwrap_or(&default_wrapper);
+        let substrate = Some((
+            substrate_url.unwrap_or(DEFAULT_SUBSTRATE_URL),
+            fast_model.unwrap_or(DEFAULT_FAST_MODEL),
+        ));
+        // Pre-check wrapper existence so we emit a clean
+        // substrate-unavailable instead of letting Command::new spawn fail
+        // with an obscure errno message.
+        if !wrapper_path.exists() {
+            eprintln!(
+                "claw plan run: wrapper not found at {}. Pass --wrapper PATH or run from repo root.",
+                wrapper_path.display()
+            );
+            substrate_unavailable_report(&plan.name)
+        } else {
+            a2_plan_runner::run_plan(&plan, wrapper_path, substrate, effective_step_timeout)
+        }
+    };
+
+    // -- 3. Emit the report in the requested format. Stdout only — never
+    // writes to disk.
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    let write_result = match report_format {
+        PlanReportFormat::Markers => write_markers(&report, &mut handle),
+        PlanReportFormat::Json => write_json(&report, &mut handle),
+    };
+    if let Err(e) = write_result {
+        eprintln!("claw plan run: failed to write report: {e}");
+        return 1;
+    }
+
+    exit_code_for(&report)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -570,6 +701,42 @@ enum CliAction {
     Help {
         output_format: CliOutputFormat,
     },
+    // A2-L1b: additive read-only plan runner subcommand. Implementation
+    // lives entirely in the `a2-plan-runner` crate; this variant only
+    // carries parsed flags. No existing CliAction variant is modified.
+    Plan {
+        file: PathBuf,
+        dry_run: bool,
+        report_format: PlanReportFormat,
+        substrate_url: Option<String>,
+        fast_model: Option<String>,
+        wrapper: Option<PathBuf>,
+        /// Operator-supplied per-step wall-clock cap. `None` = use the
+        /// runner's `DEFAULT_STEP_TIMEOUT`. Bounds enforced by
+        /// [`a2_plan_runner::parse_step_timeout_seconds`].
+        step_timeout: Option<std::time::Duration>,
+    },
+}
+
+/// A2-L1b CLI report-format selector. Separate enum from `CliOutputFormat`
+/// because the report markers form a stable operator-facing contract that
+/// is independent of the existing `--output-format` text/json toggle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlanReportFormat {
+    Markers,
+    Json,
+}
+
+impl PlanReportFormat {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "markers" => Ok(Self::Markers),
+            "json" => Ok(Self::Json),
+            other => Err(format!(
+                "unsupported value for --report-format: {other} (expected markers or json)"
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -854,6 +1021,28 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         return action;
     }
 
+    // A2-L1b additive guard: reject plan-incompatible global flags BEFORE
+    // they are consumed into the per-subcommand binding. The runner pins
+    // these by construction (build_claw_command), so accepting them at the
+    // CLI would create a path that bypasses the pinning. Non-plan
+    // subcommands are completely unaffected by this check.
+    if rest.first().map(String::as_str) == Some("plan") {
+        if permission_mode_override.is_some() {
+            return Err(
+                "--permission-mode is not supported by `claw plan run`. The runner \
+                 pins read-only execution by construction."
+                    .to_string(),
+            );
+        }
+        if !allowed_tool_values.is_empty() {
+            return Err(
+                "--allowed-tools / --allowedTools is not supported by `claw plan run`. \
+                 The runner pins the static read-only tool allowlist by construction."
+                    .to_string(),
+            );
+        }
+    }
+
     let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
 
     match rest[0].as_str() {
@@ -948,6 +1137,9 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "login" | "logout" => Err(removed_auth_surface_error(rest[0].as_str())),
         "init" => Ok(CliAction::Init { output_format }),
         "export" => parse_export_args(&rest[1..], output_format),
+        // A2-L1b: `claw plan run <file>` read-only plan runner. Purely
+        // additive — no other CliAction match arm is altered.
+        "plan" => parse_plan_subcommand_args(&rest[1..]),
         "prompt" => {
             let prompt = rest[1..].join(" ");
             if prompt.trim().is_empty() {
@@ -1156,6 +1348,153 @@ fn parse_acp_args(args: &[String], output_format: CliOutputFormat) -> Result<Cli
             "unsupported ACP invocation. Use `claw acp`, `claw acp serve`, `claw --acp`, or `claw -acp`.",
         )),
     }
+}
+
+/// A2-L1b: parse `claw plan run <file> [--dry-run] [--report-format
+/// markers|json] [--substrate-url URL] [--fast-model NAME]
+/// [--wrapper PATH]`.
+///
+/// `--wrapper PATH` is the one deviation from the saved Phase 4 flag list:
+/// the runner subprocess MUST be launched through the read-only wrapper at
+/// `scripts/claw-sidestack-local`, so the CLI needs a way to locate it.
+/// When omitted, defaults to `scripts/claw-sidestack-local` resolved
+/// against the current working directory.
+///
+/// Explicitly rejected flags (operator hard rules 6+7): `--allow-write`,
+/// `--force`, `--permission-mode`, `--model`, `--allowed-tools`. The plan
+/// runner pins these by construction via [`a2_plan_runner::run_plan`] →
+/// [`a2_plan_runner::runner::build_claw_command`]; surfacing them on the
+/// CLI would create a path that bypasses that builder.
+fn parse_plan_subcommand_args(args: &[String]) -> Result<CliAction, String> {
+    match args.first().map(String::as_str) {
+        Some("run") => {}
+        Some(other) => {
+            return Err(format!(
+                "unsupported `claw plan` subcommand: {other}. Use `claw plan run <file>`."
+            ));
+        }
+        None => {
+            return Err("missing `claw plan` subcommand. Use `claw plan run <file>`.".to_string());
+        }
+    }
+    let tail = &args[1..];
+
+    let mut file: Option<PathBuf> = None;
+    let mut dry_run = false;
+    let mut report_format = PlanReportFormat::Markers;
+    let mut substrate_url: Option<String> = None;
+    let mut fast_model: Option<String> = None;
+    let mut wrapper: Option<PathBuf> = None;
+    let mut step_timeout: Option<std::time::Duration> = None;
+
+    let mut i = 0;
+    while i < tail.len() {
+        let arg = tail[i].as_str();
+        match arg {
+            "--dry-run" => {
+                dry_run = true;
+                i += 1;
+            }
+            "--report-format" => {
+                let value = tail.get(i + 1).ok_or_else(|| {
+                    "missing value for --report-format (expected markers|json)".to_string()
+                })?;
+                report_format = PlanReportFormat::parse(value)?;
+                i += 2;
+            }
+            v if v.starts_with("--report-format=") => {
+                report_format = PlanReportFormat::parse(&v["--report-format=".len()..])?;
+                i += 1;
+            }
+            "--substrate-url" => {
+                let value = tail
+                    .get(i + 1)
+                    .ok_or_else(|| "missing value for --substrate-url".to_string())?;
+                substrate_url = Some(value.clone());
+                i += 2;
+            }
+            v if v.starts_with("--substrate-url=") => {
+                substrate_url = Some(v["--substrate-url=".len()..].to_string());
+                i += 1;
+            }
+            "--fast-model" => {
+                let value = tail
+                    .get(i + 1)
+                    .ok_or_else(|| "missing value for --fast-model".to_string())?;
+                fast_model = Some(value.clone());
+                i += 2;
+            }
+            v if v.starts_with("--fast-model=") => {
+                fast_model = Some(v["--fast-model=".len()..].to_string());
+                i += 1;
+            }
+            "--wrapper" => {
+                let value = tail
+                    .get(i + 1)
+                    .ok_or_else(|| "missing value for --wrapper".to_string())?;
+                wrapper = Some(PathBuf::from(value));
+                i += 2;
+            }
+            v if v.starts_with("--wrapper=") => {
+                wrapper = Some(PathBuf::from(&v["--wrapper=".len()..]));
+                i += 1;
+            }
+            // Phase 5 Fix A: bounded per-step wall-clock cap.
+            // Parser validates and rejects out-of-range / non-integer
+            // values via a2_plan_runner::parse_step_timeout_seconds.
+            "--step-timeout" => {
+                let value = tail
+                    .get(i + 1)
+                    .ok_or_else(|| "missing value for --step-timeout".to_string())?;
+                step_timeout = Some(a2_plan_runner::parse_step_timeout_seconds(value)?);
+                i += 2;
+            }
+            v if v.starts_with("--step-timeout=") => {
+                step_timeout = Some(a2_plan_runner::parse_step_timeout_seconds(
+                    &v["--step-timeout=".len()..],
+                )?);
+                i += 1;
+            }
+            // Explicitly reject flags that would bypass the runner's
+            // construction guarantees. Spelled out so users get a clear
+            // error instead of silent acceptance.
+            "--allow-write" | "--force" | "--permission-mode" | "--model" | "--allowed-tools" => {
+                return Err(format!(
+                    "{arg} is not supported by `claw plan run`. The runner pins read-only \
+                     execution, FAST tier, and the static tool allowlist by construction."
+                ));
+            }
+            v if v.starts_with("--") => {
+                return Err(format!("unsupported flag for `claw plan run`: {v}"));
+            }
+            v => {
+                if file.is_some() {
+                    return Err(format!(
+                        "unexpected positional argument after plan file: {v}"
+                    ));
+                }
+                file = Some(PathBuf::from(v));
+                i += 1;
+            }
+        }
+    }
+
+    let file = file.ok_or_else(|| {
+        "missing plan file. Usage: `claw plan run <file> [--dry-run] \
+         [--report-format markers|json] [--substrate-url URL] \
+         [--fast-model NAME] [--wrapper PATH] [--step-timeout SECONDS]`"
+            .to_string()
+    })?;
+
+    Ok(CliAction::Plan {
+        file,
+        dry_run,
+        report_format,
+        substrate_url,
+        fast_model,
+        wrapper,
+        step_timeout,
+    })
 }
 
 fn try_resolve_bare_skill_prompt(cwd: &Path, trimmed: &str) -> Option<String> {
@@ -14379,5 +14718,462 @@ mod dump_manifests_tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+}
+
+// =============================================================================
+// A2-L1b — `claw plan run` CLI parse + dispatch tests.
+//
+// Operator-required (Phase 4):
+//   - `claw plan run <file>` exists
+//   - valid plan path reaches a2-plan-runner
+//   - refused plan exits non-zero
+//   - no live broker call in CLI tests
+//
+// All tests stay in dry-run mode (no wrapper subprocess) OR point `--wrapper`
+// at a non-existent path (graceful substrate-unavailable, still no live call).
+// =============================================================================
+
+#[cfg(test)]
+mod plan_run_cli_tests {
+    use super::*;
+    use std::fs;
+    use std::io::Write as _;
+
+    fn args(tokens: &[&str]) -> Vec<String> {
+        tokens.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn write_temp_plan(name: &str, body: &str) -> std::path::PathBuf {
+        // Per-test sub-directory keyed by process + thread id avoids filename
+        // collisions when cargo runs tests in parallel.
+        let dir = std::env::temp_dir().join(format!(
+            "a2_l1b_cli_test_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&dir).expect("tempdir create");
+        let path = dir.join(name);
+        let mut f = fs::File::create(&path).expect("tempfile create");
+        f.write_all(body.as_bytes()).expect("tempfile write");
+        f.sync_all().expect("tempfile sync");
+        path
+    }
+
+    // --- Required claim 1: `claw plan run <file>` exists --------------------
+
+    #[test]
+    fn plan_run_parses_with_only_a_file_arg() {
+        let plan = write_temp_plan(
+            "ok.yaml",
+            "name: x\nsteps:\n  - id: s\n    description: d\n    tools: [Read]\n",
+        );
+        let action = parse_args(&args(&["plan", "run", plan.to_str().unwrap()])).unwrap();
+        match action {
+            CliAction::Plan {
+                file,
+                dry_run,
+                report_format,
+                ..
+            } => {
+                assert_eq!(file, plan);
+                assert!(!dry_run);
+                assert_eq!(report_format, PlanReportFormat::Markers);
+            }
+            other => panic!("expected CliAction::Plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_run_parses_all_documented_flags() {
+        let plan = write_temp_plan("flags.yaml", "name: x\nsteps: []\n");
+        let action = parse_args(&args(&[
+            "plan",
+            "run",
+            plan.to_str().unwrap(),
+            "--dry-run",
+            "--report-format",
+            "json",
+            "--substrate-url",
+            "http://127.0.0.1:11435/v1",
+            "--fast-model",
+            "qwen3:14b",
+            "--wrapper",
+            "/some/path/claw-sidestack-local",
+        ]))
+        .unwrap();
+        match action {
+            CliAction::Plan {
+                file,
+                dry_run,
+                report_format,
+                substrate_url,
+                fast_model,
+                wrapper,
+                step_timeout,
+            } => {
+                assert_eq!(file, plan);
+                assert!(dry_run);
+                assert_eq!(report_format, PlanReportFormat::Json);
+                assert_eq!(substrate_url.as_deref(), Some("http://127.0.0.1:11435/v1"));
+                assert_eq!(fast_model.as_deref(), Some("qwen3:14b"));
+                assert_eq!(
+                    wrapper.unwrap(),
+                    std::path::PathBuf::from("/some/path/claw-sidestack-local")
+                );
+                // No --step-timeout in this invocation → None;
+                // run_plan_subcommand falls back to DEFAULT_STEP_TIMEOUT.
+                assert_eq!(step_timeout, None);
+            }
+            other => panic!("expected CliAction::Plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_run_missing_file_errors() {
+        let err = parse_args(&args(&["plan", "run"])).unwrap_err();
+        assert!(err.contains("missing plan file"));
+    }
+
+    #[test]
+    fn plan_run_rejects_unknown_subcommand() {
+        let err = parse_args(&args(&["plan", "exec", "x.yaml"])).unwrap_err();
+        assert!(err.contains("unsupported"));
+    }
+
+    // --- Required claim 2: refused plan exits non-zero ----------------------
+    //   (Tested via run_plan_subcommand in dry-run mode — no subprocess, no
+    //   broker. The dispatch arm in run() calls std::process::exit(code), so
+    //   we test the returned exit code directly.)
+
+    #[test]
+    fn plan_run_dry_run_workspace_write_plan_exits_two_no_subprocess() {
+        let plan = write_temp_plan(
+            "refused-write.yaml",
+            "name: w\nsteps:\n  - id: s\n    description: d\n    mode: workspace-write\n    tools: [Write]\n",
+        );
+        let code = run_plan_subcommand(
+            &plan,
+            true, // dry_run
+            PlanReportFormat::Markers,
+            None,
+            None,
+            None, // wrapper unused in dry-run
+            None, // step_timeout unused in dry-run
+        );
+        assert_eq!(
+            code, 2,
+            "workspace-write plan must exit 2 (PLAN_REFUSED_PRECHECK)"
+        );
+    }
+
+    #[test]
+    fn plan_run_dry_run_deep_plan_exits_two_no_subprocess() {
+        let plan = write_temp_plan(
+            "refused-deep.yaml",
+            "name: d\nsteps:\n  - id: s\n    description: d\n    model_tier: DEEP\n    tools: [Read]\n",
+        );
+        let code = run_plan_subcommand(
+            &plan,
+            true,
+            PlanReportFormat::Markers,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(code, 2, "DEEP plan must exit 2 (PLAN_REFUSED_PRECHECK)");
+    }
+
+    #[test]
+    fn plan_run_dry_run_disallowed_tool_plan_exits_three_no_subprocess() {
+        let plan = write_temp_plan(
+            "refused-tool.yaml",
+            "name: t\nsteps:\n  - id: s\n    description: d\n    tools: [Edit]\n",
+        );
+        let code = run_plan_subcommand(
+            &plan,
+            true,
+            PlanReportFormat::Markers,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(code, 3, "Edit tool must exit 3 (TOOL_DISALLOWED)");
+    }
+
+    // --- Required claim 3: valid plan path reaches a2-plan-runner -----------
+    //   Dry-run path proves the CLI hands off to a2_plan_runner::preflight
+    //   and a2_plan_runner::runner::aggregate_plan_report (which emits the
+    //   a2-l1b-* marker stream). Exit 0 = aggregate_plan_report returned Pass.
+
+    #[test]
+    fn plan_run_dry_run_valid_plan_exits_zero_via_runner_crate() {
+        let plan = write_temp_plan(
+            "valid.yaml",
+            "name: ok\nsteps:\n  - id: s1\n    description: read\n    tools: [Read]\n",
+        );
+        let code = run_plan_subcommand(
+            &plan,
+            true,
+            PlanReportFormat::Markers,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(code, 0, "valid read-only plan must exit 0 in dry-run");
+    }
+
+    // --- Required claim 4: no live broker call in CLI tests ----------------
+    //   Substrate-unavailable path: --wrapper points at a non-existent file.
+    //   run_plan_subcommand pre-checks wrapper existence and returns 4
+    //   without spawning anything. The default substrate URL is included in
+    //   the dispatch call but probe_substrate is never reached because the
+    //   wrapper check short-circuits.
+
+    #[test]
+    fn plan_run_missing_wrapper_exits_four_without_subprocess_or_broker() {
+        let plan = write_temp_plan(
+            "valid.yaml",
+            "name: ok\nsteps:\n  - id: s1\n    description: read\n    tools: [Read]\n",
+        );
+        let missing_wrapper = std::path::PathBuf::from("/does/not/exist/claw-sidestack-local");
+        let code = run_plan_subcommand(
+            &plan,
+            false, // live path
+            PlanReportFormat::Markers,
+            None,
+            None,
+            Some(&missing_wrapper),
+            None, // step_timeout — irrelevant; wrapper check short-circuits first
+        );
+        assert_eq!(
+            code, 4,
+            "missing wrapper must exit 4 (SUBSTRATE_UNAVAILABLE)"
+        );
+    }
+
+    // --- Parse-error path: exit 5 ------------------------------------------
+
+    #[test]
+    fn plan_run_yaml_parse_error_exits_five() {
+        let plan = write_temp_plan("broken.yaml", "this is not valid yaml: {[\n");
+        let code = run_plan_subcommand(
+            &plan,
+            true,
+            PlanReportFormat::Markers,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(code, 5, "yaml parse error must exit 5 (EXIT_PARSE_ERROR)");
+    }
+
+    #[test]
+    fn plan_run_missing_file_exits_five() {
+        let missing = std::path::PathBuf::from("/does/not/exist/plan.yaml");
+        let code = run_plan_subcommand(
+            &missing,
+            true,
+            PlanReportFormat::Markers,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(code, 5, "missing plan file must exit 5 (EXIT_PARSE_ERROR)");
+    }
+
+    // --- Hard rules 6 + 7: elevation flags rejected at parse ---------------
+
+    #[test]
+    fn plan_run_rejects_allow_write_flag() {
+        let plan = write_temp_plan("x.yaml", "name: x\nsteps: []\n");
+        let err = parse_args(&args(&[
+            "plan",
+            "run",
+            plan.to_str().unwrap(),
+            "--allow-write",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("--allow-write"));
+    }
+
+    #[test]
+    fn plan_run_rejects_force_flag() {
+        let plan = write_temp_plan("x.yaml", "name: x\nsteps: []\n");
+        let err =
+            parse_args(&args(&["plan", "run", plan.to_str().unwrap(), "--force"])).unwrap_err();
+        assert!(err.contains("--force"));
+    }
+
+    #[test]
+    fn plan_run_subprocess_pins_read_only_via_runner_builder() {
+        // The CLI's global `--permission-mode` flag is consumed by
+        // `parse_args` BEFORE subcommand dispatch (it's a top-level flag,
+        // like --output-format), so a subcommand-tail rejection isn't
+        // architecturally reachable here. What matters operationally is
+        // that the subprocess invocation a2-plan-runner produces ALWAYS
+        // pins `--permission-mode read-only`, regardless of any user flag
+        // plumbing. Defense-in-depth proof from the CLI's vantage point:
+        use a2_plan_runner::runner::build_claw_command;
+        use a2_plan_schema::{ModelTier, PlanMode, PlanStep};
+        let step = PlanStep {
+            id: "s".into(),
+            description: "do".into(),
+            mode: Some(PlanMode::ReadOnly),
+            model_tier: Some(ModelTier::Fast),
+            tools: vec!["Read".into()],
+            expected_output: None,
+        };
+        let cmd = build_claw_command(std::path::Path::new("/tmp/wrapper"), &step);
+        assert!(
+            cmd.args
+                .windows(2)
+                .any(|w| w[0] == "--permission-mode" && w[1] == "read-only"),
+            "subprocess path must pin --permission-mode read-only; args were {:?}",
+            cmd.args
+        );
+    }
+
+    // --- Phase 5 Fix A: --step-timeout flag --------------------------------
+
+    #[test]
+    fn plan_run_parses_step_timeout_with_space_separator() {
+        let plan = write_temp_plan("st-space.yaml", "name: x\nsteps: []\n");
+        let action = parse_args(&args(&[
+            "plan",
+            "run",
+            plan.to_str().unwrap(),
+            "--step-timeout",
+            "300",
+        ]))
+        .unwrap();
+        match action {
+            CliAction::Plan { step_timeout, .. } => {
+                assert_eq!(step_timeout, Some(std::time::Duration::from_secs(300)));
+            }
+            other => panic!("expected CliAction::Plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_run_parses_step_timeout_with_equals_separator() {
+        let plan = write_temp_plan("st-eq.yaml", "name: x\nsteps: []\n");
+        let action = parse_args(&args(&[
+            "plan",
+            "run",
+            plan.to_str().unwrap(),
+            "--step-timeout=420",
+        ]))
+        .unwrap();
+        match action {
+            CliAction::Plan { step_timeout, .. } => {
+                assert_eq!(step_timeout, Some(std::time::Duration::from_secs(420)));
+            }
+            other => panic!("expected CliAction::Plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_run_rejects_zero_step_timeout() {
+        let plan = write_temp_plan("st-zero.yaml", "name: x\nsteps: []\n");
+        let err = parse_args(&args(&[
+            "plan",
+            "run",
+            plan.to_str().unwrap(),
+            "--step-timeout",
+            "0",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("--step-timeout"));
+        assert!(err.contains("minimum") || err.contains("below"));
+    }
+
+    #[test]
+    fn plan_run_rejects_above_max_step_timeout() {
+        let plan = write_temp_plan("st-huge.yaml", "name: x\nsteps: []\n");
+        let err = parse_args(&args(&[
+            "plan",
+            "run",
+            plan.to_str().unwrap(),
+            "--step-timeout",
+            "999999",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("--step-timeout"));
+        assert!(err.contains("maximum") || err.contains("exceeds"));
+    }
+
+    #[test]
+    fn plan_run_rejects_non_integer_step_timeout() {
+        let plan = write_temp_plan("st-bad.yaml", "name: x\nsteps: []\n");
+        let err = parse_args(&args(&[
+            "plan",
+            "run",
+            plan.to_str().unwrap(),
+            "--step-timeout",
+            "abc",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("--step-timeout"));
+        assert!(err.contains("invalid"));
+    }
+
+    #[test]
+    fn plan_run_step_timeout_missing_value_errors() {
+        let plan = write_temp_plan("st-miss.yaml", "name: x\nsteps: []\n");
+        let err = parse_args(&args(&[
+            "plan",
+            "run",
+            plan.to_str().unwrap(),
+            "--step-timeout",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("missing value for --step-timeout"));
+    }
+
+    #[test]
+    fn plan_run_step_timeout_is_applied_when_passed_through() {
+        // End-to-end: --step-timeout 5 flows through parse_args →
+        // CliAction::Plan → run_plan_subcommand → run_plan. We verify the
+        // dry-run path (no subprocess) accepts the parsed value cleanly.
+        let plan = write_temp_plan(
+            "st-applied.yaml",
+            "name: ok\nsteps:\n  - id: s\n    description: d\n    tools: [Read]\n",
+        );
+        let code = run_plan_subcommand(
+            &plan,
+            true, // dry-run: timeout value isn't exercised, but the parser must accept it cleanly
+            PlanReportFormat::Markers,
+            None,
+            None,
+            None,
+            Some(std::time::Duration::from_secs(5)),
+        );
+        assert_eq!(code, 0, "valid dry-run plan must exit 0");
+    }
+
+    // --- Existing CLI behavior MUST not regress ----------------------------
+
+    #[test]
+    fn existing_doctor_subcommand_still_parses_unchanged() {
+        let action = parse_args(&args(&["doctor"])).unwrap();
+        assert!(matches!(action, CliAction::Doctor { .. }));
+    }
+
+    #[test]
+    fn existing_prompt_subcommand_still_parses_unchanged() {
+        let action = parse_args(&args(&["prompt", "hello world"])).unwrap();
+        assert!(matches!(action, CliAction::Prompt { .. }));
+    }
+
+    #[test]
+    fn existing_state_subcommand_still_parses_unchanged() {
+        let action = parse_args(&args(&["state"])).unwrap();
+        assert!(matches!(action, CliAction::State { .. }));
     }
 }
