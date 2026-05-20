@@ -1,0 +1,10 @@
+# A2 L2a example: workspace-write step missing required write_target.
+# Expected validator result: REFUSED with marker a2-l1-write-missing-target.
+name: write-without-target
+mode: read-only
+model_tier: FAST
+steps:
+  - id: write-step
+    description: Declares workspace-write + Write tool but no write_target
+    mode: workspace-write
+    tools: [Write]

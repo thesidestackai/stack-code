@@ -1,10 +1,13 @@
-//! Static plan schema for A2 L1a.
+//! Static plan schema for A2 L1a + L2a.
 //!
 //! Types are deserialize-only. There is no executor, runner, or I/O here.
+//! L2a extends the schema with workspace-write shape (`write_target`,
+//! `expected_post_write`) but adds no execution behavior.
 
 use serde::Deserialize;
 
-/// Execution mode for a step. L1 only accepts `ReadOnly`.
+/// Execution mode for a step. L1 only accepts `ReadOnly`. L2a accepts
+/// `WorkspaceWrite` structurally but does not execute writes anywhere.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PlanMode {
@@ -28,6 +31,28 @@ pub struct ExpectedOutputContract {
     pub must_contain: Vec<String>,
 }
 
+/// Declared workspace-write target. L2a only validates this lexically.
+/// Real filesystem canonicalization, parent-dir checks, and symlink-escape
+/// detection belong to a later runner/write lane.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WriteTarget {
+    pub path: String,
+    #[serde(default)]
+    pub create_if_absent: bool,
+}
+
+/// Optional post-write content contract. L2a accepts the shape but does not
+/// enforce it (no writes happen at this layer).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectedPostWriteContract {
+    #[serde(default)]
+    pub must_contain: Vec<String>,
+    #[serde(default)]
+    pub must_not_contain: Vec<String>,
+}
+
 /// A single step inside a plan.
 ///
 /// `tools` MUST be declared explicitly. An empty or missing list is a
@@ -46,6 +71,10 @@ pub struct PlanStep {
     pub tools: Vec<String>,
     #[serde(default)]
     pub expected_output: Option<ExpectedOutputContract>,
+    #[serde(default)]
+    pub write_target: Option<WriteTarget>,
+    #[serde(default)]
+    pub expected_post_write: Option<ExpectedPostWriteContract>,
 }
 
 /// A static plan document.
@@ -196,5 +225,58 @@ steps:
 ";
         let plan = parse_plan(yaml).expect("missing tools should still parse");
         assert!(plan.steps[0].tools.is_empty());
+    }
+
+    #[test]
+    fn parses_workspace_write_step_with_target_and_post_write() {
+        let yaml = r"
+name: write-shape
+mode: read-only
+steps:
+  - id: edit
+    description: edit a file
+    mode: workspace-write
+    tools: [Write]
+    write_target:
+      path: notes/scratch.md
+      create_if_absent: true
+    expected_post_write:
+      must_contain: [hello]
+      must_not_contain: [secret]
+";
+        let plan = parse_plan(yaml).expect("workspace-write shape should parse");
+        let step = &plan.steps[0];
+        let target = step
+            .write_target
+            .as_ref()
+            .expect("write_target should be present");
+        assert_eq!(target.path, "notes/scratch.md");
+        assert!(target.create_if_absent);
+        let post = step
+            .expected_post_write
+            .as_ref()
+            .expect("expected_post_write should be present");
+        assert_eq!(post.must_contain, vec!["hello".to_string()]);
+        assert_eq!(post.must_not_contain, vec!["secret".to_string()]);
+    }
+
+    #[test]
+    fn rejects_unknown_write_target_field() {
+        let yaml = r"
+name: bad
+steps:
+  - id: s1
+    description: d
+    mode: workspace-write
+    tools: [Write]
+    write_target:
+      path: notes/scratch.md
+      mystery_flag: true
+";
+        let err = parse_plan(yaml).expect_err("unknown write_target field must fail");
+        assert!(
+            err.message().contains("mystery_flag") || err.message().contains("unknown"),
+            "parse error should mention the unknown field: {err}"
+        );
     }
 }

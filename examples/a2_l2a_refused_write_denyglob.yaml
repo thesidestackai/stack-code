@@ -1,0 +1,14 @@
+# A2 L2a example: workspace-write step targets a file matched by the
+# default L2a deny pattern set (.env, credentials*, *.pem, *.key, etc.).
+# Expected validator result: REFUSED with marker a2-l1-write-path-denyglob.
+name: write-secret-file
+mode: read-only
+model_tier: FAST
+steps:
+  - id: secret-step
+    description: Attempt to write to credentials.json
+    mode: workspace-write
+    tools: [Write]
+    write_target:
+      path: credentials.json
+      create_if_absent: true
