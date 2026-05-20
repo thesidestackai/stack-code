@@ -1,0 +1,13 @@
+# A2 L1a example: refused because a step requests DEEP tier.
+# Expected validator result: REFUSED with marker a2-l1-refused-deep.
+name: deep-analysis
+mode: read-only
+model_tier: FAST
+steps:
+  - id: shallow-scan
+    description: Quick FAST pass
+    tools: [Grep]
+  - id: deep-review
+    description: Heavy reasoning pass
+    model_tier: DEEP
+    tools: [Read]
