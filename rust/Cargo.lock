@@ -3,6 +3,16 @@
 version = 4
 
 [[package]]
+name = "a2-plan-runner"
+version = "0.1.0"
+dependencies = [
+ "a2-plan-schema",
+ "reqwest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "a2-plan-schema"
 version = "0.1.0"
 dependencies = [
@@ -1458,6 +1468,8 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 name = "rusty-claude-cli"
 version = "0.1.0"
 dependencies = [
+ "a2-plan-runner",
+ "a2-plan-schema",
  "api",
  "commands",
  "compat-harness",
