@@ -962,7 +962,10 @@ pub fn model_rejects_is_error_field(model: &str) -> bool {
 /// Public for benchmarking purposes.
 #[must_use]
 pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
-    let supports_is_error = !model_rejects_is_error_field(model);
+    // `model` is retained on the public signature for ABI stability with
+    // benches and external callers; OpenAI-compatible serialization no
+    // longer branches on model identity.
+    let _ = model;
     match message.role.as_str() {
         "assistant" => {
             let mut text = String::new();
@@ -1007,18 +1010,17 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
                 InputContentBlock::ToolResult {
                     tool_use_id,
                     content,
-                    is_error,
+                    is_error: _,
                 } => {
-                    let mut msg = json!({
+                    // `is_error` is Anthropic-specific. The OpenAI-compatible
+                    // chat schema (`role: "tool"`) has no equivalent; sending
+                    // it caused 400 Bad Request on qwen/devstral and the
+                    // original kimi failure. Omit for all OpenAI-compat models.
+                    let msg = json!({
                         "role": "tool",
                         "tool_call_id": tool_use_id,
                         "content": flatten_tool_result_content(content),
                     });
-                    // Only include is_error for models that support it.
-                    // kimi models reject this field with 400 Bad Request.
-                    if supports_is_error {
-                        msg["is_error"] = json!(is_error);
-                    }
                     Some(msg)
                 }
                 InputContentBlock::ToolUse { .. } => None,
@@ -2000,58 +2002,54 @@ mod tests {
     }
 
     #[test]
-    fn translate_message_includes_is_error_for_non_kimi_models() {
+    fn translate_message_omits_is_error_for_openai_compat_models() {
+        // Regression: `is_error` is Anthropic-specific. OpenAI-compatible chat
+        // schema has no equivalent. Sending it caused 400 Bad Request on
+        // qwen/devstral via the local broker (turns 3-4 after tool results).
+        // All OpenAI-compatible models must omit it from role:"tool" messages.
         use crate::types::{InputContentBlock, InputMessage, ToolResultContentBlock};
 
-        // Test with gpt-4o (should include is_error)
         let message = InputMessage {
             role: "user".to_string(),
             content: vec![InputContentBlock::ToolResult {
-                tool_use_id: "call_1".to_string(),
+                tool_use_id: "call_42".to_string(),
                 content: vec![ToolResultContentBlock::Text {
-                    text: "Error occurred".to_string(),
+                    text: "tool output".to_string(),
                 }],
                 is_error: true,
             }],
         };
 
-        let translated = super::translate_message(&message, "gpt-4o");
-        assert_eq!(translated.len(), 1);
-        let tool_msg = &translated[0];
-        assert_eq!(tool_msg["role"], json!("tool"));
-        assert_eq!(tool_msg["tool_call_id"], json!("call_1"));
-        assert_eq!(tool_msg["content"], json!("Error occurred"));
-        assert!(
-            tool_msg.get("is_error").is_some(),
-            "gpt-4o should include is_error field"
-        );
-        assert_eq!(tool_msg["is_error"], json!(true));
+        for model in [
+            "qwen/devstral",
+            "gpt-4o",
+            "grok-3",
+            "claude-sonnet-4-6",
+            "o1-mini",
+        ] {
+            let translated = super::translate_message(&message, model);
+            assert_eq!(translated.len(), 1, "model {model}: expected 1 message");
+            let tool_msg = &translated[0];
 
-        // Test with grok-3 (should include is_error)
-        let message2 = InputMessage {
-            role: "user".to_string(),
-            content: vec![InputContentBlock::ToolResult {
-                tool_use_id: "call_2".to_string(),
-                content: vec![ToolResultContentBlock::Text {
-                    text: "Success".to_string(),
-                }],
-                is_error: false,
-            }],
-        };
+            // Required tool-result fields preserved.
+            assert_eq!(tool_msg["role"], json!("tool"), "model {model}: role");
+            assert_eq!(
+                tool_msg["tool_call_id"],
+                json!("call_42"),
+                "model {model}: tool_call_id"
+            );
+            assert_eq!(
+                tool_msg["content"],
+                json!("tool output"),
+                "model {model}: content"
+            );
 
-        let translated2 = super::translate_message(&message2, "grok-3");
-        assert!(
-            translated2[0].get("is_error").is_some(),
-            "grok-3 should include is_error field"
-        );
-        assert_eq!(translated2[0]["is_error"], json!(false));
-
-        // Test with claude model (should include is_error)
-        let translated3 = super::translate_message(&message, "claude-sonnet-4-6");
-        assert!(
-            translated3[0].get("is_error").is_some(),
-            "claude should include is_error field"
-        );
+            // is_error must be absent.
+            assert!(
+                tool_msg.get("is_error").is_none(),
+                "model {model}: is_error must be omitted from OpenAI-compatible tool result"
+            );
+        }
     }
 
     #[test]
@@ -2097,7 +2095,7 @@ mod tests {
     }
 
     #[test]
-    fn build_chat_completion_request_kimi_vs_non_kimi_tool_results() {
+    fn build_chat_completion_request_omits_is_error_for_all_models() {
         use crate::types::{InputContentBlock, InputMessage, ToolResultContentBlock};
 
         // Helper to create a request with a tool result
@@ -2128,17 +2126,17 @@ mod tests {
             ..Default::default()
         };
 
-        // Non-kimi model: should have is_error field
+        // Non-kimi model: must NOT include is_error (Anthropic-specific field).
         let request_gpt = make_request("gpt-4o");
         let payload_gpt = build_chat_completion_request(&request_gpt, OpenAiCompatConfig::openai());
         let messages_gpt = payload_gpt["messages"].as_array().unwrap();
         let tool_msg_gpt = messages_gpt.iter().find(|m| m["role"] == "tool").unwrap();
         assert!(
-            tool_msg_gpt.get("is_error").is_some(),
-            "gpt-4o request should include is_error in tool result"
+            tool_msg_gpt.get("is_error").is_none(),
+            "gpt-4o request must NOT include is_error in tool result"
         );
 
-        // kimi model: should NOT have is_error field
+        // kimi model: must also NOT include is_error.
         let request_kimi = make_request("kimi-k2.5");
         let payload_kimi =
             build_chat_completion_request(&request_kimi, OpenAiCompatConfig::dashscope());
@@ -2146,10 +2144,10 @@ mod tests {
         let tool_msg_kimi = messages_kimi.iter().find(|m| m["role"] == "tool").unwrap();
         assert!(
             tool_msg_kimi.get("is_error").is_none(),
-            "kimi-k2.5 request must NOT include is_error in tool result (would cause 400)"
+            "kimi-k2.5 request must NOT include is_error in tool result"
         );
 
-        // Verify both have the essential fields
+        // Verify both still carry the essential tool-result fields.
         assert_eq!(tool_msg_gpt["tool_call_id"], json!("call_1"));
         assert_eq!(tool_msg_kimi["tool_call_id"], json!("call_1"));
         assert_eq!(tool_msg_gpt["content"], json!("file contents"));
