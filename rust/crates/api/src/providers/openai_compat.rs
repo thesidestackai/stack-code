@@ -1100,11 +1100,21 @@ pub fn sanitize_tool_message_pairing(messages: Vec<Value>) -> Vec<Value> {
         .collect()
 }
 
-/// Flattens tool result content blocks into a single string.
-/// Optimized to pre-allocate capacity and avoid intermediate `Vec` construction.
+/// Flattens tool result content blocks into a single string suitable for the
+/// OpenAI-compatible `role:"tool"` message `content` field.
+///
+/// `ToolResultContentBlock::Json { value }` may carry an Anthropic-style
+/// envelope (for example a file-read result `{"type":"text","file":
+/// {"content":"...","filePath":"...", ...}}`). The OpenAI-compatible chat
+/// schema expects `content` to be a plain string. Sending a JSON-stringified
+/// nested envelope as `content` caused Ollama-routed models (e.g. qwen3:14b)
+/// to fail with `"Value looks like object, but can't find closing '}' symbol"`
+/// during turn-3 tool turns. We extract the underlying text from common
+/// envelope shapes here.
 #[must_use]
 pub fn flatten_tool_result_content(content: &[ToolResultContentBlock]) -> String {
-    // Pre-calculate total capacity needed to avoid reallocations
+    // Pre-calculate an upper-bound capacity to avoid reallocations.
+    // For `Json` blocks the extracted text is always ≤ the JSON serialisation.
     let total_len: usize = content
         .iter()
         .map(|block| match block {
@@ -1124,12 +1134,60 @@ pub fn flatten_tool_result_content(content: &[ToolResultContentBlock]) -> String
         match block {
             ToolResultContentBlock::Text { text } => result.push_str(text),
             ToolResultContentBlock::Json { value } => {
-                // Use write! to append without creating intermediate String
-                result.push_str(&value.to_string());
+                result.push_str(&extract_openai_tool_result_text(value));
             }
         }
     }
     result
+}
+
+/// Extract a flat string from an arbitrary tool-result JSON value for the
+/// OpenAI-compatible chat schema.
+///
+/// Strategy (in order):
+/// 1. Plain string  → returned as-is.
+/// 2. Object with `file.content` (or `file.text`) string  → returned. This is
+///    the file-read envelope shape that produced the RCA payload.
+/// 3. Object with a string value at `text`, `content`, `output`, `result`,
+///    `message`, or `error`  → returned. These cover the common tool-result
+///    envelopes (text blocks, generic outputs, error envelopes).
+/// 4. Array  → each element is extracted and the results are joined with
+///    newlines.
+/// 5. Null / bool / number  → rendered as a plain string (no JSON quoting).
+/// 6. Any other shape  → falls back to `value.to_string()`. Reaching this
+///    branch means we encountered an envelope shape we don't recognise; the
+///    caller has chosen string-stringification as the least-bad option rather
+///    than dropping data.
+fn extract_openai_tool_result_text(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Null => String::new(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::Array(items) => items
+            .iter()
+            .map(extract_openai_tool_result_text)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(obj) => {
+            // File-read envelope: {"file": {"content": "...", ...}}
+            if let Some(file) = obj.get("file").and_then(Value::as_object) {
+                if let Some(s) = file.get("content").and_then(Value::as_str) {
+                    return s.to_string();
+                }
+                if let Some(s) = file.get("text").and_then(Value::as_str) {
+                    return s.to_string();
+                }
+            }
+            // Common envelope keys that carry a plain string payload.
+            for key in ["text", "content", "output", "result", "message", "error"] {
+                if let Some(s) = obj.get(key).and_then(Value::as_str) {
+                    return s.to_string();
+                }
+            }
+            value.to_string()
+        }
+    }
 }
 
 /// Recursively ensure every object-type node in a JSON Schema has
@@ -2265,5 +2323,200 @@ mod tests {
         assert_eq!(super::strip_routing_prefix("kimi/kimi-k2.5"), "kimi-k2.5");
         assert_eq!(super::strip_routing_prefix("kimi-k2.5"), "kimi-k2.5"); // no prefix, unchanged
         assert_eq!(super::strip_routing_prefix("kimi/kimi-k1.5"), "kimi-k1.5");
+    }
+
+    // ============================================================================
+    // OpenAI-compatible tool-result content flattening
+    //
+    // Background: turn-3 broker → Ollama traffic captured the bad payload
+    //   {"role":"tool","tool_call_id":"call_...",
+    //    "content":"{\"type\":\"text\",\"file\":{\"filePath\":\"...\",
+    //                \"content\":\"a1-smoke-ok\",\"numLines\":1,...}}"}
+    // which qwen3:14b rejected with
+    //   "Value looks like object, but can't find closing '}' symbol".
+    // The OpenAI-compatible chat schema requires `content` to be a flat string,
+    // so we extract the underlying tool output from common envelope shapes.
+    // ============================================================================
+
+    #[test]
+    fn flatten_tool_result_content_extracts_file_read_envelope() {
+        // RCA case: file-read envelope must become the inner file content,
+        // not a stringified nested object.
+        let envelope = json!({
+            "type": "text",
+            "file": {
+                "filePath": "/tmp/a1-smoke.txt",
+                "content": "a1-smoke-ok",
+                "numLines": 1,
+                "startLine": 1,
+                "totalLines": 1,
+            },
+        });
+        let blocks = vec![ToolResultContentBlock::Json { value: envelope }];
+
+        let flat = super::flatten_tool_result_content(&blocks);
+
+        assert_eq!(flat, "a1-smoke-ok");
+        assert!(
+            !flat.contains("\"type\":\"text\""),
+            "flattened content must not include the envelope type field"
+        );
+        assert!(
+            !flat.contains("filePath"),
+            "flattened content must not include filePath"
+        );
+        assert!(
+            !flat.contains("numLines"),
+            "flattened content must not include numLines"
+        );
+        assert!(
+            !flat.contains("totalLines"),
+            "flattened content must not include totalLines"
+        );
+    }
+
+    #[test]
+    fn flatten_tool_result_content_extracts_text_envelope() {
+        let envelope = json!({"type": "text", "text": "hello world"});
+        let blocks = vec![ToolResultContentBlock::Json { value: envelope }];
+        assert_eq!(super::flatten_tool_result_content(&blocks), "hello world");
+    }
+
+    #[test]
+    fn flatten_tool_result_content_extracts_plain_string_value() {
+        let blocks = vec![ToolResultContentBlock::Json {
+            value: json!("plain-output"),
+        }];
+        assert_eq!(super::flatten_tool_result_content(&blocks), "plain-output");
+    }
+
+    #[test]
+    fn flatten_tool_result_content_extracts_generic_output_keys() {
+        for (key, expected) in [
+            ("content", "from-content"),
+            ("output", "from-output"),
+            ("result", "from-result"),
+            ("message", "from-message"),
+            ("error", "from-error"),
+        ] {
+            let blocks = vec![ToolResultContentBlock::Json {
+                value: json!({ key: expected }),
+            }];
+            assert_eq!(
+                super::flatten_tool_result_content(&blocks),
+                expected,
+                "key {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn flatten_tool_result_content_passes_through_text_blocks() {
+        let blocks = vec![ToolResultContentBlock::Text {
+            text: "already flat".to_string(),
+        }];
+        assert_eq!(super::flatten_tool_result_content(&blocks), "already flat");
+    }
+
+    #[test]
+    fn translate_message_emits_flat_content_for_file_read_envelope() {
+        // End-to-end check for the OpenAI-compat translator: a ToolResult with
+        // a Json file-read envelope must become a role:"tool" message whose
+        // `content` is the flat file content, with no Anthropic envelope keys
+        // and no is_error field.
+        use crate::types::{InputContentBlock, InputMessage, ToolResultContentBlock};
+
+        let message = InputMessage {
+            role: "user".to_string(),
+            content: vec![InputContentBlock::ToolResult {
+                tool_use_id: "call_abc".to_string(),
+                content: vec![ToolResultContentBlock::Json {
+                    value: json!({
+                        "type": "text",
+                        "file": {
+                            "filePath": "/tmp/a1-smoke.txt",
+                            "content": "a1-smoke-ok",
+                            "numLines": 1,
+                            "startLine": 1,
+                            "totalLines": 1,
+                        },
+                    }),
+                }],
+                is_error: false,
+            }],
+        };
+
+        for model in ["qwen3:14b", "gpt-4o", "kimi-k2.5", "grok-3"] {
+            let translated = super::translate_message(&message, model);
+            assert_eq!(translated.len(), 1, "model {model}: one tool message");
+            let tool_msg = &translated[0];
+
+            assert_eq!(tool_msg["role"], json!("tool"), "model {model}: role");
+            assert_eq!(
+                tool_msg["tool_call_id"],
+                json!("call_abc"),
+                "model {model}: tool_call_id"
+            );
+            assert_eq!(
+                tool_msg["content"],
+                json!("a1-smoke-ok"),
+                "model {model}: flattened content"
+            );
+            assert!(
+                tool_msg.get("is_error").is_none(),
+                "model {model}: is_error must remain absent"
+            );
+
+            let serialized = serde_json::to_string(tool_msg).unwrap();
+            for forbidden in [
+                "\"type\":\"text\"",
+                "filePath",
+                "numLines",
+                "startLine",
+                "totalLines",
+            ] {
+                assert!(
+                    !serialized.contains(forbidden),
+                    "model {model}: serialized tool message must not contain {forbidden} (got: {serialized})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn flatten_tool_result_content_extracts_file_nested_text() {
+        // Some file envelopes carry `file.text` instead of `file.content`.
+        let envelope = json!({"type": "text", "file": {"text": "alt-shape"}});
+        let blocks = vec![ToolResultContentBlock::Json { value: envelope }];
+        assert_eq!(super::flatten_tool_result_content(&blocks), "alt-shape");
+    }
+
+    #[test]
+    fn flatten_tool_result_content_handles_array_of_envelopes() {
+        // An array of nested envelopes should produce newline-joined flat text.
+        let envelope = json!([
+            {"type": "text", "text": "line one"},
+            {"type": "text", "text": "line two"},
+        ]);
+        let blocks = vec![ToolResultContentBlock::Json { value: envelope }];
+        assert_eq!(
+            super::flatten_tool_result_content(&blocks),
+            "line one\nline two"
+        );
+    }
+
+    #[test]
+    fn flatten_tool_result_content_unknown_object_falls_back_to_json_string() {
+        // Defensive: shapes we don't recognise stay as a JSON string rather
+        // than silently dropping data. This preserves the existing behaviour
+        // for any shape outside the documented envelope set.
+        let envelope = json!({"unexpected_root_key": {"nested": 1}});
+        let blocks = vec![ToolResultContentBlock::Json {
+            value: envelope.clone(),
+        }];
+        assert_eq!(
+            super::flatten_tool_result_content(&blocks),
+            envelope.to_string()
+        );
     }
 }
