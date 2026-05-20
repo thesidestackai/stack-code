@@ -1,0 +1,12 @@
+# A2 L1a example: refused because a step has no declared tools.
+# Expected validator result: REFUSED with marker a2-l1-missing-tools.
+name: undeclared-tools
+mode: read-only
+model_tier: FAST
+steps:
+  - id: ok-step
+    description: Properly declared
+    tools: [Read]
+  - id: bad-step
+    description: Forgot the tool whitelist
+    tools: []

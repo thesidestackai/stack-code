@@ -1,0 +1,13 @@
+# A2 L1a example: refused because a step declares workspace-write.
+# Expected validator result: REFUSED with marker a2-l1-refused-write.
+name: attempted-edit
+mode: read-only
+model_tier: FAST
+steps:
+  - id: read-file
+    description: Read the source file
+    tools: [Read]
+  - id: edit-file
+    description: Edit the source file
+    mode: workspace-write
+    tools: [Edit]
