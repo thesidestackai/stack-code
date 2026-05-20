@@ -1,0 +1,19 @@
+[package]
+name = "a2-plan-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "a2_plan_runner"
+path = "src/lib.rs"
+
+[dependencies]
+a2-plan-schema = { path = "../a2-plan-schema" }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json.workspace = true
+
+[lints]
+workspace = true
