@@ -1,0 +1,20 @@
+# A2 L2a example: valid workspace-write plan.
+# Expected validator result: PASS with marker a2-l1-accepted-workspace-write.
+# L2a is schema-only — no runner writes happen at this layer.
+name: write-scratch-notes
+mode: read-only
+model_tier: FAST
+steps:
+  - id: read-context
+    description: Read the source context
+    tools: [Read]
+  - id: write-notes
+    description: Write summary notes to a workspace-relative file
+    mode: workspace-write
+    tools: [Write]
+    write_target:
+      path: notes/scratch.md
+      create_if_absent: true
+    expected_post_write:
+      must_contain: ["summary"]
+      must_not_contain: ["TODO"]

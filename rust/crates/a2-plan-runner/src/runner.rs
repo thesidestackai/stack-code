@@ -656,6 +656,8 @@ mod tests {
             model_tier: Some(ModelTier::Fast),
             tools: tools.iter().map(|s| (*s).to_string()).collect(),
             expected_output: None,
+            write_target: None,
+            expected_post_write: None,
         }
     }
 

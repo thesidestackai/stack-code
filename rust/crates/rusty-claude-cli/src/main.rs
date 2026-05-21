@@ -15028,6 +15028,8 @@ mod plan_run_cli_tests {
             model_tier: Some(ModelTier::Fast),
             tools: vec!["Read".into()],
             expected_output: None,
+            write_target: None,
+            expected_post_write: None,
         };
         let cmd = build_claw_command(std::path::Path::new("/tmp/wrapper"), &step);
         assert!(

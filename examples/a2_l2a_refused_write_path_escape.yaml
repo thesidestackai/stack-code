@@ -1,0 +1,14 @@
+# A2 L2a example: workspace-write step targets a path that escapes the
+# workspace via parent traversal.
+# Expected validator result: REFUSED with marker a2-l1-write-path-refused.
+name: write-escape-path
+mode: read-only
+model_tier: FAST
+steps:
+  - id: escape-step
+    description: Attempt to write outside the workspace via ..
+    mode: workspace-write
+    tools: [Write]
+    write_target:
+      path: ../escape.txt
+      create_if_absent: true
