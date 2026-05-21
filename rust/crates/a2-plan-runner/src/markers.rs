@@ -46,6 +46,40 @@ pub const STEP_FAILED: &str = "a2-l1b-step-failed";
 /// Step skipped because an earlier step failed under default abort.
 pub const STEP_SKIPPED: &str = "a2-l1b-step-skipped";
 
+// --- A2-L2b workspace-write markers --------------------------------------
+//
+// L2b additions are scoped to the workspace-write runner. They never appear
+// in an L1b read-only run. The `a2-l2b-` prefix is a separate operator
+// contract from `a2-l1b-` so scrapers can opt in or out per layer.
+//
+// Slice 1 only introduces the path-safety markers. Approval, checkpoint,
+// diff, write, and rollback markers land in later slices.
+
+/// First L2b marker emitted at the start of a workspace-write run.
+/// Not emitted by anything in slice 1; consumers wire it in slice 2.
+pub const L2B_RUNNER_START: &str = "a2-l2b-runner-start";
+
+/// Per-step boundary marker emitted at the start of a workspace-write step.
+pub const L2B_STEP_STARTED: &str = "a2-l2b-step-started";
+
+/// Path safety resolution succeeded; the workspace-write step is permitted
+/// to proceed to the (later) approval / write phases.
+pub const L2B_PATH_RESOLVED: &str = "a2-l2b-path-resolved";
+
+/// Runtime path safety refused: absolute path, `..` traversal,
+/// canonical-parent prefix mismatch, deny-component, or deny-glob filename.
+/// Maps to exit code 6.
+pub const L2B_PATH_REFUSED_RUNTIME: &str = "a2-l2b-path-refused-runtime";
+
+/// Symlink refused: a component in the parent chain is a symlink, or the
+/// final target itself is a symlink. Maps to exit code 6.
+pub const L2B_SYMLINK_REFUSED: &str = "a2-l2b-symlink-refused";
+
+/// The parent directory of the requested write target does not exist (or
+/// is not a directory). L2b refuses parent creation; that policy is
+/// deferred. Maps to exit code 6.
+pub const L2B_PARENT_MISSING: &str = "a2-l2b-parent-missing";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,6 +117,36 @@ mod tests {
             assert!(
                 m.starts_with("a2-l1b-"),
                 "runner marker {m:?} must use a2-l1b- prefix"
+            );
+        }
+    }
+
+    /// L2b pinning test: workspace-write marker tokens are an operator
+    /// contract distinct from L1b. Renaming any of these breaks scrapers
+    /// keyed on L2b runs and is a breaking change.
+    #[test]
+    fn l2b_marker_tokens_are_pinned() {
+        assert_eq!(L2B_RUNNER_START, "a2-l2b-runner-start");
+        assert_eq!(L2B_STEP_STARTED, "a2-l2b-step-started");
+        assert_eq!(L2B_PATH_RESOLVED, "a2-l2b-path-resolved");
+        assert_eq!(L2B_PATH_REFUSED_RUNTIME, "a2-l2b-path-refused-runtime");
+        assert_eq!(L2B_SYMLINK_REFUSED, "a2-l2b-symlink-refused");
+        assert_eq!(L2B_PARENT_MISSING, "a2-l2b-parent-missing");
+    }
+
+    #[test]
+    fn all_l2b_markers_use_a2_l2b_prefix() {
+        for m in [
+            L2B_RUNNER_START,
+            L2B_STEP_STARTED,
+            L2B_PATH_RESOLVED,
+            L2B_PATH_REFUSED_RUNTIME,
+            L2B_SYMLINK_REFUSED,
+            L2B_PARENT_MISSING,
+        ] {
+            assert!(
+                m.starts_with("a2-l2b-"),
+                "L2b marker {m:?} must use a2-l2b- prefix"
             );
         }
     }
