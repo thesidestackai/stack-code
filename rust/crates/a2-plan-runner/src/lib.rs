@@ -38,8 +38,18 @@
 //!   captures pre-write target state under
 //!   `<workspace_root>/.claw/l2b-checkpoints/`, never mutates the target
 //!   file, never wires into [`runner::run_plan`]).
+//! - [`diff_preview`] — A2-L2b workspace-write diff-preview primitive
+//!   (slice 3a; produces a structured [`diff_preview::PreviewRecord`]
+//!   plus a sanitized human display, never writes to the target,
+//!   never wires into [`runner::run_plan`]).
+//! - [`approval`] — A2-L2b workspace-write approval primitive
+//!   (slice 3a; strict parser + structured
+//!   [`approval::ApprovalDecision`]; markers in [`markers`] are
+//!   audit-only and never authority for an approval outcome).
 
+pub mod approval;
 pub mod checkpoint;
+pub mod diff_preview;
 pub mod markers;
 pub mod preflight;
 pub mod report;
@@ -48,9 +58,19 @@ pub mod write_runtime;
 
 // Re-exports for the CLI entry point. Kept narrow on purpose so the CLI
 // has a single, audited surface area into the runner.
+pub use approval::{
+    evaluate_approval, ApprovalContext, ApprovalDecision, ApprovalRefusal, EXIT_APPROVAL_DENIED,
+    EXIT_ROLLBACK_FAILED, PREVIEW_SHA256_HEX_LEN,
+};
 pub use checkpoint::{
     CheckpointError, CheckpointHandle, CheckpointStore, Manifest, EXIT_CHECKPOINT_FAILED,
     MANIFEST_VERSION, MAX_CHECKPOINT_BYTES,
+};
+pub use diff_preview::{
+    build_preview, canonical_preview_record_for_approval, contains_secret_like,
+    preview_hash_from_parts, CanonicalSubset, PreviewBuildError, PreviewDisplay, PreviewInputs,
+    PreviewRecord, CANONICAL_HEADER, HASH_DISPLAY_SEPARATOR, MAX_CONTENT_BYTES_FOR_DIFF,
+    MAX_DIFF_BYTES, MAX_DIFF_LINES, PREVIEW_FORMAT_VERSION,
 };
 pub use preflight::{PrecheckRefusal, READ_ONLY_TOOLS};
 pub use report::{exit_code_for, write_json, write_markers, EXIT_PARSE_ERROR};
