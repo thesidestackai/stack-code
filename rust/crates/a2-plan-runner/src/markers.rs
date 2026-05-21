@@ -80,6 +80,45 @@ pub const L2B_SYMLINK_REFUSED: &str = "a2-l2b-symlink-refused";
 /// deferred. Maps to exit code 6.
 pub const L2B_PARENT_MISSING: &str = "a2-l2b-parent-missing";
 
+// --- A2-L2b checkpoint-store markers (slice 2) ---------------------------
+//
+// Slice 2 adds the checkpoint store under `<workspace_root>/.claw/`. The
+// run-id marker is a *formatted* token: a stable prefix followed by the
+// 26-character Crockford-base32 ULID minted once per plan run. The other
+// three are plain `&'static str` constants. All four pin to the `a2-l2b-`
+// operator contract established by slice 1.
+
+/// Prefix of the per-plan-run announcement marker. Followed immediately
+/// by a 26-char Crockford-base32 ULID. Operators grep `^a2-l2b-run-id=`.
+/// Build the full token via [`l2b_run_id_marker`].
+pub const L2B_RUN_ID_PREFIX: &str = "a2-l2b-run-id=";
+
+/// Emitted after `checkpoint::CheckpointStore::create_checkpoint` returns
+/// `Ok`. The single positive signal that the pre-write state was captured
+/// durably under the runner-owned checkpoint root.
+pub const L2B_CHECKPOINT_WRITTEN: &str = "a2-l2b-checkpoint-written";
+
+/// Emitted when a target file's pre-write size exceeds
+/// `checkpoint::MAX_CHECKPOINT_BYTES`. Maps to exit code 9.
+pub const L2B_CHECKPOINT_TOO_LARGE: &str = "a2-l2b-checkpoint-too-large";
+
+/// Generic checkpoint-store refusal (overwrite of an existing step dir,
+/// invalid step-id, non-regular-file target, or any other I/O failure
+/// during checkpoint write). Maps to exit code 9. Sized refusal is its
+/// own marker via [`L2B_CHECKPOINT_TOO_LARGE`].
+pub const L2B_CHECKPOINT_REFUSED: &str = "a2-l2b-checkpoint-refused";
+
+/// Build the per-plan-run announcement marker (`a2-l2b-run-id=<ulid>`).
+///
+/// The result is the concatenation of [`L2B_RUN_ID_PREFIX`] and the
+/// 26-character Crockford-base32 rendering of `id`. The format is stable
+/// — operators grep `^a2-l2b-run-id=` and parse the 26 chars that follow
+/// the `=`.
+#[must_use]
+pub fn l2b_run_id_marker(id: &ulid::Ulid) -> String {
+    format!("{L2B_RUN_ID_PREFIX}{id}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,5 +188,63 @@ mod tests {
                 "L2b marker {m:?} must use a2-l2b- prefix"
             );
         }
+    }
+
+    /// L2b checkpoint-store marker pinning (slice 2). The literal byte
+    /// values are an operator contract; renaming any of them breaks log
+    /// scrapers and is a breaking change.
+    #[test]
+    fn l2b_checkpoint_marker_tokens_are_pinned() {
+        assert_eq!(L2B_RUN_ID_PREFIX, "a2-l2b-run-id=");
+        assert_eq!(L2B_CHECKPOINT_WRITTEN, "a2-l2b-checkpoint-written");
+        assert_eq!(L2B_CHECKPOINT_TOO_LARGE, "a2-l2b-checkpoint-too-large");
+        assert_eq!(L2B_CHECKPOINT_REFUSED, "a2-l2b-checkpoint-refused");
+    }
+
+    #[test]
+    fn all_l2b_checkpoint_static_markers_use_a2_l2b_prefix() {
+        // Prefix-only token is exercised by its own dedicated test; the
+        // three full markers each must start with `a2-l2b-`.
+        for m in [
+            L2B_CHECKPOINT_WRITTEN,
+            L2B_CHECKPOINT_TOO_LARGE,
+            L2B_CHECKPOINT_REFUSED,
+        ] {
+            assert!(
+                m.starts_with("a2-l2b-"),
+                "L2b checkpoint marker {m:?} must use a2-l2b- prefix"
+            );
+        }
+    }
+
+    #[test]
+    fn l2b_run_id_prefix_shape() {
+        assert!(L2B_RUN_ID_PREFIX.starts_with("a2-l2b-"));
+        assert!(L2B_RUN_ID_PREFIX.ends_with('='));
+    }
+
+    #[test]
+    fn l2b_run_id_marker_format() {
+        let id = ulid::Ulid::new();
+        let s = l2b_run_id_marker(&id);
+        assert!(s.starts_with(L2B_RUN_ID_PREFIX));
+        // Crockford-base32 ULID rendering is always 26 ASCII chars.
+        let body = &s[L2B_RUN_ID_PREFIX.len()..];
+        assert_eq!(body.len(), 26);
+        assert!(
+            body.chars().all(|c| c.is_ascii_alphanumeric()),
+            "ULID body must be ASCII alphanumeric Crockford-base32: {body:?}"
+        );
+        // Total length is prefix + 26.
+        assert_eq!(s.len(), L2B_RUN_ID_PREFIX.len() + 26);
+    }
+
+    #[test]
+    fn l2b_run_id_marker_round_trips_through_ulid_parse() {
+        let id = ulid::Ulid::new();
+        let s = l2b_run_id_marker(&id);
+        let body = &s[L2B_RUN_ID_PREFIX.len()..];
+        let parsed: ulid::Ulid = body.parse().expect("ULID body must parse");
+        assert_eq!(parsed, id);
     }
 }

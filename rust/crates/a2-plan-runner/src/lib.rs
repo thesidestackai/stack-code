@@ -34,7 +34,12 @@
 //!   resolver (slice 1 only; not yet wired into [`runner::run_plan`],
 //!   never performs filesystem writes, never spawns subprocesses, never
 //!   prompts for approval).
+//! - [`checkpoint`] — A2-L2b workspace-write checkpoint store (slice 2;
+//!   captures pre-write target state under
+//!   `<workspace_root>/.claw/l2b-checkpoints/`, never mutates the target
+//!   file, never wires into [`runner::run_plan`]).
 
+pub mod checkpoint;
 pub mod markers;
 pub mod preflight;
 pub mod report;
@@ -43,6 +48,10 @@ pub mod write_runtime;
 
 // Re-exports for the CLI entry point. Kept narrow on purpose so the CLI
 // has a single, audited surface area into the runner.
+pub use checkpoint::{
+    CheckpointError, CheckpointHandle, CheckpointStore, Manifest, EXIT_CHECKPOINT_FAILED,
+    MANIFEST_VERSION, MAX_CHECKPOINT_BYTES,
+};
 pub use preflight::{PrecheckRefusal, READ_ONLY_TOOLS};
 pub use report::{exit_code_for, write_json, write_markers, EXIT_PARSE_ERROR};
 pub use runner::{

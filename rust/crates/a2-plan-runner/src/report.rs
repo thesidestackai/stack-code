@@ -20,19 +20,27 @@
 //!
 //! # Exit-code contract (CLI-facing)
 //!
-//! | Code | Meaning                                                      |
-//! | ---- | ------------------------------------------------------------ |
-//! | 0    | `PLAN_EXEC_PASS` — every accepted step passed.               |
-//! | 1    | `PLAN_EXEC_FAIL` — at least one accepted step failed.        |
-//! | 2    | `PLAN_REFUSED_PRECHECK` — schema validator refused.          |
-//! | 3    | `TOOL_DISALLOWED` — step declared a non-allowlist tool.      |
-//! | 4    | `SUBSTRATE_UNAVAILABLE` — broker probe failed.               |
-//! | 5    | YAML parse error (surfaced by the CLI before the runner runs). |
+//! | Code | Meaning                                                          |
+//! | ---- | ---------------------------------------------------------------- |
+//! | 0    | `PLAN_EXEC_PASS` — every accepted step passed.                   |
+//! | 1    | `PLAN_EXEC_FAIL` — at least one accepted step failed.            |
+//! | 2    | `PLAN_REFUSED_PRECHECK` — schema validator refused.              |
+//! | 3    | `TOOL_DISALLOWED` — step declared a non-allowlist tool.          |
+//! | 4    | `SUBSTRATE_UNAVAILABLE` — broker probe failed.                   |
+//! | 5    | YAML parse error (surfaced by the CLI before the runner runs).   |
+//! | 6    | `EXIT_WRITE_PATH_REFUSED` — L2b write-target path safety refused. |
+//! | 7    | reserved — `EXIT_APPROVAL_DENIED`, future slice.                 |
+//! | 8    | reserved — `EXIT_ROLLBACK_FAILED`, future slice.                 |
+//! | 9    | `EXIT_CHECKPOINT_FAILED` — L2b checkpoint write failed.          |
 //!
 //! The runner itself produces a [`crate::runner::PlanReport`]; the CLI maps
 //! it to exit codes 0–4 via [`exit_code_for`]. Exit code 5 is the CLI's
 //! responsibility (it's raised before a `PlanReport` even exists, on YAML
-//! parse failure).
+//! parse failure). Codes 6 and 9 are produced by the L2b workspace-write
+//! path (slice 1 / slice 2 respectively) and surface through their own
+//! refusal types — [`crate::write_runtime::WriteTargetRefusal::exit_code`]
+//! and [`crate::checkpoint::CheckpointError::exit_code`]. Codes 7 and 8 are
+//! reserved and unbound in slice 2.
 
 use std::io::{self, Write};
 

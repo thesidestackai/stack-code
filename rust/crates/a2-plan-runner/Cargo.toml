@@ -14,6 +14,8 @@ a2-plan-schema = { path = "../a2-plan-schema" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
+sha2 = "0.10"
+ulid = { version = "1", features = ["serde"] }
 
 [lints]
 workspace = true
