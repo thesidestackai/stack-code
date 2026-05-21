@@ -30,11 +30,16 @@
 //! - [`preflight`] — pure pre-execution refusal checks.
 //! - [`runner`] — step executor (subprocess + broker boundary).
 //! - [`report`] — marker-stream / JSON writers.
+//! - [`write_runtime`] — A2-L2b workspace-write runtime path-safety
+//!   resolver (slice 1 only; not yet wired into [`runner::run_plan`],
+//!   never performs filesystem writes, never spawns subprocesses, never
+//!   prompts for approval).
 
 pub mod markers;
 pub mod preflight;
 pub mod report;
 pub mod runner;
+pub mod write_runtime;
 
 // Re-exports for the CLI entry point. Kept narrow on purpose so the CLI
 // has a single, audited surface area into the runner.
