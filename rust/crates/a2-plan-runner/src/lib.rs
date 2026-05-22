@@ -46,8 +46,15 @@
 //!   (slice 3a; strict parser + structured
 //!   [`approval::ApprovalDecision`]; markers in [`markers`] are
 //!   audit-only and never authority for an approval outcome).
+//! - [`approval_ux`] — A2-L2b workspace-write approval UX helpers
+//!   (slice 3b; pure renderers for operator preview / approval
+//!   prompts plus a convenience wrapper around
+//!   [`approval::evaluate_approval`]. Never writes the target, never
+//!   wires into [`runner::run_plan`], never reads stdin or writes
+//!   stdout).
 
 pub mod approval;
+pub mod approval_ux;
 pub mod checkpoint;
 pub mod diff_preview;
 pub mod markers;
@@ -61,6 +68,10 @@ pub mod write_runtime;
 pub use approval::{
     evaluate_approval, ApprovalContext, ApprovalDecision, ApprovalRefusal, EXIT_APPROVAL_DENIED,
     EXIT_ROLLBACK_FAILED, PREVIEW_SHA256_HEX_LEN,
+};
+pub use approval_ux::{
+    evaluate_operator_input, render_approval_prompt, render_non_approvable_summary,
+    render_preview_for_operator, ApprovalPromptRender,
 };
 pub use checkpoint::{
     CheckpointError, CheckpointHandle, CheckpointStore, Manifest, EXIT_CHECKPOINT_FAILED,
