@@ -119,6 +119,59 @@ pub fn l2b_run_id_marker(id: &ulid::Ulid) -> String {
     format!("{L2B_RUN_ID_PREFIX}{id}")
 }
 
+// --- A2-L2b slice-3a diff-preview + approval markers ---------------------
+//
+// Every token in this section is **audit-only**: the runtime decides
+// approval from the [`PreviewRecord`][crate::diff_preview::PreviewRecord]
+// + the [`ApprovalDecision`][crate::approval::ApprovalDecision] structure
+// alone. The markers are intended for log scrapers and operator
+// transcripts; emitting any of them is never authority for an approval
+// outcome. Slice 3a is offline-only; nothing here is wired into
+// [`crate::runner::run_plan`].
+
+/// A [`crate::diff_preview::PreviewRecord`] was constructed for a step.
+/// Emitted regardless of whether the resulting preview is approvable.
+pub const L2B_PREVIEW_RECORD_CREATED: &str = "a2-l2b-preview-record-created";
+
+/// The textual unified diff was generated, sanitized, and is ready to
+/// surface to a human. Implies non-binary, non-redacted, non-truncated.
+pub const L2B_DIFF_PREVIEW_READY: &str = "a2-l2b-diff-preview-ready";
+
+/// At least one redaction pattern matched the rendered preview content
+/// (key=value secrets, PEM blocks, vendor token prefixes, JWT-shaped
+/// strings, URL credentials, etc.). The preview is non-approvable in
+/// slice 3a.
+pub const L2B_DIFF_REDACTED: &str = "a2-l2b-diff-redacted";
+
+/// The preview hit a deterministic line- or byte-truncation limit. The
+/// preview is non-approvable in slice 3a.
+pub const L2B_DIFF_TRUNCATED: &str = "a2-l2b-diff-truncated";
+
+/// The before- or after-content was detected as binary; no diff body is
+/// rendered. Summary metadata only; non-approvable in slice 3a.
+pub const L2B_BINARY_PREVIEW: &str = "a2-l2b-binary-preview";
+
+/// A textual approval prompt was surfaced for a `(step_id, preview_sha256)`
+/// pair. Audit-only: the prompt's appearance never implies the operator
+/// will approve, and the operator's response is bound by the strict
+/// parser in [`crate::approval`].
+pub const L2B_APPROVAL_PROMPT: &str = "a2-l2b-approval-prompt";
+
+/// An [`crate::approval::ApprovalDecision::Approved`] was produced for the
+/// step. Mirrors the structured decision in the report stream; the
+/// decision struct itself remains the source of truth.
+pub const L2B_APPROVED: &str = "a2-l2b-approved";
+
+/// An [`crate::approval::ApprovalDecision::Refused`] was produced for the
+/// step (syntax violation, hash mismatch, preview non-approvable, or
+/// checkpoint drift). Carries exit code 7 when surfaced by the CLI.
+pub const L2B_APPROVAL_REFUSED: &str = "a2-l2b-approval-refused";
+
+/// Slice-3a refusal of any preapproval / `--yes` / batch-apply attempt.
+/// The runtime hard-rejects all such inputs ahead of the strict parser
+/// and emits this marker for audit.
+pub const L2B_PREAPPROVAL_REFUSED: &str = "a2-l2b-preapproval-refused";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,5 +299,41 @@ mod tests {
         let body = &s[L2B_RUN_ID_PREFIX.len()..];
         let parsed: ulid::Ulid = body.parse().expect("ULID body must parse");
         assert_eq!(parsed, id);
+    }
+
+    /// L2b slice-3a marker pinning. Every slice-3a token is **audit-only**:
+    /// emitting one is never authority for an approval decision. Renaming
+    /// any of these breaks scrapers and is a breaking change.
+    #[test]
+    fn l2b_slice_3a_marker_tokens_are_pinned() {
+        assert_eq!(L2B_PREVIEW_RECORD_CREATED, "a2-l2b-preview-record-created");
+        assert_eq!(L2B_DIFF_PREVIEW_READY, "a2-l2b-diff-preview-ready");
+        assert_eq!(L2B_DIFF_REDACTED, "a2-l2b-diff-redacted");
+        assert_eq!(L2B_DIFF_TRUNCATED, "a2-l2b-diff-truncated");
+        assert_eq!(L2B_BINARY_PREVIEW, "a2-l2b-binary-preview");
+        assert_eq!(L2B_APPROVAL_PROMPT, "a2-l2b-approval-prompt");
+        assert_eq!(L2B_APPROVED, "a2-l2b-approved");
+        assert_eq!(L2B_APPROVAL_REFUSED, "a2-l2b-approval-refused");
+        assert_eq!(L2B_PREAPPROVAL_REFUSED, "a2-l2b-preapproval-refused");
+    }
+
+    #[test]
+    fn all_l2b_slice_3a_markers_use_a2_l2b_prefix() {
+        for m in [
+            L2B_PREVIEW_RECORD_CREATED,
+            L2B_DIFF_PREVIEW_READY,
+            L2B_DIFF_REDACTED,
+            L2B_DIFF_TRUNCATED,
+            L2B_BINARY_PREVIEW,
+            L2B_APPROVAL_PROMPT,
+            L2B_APPROVED,
+            L2B_APPROVAL_REFUSED,
+            L2B_PREAPPROVAL_REFUSED,
+        ] {
+            assert!(
+                m.starts_with("a2-l2b-"),
+                "L2b slice-3a marker {m:?} must use a2-l2b- prefix"
+            );
+        }
     }
 }

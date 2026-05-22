@@ -29,7 +29,7 @@
 //! | 4    | `SUBSTRATE_UNAVAILABLE` — broker probe failed.                   |
 //! | 5    | YAML parse error (surfaced by the CLI before the runner runs).   |
 //! | 6    | `EXIT_WRITE_PATH_REFUSED` — L2b write-target path safety refused. |
-//! | 7    | reserved — `EXIT_APPROVAL_DENIED`, future slice.                 |
+//! | 7    | `EXIT_APPROVAL_DENIED` — L2b approval refused / preview non-approvable. |
 //! | 8    | reserved — `EXIT_ROLLBACK_FAILED`, future slice.                 |
 //! | 9    | `EXIT_CHECKPOINT_FAILED` — L2b checkpoint write failed.          |
 //!
@@ -39,8 +39,11 @@
 //! parse failure). Codes 6 and 9 are produced by the L2b workspace-write
 //! path (slice 1 / slice 2 respectively) and surface through their own
 //! refusal types — [`crate::write_runtime::WriteTargetRefusal::exit_code`]
-//! and [`crate::checkpoint::CheckpointError::exit_code`]. Codes 7 and 8 are
-//! reserved and unbound in slice 2.
+//! and [`crate::checkpoint::CheckpointError::exit_code`]. Code 7 is bound
+//! in slice 3a as [`crate::approval::EXIT_APPROVAL_DENIED`] but
+//! intentionally **not** wired into [`exit_code_for`]: slice 3a is
+//! offline-only and never executes through `run_plan`. Code 8 remains
+//! reserved for the future rollback slice.
 
 use std::io::{self, Write};
 
