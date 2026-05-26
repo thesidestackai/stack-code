@@ -491,6 +491,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // fail / refused / substrate-unavailable / parse-error).
             std::process::exit(code);
         }
+        CliAction::PlanApprove { bundle_path } => {
+            // A2-L2b Slice 3d: read bundle, render prompt to stderr,
+            // read approval line from stdin, emit approval-result JSON
+            // on stdout, exit with operator-facing code (0/5/7). The
+            // command never writes target files; cf. `run_plan_approve`.
+            let stdin = std::io::stdin();
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let stdin_is_tty = stdin.is_terminal();
+            let mut stdin_lock = stdin.lock();
+            let mut stdout_lock = stdout.lock();
+            let mut stderr_lock = stderr.lock();
+            let code = run_plan_approve(
+                &bundle_path,
+                stdin_is_tty,
+                &mut stdin_lock,
+                &mut stdout_lock,
+                &mut stderr_lock,
+            );
+            std::process::exit(code);
+        }
     }
     Ok(())
 }
@@ -751,6 +772,312 @@ fn strip_one_trailing_newline(s: &str) -> &str {
     s
 }
 
+// =========================================================================
+// A2-L2b Slice 3d — `claw plan approve <preview-bundle.json>` command
+// =========================================================================
+//
+// Scope (Slice 3d):
+//
+// * Reads ONE preview bundle JSON file from disk.
+// * Validates the bundle schema (`a2-l2b-preview-bundle.v1`, no extra
+//   fields).
+// * Verifies the binding between the embedded `PreviewRecord` and
+//   `PreviewDisplay` by re-deriving `preview_sha256` from the canonical
+//   record subset plus the display's `rendered` bytes — mismatch is a
+//   bundle integrity error (exit 5), not a refusal (exit 7).
+// * Delegates render-prompt + read-line + evaluate to the Slice-3c
+//   helper `run_approval_interaction`.
+// * Emits canonical approval-result JSON (`a2-l2b-approval-result.v1`)
+//   on stdout.
+// * Exit codes: 0 approved, 7 refused / non-approvable / EOF / drift /
+//   non-TTY, 5 bundle read / parse / schema / integrity error.
+//
+// Hard contract (Slice 3d):
+//
+// * Never opens a write-capable handle to any target file.
+// * Never mutates the checkpoint store.
+// * Never wires workspace-write into `run_plan`.
+// * Never calls the broker, model, or any network.
+// * Never spawns a subprocess.
+// * Never trusts an embedded approval decision in the bundle;
+//   `serde(deny_unknown_fields)` rejects any such field outright.
+
+/// Pinned bundle schema version. Bumped only on a wire-incompatible
+/// change to the on-disk layout.
+const PREVIEW_BUNDLE_SCHEMA_V1: &str = "a2-l2b-preview-bundle.v1";
+
+/// Pinned approval-result schema version emitted on stdout.
+const APPROVAL_RESULT_SCHEMA_V1: &str = "a2-l2b-approval-result.v1";
+
+/// Operator-facing audit marker tokens used in the refusal JSON when
+/// the command rejects a bundle before any approval interaction. Pinned
+/// here (not as runner markers) because these surface only on the CLI
+/// approval-result wire, not in the runner's marker stream.
+const APPROVAL_RESULT_AUDIT_BUNDLE_REJECTED: &str = "a2-l2b-approval-result-bundle-rejected";
+const APPROVAL_RESULT_AUDIT_NON_TTY: &str = "a2-l2b-approval-result-non-tty";
+
+/// On-disk preview bundle. `deny_unknown_fields` is load-bearing: it
+/// rejects any bundle that smuggles an `approval_decision`, `markers`,
+/// `signature`, or other field the command might mistake for authority.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreviewBundleV1 {
+    schema_version: String,
+    preview_record: a2_plan_runner::PreviewRecord,
+    preview_display: a2_plan_runner::PreviewDisplay,
+    checkpoint_baseline_unchanged: bool,
+}
+
+/// Bundle-read / parse / schema / integrity failure causes. Each
+/// variant carries a stable short string for the refusal JSON `reason`
+/// field; the operator never sees the internal enum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BundleLoadError {
+    /// `fs::read` failed (file missing, permission denied, etc.).
+    Io(String),
+    /// `serde_json::from_slice` failed.
+    Json(String),
+    /// `schema_version` field did not match `PREVIEW_BUNDLE_SCHEMA_V1`.
+    SchemaVersionMismatch { actual: String },
+    /// Re-derived `preview_sha256` did not match
+    /// `preview_record.preview_sha256` — the record/display binding is
+    /// broken.
+    BindingMismatch,
+}
+
+impl BundleLoadError {
+    fn reason(&self) -> String {
+        match self {
+            Self::Io(msg) => format!("bundle-io-error: {msg}"),
+            Self::Json(msg) => format!("bundle-json-parse-error: {msg}"),
+            Self::SchemaVersionMismatch { actual } => {
+                format!("bundle-schema-version-mismatch: got {actual}")
+            }
+            Self::BindingMismatch => "bundle-record-display-binding-mismatch".to_string(),
+        }
+    }
+
+    fn short(&self) -> &'static str {
+        match self {
+            Self::Io(_) => "bundle-io-error",
+            Self::Json(_) => "bundle-json-parse-error",
+            Self::SchemaVersionMismatch { .. } => "bundle-schema-version-mismatch",
+            Self::BindingMismatch => "bundle-record-display-binding-mismatch",
+        }
+    }
+}
+
+/// CLI exit code returned when the bundle cannot be loaded, parsed,
+/// schema-validated, or its record/display binding fails. Mirrors the
+/// `claw plan run` parse-error code so the operator-facing
+/// "5 = parse error" contract stays consistent across plan
+/// subcommands.
+const EXIT_BUNDLE_PARSE_ERROR: i32 = 5;
+
+/// Load and validate a preview bundle from disk.
+///
+/// Performs read → JSON parse → schema-version check → binding check.
+/// All four steps fail with [`BundleLoadError`] mapped to exit code
+/// [`EXIT_BUNDLE_PARSE_ERROR`]. The returned bundle is safe to feed
+/// into `run_approval_interaction` without further validation.
+fn load_preview_bundle(bundle_path: &Path) -> Result<PreviewBundleV1, BundleLoadError> {
+    let bytes = std::fs::read(bundle_path).map_err(|e| BundleLoadError::Io(e.to_string()))?;
+    let bundle: PreviewBundleV1 =
+        serde_json::from_slice(&bytes).map_err(|e| BundleLoadError::Json(e.to_string()))?;
+    if bundle.schema_version != PREVIEW_BUNDLE_SCHEMA_V1 {
+        return Err(BundleLoadError::SchemaVersionMismatch {
+            actual: bundle.schema_version,
+        });
+    }
+    verify_record_display_binding(&bundle.preview_record, &bundle.preview_display)?;
+    Ok(bundle)
+}
+
+/// Re-derive `preview_sha256` from the canonical record subset plus
+/// `display.rendered` and compare against `record.preview_sha256`.
+///
+/// This is the cryptographic binding that prevents an operator from
+/// approving a display they never saw: the hash on the wire MUST be
+/// reproducible from the record fields plus the exact rendered bytes
+/// the prompt will surface.
+fn verify_record_display_binding(
+    record: &a2_plan_runner::PreviewRecord,
+    display: &a2_plan_runner::PreviewDisplay,
+) -> Result<(), BundleLoadError> {
+    let subset = a2_plan_runner::CanonicalSubset {
+        preview_id: &record.preview_id,
+        step_id: &record.step_id,
+        target_relative_path_sanitized: &record.target_relative_path_sanitized,
+        before_sha256: &record.before_sha256,
+        after_sha256: &record.after_sha256,
+        checkpoint_run_id: &record.checkpoint_run_id,
+        checkpoint_step_id: &record.checkpoint_step_id,
+        is_binary: record.is_binary,
+        is_redacted: record.is_redacted,
+        is_truncated: record.is_truncated,
+        preview_format_version: record.preview_format_version,
+    };
+    let canonical = a2_plan_runner::canonical_preview_record_for_approval(&subset);
+    let derived = a2_plan_runner::preview_hash_from_parts(&canonical, &display.rendered);
+    if derived != record.preview_sha256 {
+        return Err(BundleLoadError::BindingMismatch);
+    }
+    Ok(())
+}
+
+/// Emit the bundle-load refusal JSON envelope to `stdout`. Exit code is
+/// [`EXIT_BUNDLE_PARSE_ERROR`]; the JSON `exit_code_hint` mirrors it.
+fn emit_bundle_load_failure(err: &BundleLoadError, stdout: &mut dyn Write) -> i32 {
+    let payload = serde_json::json!({
+        "schema_version": APPROVAL_RESULT_SCHEMA_V1,
+        "decision": "bundle_rejected",
+        "reason": err.reason(),
+        "exit_code_hint": EXIT_BUNDLE_PARSE_ERROR,
+        "audit_markers": [APPROVAL_RESULT_AUDIT_BUNDLE_REJECTED, err.short()],
+    });
+    // Best-effort emit: a broken stdout pipe at this point cannot
+    // change the operator's verdict (we have nothing useful to do
+    // beyond returning the exit code).
+    let _ = writeln!(stdout, "{payload}");
+    let _ = stdout.flush();
+    EXIT_BUNDLE_PARSE_ERROR
+}
+
+/// Emit the non-TTY refusal JSON envelope to `stdout`. Exit code is
+/// [`EXIT_APPROVAL_DENIED`]; the JSON `exit_code_hint` mirrors it.
+/// `checkpoint_baseline_unchanged` is the bundle's reported value
+/// (passed through, never re-asserted by this command).
+fn emit_non_tty_refusal(
+    record: &a2_plan_runner::PreviewRecord,
+    checkpoint_baseline_unchanged: bool,
+    reason: &str,
+    stdout: &mut dyn Write,
+) -> i32 {
+    let payload = serde_json::json!({
+        "schema_version": APPROVAL_RESULT_SCHEMA_V1,
+        "decision": "refused",
+        "reason": reason,
+        "preview_id": record.preview_id,
+        "step_id": record.step_id,
+        "preview_sha256": record.preview_sha256,
+        "checkpoint_baseline_unchanged": checkpoint_baseline_unchanged,
+        "exit_code_hint": EXIT_APPROVAL_DENIED,
+        "audit_markers": [
+            APPROVAL_RESULT_AUDIT_NON_TTY,
+            a2_plan_runner::markers::L2B_APPROVAL_REFUSED,
+        ],
+    });
+    let _ = writeln!(stdout, "{payload}");
+    let _ = stdout.flush();
+    EXIT_APPROVAL_DENIED
+}
+
+/// Emit the approval-result JSON envelope to `stdout` for an
+/// `ApprovalDecision` produced by the Slice-3c interaction helper.
+/// Returns the exit code mirrored in `exit_code_hint`.
+fn emit_approval_result(
+    record: &a2_plan_runner::PreviewRecord,
+    interaction: &CliApprovalInteractionResult,
+    checkpoint_baseline_unchanged: bool,
+    stdout: &mut dyn Write,
+) -> i32 {
+    let (decision_label, reason): (&str, Option<String>) = match &interaction.decision {
+        a2_plan_runner::ApprovalDecision::Approved { .. } => ("approved", None),
+        a2_plan_runner::ApprovalDecision::Refused(refusal) => {
+            ("refused", Some(refusal.describe().to_string()))
+        }
+    };
+    let mut payload = serde_json::json!({
+        "schema_version": APPROVAL_RESULT_SCHEMA_V1,
+        "decision": decision_label,
+        "preview_id": record.preview_id,
+        "step_id": record.step_id,
+        "preview_sha256": record.preview_sha256,
+        "checkpoint_baseline_unchanged": checkpoint_baseline_unchanged,
+        "exit_code_hint": interaction.exit_code_hint,
+        "audit_markers": interaction.audit_markers,
+    });
+    if let Some(r) = reason {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("reason".to_string(), serde_json::Value::String(r));
+        }
+    }
+    let _ = writeln!(stdout, "{payload}");
+    let _ = stdout.flush();
+    interaction.exit_code_hint
+}
+
+/// Operator entry point for `claw plan approve <bundle-path>`.
+///
+/// `stdin_is_tty` is the production runtime's `IsTerminal` probe. Tests
+/// inject `true` so the production TTY guard is exercisable through the
+/// helper without requiring a real terminal; the production dispatcher
+/// always passes the live probe result.
+fn run_plan_approve<R: Read, W1: Write, W2: Write>(
+    bundle_path: &Path,
+    stdin_is_tty: bool,
+    stdin: &mut R,
+    stdout: &mut W1,
+    stderr: &mut W2,
+) -> i32 {
+    let bundle = match load_preview_bundle(bundle_path) {
+        Ok(b) => b,
+        Err(e) => {
+            return emit_bundle_load_failure(&e, stdout);
+        }
+    };
+
+    // Fail-closed non-TTY guard: only triggers for approvable previews,
+    // because a non-approvable preview never reads stdin in the first
+    // place (Slice-3c short-circuits). Honoring the TTY check on the
+    // non-approvable path would surface an unrelated refusal reason.
+    if bundle.preview_record.is_approvable() && !stdin_is_tty {
+        return emit_non_tty_refusal(
+            &bundle.preview_record,
+            bundle.checkpoint_baseline_unchanged,
+            "approval-stdin-not-tty",
+            stdout,
+        );
+    }
+
+    let interaction = match run_approval_interaction(
+        &bundle.preview_record,
+        &bundle.preview_display,
+        bundle.checkpoint_baseline_unchanged,
+        stdin,
+        &mut *stderr,
+    ) {
+        Ok(r) => r,
+        Err(_e) => {
+            // A stderr write failure here is unusual and not the
+            // operator's fault. Surface as a refusal so the operator
+            // never sees a silent approval; the exit code stays in the
+            // operator-facing namespace.
+            return emit_non_tty_refusal(
+                &bundle.preview_record,
+                bundle.checkpoint_baseline_unchanged,
+                "approval-prompt-write-failed",
+                stdout,
+            );
+        }
+    };
+
+    emit_approval_result(
+        &bundle.preview_record,
+        &interaction,
+        bundle.checkpoint_baseline_unchanged,
+        stdout,
+    )
+}
+
+// =========================================================================
+// END A2-L2b Slice 3d — scope sentinel
+// =========================================================================
+//
+// The source-grep tests in `plan_approve_tests` use this sentinel to bound
+// the implementation region they scan for forbidden APIs. Do not move or
+// rename it without updating those tests.
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CliAction {
     DumpManifests {
@@ -866,6 +1193,16 @@ enum CliAction {
         /// runner's `DEFAULT_STEP_TIMEOUT`. Bounds enforced by
         /// [`a2_plan_runner::parse_step_timeout_seconds`].
         step_timeout: Option<std::time::Duration>,
+    },
+    // A2-L2b Slice 3d: operator-facing approval command. Reads ONE
+    // preview bundle file from disk, renders the Slice-3b operator
+    // prompt to stderr, reads exactly one approval line from TTY stdin,
+    // and emits a structured approval-result JSON on stdout. The
+    // command NEVER writes target files, NEVER mutates the checkpoint
+    // store, NEVER calls the broker, NEVER spawns subprocesses. It is
+    // purely a renderer + input reader + Slice-3a evaluator wrapper.
+    PlanApprove {
+        bundle_path: PathBuf,
     },
 }
 
@@ -1519,13 +1856,17 @@ fn parse_acp_args(args: &[String], output_format: CliOutputFormat) -> Result<Cli
 fn parse_plan_subcommand_args(args: &[String]) -> Result<CliAction, String> {
     match args.first().map(String::as_str) {
         Some("run") => {}
+        Some("approve") => return parse_plan_approve_subcommand_args(&args[1..]),
         Some(other) => {
             return Err(format!(
-                "unsupported `claw plan` subcommand: {other}. Use `claw plan run <file>`."
+                "unsupported `claw plan` subcommand: {other}. \
+                 Use `claw plan run <file>` or `claw plan approve <preview-bundle.json>`."
             ));
         }
         None => {
-            return Err("missing `claw plan` subcommand. Use `claw plan run <file>`.".to_string());
+            return Err("missing `claw plan` subcommand. \
+                 Use `claw plan run <file>` or `claw plan approve <preview-bundle.json>`."
+                .to_string());
         }
     }
     let tail = &args[1..];
@@ -1646,6 +1987,35 @@ fn parse_plan_subcommand_args(args: &[String]) -> Result<CliAction, String> {
         wrapper,
         step_timeout,
     })
+}
+
+/// A2-L2b Slice 3d: parse `claw plan approve <preview-bundle.json>`.
+///
+/// Exactly one positional argument, no flags. Any `--*` flag — including
+/// pre-approval flags like `--yes`, `--auto`, `--force`, `--allow-write`
+/// — is refused outright before any filesystem touch.
+fn parse_plan_approve_subcommand_args(args: &[String]) -> Result<CliAction, String> {
+    let mut bundle: Option<PathBuf> = None;
+    for arg in args {
+        let v = arg.as_str();
+        if v.starts_with("--") {
+            return Err(format!(
+                "unsupported flag for `claw plan approve`: {v}. \
+                 Usage: `claw plan approve <preview-bundle.json>`."
+            ));
+        }
+        if bundle.is_some() {
+            return Err(format!(
+                "unexpected positional argument after preview bundle: {v}. \
+                 Usage: `claw plan approve <preview-bundle.json>`."
+            ));
+        }
+        bundle = Some(PathBuf::from(v));
+    }
+    let bundle_path = bundle.ok_or_else(|| {
+        "missing preview bundle. Usage: `claw plan approve <preview-bundle.json>`.".to_string()
+    })?;
+    Ok(CliAction::PlanApprove { bundle_path })
 }
 
 fn try_resolve_bare_skill_prompt(cwd: &Path, trimmed: &str) -> Option<String> {
@@ -15945,5 +16315,827 @@ mod approval_interaction_tests {
             .find(end_marker)
             .expect("slice-3c helper section end marker should be present after start");
         &src[start..start + rel_end]
+    }
+}
+
+// =========================================================================
+// A2-L2b Slice 3d — `claw plan approve` command tests
+// =========================================================================
+
+#[cfg(test)]
+mod plan_approve_tests {
+    use super::{
+        emit_approval_result, emit_bundle_load_failure, emit_non_tty_refusal, load_preview_bundle,
+        parse_plan_subcommand_args, run_approval_interaction, run_plan_approve,
+        verify_record_display_binding, BundleLoadError, CliAction, CliApprovalInteractionResult,
+        APPROVAL_RESULT_AUDIT_BUNDLE_REJECTED, APPROVAL_RESULT_AUDIT_NON_TTY,
+        APPROVAL_RESULT_SCHEMA_V1, EXIT_APPROVAL_DENIED, EXIT_BUNDLE_PARSE_ERROR,
+        PREVIEW_BUNDLE_SCHEMA_V1,
+    };
+    use a2_plan_runner::{
+        canonical_preview_record_for_approval, preview_hash_from_parts, CanonicalSubset,
+        PreviewDisplay, PreviewRecord, PREVIEW_FORMAT_VERSION,
+    };
+    use serde_json::Value;
+    use std::fs;
+    use std::io::Cursor;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // -- Fixtures --------------------------------------------------------
+
+    const STEP: &str = "step-1";
+    const PREVIEW_ID: &str = "01HZZZZZZZZZZZZZZZZZZZZZZ0";
+    const RUN_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_temp_dir() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock sane")
+            .as_nanos();
+        let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("a2-l2b-approve-{nanos}-{seq}"));
+        fs::create_dir_all(&dir).expect("tempdir create");
+        dir
+    }
+
+    /// Build an approvable record + display, computing `preview_sha256`
+    /// from the canonical subset so the resulting pair has a valid
+    /// binding under [`verify_record_display_binding`].
+    fn build_bound_pair() -> (PreviewRecord, PreviewDisplay) {
+        build_pair(false, false, false, "--- a/src/lib.rs\n+++ b/src/lib.rs\n")
+    }
+
+    fn build_pair(
+        is_binary: bool,
+        is_redacted: bool,
+        is_truncated: bool,
+        rendered: &str,
+    ) -> (PreviewRecord, PreviewDisplay) {
+        let before_sha = "a".repeat(64);
+        let after_sha = "b".repeat(64);
+        let rel = "src/lib.rs".to_string();
+        let subset = CanonicalSubset {
+            preview_id: PREVIEW_ID,
+            step_id: STEP,
+            target_relative_path_sanitized: &rel,
+            before_sha256: &before_sha,
+            after_sha256: &after_sha,
+            checkpoint_run_id: RUN_ID,
+            checkpoint_step_id: STEP,
+            is_binary,
+            is_redacted,
+            is_truncated,
+            preview_format_version: PREVIEW_FORMAT_VERSION,
+        };
+        let canonical = canonical_preview_record_for_approval(&subset);
+        let hash = preview_hash_from_parts(&canonical, rendered);
+        let record = PreviewRecord {
+            preview_id: PREVIEW_ID.to_string(),
+            step_id: STEP.to_string(),
+            target_relative_path_sanitized: rel,
+            target_absolute_path_sanitized: "/ws/src/lib.rs".to_string(),
+            before_sha256: before_sha,
+            after_sha256: after_sha,
+            preview_sha256: hash,
+            checkpoint_run_id: RUN_ID.to_string(),
+            checkpoint_step_id: STEP.to_string(),
+            is_binary,
+            is_redacted,
+            is_truncated,
+            created_at_utc: "2026-05-21T00:00:00.000000000Z".to_string(),
+            preview_format_version: PREVIEW_FORMAT_VERSION,
+        };
+        let display = PreviewDisplay {
+            rendered: rendered.to_string(),
+        };
+        (record, display)
+    }
+
+    fn write_bundle_json(
+        dir: &std::path::Path,
+        record: &PreviewRecord,
+        display: &PreviewDisplay,
+        baseline_unchanged: bool,
+    ) -> PathBuf {
+        let bundle = serde_json::json!({
+            "schema_version": PREVIEW_BUNDLE_SCHEMA_V1,
+            "preview_record": record,
+            "preview_display": display,
+            "checkpoint_baseline_unchanged": baseline_unchanged,
+        });
+        let path = dir.join("bundle.json");
+        fs::write(
+            &path,
+            serde_json::to_vec(&bundle).expect("serialize bundle"),
+        )
+        .expect("write bundle");
+        path
+    }
+
+    fn parse_stdout_json(stdout: &[u8]) -> Value {
+        let text = std::str::from_utf8(stdout).expect("stdout utf8");
+        serde_json::from_str(text.trim_end()).expect("stdout is one JSON value")
+    }
+
+    // -- CLI parse tests -------------------------------------------------
+
+    fn args(tokens: &[&str]) -> Vec<String> {
+        tokens.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn plan_approve_subcommand_parses_with_bundle_path() {
+        let action = parse_plan_subcommand_args(&args(&["approve", "/tmp/x.json"])).unwrap();
+        match action {
+            CliAction::PlanApprove { bundle_path } => {
+                assert_eq!(bundle_path, PathBuf::from("/tmp/x.json"));
+            }
+            other => panic!("expected PlanApprove, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_approve_subcommand_rejects_missing_bundle_path() {
+        let err = parse_plan_subcommand_args(&args(&["approve"])).unwrap_err();
+        assert!(err.contains("missing preview bundle"), "got: {err}");
+    }
+
+    #[test]
+    fn plan_approve_subcommand_rejects_extra_positional() {
+        let err = parse_plan_subcommand_args(&args(&["approve", "a.json", "b.json"])).unwrap_err();
+        assert!(err.contains("unexpected positional"), "got: {err}");
+    }
+
+    #[test]
+    fn plan_approve_subcommand_rejects_yes_flag() {
+        let err = parse_plan_subcommand_args(&args(&["approve", "--yes", "a.json"])).unwrap_err();
+        assert!(err.contains("unsupported flag"), "got: {err}");
+    }
+
+    #[test]
+    fn plan_approve_subcommand_rejects_auto_flag() {
+        let err = parse_plan_subcommand_args(&args(&["approve", "--auto", "a.json"])).unwrap_err();
+        assert!(err.contains("unsupported flag"), "got: {err}");
+    }
+
+    #[test]
+    fn plan_approve_subcommand_rejects_force_flag() {
+        let err = parse_plan_subcommand_args(&args(&["approve", "--force", "a.json"])).unwrap_err();
+        assert!(err.contains("unsupported flag"), "got: {err}");
+    }
+
+    // -- Bundle load tests -----------------------------------------------
+
+    #[test]
+    fn load_preview_bundle_round_trips_valid_bundle() {
+        let dir = unique_temp_dir();
+        let (rec, disp) = build_bound_pair();
+        let path = write_bundle_json(&dir, &rec, &disp, true);
+        let bundle = load_preview_bundle(&path).expect("valid bundle");
+        assert_eq!(bundle.schema_version, PREVIEW_BUNDLE_SCHEMA_V1);
+        assert_eq!(bundle.preview_record.preview_sha256, rec.preview_sha256);
+        assert!(bundle.checkpoint_baseline_unchanged);
+    }
+
+    #[test]
+    fn load_preview_bundle_rejects_missing_file() {
+        let dir = unique_temp_dir();
+        let missing = dir.join("does-not-exist.json");
+        match load_preview_bundle(&missing).unwrap_err() {
+            BundleLoadError::Io(_) => {}
+            other => panic!("expected Io, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_preview_bundle_rejects_invalid_json() {
+        let dir = unique_temp_dir();
+        let path = dir.join("broken.json");
+        fs::write(&path, "{not json").unwrap();
+        match load_preview_bundle(&path).unwrap_err() {
+            BundleLoadError::Json(_) => {}
+            other => panic!("expected Json, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_preview_bundle_rejects_wrong_schema_version() {
+        let dir = unique_temp_dir();
+        let (rec, disp) = build_bound_pair();
+        let bundle = serde_json::json!({
+            "schema_version": "a2-l2b-preview-bundle.v999",
+            "preview_record": rec,
+            "preview_display": disp,
+            "checkpoint_baseline_unchanged": true,
+        });
+        let path = dir.join("bundle.json");
+        fs::write(&path, serde_json::to_vec(&bundle).unwrap()).unwrap();
+        match load_preview_bundle(&path).unwrap_err() {
+            BundleLoadError::SchemaVersionMismatch { actual } => {
+                assert_eq!(actual, "a2-l2b-preview-bundle.v999");
+            }
+            other => panic!("expected SchemaVersionMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_preview_bundle_rejects_unknown_fields() {
+        // `serde(deny_unknown_fields)` is load-bearing: an attacker MUST
+        // NOT be able to smuggle a trusted approval decision through.
+        let dir = unique_temp_dir();
+        let (rec, disp) = build_bound_pair();
+        let bundle = serde_json::json!({
+            "schema_version": PREVIEW_BUNDLE_SCHEMA_V1,
+            "preview_record": rec,
+            "preview_display": disp,
+            "checkpoint_baseline_unchanged": true,
+            "approval_decision": "approved",
+        });
+        let path = dir.join("bundle.json");
+        fs::write(&path, serde_json::to_vec(&bundle).unwrap()).unwrap();
+        match load_preview_bundle(&path).unwrap_err() {
+            BundleLoadError::Json(msg) => {
+                assert!(
+                    msg.contains("unknown field") || msg.contains("approval_decision"),
+                    "got: {msg}"
+                );
+            }
+            other => panic!("expected Json (deny_unknown_fields), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_preview_bundle_rejects_record_display_mismatch() {
+        let dir = unique_temp_dir();
+        let (rec, _disp) = build_bound_pair();
+        // Tamper with the display by changing rendered bytes — the
+        // re-derived hash no longer matches the record's preview_sha256.
+        let tampered = PreviewDisplay {
+            rendered: "completely different rendered bytes\n".to_string(),
+        };
+        let path = write_bundle_json(&dir, &rec, &tampered, true);
+        match load_preview_bundle(&path).unwrap_err() {
+            BundleLoadError::BindingMismatch => {}
+            other => panic!("expected BindingMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_record_display_binding_accepts_valid_pair() {
+        let (rec, disp) = build_bound_pair();
+        verify_record_display_binding(&rec, &disp).expect("valid binding");
+    }
+
+    #[test]
+    fn verify_record_display_binding_rejects_tampered_record() {
+        let (mut rec, disp) = build_bound_pair();
+        // Flip one hex digit in preview_sha256.
+        let mut hash: Vec<char> = rec.preview_sha256.chars().collect();
+        hash[0] = if hash[0] == 'a' { 'b' } else { 'a' };
+        rec.preview_sha256 = hash.into_iter().collect();
+        match verify_record_display_binding(&rec, &disp).unwrap_err() {
+            BundleLoadError::BindingMismatch => {}
+            other => panic!("expected BindingMismatch, got {other:?}"),
+        }
+    }
+
+    // -- run_plan_approve happy + refusal paths --------------------------
+
+    fn run_with(
+        bundle_path: &std::path::Path,
+        stdin_is_tty: bool,
+        input_bytes: &[u8],
+    ) -> (i32, Vec<u8>, Vec<u8>) {
+        let mut stdin = Cursor::new(input_bytes.to_vec());
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        let code = run_plan_approve(
+            bundle_path,
+            stdin_is_tty,
+            &mut stdin,
+            &mut stdout,
+            &mut stderr,
+        );
+        (code, stdout, stderr)
+    }
+
+    #[test]
+    fn run_plan_approve_happy_path_emits_approved_json_exit_zero() {
+        let dir = unique_temp_dir();
+        let (rec, disp) = build_bound_pair();
+        let path = write_bundle_json(&dir, &rec, &disp, true);
+        let approval = format!("apply {} {}\n", rec.step_id, rec.preview_sha256);
+        let (code, stdout, _stderr) = run_with(&path, true, approval.as_bytes());
+        assert_eq!(code, 0);
+        let json = parse_stdout_json(&stdout);
+        assert_eq!(json["schema_version"], APPROVAL_RESULT_SCHEMA_V1);
+        assert_eq!(json["decision"], "approved");
+        assert_eq!(json["preview_id"], rec.preview_id);
+        assert_eq!(json["step_id"], rec.step_id);
+        assert_eq!(json["preview_sha256"], rec.preview_sha256);
+        assert_eq!(json["checkpoint_baseline_unchanged"], true);
+        assert_eq!(json["exit_code_hint"], 0);
+        let markers = json["audit_markers"].as_array().unwrap();
+        assert!(markers.iter().any(|m| m == "a2-l2b-approved"));
+    }
+
+    #[test]
+    fn run_plan_approve_wrong_hash_emits_refused_exit_seven() {
+        let dir = unique_temp_dir();
+        let (rec, disp) = build_bound_pair();
+        let path = write_bundle_json(&dir, &rec, &disp, true);
+        let bad_hash = "f".repeat(64);
+        let approval = format!("apply {} {bad_hash}\n", rec.step_id);
+        let (code, stdout, _stderr) = run_with(&path, true, approval.as_bytes());
+        assert_eq!(code, EXIT_APPROVAL_DENIED);
+        let json = parse_stdout_json(&stdout);
+        assert_eq!(json["decision"], "refused");
+        assert_eq!(json["exit_code_hint"], EXIT_APPROVAL_DENIED);
+        assert_eq!(
+            json["reason"].as_str().unwrap(),
+            "approval-preview-hash-mismatch"
+        );
+    }
+
+    #[test]
+    fn run_plan_approve_eof_input_refuses_exit_seven() {
+        let dir = unique_temp_dir();
+        let (rec, disp) = build_bound_pair();
+        let path = write_bundle_json(&dir, &rec, &disp, true);
+        let (code, stdout, _stderr) = run_with(&path, true, b"");
+        assert_eq!(code, EXIT_APPROVAL_DENIED);
+        let json = parse_stdout_json(&stdout);
+        assert_eq!(json["decision"], "refused");
+        // Slice-3a routes EOF through ArgCount.
+        assert_eq!(
+            json["reason"].as_str().unwrap(),
+            "approval-arg-count-invalid"
+        );
+    }
+
+    #[test]
+    fn run_plan_approve_checkpoint_drift_refuses_exit_seven() {
+        let dir = unique_temp_dir();
+        let (rec, disp) = build_bound_pair();
+        let path = write_bundle_json(&dir, &rec, &disp, false);
+        let approval = format!("apply {} {}\n", rec.step_id, rec.preview_sha256);
+        let (code, stdout, _stderr) = run_with(&path, true, approval.as_bytes());
+        assert_eq!(code, EXIT_APPROVAL_DENIED);
+        let json = parse_stdout_json(&stdout);
+        assert_eq!(json["decision"], "refused");
+        assert_eq!(json["checkpoint_baseline_unchanged"], false);
+        assert_eq!(
+            json["reason"].as_str().unwrap(),
+            "checkpoint-baseline-changed"
+        );
+    }
+
+    /// Reader that panics on any read. Proves a non-approvable bundle
+    /// never touches `stdin` before refusing.
+    struct PanicOnReadReader;
+    impl std::io::Read for PanicOnReadReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            panic!("run_plan_approve must not read stdin for a non-approvable bundle");
+        }
+    }
+
+    fn run_with_panic_reader(bundle_path: &std::path::Path) -> (i32, Vec<u8>) {
+        let mut stdin = PanicOnReadReader;
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        let code = run_plan_approve(bundle_path, true, &mut stdin, &mut stdout, &mut stderr);
+        (code, stdout)
+    }
+
+    #[test]
+    fn run_plan_approve_binary_preview_refuses_without_reading_input() {
+        let dir = unique_temp_dir();
+        let (rec, disp) = build_pair(true, false, false, "binary preview placeholder\n");
+        let path = write_bundle_json(&dir, &rec, &disp, true);
+        let (code, stdout) = run_with_panic_reader(&path);
+        assert_eq!(code, EXIT_APPROVAL_DENIED);
+        let json = parse_stdout_json(&stdout);
+        assert_eq!(json["decision"], "refused");
+        assert_eq!(
+            json["reason"].as_str().unwrap(),
+            "preview-binary-non-approvable"
+        );
+    }
+
+    #[test]
+    fn run_plan_approve_redacted_preview_refuses_without_reading_input() {
+        let dir = unique_temp_dir();
+        let (rec, disp) = build_pair(false, true, false, "redacted preview placeholder\n");
+        let path = write_bundle_json(&dir, &rec, &disp, true);
+        let (code, stdout) = run_with_panic_reader(&path);
+        assert_eq!(code, EXIT_APPROVAL_DENIED);
+        let json = parse_stdout_json(&stdout);
+        assert_eq!(json["decision"], "refused");
+        assert_eq!(
+            json["reason"].as_str().unwrap(),
+            "preview-redacted-non-approvable"
+        );
+    }
+
+    #[test]
+    fn run_plan_approve_truncated_preview_refuses_without_reading_input() {
+        let dir = unique_temp_dir();
+        let (rec, disp) = build_pair(false, false, true, "truncated preview placeholder\n");
+        let path = write_bundle_json(&dir, &rec, &disp, true);
+        let (code, stdout) = run_with_panic_reader(&path);
+        assert_eq!(code, EXIT_APPROVAL_DENIED);
+        let json = parse_stdout_json(&stdout);
+        assert_eq!(json["decision"], "refused");
+        assert_eq!(
+            json["reason"].as_str().unwrap(),
+            "preview-truncated-non-approvable"
+        );
+    }
+
+    #[test]
+    fn run_plan_approve_invalid_bundle_json_exits_five() {
+        let dir = unique_temp_dir();
+        let path = dir.join("broken.json");
+        fs::write(&path, "{not json").unwrap();
+        let (code, stdout, _stderr) = run_with(&path, true, b"");
+        assert_eq!(code, EXIT_BUNDLE_PARSE_ERROR);
+        let json = parse_stdout_json(&stdout);
+        assert_eq!(json["decision"], "bundle_rejected");
+        assert_eq!(json["exit_code_hint"], EXIT_BUNDLE_PARSE_ERROR);
+        assert!(json["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("bundle-json-parse-error"));
+    }
+
+    #[test]
+    fn run_plan_approve_missing_bundle_file_exits_five() {
+        let dir = unique_temp_dir();
+        let missing = dir.join("nope.json");
+        let (code, stdout, _stderr) = run_with(&missing, true, b"");
+        assert_eq!(code, EXIT_BUNDLE_PARSE_ERROR);
+        let json = parse_stdout_json(&stdout);
+        assert_eq!(json["decision"], "bundle_rejected");
+        assert!(json["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("bundle-io-error"));
+    }
+
+    #[test]
+    fn run_plan_approve_wrong_schema_version_exits_five() {
+        let dir = unique_temp_dir();
+        let (rec, disp) = build_bound_pair();
+        let bundle = serde_json::json!({
+            "schema_version": "a2-l2b-preview-bundle.v999",
+            "preview_record": rec,
+            "preview_display": disp,
+            "checkpoint_baseline_unchanged": true,
+        });
+        let path = dir.join("bundle.json");
+        fs::write(&path, serde_json::to_vec(&bundle).unwrap()).unwrap();
+        let (code, stdout, _stderr) = run_with(&path, true, b"");
+        assert_eq!(code, EXIT_BUNDLE_PARSE_ERROR);
+        let json = parse_stdout_json(&stdout);
+        assert_eq!(json["decision"], "bundle_rejected");
+        assert!(json["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("bundle-schema-version-mismatch"));
+    }
+
+    #[test]
+    fn run_plan_approve_record_display_mismatch_exits_five() {
+        let dir = unique_temp_dir();
+        let (rec, _disp) = build_bound_pair();
+        let tampered = PreviewDisplay {
+            rendered: "different bytes that change the hash\n".to_string(),
+        };
+        let path = write_bundle_json(&dir, &rec, &tampered, true);
+        let (code, stdout, _stderr) = run_with(&path, true, b"");
+        assert_eq!(code, EXIT_BUNDLE_PARSE_ERROR);
+        let json = parse_stdout_json(&stdout);
+        assert_eq!(json["decision"], "bundle_rejected");
+        assert_eq!(
+            json["reason"].as_str().unwrap(),
+            "bundle-record-display-binding-mismatch"
+        );
+    }
+
+    #[test]
+    fn run_plan_approve_pasted_marker_text_refuses() {
+        let dir = unique_temp_dir();
+        let (rec, disp) = build_bound_pair();
+        let path = write_bundle_json(&dir, &rec, &disp, true);
+        // An operator pasting the audit marker token instead of the
+        // approval line — the Slice-3a parser must refuse. A single
+        // token (no space-separated tail) is refused by the parser's
+        // arg-count check, BEFORE the keyword check; either way the
+        // exit code is 7 and the decision is "refused".
+        let approval = b"a2-l2b-approved\n";
+        let (code, stdout, _stderr) = run_with(&path, true, approval);
+        assert_eq!(code, EXIT_APPROVAL_DENIED);
+        let json = parse_stdout_json(&stdout);
+        assert_eq!(json["decision"], "refused");
+        let reason = json["reason"].as_str().unwrap();
+        assert!(
+            reason == "approval-arg-count-invalid" || reason == "apply-keyword-invalid",
+            "expected pasted-marker text to be refused via arg-count or keyword check, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn run_plan_approve_pasted_three_token_marker_text_refuses_keyword() {
+        // Three-space-separated tokens whose first token is not
+        // `apply` exercise the keyword-check path explicitly.
+        let dir = unique_temp_dir();
+        let (rec, disp) = build_bound_pair();
+        let path = write_bundle_json(&dir, &rec, &disp, true);
+        let approval = format!("a2-l2b-approved {} {}\n", rec.step_id, rec.preview_sha256);
+        let (code, stdout, _stderr) = run_with(&path, true, approval.as_bytes());
+        assert_eq!(code, EXIT_APPROVAL_DENIED);
+        let json = parse_stdout_json(&stdout);
+        assert_eq!(json["decision"], "refused");
+        assert_eq!(json["reason"].as_str().unwrap(), "apply-keyword-invalid");
+    }
+
+    #[test]
+    fn run_plan_approve_non_tty_for_approvable_refuses_without_reading() {
+        let dir = unique_temp_dir();
+        let (rec, disp) = build_bound_pair();
+        let path = write_bundle_json(&dir, &rec, &disp, true);
+        let mut stdin = PanicOnReadReader;
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        // stdin_is_tty=false on an approvable bundle must short-circuit
+        // before any read.
+        let code = run_plan_approve(&path, false, &mut stdin, &mut stdout, &mut stderr);
+        assert_eq!(code, EXIT_APPROVAL_DENIED);
+        let json = parse_stdout_json(&stdout);
+        assert_eq!(json["decision"], "refused");
+        assert_eq!(json["reason"].as_str().unwrap(), "approval-stdin-not-tty");
+        let markers = json["audit_markers"].as_array().unwrap();
+        assert!(markers
+            .iter()
+            .any(|m| m.as_str() == Some(APPROVAL_RESULT_AUDIT_NON_TTY)));
+    }
+
+    #[test]
+    fn run_plan_approve_batch_syntax_refuses() {
+        let dir = unique_temp_dir();
+        let (rec, disp) = build_bound_pair();
+        let path = write_bundle_json(&dir, &rec, &disp, true);
+        let approval = format!(
+            "apply {} {} ; apply {} {}\n",
+            rec.step_id, rec.preview_sha256, rec.step_id, rec.preview_sha256
+        );
+        let (code, stdout, _stderr) = run_with(&path, true, approval.as_bytes());
+        assert_eq!(code, EXIT_APPROVAL_DENIED);
+        let json = parse_stdout_json(&stdout);
+        assert_eq!(json["decision"], "refused");
+        // Slice-3a refuses batch syntax via `BatchSyntax`.
+        assert_eq!(json["reason"].as_str().unwrap(), "batch-syntax-in-approval");
+    }
+
+    #[test]
+    fn run_plan_approve_preapproval_token_refuses() {
+        let dir = unique_temp_dir();
+        let (rec, disp) = build_bound_pair();
+        let path = write_bundle_json(&dir, &rec, &disp, true);
+        // Operator tries to slip in a preapproval token. The Slice-3a
+        // parser must refuse with `Preapproval`.
+        let approval = b"apply --yes --auto\n";
+        let (code, stdout, _stderr) = run_with(&path, true, approval);
+        assert_eq!(code, EXIT_APPROVAL_DENIED);
+        let json = parse_stdout_json(&stdout);
+        assert_eq!(json["decision"], "refused");
+        assert_eq!(json["reason"].as_str().unwrap(), "preapproval-refused");
+    }
+
+    #[test]
+    fn run_plan_approve_emits_exactly_one_json_line_on_stdout() {
+        let dir = unique_temp_dir();
+        let (rec, disp) = build_bound_pair();
+        let path = write_bundle_json(&dir, &rec, &disp, true);
+        let approval = format!("apply {} {}\n", rec.step_id, rec.preview_sha256);
+        let (_code, stdout, _stderr) = run_with(&path, true, approval.as_bytes());
+        let text = std::str::from_utf8(&stdout).unwrap();
+        // exactly one trailing newline ⇒ exactly one JSON object on stdout
+        let trimmed = text.trim_end_matches('\n');
+        assert!(
+            !trimmed.contains('\n'),
+            "stdout should contain a single JSON line, got: {text:?}"
+        );
+        let _: Value = serde_json::from_str(trimmed).expect("stdout single json value");
+    }
+
+    #[test]
+    fn run_plan_approve_writes_prompt_to_stderr_not_stdout() {
+        let dir = unique_temp_dir();
+        let (rec, disp) = build_bound_pair();
+        let path = write_bundle_json(&dir, &rec, &disp, true);
+        let approval = format!("apply {} {}\n", rec.step_id, rec.preview_sha256);
+        let (_code, stdout, stderr) = run_with(&path, true, approval.as_bytes());
+        let err = std::str::from_utf8(&stderr).unwrap();
+        let out = std::str::from_utf8(&stdout).unwrap();
+        // The Slice-3b operator prompt header lives on stderr.
+        assert!(
+            err.contains("A2-L2b approval required"),
+            "approval prompt must surface on stderr; stderr was {err:?}"
+        );
+        // Stdout carries only the structured JSON.
+        assert!(
+            !out.contains("A2-L2b approval required"),
+            "approval prompt must NOT bleed onto stdout; stdout was {out:?}"
+        );
+    }
+
+    // -- Source-grep tests: no auto-approve, no broker, no run_plan wiring
+
+    fn approve_section(src: &str) -> &str {
+        let start_marker = "// A2-L2b Slice 3d — `claw plan approve <preview-bundle.json>` command";
+        let end_marker = "// END A2-L2b Slice 3d — scope sentinel";
+        let start = src
+            .find(start_marker)
+            .expect("approve section start marker");
+        let end = src[start..]
+            .find(end_marker)
+            .expect("approve section end sentinel must follow start marker");
+        &src[start..start + end]
+    }
+
+    #[test]
+    fn no_yes_flag_in_approve_subcommand_parser() {
+        let src = include_str!("main.rs");
+        // The only references to "--yes" / "--auto" / "auto-apply" in
+        // the approve section must be REJECTIONS (the test fixtures
+        // above) or rejection error messages. There must be no parsing
+        // arm that ACCEPTS them.
+        let section = approve_section(src);
+        for forbidden in [
+            "\"--yes\" =>",
+            "\"--auto\" =>",
+            "\"--force\" =>",
+            "\"--allow-write\" =>",
+            "\"--apply\" =>",
+            "auto_approve",
+            "preapproved",
+            "PreApproved",
+        ] {
+            assert!(
+                !section.contains(forbidden),
+                "approve section must not contain accept-arm `{forbidden}`"
+            );
+        }
+    }
+
+    #[test]
+    fn approve_section_has_no_target_write_apis() {
+        let src = include_str!("main.rs");
+        let section = approve_section(src);
+        for forbidden in [
+            "File::create",
+            "OpenOptions",
+            "std::fs::write",
+            "fs::write(",
+            ".write_all(",
+            "fs::rename",
+            "remove_file",
+            "remove_dir",
+            "fs::create_dir",
+            "fs::create_dir_all",
+        ] {
+            assert!(
+                !section.contains(forbidden),
+                "approve section must not call `{forbidden}` (workspace-write executor is out of scope)"
+            );
+        }
+    }
+
+    #[test]
+    fn approve_section_has_no_broker_or_network_calls() {
+        let src = include_str!("main.rs");
+        let section = approve_section(src);
+        for forbidden in [
+            "reqwest",
+            "http://",
+            "https://",
+            "11434",
+            "11435",
+            "Command::new",
+            ".spawn(",
+            "Ollama",
+            "vram-broker",
+            "broker.py",
+            "OPENAI_BASE_URL",
+            "SideStackAI",
+            "sidestackai",
+        ] {
+            assert!(
+                !section.contains(forbidden),
+                "approve section must not reference `{forbidden}` (no broker / model / subprocess)"
+            );
+        }
+    }
+
+    #[test]
+    fn approve_section_does_not_wire_into_run_plan() {
+        let src = include_str!("main.rs");
+        let section = approve_section(src);
+        // The slice MUST NOT wire workspace-write into `run_plan` or
+        // any new write executor entry point. Surface symbols that
+        // would indicate such wiring.
+        for forbidden in [
+            "run_plan(",
+            "run_plan_subcommand(",
+            "WorkspaceWrite",
+            "write_runtime",
+            "CheckpointStore",
+            "execute_write",
+            "apply_diff(",
+        ] {
+            assert!(
+                !section.contains(forbidden),
+                "approve section must not wire into `{forbidden}`"
+            );
+        }
+    }
+
+    #[test]
+    fn approve_section_does_not_introduce_deep_path() {
+        let src = include_str!("main.rs");
+        let section = approve_section(src);
+        for forbidden in ["DEEP", "model_tier", "claude-opus", "claude-sonnet"] {
+            assert!(
+                !section.contains(forbidden),
+                "approve section must not reference `{forbidden}` (read-only / no model selection)"
+            );
+        }
+    }
+
+    // -- Misc emitter coverage -------------------------------------------
+
+    #[test]
+    fn emit_bundle_load_failure_envelope_shape() {
+        let mut out: Vec<u8> = Vec::new();
+        let code = emit_bundle_load_failure(&BundleLoadError::Io("nope".to_string()), &mut out);
+        assert_eq!(code, EXIT_BUNDLE_PARSE_ERROR);
+        let v: Value = serde_json::from_str(std::str::from_utf8(&out).unwrap().trim_end()).unwrap();
+        assert_eq!(v["schema_version"], APPROVAL_RESULT_SCHEMA_V1);
+        assert_eq!(v["decision"], "bundle_rejected");
+        assert_eq!(v["exit_code_hint"], EXIT_BUNDLE_PARSE_ERROR);
+        let markers = v["audit_markers"].as_array().unwrap();
+        assert!(markers
+            .iter()
+            .any(|m| m.as_str() == Some(APPROVAL_RESULT_AUDIT_BUNDLE_REJECTED)));
+    }
+
+    #[test]
+    fn emit_non_tty_refusal_envelope_shape() {
+        let (rec, _disp) = build_bound_pair();
+        let mut out: Vec<u8> = Vec::new();
+        let code = emit_non_tty_refusal(&rec, true, "approval-stdin-not-tty", &mut out);
+        assert_eq!(code, EXIT_APPROVAL_DENIED);
+        let v: Value = serde_json::from_str(std::str::from_utf8(&out).unwrap().trim_end()).unwrap();
+        assert_eq!(v["decision"], "refused");
+        assert_eq!(v["reason"], "approval-stdin-not-tty");
+        assert_eq!(v["preview_id"], rec.preview_id);
+        assert_eq!(v["exit_code_hint"], EXIT_APPROVAL_DENIED);
+    }
+
+    #[test]
+    fn emit_approval_result_approved_envelope() {
+        let (rec, disp) = build_bound_pair();
+        let mut stdin =
+            Cursor::new(format!("apply {} {}\n", rec.step_id, rec.preview_sha256).into_bytes());
+        let mut stderr_buf: Vec<u8> = Vec::new();
+        let interaction = run_approval_interaction(&rec, &disp, true, &mut stdin, &mut stderr_buf)
+            .expect("interaction ok");
+        let mut out: Vec<u8> = Vec::new();
+        let code = emit_approval_result(&rec, &interaction, true, &mut out);
+        assert_eq!(code, 0);
+        let v: Value = serde_json::from_str(std::str::from_utf8(&out).unwrap().trim_end()).unwrap();
+        assert_eq!(v["decision"], "approved");
+        assert!(
+            v.get("reason").is_none(),
+            "approved envelopes have no reason field"
+        );
+    }
+
+    #[test]
+    fn cli_apply_keyword_in_approve_section_is_only_string_literal() {
+        // The Slice-3a parser is the only authority over the `apply`
+        // keyword. The approve section MUST NOT introduce a second
+        // keyword-acceptance code path.
+        let src = include_str!("main.rs");
+        let section = approve_section(src);
+        // No additional "fn parse_apply" / "fn match_apply" helpers.
+        assert!(!section.contains("fn parse_apply"));
+        assert!(!section.contains("fn match_apply"));
+        assert!(!section.contains("fn accept_apply"));
     }
 }
