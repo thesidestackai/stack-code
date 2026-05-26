@@ -52,6 +52,12 @@
 //!   [`approval::evaluate_approval`]. Never writes the target, never
 //!   wires into [`runner::run_plan`], never reads stdin or writes
 //!   stdout).
+//! - [`write_payload`] — A2-L2b workspace-write byte-authority object
+//!   (slice 4a; binds exact after-bytes to an approved
+//!   [`diff_preview::PreviewRecord`] via SHA-256. Carries the only
+//!   in-memory raw-bytes channel between preview producer and the
+//!   future Slice-4 executor. Never serialized, never written to
+//!   disk, never wired into [`runner::run_plan`]).
 
 pub mod approval;
 pub mod approval_ux;
@@ -61,6 +67,7 @@ pub mod markers;
 pub mod preflight;
 pub mod report;
 pub mod runner;
+pub mod write_payload;
 pub mod write_runtime;
 
 // Re-exports for the CLI entry point. Kept narrow on purpose so the CLI
@@ -89,4 +96,7 @@ pub use runner::{
     parse_step_timeout_seconds, refused_precheck_report, run_plan, substrate_unavailable_report,
     PlanOutcome, PlanReport, StepFailure, StepReport, DEFAULT_STEP_TIMEOUT, MAX_STEP_TIMEOUT_SECS,
     MIN_STEP_TIMEOUT_SECS,
+};
+pub use write_payload::{
+    bind_after_bytes, ApprovedWritePayload, BindError, MAX_APPROVED_PAYLOAD_BYTES,
 };
