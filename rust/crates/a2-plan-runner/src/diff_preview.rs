@@ -175,7 +175,14 @@ impl PreviewRecord {
 /// Any change to `rendered` changes the hash; the inverse is **not**
 /// guaranteed (records with identical render but different metadata
 /// also produce different hashes).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serde derives are pinned to allow A2-L2b CLI consumers to round-trip
+/// a `PreviewDisplay` through a preview bundle without forking the
+/// in-memory shape. The non-authoritative contract is unchanged: the
+/// CLI re-derives `preview_sha256` from the record subset plus this
+/// `rendered` text and refuses any bundle whose hash does not match the
+/// embedded record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreviewDisplay {
     /// Sanitized text. Safe to print to a TTY. Always ends with a
     /// trailing `\n`. Never contains raw control bytes, raw ANSI
