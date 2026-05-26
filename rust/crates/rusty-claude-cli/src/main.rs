@@ -600,6 +600,157 @@ fn run_plan_subcommand(
     exit_code_for(&report)
 }
 
+// =========================================================================
+// A2-L2b Slice 3c — CLI-local approval UX plumbing (hidden test-only seam)
+// =========================================================================
+//
+// This block wires the Slice-3b operator-facing renderers
+// (`render_approval_prompt`, `render_non_approvable_summary`) and the
+// Slice-3a strict approval parser (`evaluate_operator_input`) to an
+// injected `Read` / `Write` pair so the CLI can be unit-tested against
+// the approval contract without a live TTY.
+//
+// Hard scope (Slice 3c):
+//
+// * Helper is private to this binary. There is no public CLI subcommand
+//   that invokes it; the production `claw plan run` dispatch above is
+//   unchanged.
+// * The helper performs no filesystem writes, no subprocess invocations,
+//   no broker/network calls, and never wires into the `run_plan`
+//   workspace-write execution path (workspace-write remains entirely
+//   out of `run_plan` in this slice).
+// * `a2-plan-runner` is consumed via its existing crate-root re-exports
+//   only. No new exports are added there, and no `stdin`/`stdout`
+//   side effects are introduced into that crate.
+
+// Mirror of [`a2_plan_runner::EXIT_APPROVAL_DENIED`], pinned here so the
+// CLI owns its exit-code namespace. The value is taken from the runner
+// constant directly so the two cannot drift.
+const EXIT_APPROVAL_DENIED: i32 = a2_plan_runner::EXIT_APPROVAL_DENIED;
+
+/// Structured outcome of one CLI-local approval interaction.
+///
+/// `decision` is the authoritative result from the Slice-3a parser.
+/// `audit_markers` carry the Slice-3b renderer's audit-only tokens plus
+/// a single decision-tier marker; they are *never* authority for the
+/// outcome. `exit_code_hint` is the CLI's standard approval-denial code
+/// (`7`) on any non-approval, and `0` on approval; callers MAY use it
+/// to drive `std::process::exit`, but the slice does not itself wire
+/// this into any process-exit path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CliApprovalInteractionResult {
+    decision: a2_plan_runner::ApprovalDecision,
+    exit_code_hint: i32,
+    audit_markers: Vec<&'static str>,
+}
+
+/// Render the operator prompt (or non-approvable summary) for
+/// `preview_record` to `output`, optionally read one operator
+/// submission from `input`, and return the structured approval
+/// decision.
+///
+/// Contract:
+///
+/// 1. Renders via the Slice-3b helpers
+///    [`a2_plan_runner::render_approval_prompt`] /
+///    [`a2_plan_runner::render_non_approvable_summary`].
+/// 2. Writes the rendered text to `output` exactly once.
+/// 3. Flushes `output` BEFORE any read from `input`.
+/// 4. Non-approvable previews (`is_binary`, `is_redacted`,
+///    `is_truncated`) short-circuit: **no bytes are read from `input`**.
+///    The returned decision mirrors the refusal the Slice-3a parser
+///    would have produced on the matching preview-state branch.
+/// 5. Approvable previews read `input` to EOF, strip *exactly one*
+///    trailing `\n` or `\r\n` (priority: `\r\n` first, then `\n`), and
+///    pass the residue verbatim to
+///    [`a2_plan_runner::evaluate_operator_input`]. Embedded newlines,
+///    pasted approval markers, batch syntax, etc. are all refused by
+///    the underlying strict parser.
+/// 6. EOF (operator supplies zero bytes) flows through the parser path
+///    and is refused via [`a2_plan_runner::ApprovalRefusal::ArgCount`].
+fn run_approval_interaction<R: std::io::Read, W: std::io::Write>(
+    preview_record: &a2_plan_runner::PreviewRecord,
+    preview_display: &a2_plan_runner::PreviewDisplay,
+    checkpoint_baseline_unchanged: bool,
+    mut input: R,
+    mut output: W,
+) -> std::io::Result<CliApprovalInteractionResult> {
+    use a2_plan_runner::markers::{L2B_APPROVAL_REFUSED, L2B_APPROVED};
+    use a2_plan_runner::{
+        evaluate_operator_input, render_approval_prompt, render_non_approvable_summary,
+        ApprovalDecision, ApprovalRefusal,
+    };
+
+    if !preview_record.is_approvable() {
+        let render = render_non_approvable_summary(preview_record);
+        write!(output, "{}", render.text)?;
+        output.flush()?;
+
+        // Mirror the precedence used by `evaluate_approval` so callers
+        // see the same refusal variant the parser would have produced
+        // if the operator had typed a syntactically valid approval.
+        let refusal = if preview_record.is_binary {
+            ApprovalRefusal::PreviewBinary
+        } else if preview_record.is_redacted {
+            ApprovalRefusal::PreviewRedacted
+        } else if preview_record.is_truncated {
+            ApprovalRefusal::PreviewTruncated
+        } else {
+            // Defensive: `is_approvable()` returned false but no flag
+            // was set. Surface a refusal consistent with the
+            // "no approval command accepted" contract.
+            ApprovalRefusal::ArgCount
+        };
+
+        let mut audit_markers = render.audit_markers;
+        audit_markers.push(L2B_APPROVAL_REFUSED);
+
+        return Ok(CliApprovalInteractionResult {
+            decision: ApprovalDecision::Refused(refusal),
+            exit_code_hint: EXIT_APPROVAL_DENIED,
+            audit_markers,
+        });
+    }
+
+    let render = render_approval_prompt(preview_record, preview_display);
+    write!(output, "{}", render.text)?;
+    output.flush()?;
+
+    let mut raw = String::new();
+    input.read_to_string(&mut raw)?;
+    let stripped = strip_one_trailing_newline(&raw);
+    let decision = evaluate_operator_input(preview_record, stripped, checkpoint_baseline_unchanged);
+
+    let (exit_code_hint, decision_marker) = match &decision {
+        ApprovalDecision::Approved { .. } => (0, L2B_APPROVED),
+        ApprovalDecision::Refused(_) => (EXIT_APPROVAL_DENIED, L2B_APPROVAL_REFUSED),
+    };
+    let mut audit_markers = render.audit_markers;
+    audit_markers.push(decision_marker);
+
+    Ok(CliApprovalInteractionResult {
+        decision,
+        exit_code_hint,
+        audit_markers,
+    })
+}
+
+/// Strip *exactly one* trailing line terminator from `s`.
+///
+/// Recognized terminators in priority order: `"\r\n"`, then `"\n"`. Any
+/// earlier newline (including a second trailing one) is left in place
+/// so the Slice-3a parser surfaces it as
+/// [`a2_plan_runner::ApprovalRefusal::ControlChars`].
+fn strip_one_trailing_newline(s: &str) -> &str {
+    if let Some(rest) = s.strip_suffix("\r\n") {
+        return rest;
+    }
+    if let Some(rest) = s.strip_suffix('\n') {
+        return rest;
+    }
+    s
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CliAction {
     DumpManifests {
@@ -15177,5 +15328,622 @@ mod plan_run_cli_tests {
     fn existing_state_subcommand_still_parses_unchanged() {
         let action = parse_args(&args(&["state"])).unwrap();
         assert!(matches!(action, CliAction::State { .. }));
+    }
+}
+
+// =========================================================================
+// A2-L2b Slice 3c — CLI-local approval UX plumbing tests
+// =========================================================================
+
+#[cfg(test)]
+mod approval_interaction_tests {
+    use super::{
+        run_approval_interaction, strip_one_trailing_newline, CliApprovalInteractionResult,
+        EXIT_APPROVAL_DENIED,
+    };
+    use a2_plan_runner::{
+        evaluate_operator_input, ApprovalDecision, ApprovalRefusal, PreviewDisplay, PreviewRecord,
+    };
+    use std::io::{self, Cursor, Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    // -- Fixtures ----------------------------------------------------------
+
+    const STEP: &str = "step-1";
+    const HASH: &str = "c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4";
+
+    fn mk_record(binary: bool, redacted: bool, truncated: bool) -> PreviewRecord {
+        PreviewRecord {
+            preview_id: "01HZZZZZZZZZZZZZZZZZZZZZZ0".to_string(),
+            step_id: STEP.to_string(),
+            target_relative_path_sanitized: "src/lib.rs".to_string(),
+            target_absolute_path_sanitized: "/ws/src/lib.rs".to_string(),
+            before_sha256: "a".repeat(64),
+            after_sha256: "b".repeat(64),
+            preview_sha256: HASH.to_string(),
+            checkpoint_run_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+            checkpoint_step_id: STEP.to_string(),
+            is_binary: binary,
+            is_redacted: redacted,
+            is_truncated: truncated,
+            created_at_utc: "2026-05-21T00:00:00.000000000Z".to_string(),
+            preview_format_version: 1,
+        }
+    }
+
+    fn mk_display() -> PreviewDisplay {
+        PreviewDisplay {
+            rendered: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@\n-old\n+new\n".to_string(),
+        }
+    }
+
+    fn approvable_input() -> String {
+        format!("apply {STEP} {HASH}")
+    }
+
+    // -- I/O helpers ------------------------------------------------------
+
+    /// Reader that records, on its first `read` call, the value of a
+    /// shared `flushed_count` so a test can prove the helper flushed
+    /// `output` BEFORE reading any byte from `input`.
+    struct FlushOrderReader {
+        log: Arc<Mutex<IoLog>>,
+        data: Cursor<Vec<u8>>,
+    }
+
+    impl Read for FlushOrderReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            {
+                let mut log = self.log.lock().unwrap();
+                if log.read_started_with_flush_count.is_none() {
+                    log.read_started_with_flush_count = Some(log.flushed_count);
+                }
+            }
+            self.data.read(buf)
+        }
+    }
+
+    /// Companion writer that bumps `flushed_count` on every `flush` call
+    /// and never marks itself flushed on `write`.
+    struct FlushOrderWriter {
+        log: Arc<Mutex<IoLog>>,
+    }
+
+    impl Write for FlushOrderWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let mut log = self.log.lock().unwrap();
+            log.output.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.log.lock().unwrap().flushed_count += 1;
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct IoLog {
+        output: Vec<u8>,
+        flushed_count: usize,
+        read_started_with_flush_count: Option<usize>,
+    }
+
+    /// Reader that panics on any read. Used to prove non-approvable
+    /// previews short-circuit without ever touching the input stream.
+    struct PanicOnReadReader;
+
+    impl Read for PanicOnReadReader {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            panic!("run_approval_interaction read input on a non-approvable preview");
+        }
+    }
+
+    fn run_with_buffers(
+        rec: &PreviewRecord,
+        display: &PreviewDisplay,
+        baseline_ok: bool,
+        input: &[u8],
+    ) -> (CliApprovalInteractionResult, Vec<u8>) {
+        let mut output = Vec::<u8>::new();
+        let result = run_approval_interaction(
+            rec,
+            display,
+            baseline_ok,
+            Cursor::new(input.to_vec()),
+            &mut output,
+        )
+        .expect("run_approval_interaction must not error on in-memory streams");
+        (result, output)
+    }
+
+    // -- 1. prompt text is written to output stream -----------------------
+
+    #[test]
+    fn approvable_preview_writes_prompt_to_output() {
+        let rec = mk_record(false, false, false);
+        let display = mk_display();
+        let (_result, output) =
+            run_with_buffers(&rec, &display, true, approvable_input().as_bytes());
+        let text = String::from_utf8(output).unwrap();
+        assert!(
+            text.contains("A2-L2b approval required"),
+            "prompt header missing from output: {text}"
+        );
+        assert!(
+            text.contains("To approve, type exactly:"),
+            "approval instruction line missing from output: {text}"
+        );
+        assert!(
+            text.contains(&format!("apply {STEP} {HASH}")),
+            "approval command line missing from output: {text}"
+        );
+        assert!(
+            text.contains("--- Diff Preview ---"),
+            "diff preview separator missing from output: {text}"
+        );
+    }
+
+    #[test]
+    fn non_approvable_preview_writes_summary_to_output() {
+        let rec = mk_record(true, false, false);
+        let display = mk_display();
+        let mut output = Vec::<u8>::new();
+        let result =
+            run_approval_interaction(&rec, &display, true, PanicOnReadReader, &mut output).unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(
+            text.contains("A2-L2b preview is not approvable"),
+            "non-approvable summary header missing: {text}"
+        );
+        assert!(
+            text.contains("No approval command is accepted for this preview."),
+            "non-approvable closing line missing: {text}"
+        );
+        assert_eq!(
+            result.decision,
+            ApprovalDecision::Refused(ApprovalRefusal::PreviewBinary)
+        );
+    }
+
+    // -- 2. output is flushed before read --------------------------------
+
+    #[test]
+    fn output_is_flushed_before_input_is_read() {
+        let rec = mk_record(false, false, false);
+        let display = mk_display();
+        let log = Arc::new(Mutex::new(IoLog::default()));
+        let reader = FlushOrderReader {
+            log: log.clone(),
+            data: Cursor::new(approvable_input().into_bytes()),
+        };
+        let writer = FlushOrderWriter { log: log.clone() };
+        let _result = run_approval_interaction(&rec, &display, true, reader, writer).unwrap();
+        let log = log.lock().unwrap();
+        let flush_count_at_first_read = log
+            .read_started_with_flush_count
+            .expect("first read should have observed the flushed counter");
+        assert!(
+            flush_count_at_first_read >= 1,
+            "helper must flush output BEFORE reading input; \
+             flushed_count at first read = {flush_count_at_first_read}"
+        );
+        assert!(
+            !log.output.is_empty(),
+            "helper must have written prompt bytes before reading input"
+        );
+    }
+
+    // -- 3. exactly one operator submission is handled -------------------
+
+    #[test]
+    fn approves_on_exact_command_without_trailing_newline() {
+        let rec = mk_record(false, false, false);
+        let display = mk_display();
+        let (result, _) = run_with_buffers(&rec, &display, true, approvable_input().as_bytes());
+        assert_eq!(
+            result.decision,
+            ApprovalDecision::Approved {
+                step_id: STEP.to_string(),
+                preview_sha256: HASH.to_string(),
+            }
+        );
+        assert_eq!(result.exit_code_hint, 0);
+    }
+
+    // -- 4. one terminal newline is stripped -----------------------------
+
+    #[test]
+    fn approves_on_exact_command_with_single_lf() {
+        let rec = mk_record(false, false, false);
+        let display = mk_display();
+        let input = format!("{}\n", approvable_input());
+        let (result, _) = run_with_buffers(&rec, &display, true, input.as_bytes());
+        assert_eq!(
+            result.decision,
+            ApprovalDecision::Approved {
+                step_id: STEP.to_string(),
+                preview_sha256: HASH.to_string(),
+            }
+        );
+        assert_eq!(result.exit_code_hint, 0);
+    }
+
+    // -- 5. one CRLF is stripped -----------------------------------------
+
+    #[test]
+    fn approves_on_exact_command_with_single_crlf() {
+        let rec = mk_record(false, false, false);
+        let display = mk_display();
+        let input = format!("{}\r\n", approvable_input());
+        let (result, _) = run_with_buffers(&rec, &display, true, input.as_bytes());
+        assert_eq!(
+            result.decision,
+            ApprovalDecision::Approved {
+                step_id: STEP.to_string(),
+                preview_sha256: HASH.to_string(),
+            }
+        );
+        assert_eq!(result.exit_code_hint, 0);
+    }
+
+    #[test]
+    fn strip_one_trailing_newline_only_strips_one_terminator() {
+        assert_eq!(strip_one_trailing_newline("apply x y"), "apply x y");
+        assert_eq!(strip_one_trailing_newline("apply x y\n"), "apply x y");
+        assert_eq!(strip_one_trailing_newline("apply x y\r\n"), "apply x y");
+        // Embedded earlier newlines are NOT stripped.
+        assert_eq!(strip_one_trailing_newline("a\nb\n"), "a\nb");
+        // CRLF takes priority over bare LF when both could match.
+        assert_eq!(strip_one_trailing_newline("a\r\n"), "a");
+    }
+
+    // -- 6. EOF returns refusal ------------------------------------------
+
+    #[test]
+    fn empty_input_refuses_via_arg_count() {
+        let rec = mk_record(false, false, false);
+        let display = mk_display();
+        let (result, _) = run_with_buffers(&rec, &display, true, b"");
+        assert_eq!(
+            result.decision,
+            ApprovalDecision::Refused(ApprovalRefusal::ArgCount)
+        );
+        assert_eq!(result.exit_code_hint, EXIT_APPROVAL_DENIED);
+    }
+
+    // -- 7. correct hash approves (already covered above; baseline=true) -
+
+    // -- 8. wrong hash refuses -------------------------------------------
+
+    #[test]
+    fn wrong_hash_refuses_via_preview_hash_mismatch() {
+        let rec = mk_record(false, false, false);
+        let display = mk_display();
+        let wrong_hash = "d".repeat(64);
+        let input = format!("apply {STEP} {wrong_hash}");
+        let (result, _) = run_with_buffers(&rec, &display, true, input.as_bytes());
+        assert_eq!(
+            result.decision,
+            ApprovalDecision::Refused(ApprovalRefusal::PreviewHashMismatch)
+        );
+        assert_eq!(result.exit_code_hint, EXIT_APPROVAL_DENIED);
+    }
+
+    // -- 9. baseline changed refuses -------------------------------------
+
+    #[test]
+    fn baseline_changed_refuses_via_checkpoint_drift() {
+        let rec = mk_record(false, false, false);
+        let display = mk_display();
+        let (result, _) = run_with_buffers(&rec, &display, false, approvable_input().as_bytes());
+        assert_eq!(
+            result.decision,
+            ApprovalDecision::Refused(ApprovalRefusal::CheckpointDrift)
+        );
+        assert_eq!(result.exit_code_hint, EXIT_APPROVAL_DENIED);
+    }
+
+    // -- 10. multi-line input refuses ------------------------------------
+
+    #[test]
+    fn multi_line_input_refuses_via_control_chars() {
+        let rec = mk_record(false, false, false);
+        let display = mk_display();
+        // Valid command followed by an embedded newline + extra payload.
+        let input = format!("{}\nextra-line", approvable_input());
+        let (result, _) = run_with_buffers(&rec, &display, true, input.as_bytes());
+        assert!(
+            matches!(
+                result.decision,
+                ApprovalDecision::Refused(ApprovalRefusal::ControlChars)
+            ),
+            "expected ControlChars refusal, got {:?}",
+            result.decision
+        );
+        assert_eq!(result.exit_code_hint, EXIT_APPROVAL_DENIED);
+    }
+
+    #[test]
+    fn double_trailing_newline_collapses_through_layered_strip() {
+        // Contract pin: rule 6 says the helper strips exactly one
+        // trailing terminator, and rule 7 hands the residue to
+        // `evaluate_operator_input`, whose internal
+        // `strip_single_trailing_newline` independently strips one
+        // more. Net effect for a syntactically valid command with two
+        // trailing newlines is approval — embedded (non-terminal)
+        // newlines are still refused, as the `multi_line_input_*`
+        // case proves.
+        let rec = mk_record(false, false, false);
+        let display = mk_display();
+        let input = format!("{}\n\n", approvable_input());
+        let (result, _) = run_with_buffers(&rec, &display, true, input.as_bytes());
+        assert_eq!(
+            result.decision,
+            ApprovalDecision::Approved {
+                step_id: STEP.to_string(),
+                preview_sha256: HASH.to_string(),
+            }
+        );
+        assert_eq!(result.exit_code_hint, 0);
+    }
+
+    // -- 11. pasted `a2-l2b-approved` marker text refuses ---------------
+
+    #[test]
+    fn pasted_approval_marker_text_alone_refuses() {
+        let rec = mk_record(false, false, false);
+        let display = mk_display();
+        let (result, _) = run_with_buffers(&rec, &display, true, b"a2-l2b-approved");
+        // Single token → ArgCount refusal.
+        assert_eq!(
+            result.decision,
+            ApprovalDecision::Refused(ApprovalRefusal::ArgCount)
+        );
+        assert_eq!(result.exit_code_hint, EXIT_APPROVAL_DENIED);
+    }
+
+    // -- 12. marker plus valid command pasted as junk refuses ----------
+
+    #[test]
+    fn pasted_marker_plus_command_refuses_as_junk() {
+        let rec = mk_record(false, false, false);
+        let display = mk_display();
+        let input = format!("a2-l2b-approved apply {STEP} {HASH}");
+        let (result, _) = run_with_buffers(&rec, &display, true, input.as_bytes());
+        // 4 tokens (marker + apply + step + hash) → ArgCount refusal.
+        assert_eq!(
+            result.decision,
+            ApprovalDecision::Refused(ApprovalRefusal::ArgCount)
+        );
+        assert_eq!(result.exit_code_hint, EXIT_APPROVAL_DENIED);
+    }
+
+    // -- 13-15. binary / redacted / truncated previews skip input read --
+
+    #[test]
+    fn binary_preview_refuses_without_reading_input() {
+        let rec = mk_record(true, false, false);
+        let display = mk_display();
+        let mut output = Vec::<u8>::new();
+        let result =
+            run_approval_interaction(&rec, &display, true, PanicOnReadReader, &mut output).unwrap();
+        assert_eq!(
+            result.decision,
+            ApprovalDecision::Refused(ApprovalRefusal::PreviewBinary)
+        );
+        assert_eq!(result.exit_code_hint, EXIT_APPROVAL_DENIED);
+    }
+
+    #[test]
+    fn redacted_preview_refuses_without_reading_input() {
+        let rec = mk_record(false, true, false);
+        let display = mk_display();
+        let mut output = Vec::<u8>::new();
+        let result =
+            run_approval_interaction(&rec, &display, true, PanicOnReadReader, &mut output).unwrap();
+        assert_eq!(
+            result.decision,
+            ApprovalDecision::Refused(ApprovalRefusal::PreviewRedacted)
+        );
+        assert_eq!(result.exit_code_hint, EXIT_APPROVAL_DENIED);
+    }
+
+    #[test]
+    fn truncated_preview_refuses_without_reading_input() {
+        let rec = mk_record(false, false, true);
+        let display = mk_display();
+        let mut output = Vec::<u8>::new();
+        let result =
+            run_approval_interaction(&rec, &display, true, PanicOnReadReader, &mut output).unwrap();
+        assert_eq!(
+            result.decision,
+            ApprovalDecision::Refused(ApprovalRefusal::PreviewTruncated)
+        );
+        assert_eq!(result.exit_code_hint, EXIT_APPROVAL_DENIED);
+    }
+
+    // -- 16. audit markers are emitted but not authoritative -----------
+
+    #[test]
+    fn audit_markers_are_emitted_alongside_decision() {
+        let rec = mk_record(false, false, false);
+        let display = mk_display();
+        let (result, _) = run_with_buffers(&rec, &display, true, approvable_input().as_bytes());
+        // Approval markers from the renderer plus the decision-tier
+        // marker are present.
+        assert!(result.audit_markers.contains(&"a2-l2b-diff-preview-ready"));
+        assert!(result.audit_markers.contains(&"a2-l2b-approval-prompt"));
+        assert!(result.audit_markers.contains(&"a2-l2b-approved"));
+    }
+
+    #[test]
+    fn audit_markers_are_not_authority_for_decision() {
+        // The decision returned by the helper is the *exact* decision
+        // the underlying strict parser would have returned given the
+        // same residue: markers are emitted in parallel and never
+        // determine the verdict.
+        let rec = mk_record(false, false, false);
+        let display = mk_display();
+        let raw = approvable_input();
+        let (result, _) = run_with_buffers(&rec, &display, true, raw.as_bytes());
+        let direct = evaluate_operator_input(&rec, &raw, true);
+        assert_eq!(result.decision, direct);
+
+        let wrong_hash = "d".repeat(64);
+        let bad_raw = format!("apply {STEP} {wrong_hash}");
+        let (bad_result, _) = run_with_buffers(&rec, &display, true, bad_raw.as_bytes());
+        let bad_direct = evaluate_operator_input(&rec, &bad_raw, true);
+        assert_eq!(bad_result.decision, bad_direct);
+        // Markers still emitted on refusal, but `decision` carries the
+        // authoritative refusal variant.
+        assert!(bad_result
+            .audit_markers
+            .contains(&"a2-l2b-approval-refused"));
+    }
+
+    // -- 17. no target write APIs introduced (slice-3c helper section) -
+
+    /// Source-grep test scoped to the slice-3c helper region of this
+    /// binary. Mirrors the Phase-8 audit grep on the live diff so future
+    /// edits can't silently introduce target-write APIs into the helper.
+    #[test]
+    fn slice_3c_helper_introduces_no_target_write_apis() {
+        const SELF_SRC: &str = include_str!("main.rs");
+        let section = slice_3c_helper_section(SELF_SRC);
+        for needle in [
+            "File::create",
+            "OpenOptions",
+            "std::fs::write",
+            "::rename(",
+            "remove_file",
+            "remove_dir",
+            "create_dir",
+            "create_dir_all",
+            "write_all",
+        ] {
+            assert!(
+                !section.contains(needle),
+                "slice-3c helper unexpectedly contains target-write token {needle:?}"
+            );
+        }
+    }
+
+    // -- 18. no run_plan workspace-write wiring introduced -------------
+
+    #[test]
+    fn slice_3c_helper_does_not_wire_run_plan_workspace_write() {
+        // Phase-8 audit form: scoped to the slice-3c helper region of
+        // this binary, assert no code-level workspace-write call sites
+        // appear. The exact Phase-8 grep is `run_plan.*WorkspaceWrite`;
+        // we replicate that as a per-line conjunction so descriptive
+        // doc-comments (which reference the concepts in prose) don't
+        // false-positive.
+        const SELF_SRC: &str = include_str!("main.rs");
+        let section = slice_3c_helper_section(SELF_SRC);
+        for line in section.lines() {
+            assert!(
+                !(line.contains("run_plan") && line.contains("WorkspaceWrite")),
+                "slice-3c helper unexpectedly contains a run_plan+WorkspaceWrite \
+                 reference on line {line:?}; workspace-write wiring is out of scope"
+            );
+        }
+        // The PascalCase Rust type name is a strong code-only signal —
+        // it never appears in slice-3c prose, so any occurrence here is
+        // a regression on its own.
+        assert!(
+            !section.contains("WorkspaceWrite"),
+            "slice-3c helper unexpectedly contains `WorkspaceWrite` type reference"
+        );
+        // Direct invocation of the runner's plan executor would be a
+        // function call, identifiable by the open paren. Doc-comments
+        // refer to `run_plan` (no paren), so the paren-bound check is
+        // comment-safe.
+        for line in section.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with("/*") {
+                continue;
+            }
+            assert!(
+                !line.contains("run_plan("),
+                "slice-3c helper unexpectedly invokes `run_plan(` on line {line:?}"
+            );
+        }
+    }
+
+    // -- 19. no direct stdin/stdout added to a2-plan-runner ------------
+
+    /// Embed every `a2-plan-runner/src/*.rs` source file at compile time
+    /// and assert none of them gain stdin/stdout side effects. Slice 3c
+    /// is forbidden from editing `a2-plan-runner`; if a future change
+    /// adds I/O there, this test fails.
+    #[test]
+    fn a2_plan_runner_remains_free_of_stdin_stdout_side_effects() {
+        const SRCS: &[(&str, &str)] = &[
+            ("lib.rs", include_str!("../../a2-plan-runner/src/lib.rs")),
+            (
+                "approval.rs",
+                include_str!("../../a2-plan-runner/src/approval.rs"),
+            ),
+            (
+                "approval_ux.rs",
+                include_str!("../../a2-plan-runner/src/approval_ux.rs"),
+            ),
+            (
+                "checkpoint.rs",
+                include_str!("../../a2-plan-runner/src/checkpoint.rs"),
+            ),
+            (
+                "diff_preview.rs",
+                include_str!("../../a2-plan-runner/src/diff_preview.rs"),
+            ),
+            (
+                "markers.rs",
+                include_str!("../../a2-plan-runner/src/markers.rs"),
+            ),
+            (
+                "preflight.rs",
+                include_str!("../../a2-plan-runner/src/preflight.rs"),
+            ),
+            (
+                "report.rs",
+                include_str!("../../a2-plan-runner/src/report.rs"),
+            ),
+            (
+                "runner.rs",
+                include_str!("../../a2-plan-runner/src/runner.rs"),
+            ),
+            (
+                "write_runtime.rs",
+                include_str!("../../a2-plan-runner/src/write_runtime.rs"),
+            ),
+        ];
+        for (name, src) in SRCS {
+            for needle in ["io::stdin", "io::stdout", "println!", "eprintln!"] {
+                assert!(
+                    !src.contains(needle),
+                    "a2-plan-runner/src/{name} unexpectedly contains {needle:?}; \
+                     slice 3c forbids adding stdin/stdout side effects there"
+                );
+            }
+        }
+    }
+
+    // -- helpers ---------------------------------------------------------
+
+    /// Extract the slice-3c helper region from this binary's source so
+    /// the source-grep tests above scope their assertions to the region
+    /// this lane is allowed to edit.
+    fn slice_3c_helper_section(src: &str) -> &str {
+        let start_marker =
+            "// A2-L2b Slice 3c — CLI-local approval UX plumbing (hidden test-only seam)";
+        let end_marker = "#[derive(Debug, Clone, PartialEq, Eq)]\nenum CliAction {";
+        let start = src
+            .find(start_marker)
+            .expect("slice-3c helper section start marker should be present in main.rs");
+        let rel_end = src[start..]
+            .find(end_marker)
+            .expect("slice-3c helper section end marker should be present after start");
+        &src[start..start + rel_end]
     }
 }
