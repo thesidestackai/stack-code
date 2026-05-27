@@ -512,6 +512,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
             std::process::exit(code);
         }
+        CliAction::PlanApply { bundle_path } => {
+            // A2-L2b Slice L2b-CLI-Apply: read apply bundle, validate
+            // authority chain, resolve target, invoke library executor,
+            // emit apply-result JSON on stdout. The command never reads
+            // stdin, never spawns subprocesses, never calls the broker.
+            // cf. `run_plan_apply`.
+            let stdout = std::io::stdout();
+            let mut stdout_lock = stdout.lock();
+            let code = run_plan_apply(&bundle_path, &mut stdout_lock);
+            std::process::exit(code);
+        }
     }
     Ok(())
 }
@@ -1078,6 +1089,583 @@ fn run_plan_approve<R: Read, W1: Write, W2: Write>(
 // the implementation region they scan for forbidden APIs. Do not move or
 // rename it without updating those tests.
 
+// =========================================================================
+// A2-L2b Slice L2b-CLI-Apply — `claw plan apply <apply-bundle.json>` command
+// =========================================================================
+//
+// Scope:
+//
+// * Reads ONE apply bundle JSON file from disk.
+// * Validates the bundle schema (`a2-l2b-apply-bundle.v1`, no extra fields
+//   anywhere via `serde(deny_unknown_fields)`).
+// * Loads the payload file bytes from disk and verifies size + sha256.
+// * Re-binds the payload bytes to the embedded `PreviewRecord` via
+//   [`a2_plan_runner::bind_after_bytes`].
+// * Re-validates the embedded approval result is `decision == "approved"`
+//   and that its `step_id` / `preview_sha256` bind to the embedded
+//   `PreviewRecord` — refusal otherwise (exit 7).
+// * Loads the checkpoint `Manifest` from disk and reconstructs a
+//   `CheckpointHandle` for it (manifest + optional `before.bin`).
+// * Canonicalizes the operator-supplied `workspace_root` and resolves the
+//   write target fresh through Slice-1 `resolve_write_target`.
+// * Builds a `WriteExecutionRequest` and invokes
+//   [`a2_plan_runner::execute_write`].
+// * Emits exactly one JSON envelope (`a2-l2b-apply-result.v1`) on stdout.
+// * Exit codes mirror the executor: 0 applied, 5 invalid bundle / authority
+//   mismatch, 7 approval refused / mismatched, 8 rollback failed, 9
+//   baseline drift, 10 atomic write IO failed, 11 validation failed +
+//   rolled back.
+//
+// Hard contract:
+//
+// * Never opens a write-capable handle to any path other than the executor's
+//   atomic temp + rename inside the resolved target's parent directory.
+// * Never spawns a subprocess.
+// * Never calls the broker, model, or any network.
+// * Never reads stdin.
+// * Never accepts pre-approval flags (`--yes`, `--auto`, `--force`,
+//   `--allow-write`, `--preapproved`, `--batch`).
+// * Never writes more than one target file per invocation.
+// * Never reads or executes payload bytes from stdin or base64.
+// * Never trusts markers in the bundle as authority.
+
+/// Pinned apply-bundle schema version. Bumped only on a wire-incompatible
+/// change to the on-disk layout.
+const APPLY_BUNDLE_SCHEMA_V1: &str = "a2-l2b-apply-bundle.v1";
+
+/// Pinned apply-result schema version emitted on stdout.
+const APPLY_RESULT_SCHEMA_V1: &str = "a2-l2b-apply-result.v1";
+
+/// Operator-facing audit marker emitted on the apply-result JSON when the
+/// command rejects a bundle before any executor invocation. Pinned at the
+/// CLI layer because the executor never sees these refusals.
+const APPLY_RESULT_AUDIT_BUNDLE_REJECTED: &str = "a2-l2b-apply-result-bundle-rejected";
+
+/// Operator-facing audit marker emitted when the command rejects the
+/// embedded approval result before any executor invocation (e.g.,
+/// `decision != "approved"`, `step_id` / `preview_sha256` mismatch).
+const APPLY_RESULT_AUDIT_APPROVAL_REFUSED: &str = "a2-l2b-apply-result-approval-refused";
+
+/// Embedded approval result inside an apply bundle. Mirrors the
+/// `a2-l2b-approval-result.v1` shape `claw plan approve` emits on stdout.
+/// `deny_unknown_fields` is load-bearing: it rejects any approval result
+/// that smuggles a marker field the command might mistake for authority.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApplyBundleApprovalResult {
+    schema_version: String,
+    decision: String,
+    preview_id: String,
+    step_id: String,
+    preview_sha256: String,
+    #[serde(default)]
+    checkpoint_baseline_unchanged: Option<bool>,
+    #[serde(default)]
+    exit_code_hint: Option<i32>,
+    #[serde(default)]
+    audit_markers: Option<Vec<String>>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// Embedded checkpoint reference. v1 carries only the manifest file path;
+/// the `before.bin` (when present) is reconstructed as
+/// `manifest_path.parent()/before.bin`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApplyBundleCheckpoint {
+    manifest_path: PathBuf,
+}
+
+/// Embedded payload reference. v1 only supports `kind == "file"` with a
+/// path on disk. No inline base64, no stdin.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApplyBundlePayload {
+    kind: String,
+    path: PathBuf,
+    after_sha256: String,
+    after_size_bytes: u64,
+}
+
+/// On-disk apply bundle. `deny_unknown_fields` everywhere prevents an
+/// operator from smuggling unrecognized authority data.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApplyBundleV1 {
+    schema_version: String,
+    workspace_root: PathBuf,
+    target_relative_path: String,
+    preview_record: a2_plan_runner::PreviewRecord,
+    approval_result: ApplyBundleApprovalResult,
+    checkpoint: ApplyBundleCheckpoint,
+    payload: ApplyBundlePayload,
+}
+
+/// Apply-bundle load / validation failure causes. Each variant carries a
+/// stable short string for the refusal JSON `reason` field; the operator
+/// never sees the internal enum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ApplyBundleLoadError {
+    /// `fs::read` on the bundle file failed.
+    BundleIo(String),
+    /// `serde_json::from_slice` on the bundle failed (including unknown
+    /// fields anywhere in the nested tree).
+    BundleJson(String),
+    /// `schema_version` did not match `APPLY_BUNDLE_SCHEMA_V1`.
+    SchemaVersionMismatch { actual: String },
+    /// `workspace_root` canonicalization failed (missing / not a dir / I/O
+    /// error). Catches operator-supplied root that doesn't exist before
+    /// the resolver is touched.
+    WorkspaceRootInvalid(String),
+    /// Operator-supplied `target_relative_path` ≠
+    /// `preview_record.target_relative_path_sanitized`.
+    TargetPathMismatch,
+    /// `payload.kind` is not the supported `"file"`.
+    UnsupportedPayloadKind { actual: String },
+    /// Payload file could not be read from `payload.path`.
+    PayloadIo(String),
+    /// Disk size of payload file ≠ declared `payload.after_size_bytes`.
+    PayloadSizeMismatch { declared: u64, actual: u64 },
+    /// `payload.after_sha256` ≠ `preview_record.after_sha256`. Catches
+    /// a tampered bundle declaration before any file read.
+    PayloadPreviewAfterShaMismatch,
+    /// Manifest file could not be read.
+    ManifestIo(String),
+    /// Manifest JSON parse failed.
+    ManifestJson(String),
+    /// Manifest claimed `pre_existed = true`, but the colocated
+    /// `before.bin` is missing on disk.
+    ManifestBeforeBinMissing,
+    /// `bind_after_bytes` refused. Each [`a2_plan_runner::BindError`]
+    /// variant maps to a distinct short token so operators can
+    /// distinguish hash mismatch (the most common error) from size cap,
+    /// non-approvable preview, or lexical target-path refusal.
+    PayloadBindRefused(a2_plan_runner::BindError),
+}
+
+impl ApplyBundleLoadError {
+    fn reason(&self) -> String {
+        match self {
+            Self::BundleIo(m) => format!("bundle-io-error: {m}"),
+            Self::BundleJson(m) => format!("bundle-json-parse-error: {m}"),
+            Self::SchemaVersionMismatch { actual } => {
+                format!("bundle-schema-version-mismatch: got {actual}")
+            }
+            Self::WorkspaceRootInvalid(m) => format!("bundle-workspace-root-invalid: {m}"),
+            Self::TargetPathMismatch => "bundle-target-path-mismatch".to_string(),
+            Self::UnsupportedPayloadKind { actual } => {
+                format!("bundle-unsupported-payload-kind: got {actual}")
+            }
+            Self::PayloadIo(m) => format!("payload-io-error: {m}"),
+            Self::PayloadSizeMismatch { declared, actual } => {
+                format!("payload-size-mismatch: declared={declared} actual={actual}")
+            }
+            Self::PayloadPreviewAfterShaMismatch => {
+                "payload-preview-after-sha-mismatch".to_string()
+            }
+            Self::ManifestIo(m) => format!("checkpoint-manifest-io-error: {m}"),
+            Self::ManifestJson(m) => format!("checkpoint-manifest-parse-error: {m}"),
+            Self::ManifestBeforeBinMissing => "checkpoint-before-bin-missing".to_string(),
+            Self::PayloadBindRefused(e) => format!("{}: {e}", bind_error_short(e)),
+        }
+    }
+
+    fn short(&self) -> &'static str {
+        match self {
+            Self::BundleIo(_) => "bundle-io-error",
+            Self::BundleJson(_) => "bundle-json-parse-error",
+            Self::SchemaVersionMismatch { .. } => "bundle-schema-version-mismatch",
+            Self::WorkspaceRootInvalid(_) => "bundle-workspace-root-invalid",
+            Self::TargetPathMismatch => "bundle-target-path-mismatch",
+            Self::UnsupportedPayloadKind { .. } => "bundle-unsupported-payload-kind",
+            Self::PayloadIo(_) => "payload-io-error",
+            Self::PayloadSizeMismatch { .. } => "payload-size-mismatch",
+            Self::PayloadPreviewAfterShaMismatch => "payload-preview-after-sha-mismatch",
+            Self::ManifestIo(_) => "checkpoint-manifest-io-error",
+            Self::ManifestJson(_) => "checkpoint-manifest-parse-error",
+            Self::ManifestBeforeBinMissing => "checkpoint-before-bin-missing",
+            Self::PayloadBindRefused(e) => bind_error_short(e),
+        }
+    }
+}
+
+/// Short stable token for each [`a2_plan_runner::BindError`] variant. The
+/// payload-hash-mismatch arm is the operator-facing common case; the
+/// others are defense-in-depth and surface only when the bundle is
+/// internally inconsistent.
+fn bind_error_short(e: &a2_plan_runner::BindError) -> &'static str {
+    match e {
+        a2_plan_runner::BindError::PayloadHashMismatch { .. } => "payload-hash-mismatch",
+        a2_plan_runner::BindError::PreviewNotApprovable => "preview-not-approvable",
+        a2_plan_runner::BindError::TargetPathMismatch => "payload-target-path-mismatch",
+        a2_plan_runner::BindError::InvalidTargetPath => "payload-invalid-target-path",
+        a2_plan_runner::BindError::PayloadTooLarge { .. } => "payload-too-large",
+    }
+}
+
+/// Why the command refused the embedded approval result before any
+/// executor invocation. Returns exit code 7 on every arm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ApplyApprovalRefusal {
+    /// `approval_result.decision` was not the literal string `"approved"`.
+    DecisionNotApproved { actual: String },
+    /// `approval_result.step_id` ≠ `preview_record.step_id`.
+    StepIdMismatch,
+    /// `approval_result.preview_sha256` ≠ `preview_record.preview_sha256`.
+    PreviewShaMismatch,
+}
+
+impl ApplyApprovalRefusal {
+    fn reason(&self) -> String {
+        match self {
+            Self::DecisionNotApproved { actual } => {
+                format!("approval-decision-not-approved: got {actual:?}")
+            }
+            Self::StepIdMismatch => "approval-step-id-mismatch".to_string(),
+            Self::PreviewShaMismatch => "approval-preview-sha-mismatch".to_string(),
+        }
+    }
+
+    fn short(&self) -> &'static str {
+        match self {
+            Self::DecisionNotApproved { .. } => "approval-decision-not-approved",
+            Self::StepIdMismatch => "approval-step-id-mismatch",
+            Self::PreviewShaMismatch => "approval-preview-sha-mismatch",
+        }
+    }
+}
+
+/// CLI exit code returned when the bundle cannot be loaded, parsed,
+/// schema-validated, or fails any pre-executor authority check that is
+/// NOT specifically an approval refusal. Mirrors
+/// `a2_plan_runner::EXIT_INVALID_REQUEST` to keep the operator-facing
+/// "5 = parse / invalid request" contract consistent across plan
+/// subcommands.
+const EXIT_APPLY_BUNDLE_REJECTED: i32 = 5;
+
+/// Resolved load + validated authority chain. Owned values only; the
+/// executor borrows from this at call time.
+struct LoadedApplyBundle {
+    bundle: ApplyBundleV1,
+    workspace_root: PathBuf,
+    handle: a2_plan_runner::CheckpointHandle,
+    payload: a2_plan_runner::ApprovedWritePayload,
+}
+
+/// Read and statically validate an apply bundle from disk.
+///
+/// On success the returned [`LoadedApplyBundle`] carries the parsed bundle
+/// plus a canonicalized `workspace_root`, a reconstructed
+/// [`a2_plan_runner::CheckpointHandle`], and an
+/// [`a2_plan_runner::ApprovedWritePayload`] minted by `bind_after_bytes`.
+/// Side effects: read-only filesystem syscalls on the bundle file,
+/// payload file, and manifest file; canonicalization of `workspace_root`
+/// and `manifest_path`. No writes.
+fn load_apply_bundle(bundle_path: &Path) -> Result<LoadedApplyBundle, ApplyBundleLoadError> {
+    // 1. Read the bundle JSON.
+    let bytes =
+        std::fs::read(bundle_path).map_err(|e| ApplyBundleLoadError::BundleIo(e.to_string()))?;
+    let bundle: ApplyBundleV1 = serde_json::from_slice(&bytes)
+        .map_err(|e| ApplyBundleLoadError::BundleJson(e.to_string()))?;
+
+    if bundle.schema_version != APPLY_BUNDLE_SCHEMA_V1 {
+        return Err(ApplyBundleLoadError::SchemaVersionMismatch {
+            actual: bundle.schema_version,
+        });
+    }
+
+    // 2. Workspace root must canonicalize to an existing directory.
+    let workspace_root = bundle
+        .workspace_root
+        .canonicalize()
+        .map_err(|e| ApplyBundleLoadError::WorkspaceRootInvalid(e.to_string()))?;
+    let ws_meta = std::fs::symlink_metadata(&workspace_root)
+        .map_err(|e| ApplyBundleLoadError::WorkspaceRootInvalid(e.to_string()))?;
+    if !ws_meta.is_dir() {
+        return Err(ApplyBundleLoadError::WorkspaceRootInvalid(
+            "workspace_root is not a directory".to_string(),
+        ));
+    }
+
+    // 3. Operator-supplied target path must match the preview's.
+    if bundle.target_relative_path != bundle.preview_record.target_relative_path_sanitized {
+        return Err(ApplyBundleLoadError::TargetPathMismatch);
+    }
+
+    // 4. Payload kind must be "file" in v1.
+    if bundle.payload.kind != "file" {
+        return Err(ApplyBundleLoadError::UnsupportedPayloadKind {
+            actual: bundle.payload.kind.clone(),
+        });
+    }
+
+    // 5. Payload-preview hash cross-check (catches a tampered bundle
+    //    declaration without touching the payload file).
+    if bundle.payload.after_sha256 != bundle.preview_record.after_sha256 {
+        return Err(ApplyBundleLoadError::PayloadPreviewAfterShaMismatch);
+    }
+
+    // 6. Payload file: read + size cross-check. `bind_after_bytes` does
+    //    the authoritative sha256 + size-cap + target-path checks below.
+    let payload_bytes = std::fs::read(&bundle.payload.path)
+        .map_err(|e| ApplyBundleLoadError::PayloadIo(e.to_string()))?;
+    let payload_bytes_len = payload_bytes.len() as u64;
+    if payload_bytes_len != bundle.payload.after_size_bytes {
+        return Err(ApplyBundleLoadError::PayloadSizeMismatch {
+            declared: bundle.payload.after_size_bytes,
+            actual: payload_bytes_len,
+        });
+    }
+
+    // 7. Manifest: read, parse, reconstruct CheckpointHandle.
+    let manifest_bytes = std::fs::read(&bundle.checkpoint.manifest_path)
+        .map_err(|e| ApplyBundleLoadError::ManifestIo(e.to_string()))?;
+    let manifest: a2_plan_runner::Manifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|e| ApplyBundleLoadError::ManifestJson(e.to_string()))?;
+
+    let manifest_path = bundle.checkpoint.manifest_path.clone();
+    let step_dir = manifest_path
+        .parent()
+        .ok_or_else(|| ApplyBundleLoadError::ManifestIo("manifest_path has no parent".to_string()))?
+        .to_path_buf();
+    let before_bin_path = if manifest.pre_existed {
+        let candidate = step_dir.join("before.bin");
+        if !candidate.is_file() {
+            return Err(ApplyBundleLoadError::ManifestBeforeBinMissing);
+        }
+        Some(candidate)
+    } else {
+        None
+    };
+
+    let handle = a2_plan_runner::CheckpointHandle {
+        step_dir,
+        manifest_path,
+        before_bin_path,
+        manifest,
+    };
+
+    // 8. Bind payload bytes to the preview record via Slice-4a. This is
+    //    the authoritative hash + size + target-path check.
+    let target_rel_path = PathBuf::from(&bundle.target_relative_path);
+    let payload =
+        a2_plan_runner::bind_after_bytes(&bundle.preview_record, target_rel_path, payload_bytes)
+            .map_err(ApplyBundleLoadError::PayloadBindRefused)?;
+
+    Ok(LoadedApplyBundle {
+        bundle,
+        workspace_root,
+        handle,
+        payload,
+    })
+}
+
+/// Validate the embedded approval result against the embedded preview
+/// record. Returns the structured `ApprovalDecision::Approved` on success.
+fn validate_apply_approval(
+    approval: &ApplyBundleApprovalResult,
+    preview: &a2_plan_runner::PreviewRecord,
+) -> Result<a2_plan_runner::ApprovalDecision, ApplyApprovalRefusal> {
+    if approval.decision != "approved" {
+        return Err(ApplyApprovalRefusal::DecisionNotApproved {
+            actual: approval.decision.clone(),
+        });
+    }
+    if approval.step_id != preview.step_id {
+        return Err(ApplyApprovalRefusal::StepIdMismatch);
+    }
+    if approval.preview_sha256 != preview.preview_sha256 {
+        return Err(ApplyApprovalRefusal::PreviewShaMismatch);
+    }
+    Ok(a2_plan_runner::ApprovalDecision::Approved {
+        step_id: approval.step_id.clone(),
+        preview_sha256: approval.preview_sha256.clone(),
+    })
+}
+
+/// Emit the bundle-load refusal JSON envelope to `stdout`. Exit code is
+/// [`EXIT_APPLY_BUNDLE_REJECTED`]; the JSON `exit_code` mirrors it.
+fn emit_apply_bundle_load_failure(err: &ApplyBundleLoadError, stdout: &mut dyn Write) -> i32 {
+    let payload = serde_json::json!({
+        "schema_version": APPLY_RESULT_SCHEMA_V1,
+        "outcome": "bundle_rejected",
+        "exit_code": EXIT_APPLY_BUNDLE_REJECTED,
+        "reason": err.reason(),
+        "markers": [APPLY_RESULT_AUDIT_BUNDLE_REJECTED, err.short()],
+    });
+    let _ = writeln!(stdout, "{payload}");
+    let _ = stdout.flush();
+    EXIT_APPLY_BUNDLE_REJECTED
+}
+
+/// Emit the embedded-approval refusal JSON envelope to `stdout`. Exit
+/// code is `EXIT_APPROVAL_DENIED` (`7`); the JSON `exit_code` mirrors it.
+fn emit_apply_approval_refusal(
+    refusal: &ApplyApprovalRefusal,
+    preview: &a2_plan_runner::PreviewRecord,
+    stdout: &mut dyn Write,
+) -> i32 {
+    let exit_code = a2_plan_runner::EXIT_APPROVAL_DENIED;
+    let payload = serde_json::json!({
+        "schema_version": APPLY_RESULT_SCHEMA_V1,
+        "outcome": "refused",
+        "exit_code": exit_code,
+        "reason": refusal.reason(),
+        "step_id": preview.step_id,
+        "preview_id": preview.preview_id,
+        "preview_sha256": preview.preview_sha256,
+        "target_relative_path": preview.target_relative_path_sanitized,
+        "markers": [APPLY_RESULT_AUDIT_APPROVAL_REFUSED, refusal.short()],
+    });
+    let _ = writeln!(stdout, "{payload}");
+    let _ = stdout.flush();
+    exit_code
+}
+
+/// Emit the path-resolution refusal JSON envelope to `stdout`. The
+/// resolver's exit code is `6` (write-path-refused); we keep that
+/// verbatim so the operator gets a distinct code from the executor's `9`
+/// (baseline drift).
+fn emit_apply_resolver_refusal(
+    refusal: &a2_plan_runner::write_runtime::WriteTargetRefusal,
+    preview: &a2_plan_runner::PreviewRecord,
+    stdout: &mut dyn Write,
+) -> i32 {
+    let exit_code = refusal.exit_code();
+    let payload = serde_json::json!({
+        "schema_version": APPLY_RESULT_SCHEMA_V1,
+        "outcome": "refused",
+        "exit_code": exit_code,
+        "reason": format!("resolver-refused: {:?}", refusal),
+        "step_id": preview.step_id,
+        "preview_id": preview.preview_id,
+        "preview_sha256": preview.preview_sha256,
+        "target_relative_path": preview.target_relative_path_sanitized,
+        "markers": [refusal.marker()],
+    });
+    let _ = writeln!(stdout, "{payload}");
+    let _ = stdout.flush();
+    exit_code
+}
+
+/// Emit the executor result JSON envelope to `stdout` and return its
+/// exit code. The `outcome` label is the only thing this function adds
+/// over the executor's [`a2_plan_runner::WriteExecutionResult`] — the
+/// markers + exit code come straight from the executor.
+fn emit_apply_executor_result(
+    result: &a2_plan_runner::WriteExecutionResult,
+    preview: &a2_plan_runner::PreviewRecord,
+    stdout: &mut dyn Write,
+) -> i32 {
+    let (label, reason) = match &result.outcome {
+        a2_plan_runner::WriteExecutionOutcome::Applied { .. } => ("applied", None),
+        a2_plan_runner::WriteExecutionOutcome::RefusedAuthorityMismatch { cause } => {
+            ("refused", Some(format!("authority-mismatch: {cause:?}")))
+        }
+        a2_plan_runner::WriteExecutionOutcome::RefusedApproval { cause } => {
+            ("refused", Some(format!("approval-refused: {cause:?}")))
+        }
+        a2_plan_runner::WriteExecutionOutcome::RefusedBaselineDrift { cause } => {
+            ("refused", Some(format!("baseline-drift: {cause:?}")))
+        }
+        a2_plan_runner::WriteExecutionOutcome::AtomicWriteIoFailed { stage, message } => (
+            "io_failed",
+            Some(format!("atomic-write-io: {stage:?}: {message}")),
+        ),
+        a2_plan_runner::WriteExecutionOutcome::ValidationFailedRolledBack { message } => (
+            "validation_failed_rolled_back",
+            Some(format!("post-write-validation-failed: {message}")),
+        ),
+        a2_plan_runner::WriteExecutionOutcome::RollbackFailed { cause } => (
+            "rollback_failed",
+            Some(format!("rollback-failed: {cause:?}")),
+        ),
+    };
+    let mut payload = serde_json::json!({
+        "schema_version": APPLY_RESULT_SCHEMA_V1,
+        "outcome": label,
+        "exit_code": result.exit_code,
+        "step_id": preview.step_id,
+        "preview_id": preview.preview_id,
+        "preview_sha256": preview.preview_sha256,
+        "target_relative_path": preview.target_relative_path_sanitized,
+        "markers": result.markers,
+    });
+    if let Some(r) = reason {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("reason".to_string(), serde_json::Value::String(r));
+        }
+    }
+    let _ = writeln!(stdout, "{payload}");
+    let _ = stdout.flush();
+    result.exit_code
+}
+
+/// Operator entry point for `claw plan apply <apply-bundle.json>`.
+///
+/// Single-file real-write command. Reads the bundle from disk, validates
+/// every authority object, resolves the target through Slice-1, and
+/// invokes the library-level [`a2_plan_runner::execute_write`]. Emits
+/// exactly one JSON line on stdout and returns the executor's exit code
+/// (or a pre-executor refusal code).
+fn run_plan_apply<W: Write>(bundle_path: &Path, stdout: &mut W) -> i32 {
+    let loaded = match load_apply_bundle(bundle_path) {
+        Ok(l) => l,
+        Err(e) => return emit_apply_bundle_load_failure(&e, stdout),
+    };
+
+    let approval = match validate_apply_approval(
+        &loaded.bundle.approval_result,
+        &loaded.bundle.preview_record,
+    ) {
+        Ok(a) => a,
+        Err(refusal) => {
+            return emit_apply_approval_refusal(&refusal, &loaded.bundle.preview_record, stdout);
+        }
+    };
+
+    // Resolve the target fresh through Slice-1. `WriteTarget` carries the
+    // operator-relative path; the resolver re-proves every lexical /
+    // symlink / parent invariant against the live filesystem.
+    let write_target = a2_plan_schema::WriteTarget {
+        path: loaded.bundle.target_relative_path.clone(),
+        // `create_if_absent` is advisory for the schema layer; the runtime
+        // resolver only inspects the path. Mirror the manifest's pre-write
+        // state so the bundle's intent is preserved in the resolver call.
+        create_if_absent: !loaded.handle.manifest.pre_existed,
+    };
+    let resolved = match a2_plan_runner::write_runtime::resolve_write_target(
+        &loaded.workspace_root,
+        &write_target,
+    ) {
+        Ok(r) => r,
+        Err(refusal) => {
+            return emit_apply_resolver_refusal(&refusal, &loaded.bundle.preview_record, stdout);
+        }
+    };
+
+    let request = a2_plan_runner::WriteExecutionRequest {
+        workspace_root: &loaded.workspace_root,
+        resolved: &resolved,
+        checkpoint: &loaded.handle,
+        preview: &loaded.bundle.preview_record,
+        approval: &approval,
+        payload: &loaded.payload,
+    };
+
+    let result = a2_plan_runner::execute_write(&request);
+    emit_apply_executor_result(&result, &loaded.bundle.preview_record, stdout)
+}
+
+// =========================================================================
+// END A2-L2b Slice L2b-CLI-Apply — scope sentinel
+// =========================================================================
+//
+// The source-grep tests in `plan_apply_tests` use this sentinel to bound
+// the implementation region they scan for forbidden APIs. Do not move or
+// rename it without updating those tests.
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CliAction {
     DumpManifests {
@@ -1202,6 +1790,17 @@ enum CliAction {
     // store, NEVER calls the broker, NEVER spawns subprocesses. It is
     // purely a renderer + input reader + Slice-3a evaluator wrapper.
     PlanApprove {
+        bundle_path: PathBuf,
+    },
+    // A2-L2b Slice L2b-CLI-Apply: operator-facing single-file write
+    // command. Reads ONE apply bundle file from disk, validates every
+    // authority object (preview / approval / checkpoint / payload),
+    // resolves the target fresh through Slice-1, and invokes the
+    // library-level write executor. Emits a structured apply-result JSON
+    // on stdout. NEVER reads stdin, NEVER spawns subprocesses, NEVER
+    // calls the broker, NEVER accepts pre-approval flags, NEVER touches
+    // more than the single resolved target file.
+    PlanApply {
         bundle_path: PathBuf,
     },
 }
@@ -1857,15 +2456,18 @@ fn parse_plan_subcommand_args(args: &[String]) -> Result<CliAction, String> {
     match args.first().map(String::as_str) {
         Some("run") => {}
         Some("approve") => return parse_plan_approve_subcommand_args(&args[1..]),
+        Some("apply") => return parse_plan_apply_subcommand_args(&args[1..]),
         Some(other) => {
             return Err(format!(
                 "unsupported `claw plan` subcommand: {other}. \
-                 Use `claw plan run <file>` or `claw plan approve <preview-bundle.json>`."
+                 Use `claw plan run <file>`, `claw plan approve <preview-bundle.json>`, \
+                 or `claw plan apply <apply-bundle.json>`."
             ));
         }
         None => {
             return Err("missing `claw plan` subcommand. \
-                 Use `claw plan run <file>` or `claw plan approve <preview-bundle.json>`."
+                 Use `claw plan run <file>`, `claw plan approve <preview-bundle.json>`, \
+                 or `claw plan apply <apply-bundle.json>`."
                 .to_string());
         }
     }
@@ -2016,6 +2618,35 @@ fn parse_plan_approve_subcommand_args(args: &[String]) -> Result<CliAction, Stri
         "missing preview bundle. Usage: `claw plan approve <preview-bundle.json>`.".to_string()
     })?;
     Ok(CliAction::PlanApprove { bundle_path })
+}
+
+/// A2-L2b Slice L2b-CLI-Apply: parse `claw plan apply <apply-bundle.json>`.
+///
+/// Exactly one positional argument, no flags. Every pre-approval flag
+/// (`--yes`, `--auto`, `--force`, `--allow-write`, `--preapproved`,
+/// `--batch`) is refused outright before any filesystem touch.
+fn parse_plan_apply_subcommand_args(args: &[String]) -> Result<CliAction, String> {
+    let mut bundle: Option<PathBuf> = None;
+    for arg in args {
+        let v = arg.as_str();
+        if v.starts_with("--") {
+            return Err(format!(
+                "unsupported flag for `claw plan apply`: {v}. \
+                 Usage: `claw plan apply <apply-bundle.json>`."
+            ));
+        }
+        if bundle.is_some() {
+            return Err(format!(
+                "unexpected positional argument after apply bundle: {v}. \
+                 Usage: `claw plan apply <apply-bundle.json>`."
+            ));
+        }
+        bundle = Some(PathBuf::from(v));
+    }
+    let bundle_path = bundle.ok_or_else(|| {
+        "missing apply bundle. Usage: `claw plan apply <apply-bundle.json>`.".to_string()
+    })?;
+    Ok(CliAction::PlanApply { bundle_path })
 }
 
 fn try_resolve_bare_skill_prompt(cwd: &Path, trimmed: &str) -> Option<String> {
