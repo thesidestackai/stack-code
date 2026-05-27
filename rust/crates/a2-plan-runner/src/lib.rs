@@ -57,7 +57,12 @@
 //!   [`diff_preview::PreviewRecord`] via SHA-256. Carries the only
 //!   in-memory raw-bytes channel between preview producer and the
 //!   future Slice-4 executor. Never serialized, never written to
-//!   disk, never wired into [`runner::run_plan`]).
+//!   disk, never wired into the L1b runner).
+//! - [`write_executor`] — A2-L2b single-file write executor (slice 4;
+//!   first mutation-capable A2 surface. Same-directory temp + atomic
+//!   rename + parent fsync + post-write hash validation + bounded
+//!   rollback. Library entry point only — no CLI wiring and no
+//!   integration with the L1b runner in this slice).
 
 pub mod approval;
 pub mod approval_ux;
@@ -67,6 +72,7 @@ pub mod markers;
 pub mod preflight;
 pub mod report;
 pub mod runner;
+pub mod write_executor;
 pub mod write_payload;
 pub mod write_runtime;
 
@@ -96,6 +102,13 @@ pub use runner::{
     parse_step_timeout_seconds, refused_precheck_report, run_plan, substrate_unavailable_report,
     PlanOutcome, PlanReport, StepFailure, StepReport, DEFAULT_STEP_TIMEOUT, MAX_STEP_TIMEOUT_SECS,
     MIN_STEP_TIMEOUT_SECS,
+};
+pub use write_executor::{
+    execute_write, ApprovalRefusalCause as WriteApprovalRefusalCause, AuthorityMismatch,
+    BaselineDrift, RollbackFailureCause, RollbackStage, WriteExecutionOutcome,
+    WriteExecutionRequest, WriteExecutionResult, WriteStage, EXIT_APPROVAL_REFUSED,
+    EXIT_BASELINE_MISMATCH, EXIT_INVALID_REQUEST, EXIT_VALIDATION_ROLLED_BACK, EXIT_WRITE_APPLIED,
+    EXIT_WRITE_IO_FAILED,
 };
 pub use write_payload::{
     bind_after_bytes, ApprovedWritePayload, BindError, MAX_APPROVED_PAYLOAD_BYTES,

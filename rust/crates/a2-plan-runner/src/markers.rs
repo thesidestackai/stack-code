@@ -172,6 +172,62 @@ pub const L2B_APPROVAL_REFUSED: &str = "a2-l2b-approval-refused";
 /// and emits this marker for audit.
 pub const L2B_PREAPPROVAL_REFUSED: &str = "a2-l2b-preapproval-refused";
 
+// --- A2-L2b slice-4 write-executor markers -------------------------------
+//
+// Audit-only operator tokens emitted by
+// [`crate::write_executor::execute_write`]. The structured
+// [`crate::write_executor::WriteExecutionResult`] is authoritative;
+// these markers exist for log scrapers and operator transcripts.
+
+/// The full authority chain matched and the live baseline matched the
+/// checkpoint manifest. The executor is about to attempt the atomic
+/// write. Audit-only.
+pub const L2B_WRITE_PREFLIGHT_OK: &str = "a2-l2b-write-preflight-ok";
+
+/// Write refused before any I/O on the target: approval failure,
+/// authority-chain mismatch, or baseline drift. Audit-only; the
+/// structured outcome carries the specific cause.
+pub const L2B_WRITE_REFUSED: &str = "a2-l2b-write-refused";
+
+/// Same-directory temp file was created and the payload bytes were
+/// written + fsynced. Emitted before the commit step. Audit-only.
+pub const L2B_WRITE_TEMP_CREATED: &str = "a2-l2b-write-temp-created";
+
+/// Commit rename (or no-clobber hard-link) succeeded and the parent
+/// directory has been fsynced. The target now holds the approved
+/// after-bytes. Audit-only.
+pub const L2B_WRITE_APPLIED: &str = "a2-l2b-write-applied";
+
+/// Post-commit hash re-read matched `payload.after_sha256`. The
+/// happy-path terminal marker for [`execute_write`]. Audit-only.
+pub const L2B_WRITE_VALIDATED: &str = "a2-l2b-write-validated";
+
+/// Post-commit hash re-read did NOT match `payload.after_sha256`. The
+/// executor proceeds to bounded rollback; the structured outcome
+/// carries the mismatch detail. Audit-only.
+pub const L2B_WRITE_VALIDATION_FAILED: &str = "a2-l2b-write-validation-failed";
+
+/// Rollback was initiated following a post-write validation failure.
+/// Audit-only.
+pub const L2B_ROLLBACK_STARTED: &str = "a2-l2b-rollback-started";
+
+/// Rollback completed: target now matches the pre-write baseline
+/// (overwrite branch) or is absent again (new-file branch).
+/// Audit-only.
+pub const L2B_ROLLBACK_SUCCEEDED: &str = "a2-l2b-rollback-succeeded";
+
+/// Rollback was refused because the on-disk file no longer matches
+/// what the executor just wrote (external mutation between commit
+/// and rollback), the target became non-regular, the parent
+/// disappeared, or the checkpoint baseline was missing.
+/// Audit-only; maps to exit code 8.
+pub const L2B_ROLLBACK_REFUSED: &str = "a2-l2b-rollback-refused";
+
+/// Rollback I/O failed mid-flight. The target may be in a partially-
+/// rolled-back state and operator attention is required.
+/// Audit-only; maps to exit code 8.
+pub const L2B_ROLLBACK_FAILED: &str = "a2-l2b-rollback-failed";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,6 +389,48 @@ mod tests {
             assert!(
                 m.starts_with("a2-l2b-"),
                 "L2b slice-3a marker {m:?} must use a2-l2b- prefix"
+            );
+        }
+    }
+
+    /// L2b slice-4 write-executor marker pinning. Every token is
+    /// audit-only; the structured `WriteExecutionResult` is
+    /// authoritative. Renaming any of these breaks scrapers and is a
+    /// breaking change.
+    #[test]
+    fn l2b_slice_4_marker_tokens_are_pinned() {
+        assert_eq!(L2B_WRITE_PREFLIGHT_OK, "a2-l2b-write-preflight-ok");
+        assert_eq!(L2B_WRITE_REFUSED, "a2-l2b-write-refused");
+        assert_eq!(L2B_WRITE_TEMP_CREATED, "a2-l2b-write-temp-created");
+        assert_eq!(L2B_WRITE_APPLIED, "a2-l2b-write-applied");
+        assert_eq!(L2B_WRITE_VALIDATED, "a2-l2b-write-validated");
+        assert_eq!(
+            L2B_WRITE_VALIDATION_FAILED,
+            "a2-l2b-write-validation-failed"
+        );
+        assert_eq!(L2B_ROLLBACK_STARTED, "a2-l2b-rollback-started");
+        assert_eq!(L2B_ROLLBACK_SUCCEEDED, "a2-l2b-rollback-succeeded");
+        assert_eq!(L2B_ROLLBACK_REFUSED, "a2-l2b-rollback-refused");
+        assert_eq!(L2B_ROLLBACK_FAILED, "a2-l2b-rollback-failed");
+    }
+
+    #[test]
+    fn all_l2b_slice_4_markers_use_a2_l2b_prefix() {
+        for m in [
+            L2B_WRITE_PREFLIGHT_OK,
+            L2B_WRITE_REFUSED,
+            L2B_WRITE_TEMP_CREATED,
+            L2B_WRITE_APPLIED,
+            L2B_WRITE_VALIDATED,
+            L2B_WRITE_VALIDATION_FAILED,
+            L2B_ROLLBACK_STARTED,
+            L2B_ROLLBACK_SUCCEEDED,
+            L2B_ROLLBACK_REFUSED,
+            L2B_ROLLBACK_FAILED,
+        ] {
+            assert!(
+                m.starts_with("a2-l2b-"),
+                "L2b slice-4 marker {m:?} must use a2-l2b- prefix"
             );
         }
     }
