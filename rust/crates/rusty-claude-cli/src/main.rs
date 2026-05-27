@@ -543,6 +543,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
             std::process::exit(code);
         }
+        CliAction::PlanApplyBundle {
+            preview_result_path,
+            approval_result_path,
+        } => {
+            // A2-L2b Slice L2b-CLI-Apply-Bundle-Generator: read the
+            // preview-generator result + the approval-result, validate
+            // the full authority chain, and write an apply-bundle.json
+            // artifact consumable by `claw plan apply`. NEVER executes
+            // apply. NEVER mutates the target file. NEVER calls
+            // `execute_write` or `bind_after_bytes`. cf.
+            // `run_plan_apply_bundle`.
+            let stdout = std::io::stdout();
+            let mut stdout_lock = stdout.lock();
+            let code = run_plan_apply_bundle(
+                &preview_result_path,
+                &approval_result_path,
+                &mut stdout_lock,
+            );
+            std::process::exit(code);
+        }
     }
     Ok(())
 }
@@ -2243,6 +2263,809 @@ fn write_target_refusal_kind(
 // to bound the implementation region they scan for forbidden APIs. Do not
 // move or rename it without updating those tests.
 
+// =========================================================================
+// A2-L2b Slice L2b-CLI-Apply-Bundle-Generator — `claw plan apply-bundle`
+// =========================================================================
+//
+// Scope:
+//
+// * Reads ONE preview-generator result JSON file from disk
+//   (`a2-l2b-preview-bundle-generator-result.v1`).
+// * Reads ONE approval-result JSON file from disk
+//   (`a2-l2b-approval-result.v1`).
+// * Loads the preview bundle JSON referenced by the preview-generator
+//   result.
+// * Loads + verifies the payload artifact + its sidecar against both the
+//   preview-generator result and the preview bundle's `PreviewRecord`.
+// * Loads + verifies the checkpoint manifest against the preview result
+//   and the preview record's `before_sha256`.
+// * Validates the full authority chain — schema versions, identity bindings
+//   (`step_id`, `preview_sha256`, `preview_id`, `target_relative_path`,
+//   `after_sha256`, sizes), and the approvability of the preview.
+// * Writes ONE `apply-bundle.json` artifact adjacent to the preview bundle
+//   (`<workspace-root>/.claw/l2b-preview-bundles/<run-id>/<step-id>/apply-bundle.json`).
+// * Emits exactly ONE JSON envelope on stdout
+//   (`a2-l2b-apply-bundle-generator-result.v1`).
+//
+// Hard contract:
+//
+// * NEVER executes `claw plan apply`.
+// * NEVER calls `a2_plan_runner::execute_write`.
+// * NEVER calls `a2_plan_runner::bind_after_bytes`.
+// * NEVER wires `a2_plan_runner::run_plan` workspace-write.
+// * NEVER mutates the target file.
+// * NEVER mutates any artifact under `.claw/l2b-payloads` or
+//   `.claw/l2b-checkpoints` — read-only by construction.
+// * NEVER calls the broker, model, or any network.
+// * NEVER spawns a subprocess.
+// * NEVER reads stdin.
+// * NEVER accepts pre-approval / batch flags (`--yes`, `--auto`,
+//   `--force`, `--allow-write`, `--preapproved`, `--batch`).
+// * NEVER prints raw payload bytes to stdout or stderr.
+// * NEVER writes outside the runner-owned preview-bundle leaf directory.
+
+/// Pinned generator-result schema version emitted on stdout.
+const APPLY_BUNDLE_GEN_RESULT_SCHEMA_V1: &str = "a2-l2b-apply-bundle-generator-result.v1";
+
+/// Audit markers emitted on the success envelope.
+const APPLY_BUNDLE_GEN_MARKER_APPROVAL_VALIDATED: &str = "a2-l2b-approval-result-validated";
+const APPLY_BUNDLE_GEN_MARKER_CREATED: &str = "a2-l2b-apply-bundle-created";
+
+/// Audit marker emitted on the refusal envelope.
+const APPLY_BUNDLE_GEN_MARKER_REFUSED: &str = "a2-l2b-apply-bundle-refused";
+
+/// CLI exit code for generator refusals.
+const EXIT_APPLY_BUNDLE_GEN_REFUSED: i32 = 5;
+
+/// Runner-owned checkpoint artifact root, joined with `run-id` /
+/// `step-id` / `manifest.json`. Mirrors the checkpoint store layout.
+const APPLY_BUNDLE_GEN_CHECKPOINT_ROOT_REL: &str = ".claw/l2b-checkpoints";
+
+/// On-disk shape of the preview-generator result. Mirrors
+/// [`PreviewBundleGeneratorResultV1`] (`Serialize`-only) so this
+/// generator round-trips the file `claw plan preview-bundle` emits
+/// without any schema widening.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)]
+struct PreviewGenResultRead {
+    schema_version: String,
+    ok: bool,
+    run_id: String,
+    step_id: String,
+    preview_id: String,
+    target_relative_path: String,
+    preview_bundle_path: PathBuf,
+    payload_path: PathBuf,
+    payload_sha256_path: PathBuf,
+    payload_sha256: String,
+    payload_size_bytes: u64,
+    checkpoint_manifest_path: PathBuf,
+    #[allow(dead_code)]
+    is_binary: bool,
+    #[allow(dead_code)]
+    is_redacted: bool,
+    #[allow(dead_code)]
+    is_truncated: bool,
+    #[allow(dead_code)]
+    audit_markers: Vec<String>,
+}
+
+/// On-disk shape of the approval result. Mirrors what `claw plan approve`
+/// emits on stdout (the `Approved` and `Refused` arms — `bundle_rejected`
+/// is rejected at the decision-check step). Re-serializing this exact
+/// struct into the apply bundle's `approval_result` field guarantees the
+/// downstream `claw plan apply` parser accepts it under its
+/// `deny_unknown_fields` constraint.
+#[derive(Debug, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ApprovalResultRead {
+    schema_version: String,
+    decision: String,
+    preview_id: String,
+    step_id: String,
+    preview_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkpoint_baseline_unchanged: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exit_code_hint: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    audit_markers: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+/// Output shape of the apply-bundle artifact. Field order + names mirror
+/// the `Deserialize`-only [`ApplyBundleV1`] consumed by `claw plan apply`
+/// so the artifact this generator writes round-trips into apply without
+/// any schema widening.
+#[derive(Debug, serde::Serialize)]
+struct ApplyBundleV1Output<'a> {
+    schema_version: &'static str,
+    workspace_root: &'a Path,
+    target_relative_path: &'a str,
+    preview_record: &'a a2_plan_runner::PreviewRecord,
+    approval_result: &'a ApprovalResultRead,
+    checkpoint: ApplyBundleCheckpointOut<'a>,
+    payload: ApplyBundlePayloadOut<'a>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ApplyBundleCheckpointOut<'a> {
+    manifest_path: &'a Path,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ApplyBundlePayloadOut<'a> {
+    kind: &'a str,
+    path: &'a Path,
+    after_sha256: &'a str,
+    after_size_bytes: u64,
+}
+
+/// Success envelope. Single JSON line on stdout.
+#[derive(Debug, serde::Serialize)]
+struct ApplyBundleGenResultV1 {
+    schema_version: &'static str,
+    ok: bool,
+    run_id: String,
+    step_id: String,
+    preview_id: String,
+    target_relative_path: String,
+    apply_bundle_path: PathBuf,
+    preview_bundle_path: PathBuf,
+    approval_result_path: PathBuf,
+    payload_path: PathBuf,
+    payload_sha256: String,
+    payload_size_bytes: u64,
+    checkpoint_manifest_path: PathBuf,
+    audit_markers: Vec<&'static str>,
+}
+
+/// Refusal envelope. Same `schema_version`, `ok = false`, structured
+/// reason fields, single audit marker.
+#[derive(Debug, serde::Serialize)]
+struct ApplyBundleGenRefusalV1<'a> {
+    schema_version: &'a str,
+    ok: bool,
+    refusal: &'a str,
+    reason: String,
+    audit_markers: Vec<&'static str>,
+}
+
+/// Generator refusal causes. Each variant maps to a stable short string
+/// in the result envelope.
+#[derive(Debug)]
+enum ApplyBundleGenRefusal {
+    PreviewResultIo(String),
+    PreviewResultJson(String),
+    PreviewResultSchemaMismatch { actual: String },
+    PreviewResultNotOk,
+    ApprovalResultIo(String),
+    ApprovalResultJson(String),
+    ApprovalResultSchemaMismatch { actual: String },
+    ApprovalDecisionNotApproved { actual: String },
+    ApprovalStepIdMismatch,
+    ApprovalPreviewIdMismatch,
+    PreviewBundleIo(String),
+    PreviewBundleJson(String),
+    PreviewBundleSchemaMismatch { actual: String },
+    PreviewBundlePathLayoutInvalid(String),
+    PreviewRecordPreviewIdMismatch,
+    PreviewRecordStepIdMismatch,
+    PreviewRecordTargetPathMismatch,
+    PreviewRecordAfterShaMismatch,
+    ApprovalPreviewShaMismatch,
+    PreviewNonApprovable { kind: &'static str },
+    PayloadPathLayoutInvalid(String),
+    PayloadSidecarPathLayoutInvalid(String),
+    CheckpointManifestPathLayoutInvalid(String),
+    PayloadIo(String),
+    PayloadSidecarIo(String),
+    PayloadSidecarFormatInvalid,
+    PayloadSidecarHashMismatch,
+    PayloadSizeMismatch { declared: u64, actual: u64 },
+    PayloadHashMismatchPreviewResult { expected: String, actual: String },
+    CheckpointManifestIo(String),
+    CheckpointManifestJson(String),
+    CheckpointManifestStepIdMismatch,
+    CheckpointManifestTargetPathMismatch,
+    CheckpointManifestPreShaMismatch,
+    ApplyBundleIo(String),
+    ApplyBundleExistsDivergent,
+}
+
+impl ApplyBundleGenRefusal {
+    fn short(&self) -> &'static str {
+        match self {
+            Self::PreviewResultIo(_) => "preview-result-io-error",
+            Self::PreviewResultJson(_) => "preview-result-json-parse-error",
+            Self::PreviewResultSchemaMismatch { .. } => "preview-result-schema-version-mismatch",
+            Self::PreviewResultNotOk => "preview-result-not-ok",
+            Self::ApprovalResultIo(_) => "approval-result-io-error",
+            Self::ApprovalResultJson(_) => "approval-result-json-parse-error",
+            Self::ApprovalResultSchemaMismatch { .. } => "approval-result-schema-version-mismatch",
+            Self::ApprovalDecisionNotApproved { .. } => "approval-decision-not-approved",
+            Self::ApprovalStepIdMismatch => "approval-step-id-mismatch",
+            Self::ApprovalPreviewIdMismatch => "approval-preview-id-mismatch",
+            Self::PreviewBundleIo(_) => "preview-bundle-io-error",
+            Self::PreviewBundleJson(_) => "preview-bundle-json-parse-error",
+            Self::PreviewBundleSchemaMismatch { .. } => "preview-bundle-schema-version-mismatch",
+            Self::PreviewBundlePathLayoutInvalid(_) => "preview-bundle-path-layout-invalid",
+            Self::PreviewRecordPreviewIdMismatch => "preview-record-preview-id-mismatch",
+            Self::PreviewRecordStepIdMismatch => "preview-record-step-id-mismatch",
+            Self::PreviewRecordTargetPathMismatch => "preview-record-target-path-mismatch",
+            Self::PreviewRecordAfterShaMismatch => "preview-record-after-sha-mismatch",
+            Self::ApprovalPreviewShaMismatch => "approval-preview-sha-mismatch",
+            Self::PreviewNonApprovable { kind } => kind,
+            Self::PayloadPathLayoutInvalid(_) => "payload-path-layout-invalid",
+            Self::PayloadSidecarPathLayoutInvalid(_) => "payload-sidecar-path-layout-invalid",
+            Self::CheckpointManifestPathLayoutInvalid(_) => {
+                "checkpoint-manifest-path-layout-invalid"
+            }
+            Self::PayloadIo(_) => "payload-io-error",
+            Self::PayloadSidecarIo(_) => "payload-sidecar-io-error",
+            Self::PayloadSidecarFormatInvalid => "payload-sidecar-format-invalid",
+            Self::PayloadSidecarHashMismatch => "payload-sidecar-hash-mismatch",
+            Self::PayloadSizeMismatch { .. } => "payload-size-mismatch",
+            Self::PayloadHashMismatchPreviewResult { .. } => "payload-hash-mismatch",
+            Self::CheckpointManifestIo(_) => "checkpoint-manifest-io-error",
+            Self::CheckpointManifestJson(_) => "checkpoint-manifest-parse-error",
+            Self::CheckpointManifestStepIdMismatch => "checkpoint-manifest-step-id-mismatch",
+            Self::CheckpointManifestTargetPathMismatch => {
+                "checkpoint-manifest-target-path-mismatch"
+            }
+            Self::CheckpointManifestPreShaMismatch => "checkpoint-manifest-pre-sha-mismatch",
+            Self::ApplyBundleIo(_) => "apply-bundle-io-error",
+            Self::ApplyBundleExistsDivergent => "apply-bundle-exists-divergent",
+        }
+    }
+
+    fn reason(&self) -> String {
+        match self {
+            Self::PreviewResultIo(m) => format!("preview-result-io-error: {m}"),
+            Self::PreviewResultJson(m) => format!("preview-result-json-parse-error: {m}"),
+            Self::PreviewResultSchemaMismatch { actual } => {
+                format!("preview-result-schema-version-mismatch: got {actual}")
+            }
+            Self::PreviewResultNotOk => "preview-result-not-ok: ok=false".to_string(),
+            Self::ApprovalResultIo(m) => format!("approval-result-io-error: {m}"),
+            Self::ApprovalResultJson(m) => format!("approval-result-json-parse-error: {m}"),
+            Self::ApprovalResultSchemaMismatch { actual } => {
+                format!("approval-result-schema-version-mismatch: got {actual}")
+            }
+            Self::ApprovalDecisionNotApproved { actual } => {
+                format!("approval-decision-not-approved: got {actual:?}")
+            }
+            Self::ApprovalStepIdMismatch => "approval-step-id-mismatch".to_string(),
+            Self::ApprovalPreviewIdMismatch => "approval-preview-id-mismatch".to_string(),
+            Self::PreviewBundleIo(m) => format!("preview-bundle-io-error: {m}"),
+            Self::PreviewBundleJson(m) => format!("preview-bundle-json-parse-error: {m}"),
+            Self::PreviewBundleSchemaMismatch { actual } => {
+                format!("preview-bundle-schema-version-mismatch: got {actual}")
+            }
+            Self::PreviewBundlePathLayoutInvalid(m) => {
+                format!("preview-bundle-path-layout-invalid: {m}")
+            }
+            Self::PreviewRecordPreviewIdMismatch => {
+                "preview-record-preview-id-mismatch".to_string()
+            }
+            Self::PreviewRecordStepIdMismatch => "preview-record-step-id-mismatch".to_string(),
+            Self::PreviewRecordTargetPathMismatch => {
+                "preview-record-target-path-mismatch".to_string()
+            }
+            Self::PreviewRecordAfterShaMismatch => "preview-record-after-sha-mismatch".to_string(),
+            Self::ApprovalPreviewShaMismatch => "approval-preview-sha-mismatch".to_string(),
+            Self::PreviewNonApprovable { kind } => format!("preview-non-approvable: {kind}"),
+            Self::PayloadPathLayoutInvalid(m) => format!("payload-path-layout-invalid: {m}"),
+            Self::PayloadSidecarPathLayoutInvalid(m) => {
+                format!("payload-sidecar-path-layout-invalid: {m}")
+            }
+            Self::CheckpointManifestPathLayoutInvalid(m) => {
+                format!("checkpoint-manifest-path-layout-invalid: {m}")
+            }
+            Self::PayloadIo(m) => format!("payload-io-error: {m}"),
+            Self::PayloadSidecarIo(m) => format!("payload-sidecar-io-error: {m}"),
+            Self::PayloadSidecarFormatInvalid => "payload-sidecar-format-invalid".to_string(),
+            Self::PayloadSidecarHashMismatch => "payload-sidecar-hash-mismatch".to_string(),
+            Self::PayloadSizeMismatch { declared, actual } => {
+                format!("payload-size-mismatch: declared={declared} actual={actual}")
+            }
+            Self::PayloadHashMismatchPreviewResult { expected, actual } => {
+                format!("payload-hash-mismatch: expected={expected} actual={actual}")
+            }
+            Self::CheckpointManifestIo(m) => format!("checkpoint-manifest-io-error: {m}"),
+            Self::CheckpointManifestJson(m) => format!("checkpoint-manifest-parse-error: {m}"),
+            Self::CheckpointManifestStepIdMismatch => {
+                "checkpoint-manifest-step-id-mismatch".to_string()
+            }
+            Self::CheckpointManifestTargetPathMismatch => {
+                "checkpoint-manifest-target-path-mismatch".to_string()
+            }
+            Self::CheckpointManifestPreShaMismatch => {
+                "checkpoint-manifest-pre-sha-mismatch".to_string()
+            }
+            Self::ApplyBundleIo(m) => format!("apply-bundle-io-error: {m}"),
+            Self::ApplyBundleExistsDivergent => {
+                "apply-bundle-exists-divergent: existing apply-bundle.json differs from \
+                 the canonical serialization for the same authority chain"
+                    .to_string()
+            }
+        }
+    }
+}
+
+/// Walk `path` upward, confirming each component matches `expected`
+/// from the leaf up. Returns the ancestor directory above the last
+/// matched component on success. Used to validate the four runner-owned
+/// artifact paths share the same workspace-root parent.
+fn strip_expected_suffix(path: &Path, expected: &[&str]) -> Result<PathBuf, String> {
+    let mut cur = path.to_path_buf();
+    for segment in expected {
+        let name = cur
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| format!("path has no file_name at {}", cur.display()))?
+            .to_string();
+        if name != *segment {
+            return Err(format!(
+                "expected segment {segment:?} at {}, got {name:?}",
+                cur.display()
+            ));
+        }
+        let parent = cur
+            .parent()
+            .ok_or_else(|| format!("path has no parent at {}", cur.display()))?
+            .to_path_buf();
+        cur = parent;
+    }
+    Ok(cur)
+}
+
+/// Read a JSON file from disk into the requested type, returning the
+/// raw read error mapped via `io_err` and parse error mapped via
+/// `json_err` so callers can surface a stable refusal token.
+fn read_json_file<T, IoErr, JsonErr>(
+    path: &Path,
+    io_err: IoErr,
+    json_err: JsonErr,
+) -> Result<T, ApplyBundleGenRefusal>
+where
+    T: for<'de> serde::Deserialize<'de>,
+    IoErr: FnOnce(String) -> ApplyBundleGenRefusal,
+    JsonErr: FnOnce(String) -> ApplyBundleGenRefusal,
+{
+    let bytes = std::fs::read(path).map_err(|e| io_err(format!("{}: {e}", path.display())))?;
+    serde_json::from_slice::<T>(&bytes).map_err(|e| json_err(format!("{}: {e}", path.display())))
+}
+
+/// Stream the file at `path` through SHA-256 and return the lowercase
+/// hex digest. Streaming avoids loading the full payload into memory
+/// just for the hash check.
+fn sha256_file_hex(path: &Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = std::io::Read::read(&mut file, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let out = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for byte in &out {
+        write!(hex, "{byte:02x}").expect("writing to String never fails");
+    }
+    Ok(hex)
+}
+
+/// Parse a `<hex>\n` (or `<hex>`) sidecar file, returning just the hex
+/// portion. Refuses anything else so an operator who tampered with the
+/// sidecar can't slip a different hash past the cross-check.
+fn parse_payload_sidecar(content: &str) -> Result<String, ApplyBundleGenRefusal> {
+    let mut lines = content.split('\n');
+    let first = lines
+        .next()
+        .ok_or(ApplyBundleGenRefusal::PayloadSidecarFormatInvalid)?;
+    let trailing = lines.next().unwrap_or("");
+    let rest: String = lines.collect();
+    if !trailing.is_empty() || !rest.is_empty() {
+        return Err(ApplyBundleGenRefusal::PayloadSidecarFormatInvalid);
+    }
+    if first.len() != 64 {
+        return Err(ApplyBundleGenRefusal::PayloadSidecarFormatInvalid);
+    }
+    if !first
+        .chars()
+        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    {
+        return Err(ApplyBundleGenRefusal::PayloadSidecarFormatInvalid);
+    }
+    Ok(first.to_string())
+}
+
+fn run_plan_apply_bundle(
+    preview_result_path: &Path,
+    approval_result_path: &Path,
+    stdout: &mut dyn Write,
+) -> i32 {
+    match try_run_plan_apply_bundle(preview_result_path, approval_result_path) {
+        Ok(envelope) => {
+            if let Err(e) = serde_json::to_writer(&mut *stdout, &envelope) {
+                eprintln!("claw plan apply-bundle: failed to write envelope: {e}");
+                return EXIT_APPLY_BUNDLE_GEN_REFUSED;
+            }
+            let _ = stdout.write_all(b"\n");
+            0
+        }
+        Err(refusal) => emit_apply_bundle_gen_refusal(&refusal, stdout),
+    }
+}
+
+fn emit_apply_bundle_gen_refusal(refusal: &ApplyBundleGenRefusal, stdout: &mut dyn Write) -> i32 {
+    let envelope = ApplyBundleGenRefusalV1 {
+        schema_version: APPLY_BUNDLE_GEN_RESULT_SCHEMA_V1,
+        ok: false,
+        refusal: refusal.short(),
+        reason: refusal.reason(),
+        audit_markers: vec![APPLY_BUNDLE_GEN_MARKER_REFUSED],
+    };
+    if let Err(e) = serde_json::to_writer(&mut *stdout, &envelope) {
+        eprintln!("claw plan apply-bundle: failed to write refusal envelope: {e}");
+    }
+    let _ = stdout.write_all(b"\n");
+    EXIT_APPLY_BUNDLE_GEN_REFUSED
+}
+
+#[allow(clippy::too_many_lines)]
+fn try_run_plan_apply_bundle(
+    preview_result_path: &Path,
+    approval_result_path: &Path,
+) -> Result<ApplyBundleGenResultV1, ApplyBundleGenRefusal> {
+    // 1. Read + validate the preview-generator result.
+    let preview_result: PreviewGenResultRead = read_json_file(
+        preview_result_path,
+        ApplyBundleGenRefusal::PreviewResultIo,
+        ApplyBundleGenRefusal::PreviewResultJson,
+    )?;
+    if preview_result.schema_version != PREVIEW_BUNDLE_GENERATOR_RESULT_SCHEMA_V1 {
+        return Err(ApplyBundleGenRefusal::PreviewResultSchemaMismatch {
+            actual: preview_result.schema_version,
+        });
+    }
+    if !preview_result.ok {
+        return Err(ApplyBundleGenRefusal::PreviewResultNotOk);
+    }
+
+    // 2. Read + validate the approval result.
+    let approval: ApprovalResultRead = read_json_file(
+        approval_result_path,
+        ApplyBundleGenRefusal::ApprovalResultIo,
+        ApplyBundleGenRefusal::ApprovalResultJson,
+    )?;
+    if approval.schema_version != APPROVAL_RESULT_SCHEMA_V1 {
+        return Err(ApplyBundleGenRefusal::ApprovalResultSchemaMismatch {
+            actual: approval.schema_version,
+        });
+    }
+    if approval.decision != "approved" {
+        return Err(ApplyBundleGenRefusal::ApprovalDecisionNotApproved {
+            actual: approval.decision,
+        });
+    }
+    if approval.step_id != preview_result.step_id {
+        return Err(ApplyBundleGenRefusal::ApprovalStepIdMismatch);
+    }
+    if approval.preview_id != preview_result.preview_id {
+        return Err(ApplyBundleGenRefusal::ApprovalPreviewIdMismatch);
+    }
+
+    // 3. Read + validate the preview bundle. Use the same `PreviewBundleV1`
+    //    parser `claw plan approve` uses, so any tampered binding fails
+    //    the same way it would there.
+    let preview_bundle: PreviewBundleV1 = read_json_file(
+        &preview_result.preview_bundle_path,
+        ApplyBundleGenRefusal::PreviewBundleIo,
+        ApplyBundleGenRefusal::PreviewBundleJson,
+    )?;
+    if preview_bundle.schema_version != PREVIEW_BUNDLE_SCHEMA_V1 {
+        return Err(ApplyBundleGenRefusal::PreviewBundleSchemaMismatch {
+            actual: preview_bundle.schema_version,
+        });
+    }
+
+    // 3a. PreviewRecord identity bindings against the preview-generator
+    //     result.
+    let record = &preview_bundle.preview_record;
+    if record.preview_id != preview_result.preview_id {
+        return Err(ApplyBundleGenRefusal::PreviewRecordPreviewIdMismatch);
+    }
+    if record.step_id != preview_result.step_id {
+        return Err(ApplyBundleGenRefusal::PreviewRecordStepIdMismatch);
+    }
+    if record.target_relative_path_sanitized != preview_result.target_relative_path {
+        return Err(ApplyBundleGenRefusal::PreviewRecordTargetPathMismatch);
+    }
+    if record.after_sha256 != preview_result.payload_sha256 {
+        return Err(ApplyBundleGenRefusal::PreviewRecordAfterShaMismatch);
+    }
+
+    // 3b. Approval ↔ record `preview_sha256` binding.
+    if approval.preview_sha256 != record.preview_sha256 {
+        return Err(ApplyBundleGenRefusal::ApprovalPreviewShaMismatch);
+    }
+
+    // 3c. Refuse non-approvable previews — apply must never be reachable
+    //     for binary / redacted / truncated payloads.
+    if record.is_binary {
+        return Err(ApplyBundleGenRefusal::PreviewNonApprovable {
+            kind: "preview-binary",
+        });
+    }
+    if record.is_redacted {
+        return Err(ApplyBundleGenRefusal::PreviewNonApprovable {
+            kind: "preview-redacted",
+        });
+    }
+    if record.is_truncated {
+        return Err(ApplyBundleGenRefusal::PreviewNonApprovable {
+            kind: "preview-truncated",
+        });
+    }
+
+    // 4. Derive the canonical workspace root from the preview bundle's
+    //    canonical path. The preview bundle path is the anchor because the
+    //    `claw plan preview-bundle` generator writes it under
+    //    `<workspace-root>/.claw/l2b-preview-bundles/<run-id>/<step-id>/preview-bundle.json`.
+    let preview_bundle_canonical =
+        preview_result
+            .preview_bundle_path
+            .canonicalize()
+            .map_err(|e| {
+                ApplyBundleGenRefusal::PreviewBundlePathLayoutInvalid(format!(
+                    "{}: {e}",
+                    preview_result.preview_bundle_path.display()
+                ))
+            })?;
+    let workspace_root_canonical = strip_expected_suffix(
+        &preview_bundle_canonical,
+        &[
+            "preview-bundle.json",
+            &preview_result.step_id,
+            &preview_result.run_id,
+            "l2b-preview-bundles",
+            ".claw",
+        ],
+    )
+    .map_err(ApplyBundleGenRefusal::PreviewBundlePathLayoutInvalid)?;
+
+    // 5. Validate each runner-owned artifact path canonicalizes to the
+    //    expected location under the derived workspace root. Any operator-
+    //    supplied path that escapes this layout is refused.
+    let expected_payload_path = workspace_root_canonical
+        .join(PREVIEW_BUNDLE_PAYLOAD_ROOT_REL)
+        .join(&preview_result.run_id)
+        .join(&preview_result.step_id)
+        .join("after.bin");
+    let actual_payload_canonical = preview_result.payload_path.canonicalize().map_err(|e| {
+        ApplyBundleGenRefusal::PayloadPathLayoutInvalid(format!(
+            "{}: canonicalize failed: {e}",
+            preview_result.payload_path.display()
+        ))
+    })?;
+    let expected_payload_canonical = expected_payload_path.canonicalize().map_err(|e| {
+        ApplyBundleGenRefusal::PayloadPathLayoutInvalid(format!(
+            "expected payload canonicalize failed: {}: {e}",
+            expected_payload_path.display()
+        ))
+    })?;
+    if actual_payload_canonical != expected_payload_canonical {
+        return Err(ApplyBundleGenRefusal::PayloadPathLayoutInvalid(format!(
+            "{} != {}",
+            actual_payload_canonical.display(),
+            expected_payload_canonical.display()
+        )));
+    }
+
+    let expected_sidecar_path = workspace_root_canonical
+        .join(PREVIEW_BUNDLE_PAYLOAD_ROOT_REL)
+        .join(&preview_result.run_id)
+        .join(&preview_result.step_id)
+        .join("after.sha256");
+    let actual_sidecar_canonical =
+        preview_result
+            .payload_sha256_path
+            .canonicalize()
+            .map_err(|e| {
+                ApplyBundleGenRefusal::PayloadSidecarPathLayoutInvalid(format!(
+                    "{}: canonicalize failed: {e}",
+                    preview_result.payload_sha256_path.display()
+                ))
+            })?;
+    let expected_sidecar_canonical = expected_sidecar_path.canonicalize().map_err(|e| {
+        ApplyBundleGenRefusal::PayloadSidecarPathLayoutInvalid(format!(
+            "expected sidecar canonicalize failed: {}: {e}",
+            expected_sidecar_path.display()
+        ))
+    })?;
+    if actual_sidecar_canonical != expected_sidecar_canonical {
+        return Err(ApplyBundleGenRefusal::PayloadSidecarPathLayoutInvalid(
+            format!(
+                "{} != {}",
+                actual_sidecar_canonical.display(),
+                expected_sidecar_canonical.display()
+            ),
+        ));
+    }
+
+    let expected_manifest_path = workspace_root_canonical
+        .join(APPLY_BUNDLE_GEN_CHECKPOINT_ROOT_REL)
+        .join(&preview_result.run_id)
+        .join(&preview_result.step_id)
+        .join("manifest.json");
+    let actual_manifest_canonical = preview_result
+        .checkpoint_manifest_path
+        .canonicalize()
+        .map_err(|e| {
+            ApplyBundleGenRefusal::CheckpointManifestPathLayoutInvalid(format!(
+                "{}: canonicalize failed: {e}",
+                preview_result.checkpoint_manifest_path.display()
+            ))
+        })?;
+    let expected_manifest_canonical = expected_manifest_path.canonicalize().map_err(|e| {
+        ApplyBundleGenRefusal::CheckpointManifestPathLayoutInvalid(format!(
+            "expected manifest canonicalize failed: {}: {e}",
+            expected_manifest_path.display()
+        ))
+    })?;
+    if actual_manifest_canonical != expected_manifest_canonical {
+        return Err(ApplyBundleGenRefusal::CheckpointManifestPathLayoutInvalid(
+            format!(
+                "{} != {}",
+                actual_manifest_canonical.display(),
+                expected_manifest_canonical.display()
+            ),
+        ));
+    }
+
+    // 6. Verify the payload file: size matches the declared size, then
+    //    streaming sha256 matches both the declared hash AND the embedded
+    //    PreviewRecord's `after_sha256` (already cross-checked at 3a).
+    let payload_meta = std::fs::symlink_metadata(&actual_payload_canonical).map_err(|e| {
+        ApplyBundleGenRefusal::PayloadIo(format!("{}: {e}", actual_payload_canonical.display()))
+    })?;
+    if !payload_meta.is_file() {
+        return Err(ApplyBundleGenRefusal::PayloadIo(format!(
+            "{}: not a regular file",
+            actual_payload_canonical.display()
+        )));
+    }
+    let actual_size = payload_meta.len();
+    if actual_size != preview_result.payload_size_bytes {
+        return Err(ApplyBundleGenRefusal::PayloadSizeMismatch {
+            declared: preview_result.payload_size_bytes,
+            actual: actual_size,
+        });
+    }
+    let payload_hex = sha256_file_hex(&actual_payload_canonical).map_err(|e| {
+        ApplyBundleGenRefusal::PayloadIo(format!("{}: {e}", actual_payload_canonical.display()))
+    })?;
+    if payload_hex != preview_result.payload_sha256 {
+        return Err(ApplyBundleGenRefusal::PayloadHashMismatchPreviewResult {
+            expected: preview_result.payload_sha256.clone(),
+            actual: payload_hex,
+        });
+    }
+
+    // 7. Verify the payload sidecar agrees with the disk hash.
+    let sidecar_text = std::fs::read_to_string(&actual_sidecar_canonical).map_err(|e| {
+        ApplyBundleGenRefusal::PayloadSidecarIo(format!(
+            "{}: {e}",
+            actual_sidecar_canonical.display()
+        ))
+    })?;
+    let sidecar_hex = parse_payload_sidecar(&sidecar_text)?;
+    if sidecar_hex != payload_hex {
+        return Err(ApplyBundleGenRefusal::PayloadSidecarHashMismatch);
+    }
+
+    // 8. Read + validate the checkpoint manifest against the preview
+    //    record's `before_sha256` plus the run-id / step-id bindings.
+    let manifest: a2_plan_runner::Manifest = read_json_file(
+        &actual_manifest_canonical,
+        ApplyBundleGenRefusal::CheckpointManifestIo,
+        ApplyBundleGenRefusal::CheckpointManifestJson,
+    )?;
+    if manifest.step_id != preview_result.step_id {
+        return Err(ApplyBundleGenRefusal::CheckpointManifestStepIdMismatch);
+    }
+    if manifest.target_relative_path != preview_result.target_relative_path {
+        return Err(ApplyBundleGenRefusal::CheckpointManifestTargetPathMismatch);
+    }
+    if manifest.pre_sha256 != record.before_sha256 {
+        return Err(ApplyBundleGenRefusal::CheckpointManifestPreShaMismatch);
+    }
+
+    // 9. Serialize the apply-bundle artifact under canonical form.
+    let apply_bundle_out = ApplyBundleV1Output {
+        schema_version: APPLY_BUNDLE_SCHEMA_V1,
+        workspace_root: &workspace_root_canonical,
+        target_relative_path: &preview_result.target_relative_path,
+        preview_record: record,
+        approval_result: &approval,
+        checkpoint: ApplyBundleCheckpointOut {
+            manifest_path: &actual_manifest_canonical,
+        },
+        payload: ApplyBundlePayloadOut {
+            kind: "file",
+            path: &actual_payload_canonical,
+            after_sha256: &record.after_sha256,
+            after_size_bytes: actual_size,
+        },
+    };
+    let apply_bundle_bytes = serde_json::to_vec_pretty(&apply_bundle_out)
+        .map_err(|e| ApplyBundleGenRefusal::ApplyBundleIo(format!("serde_json error: {e}")))?;
+
+    // 10. Write the apply-bundle.json adjacent to the preview bundle.
+    //     If a previous run already produced a byte-identical artifact,
+    //     accept it; otherwise refuse with `apply-bundle-exists-divergent`
+    //     so the operator regenerates from scratch instead of silently
+    //     overwriting an existing bundle.
+    let apply_bundle_dir = workspace_root_canonical
+        .join(PREVIEW_BUNDLE_BUNDLE_ROOT_REL)
+        .join(&preview_result.run_id)
+        .join(&preview_result.step_id);
+    let apply_bundle_path = apply_bundle_dir.join("apply-bundle.json");
+
+    if apply_bundle_path.exists() {
+        let existing = std::fs::read(&apply_bundle_path).map_err(|e| {
+            ApplyBundleGenRefusal::ApplyBundleIo(format!("{}: {e}", apply_bundle_path.display()))
+        })?;
+        if existing != apply_bundle_bytes {
+            return Err(ApplyBundleGenRefusal::ApplyBundleExistsDivergent);
+        }
+    } else {
+        create_dir_0700(&apply_bundle_dir).map_err(|e| {
+            ApplyBundleGenRefusal::ApplyBundleIo(format!("{}: {e}", apply_bundle_dir.display()))
+        })?;
+        write_file_0600_atomic(&apply_bundle_path, &apply_bundle_bytes).map_err(|e| {
+            ApplyBundleGenRefusal::ApplyBundleIo(format!("{}: {e}", apply_bundle_path.display()))
+        })?;
+    }
+
+    Ok(ApplyBundleGenResultV1 {
+        schema_version: APPLY_BUNDLE_GEN_RESULT_SCHEMA_V1,
+        ok: true,
+        run_id: preview_result.run_id.clone(),
+        step_id: preview_result.step_id.clone(),
+        preview_id: preview_result.preview_id.clone(),
+        target_relative_path: preview_result.target_relative_path.clone(),
+        apply_bundle_path,
+        preview_bundle_path: preview_bundle_canonical,
+        approval_result_path: approval_result_path.to_path_buf(),
+        payload_path: actual_payload_canonical,
+        payload_sha256: payload_hex,
+        payload_size_bytes: actual_size,
+        checkpoint_manifest_path: actual_manifest_canonical,
+        audit_markers: vec![
+            APPLY_BUNDLE_GEN_MARKER_APPROVAL_VALIDATED,
+            APPLY_BUNDLE_GEN_MARKER_CREATED,
+        ],
+    })
+}
+
+// =========================================================================
+// END A2-L2b Slice L2b-CLI-Apply-Bundle-Generator — scope sentinel
+// =========================================================================
+//
+// The source-grep tests in `plan_apply_bundle_tests` use this sentinel to
+// bound the implementation region they scan for forbidden APIs. Do not move
+// or rename it without updating those tests.
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CliAction {
     DumpManifests {
@@ -2391,6 +3214,17 @@ enum CliAction {
         workspace_root: PathBuf,
         target_relative_path: String,
         after_file: PathBuf,
+    },
+    // A2-L2b Slice L2b-CLI-Apply-Bundle-Generator: operator-facing
+    // apply-bundle artifact producer. Reads the result of `claw plan
+    // preview-bundle` and the result of `claw plan approve`, validates
+    // the full authority chain, and writes an `apply-bundle.json`
+    // consumable by `claw plan apply`. NEVER executes apply. NEVER
+    // mutates the target file. NEVER calls `execute_write` or
+    // `bind_after_bytes`. NEVER wires `run_plan` workspace-write.
+    PlanApplyBundle {
+        preview_result_path: PathBuf,
+        approval_result_path: PathBuf,
     },
 }
 
@@ -3049,20 +3883,25 @@ fn parse_plan_subcommand_args(args: &[String]) -> Result<CliAction, String> {
         Some("preview-bundle") => {
             return parse_plan_preview_bundle_subcommand_args(&args[1..]);
         }
+        Some("apply-bundle") => {
+            return parse_plan_apply_bundle_subcommand_args(&args[1..]);
+        }
         Some(other) => {
             return Err(format!(
                 "unsupported `claw plan` subcommand: {other}. \
                  Use `claw plan run <file>`, `claw plan approve <preview-bundle.json>`, \
-                 `claw plan apply <apply-bundle.json>`, or \
-                 `claw plan preview-bundle <workspace-root> <target-relative-path> <after-file>`."
+                 `claw plan apply <apply-bundle.json>`, \
+                 `claw plan preview-bundle <workspace-root> <target-relative-path> <after-file>`, \
+                 or `claw plan apply-bundle <preview-generator-result.json> <approval-result.json>`."
             ));
         }
         None => {
             return Err(
                 "missing `claw plan` subcommand. \
                  Use `claw plan run <file>`, `claw plan approve <preview-bundle.json>`, \
-                 `claw plan apply <apply-bundle.json>`, or \
-                 `claw plan preview-bundle <workspace-root> <target-relative-path> <after-file>`."
+                 `claw plan apply <apply-bundle.json>`, \
+                 `claw plan preview-bundle <workspace-root> <target-relative-path> <after-file>`, \
+                 or `claw plan apply-bundle <preview-generator-result.json> <approval-result.json>`."
                     .to_string(),
             );
         }
@@ -3285,6 +4124,46 @@ fn parse_plan_preview_bundle_subcommand_args(args: &[String]) -> Result<CliActio
         workspace_root,
         target_relative_path,
         after_file,
+    })
+}
+
+/// A2-L2b Slice L2b-CLI-Apply-Bundle-Generator: parse
+/// `claw plan apply-bundle <preview-generator-result.json> <approval-result.json>`.
+///
+/// Exactly two positional arguments, no flags. Every pre-approval / batch
+/// flag (`--yes`, `--auto`, `--force`, `--allow-write`, `--preapproved`,
+/// `--batch`) is refused outright before any filesystem touch. The
+/// generator never reads stdin and never accepts inline JSON; both inputs
+/// must be on-disk file paths.
+fn parse_plan_apply_bundle_subcommand_args(args: &[String]) -> Result<CliAction, String> {
+    let usage = "Usage: `claw plan apply-bundle <preview-generator-result.json> \
+                 <approval-result.json>`.";
+    let mut positionals: Vec<&str> = Vec::with_capacity(2);
+    for arg in args {
+        let v = arg.as_str();
+        if v.starts_with("--") {
+            return Err(format!(
+                "unsupported flag for `claw plan apply-bundle`: {v}. {usage}"
+            ));
+        }
+        if positionals.len() >= 2 {
+            return Err(format!(
+                "unexpected positional argument after approval-result: {v}. {usage}"
+            ));
+        }
+        positionals.push(v);
+    }
+    if positionals.len() != 2 {
+        return Err(format!(
+            "expected 2 positional arguments (got {}). {usage}",
+            positionals.len()
+        ));
+    }
+    let preview_result_path = PathBuf::from(positionals[0]);
+    let approval_result_path = PathBuf::from(positionals[1]);
+    Ok(CliAction::PlanApplyBundle {
+        preview_result_path,
+        approval_result_path,
     })
 }
 
