@@ -523,6 +523,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let code = run_plan_apply(&bundle_path, &mut stdout_lock);
             std::process::exit(code);
         }
+        CliAction::PlanPreviewBundle {
+            workspace_root,
+            target_relative_path,
+            after_file,
+        } => {
+            // A2-L2b Slice L2b-CLI-Preview-Bundle: resolve target via
+            // Slice-1, capture Slice-2 checkpoint, copy after-file bytes
+            // into runner-owned payload storage, build Slice-3a preview,
+            // write preview-bundle.json. NEVER mutates target. NEVER
+            // approves. NEVER applies. cf. `run_plan_preview_bundle`.
+            let stdout = std::io::stdout();
+            let mut stdout_lock = stdout.lock();
+            let code = run_plan_preview_bundle(
+                &workspace_root,
+                &target_relative_path,
+                &after_file,
+                &mut stdout_lock,
+            );
+            std::process::exit(code);
+        }
     }
     Ok(())
 }
@@ -1666,6 +1686,563 @@ fn run_plan_apply<W: Write>(bundle_path: &Path, stdout: &mut W) -> i32 {
 // the implementation region they scan for forbidden APIs. Do not move or
 // rename it without updating those tests.
 
+// =========================================================================
+// A2-L2b Slice L2b-CLI-Preview-Bundle — `claw plan preview-bundle` command
+// =========================================================================
+//
+// Scope:
+//
+// * Resolves an operator-supplied target through Slice-1
+//   [`a2_plan_runner::write_runtime::resolve_write_target`].
+// * Captures a Slice-2 pre-write checkpoint via
+//   [`a2_plan_runner::CheckpointStore::create_checkpoint`].
+// * Reads bytes from an operator-supplied after-file and copies them
+//   into runner-owned payload storage
+//   (`<workspace-root>/.claw/l2b-payloads/<run-id>/<step-id>/after.bin`).
+// * Builds a Slice-3a [`a2_plan_runner::PreviewRecord`] +
+//   [`a2_plan_runner::PreviewDisplay`] via
+//   [`a2_plan_runner::build_preview`].
+// * Writes a `preview-bundle.json` compatible with
+//   [`PreviewBundleV1`] / `claw plan approve` under
+//   `<workspace-root>/.claw/l2b-preview-bundles/<run-id>/<step-id>/`.
+// * Emits exactly one JSON envelope
+//   (`a2-l2b-preview-bundle-generator-result.v1`) on stdout.
+//
+// Hard contract:
+//
+// * NEVER mutates the operator-supplied target file.
+// * NEVER calls `claw plan approve` or `claw plan apply` programmatically.
+// * NEVER wires into [`a2_plan_runner::run_plan`] workspace-write.
+// * NEVER spawns a subprocess.
+// * NEVER reads stdin.
+// * NEVER calls the broker, model, or any network.
+// * NEVER accepts pre-approval flags (`--yes`, `--auto`, `--force`,
+//   `--allow-write`, `--preapproved`, `--batch`).
+// * NEVER prints raw payload bytes to stdout or stderr.
+// * NEVER accepts inline / base64 / stdin payloads — only an on-disk
+//   after-file path.
+// * NEVER follows a symlinked after-file.
+// * NEVER admits an after-file larger than
+//   [`a2_plan_runner::MAX_APPROVED_PAYLOAD_BYTES`].
+
+/// Pinned generator-result schema version emitted on stdout. Bumped
+/// only on a wire-incompatible change to the envelope's shape.
+const PREVIEW_BUNDLE_GENERATOR_RESULT_SCHEMA_V1: &str = "a2-l2b-preview-bundle-generator-result.v1";
+
+/// Pinned step-id used by the single per-invocation preview produced by
+/// this generator. The checkpoint store's `run_id` is generated fresh
+/// on every call, so colocating a fixed step-id underneath that ULID
+/// directory is safe: each invocation lives in its own run dir.
+const PREVIEW_BUNDLE_GENERATOR_STEP_ID: &str = "preview-bundle-step";
+
+/// Audit markers emitted on the generator-result JSON. These are
+/// **audit-only**; they MUST NOT be interpreted as authority by any
+/// downstream consumer. The cryptographic authority lives in
+/// `preview_record.preview_sha256` and the file artifacts the
+/// envelope points at.
+const PREVIEW_BUNDLE_MARKER_CREATED: &str = "a2-l2b-preview-bundle-created";
+const PREVIEW_BUNDLE_MARKER_PAYLOAD_CAPTURED: &str = "a2-l2b-payload-captured";
+const PREVIEW_BUNDLE_MARKER_CHECKPOINT_WRITTEN: &str = "a2-l2b-checkpoint-written";
+
+/// Runner-owned payload artifact root, joined with `run-id` /
+/// `step-id` / `after.bin` (and a sibling `after.sha256`).
+const PREVIEW_BUNDLE_PAYLOAD_ROOT_REL: &str = ".claw/l2b-payloads";
+
+/// Runner-owned preview-bundle artifact root, joined with `run-id` /
+/// `step-id` / `preview-bundle.json`.
+const PREVIEW_BUNDLE_BUNDLE_ROOT_REL: &str = ".claw/l2b-preview-bundles";
+
+/// CLI exit code for generator refusals. Mirrors the `EXIT_PARSE_ERROR`
+/// family used by `claw plan run`, `approve`, and `apply` so the
+/// operator-facing "5 = refusal" contract stays consistent across plan
+/// subcommands. Granularity is exposed via the `audit_markers` and
+/// `reason` fields of the result envelope, not via the exit code.
+const EXIT_PREVIEW_BUNDLE_REFUSED: i32 = 5;
+
+/// On-disk preview-bundle shape produced by the generator.
+///
+/// Field order + names mirror the existing [`PreviewBundleV1`]
+/// (`Deserialize`-only) so the bundle this generator writes round-trips
+/// into `claw plan approve` without any schema widening.
+#[derive(Debug, serde::Serialize)]
+struct PreviewBundleV1Output<'a> {
+    schema_version: &'a str,
+    preview_record: &'a a2_plan_runner::PreviewRecord,
+    preview_display: &'a a2_plan_runner::PreviewDisplay,
+    checkpoint_baseline_unchanged: bool,
+}
+
+/// Generator refusal causes. Each variant maps to a stable short string
+/// in the result envelope; the operator never sees the internal enum.
+#[derive(Debug)]
+enum PreviewBundleRefusal {
+    WorkspaceRootInvalid(String),
+    AfterFileMissing(String),
+    AfterFileNotRegular,
+    AfterFileSymlink,
+    AfterFileTooLarge {
+        actual: u64,
+        cap: u64,
+    },
+    AfterFileIo(String),
+    TargetResolveRefused {
+        marker: &'static str,
+        kind: &'static str,
+    },
+    BeforeReadIo(String),
+    CheckpointFailed(String),
+    PreviewBuildFailed(String),
+    PayloadIo(String),
+    PayloadVerifyMismatch {
+        expected: String,
+        actual: String,
+    },
+    PreviewBundleIo(String),
+}
+
+impl PreviewBundleRefusal {
+    fn short(&self) -> &'static str {
+        match self {
+            Self::WorkspaceRootInvalid(_) => "workspace-root-invalid",
+            Self::AfterFileMissing(_) => "after-file-missing",
+            Self::AfterFileNotRegular => "after-file-not-regular",
+            Self::AfterFileSymlink => "after-file-symlink",
+            Self::AfterFileTooLarge { .. } => "after-file-too-large",
+            Self::AfterFileIo(_) => "after-file-io-error",
+            Self::TargetResolveRefused { kind, .. } => kind,
+            Self::BeforeReadIo(_) => "before-read-io-error",
+            Self::CheckpointFailed(_) => "checkpoint-failed",
+            Self::PreviewBuildFailed(_) => "preview-build-failed",
+            Self::PayloadIo(_) => "payload-io-error",
+            Self::PayloadVerifyMismatch { .. } => "payload-verify-mismatch",
+            Self::PreviewBundleIo(_) => "preview-bundle-io-error",
+        }
+    }
+
+    fn reason(&self) -> String {
+        match self {
+            Self::WorkspaceRootInvalid(m) => format!("workspace-root-invalid: {m}"),
+            Self::AfterFileMissing(m) => format!("after-file-missing: {m}"),
+            Self::AfterFileNotRegular => "after-file-not-regular: not a regular file".to_string(),
+            Self::AfterFileSymlink => "after-file-symlink: refusing to follow symlink".to_string(),
+            Self::AfterFileTooLarge { actual, cap } => {
+                format!("after-file-too-large: {actual} bytes exceeds cap {cap}")
+            }
+            Self::AfterFileIo(m) => format!("after-file-io-error: {m}"),
+            Self::TargetResolveRefused { marker, kind } => {
+                format!("{kind}: resolver refused with marker {marker}")
+            }
+            Self::BeforeReadIo(m) => format!("before-read-io-error: {m}"),
+            Self::CheckpointFailed(m) => format!("checkpoint-failed: {m}"),
+            Self::PreviewBuildFailed(m) => format!("preview-build-failed: {m}"),
+            Self::PayloadIo(m) => format!("payload-io-error: {m}"),
+            Self::PayloadVerifyMismatch { expected, actual } => {
+                format!("payload-verify-mismatch: expected after_sha256={expected} actual={actual}")
+            }
+            Self::PreviewBundleIo(m) => format!("preview-bundle-io-error: {m}"),
+        }
+    }
+}
+
+/// Lowercase hex SHA-256 of `bytes`. Local to the CLI because the
+/// runner's `sha256_hex` is crate-private; this implementation MUST
+/// produce byte-identical output for every input so the verify
+/// round-trip below catches any drift between the operator-supplied
+/// after-bytes and the on-disk payload.
+fn cli_sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let out = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for byte in &out {
+        write!(hex, "{byte:02x}").expect("writing to String never fails");
+    }
+    hex
+}
+
+/// Format a UTC timestamp as `YYYY-MM-DDTHH:MM:SS.<nanos>Z` without
+/// pulling in chrono. Caller-owned format per
+/// [`a2_plan_runner::PreviewInputs::created_at_utc`] — the canonical
+/// preview hash treats this as an opaque string. Uses the existing
+/// `civil_from_days` Hinnant implementation already defined below to
+/// avoid a duplicate-symbol clash.
+fn now_utc_rfc3339_nanos() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+    let nanos = now.subsec_nanos();
+    let days_since_epoch = secs / 86_400;
+    let seconds_of_day = secs % 86_400;
+    let hours = seconds_of_day / 3_600;
+    let minutes = (seconds_of_day % 3_600) / 60;
+    let seconds = seconds_of_day % 60;
+    let (year, month, day) = civil_from_days(i64::try_from(days_since_epoch).unwrap_or(0));
+    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}.{nanos:09}Z")
+}
+
+/// Inspect the after-file path with `symlink_metadata` and refuse on
+/// any non-regular kind (directory, symlink, socket, FIFO, char/block
+/// device). Returns the byte length on success.
+fn inspect_after_file(path: &Path) -> Result<u64, PreviewBundleRefusal> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(PreviewBundleRefusal::AfterFileMissing(format!(
+                "{}: not found",
+                path.display()
+            )));
+        }
+        Err(e) => {
+            return Err(PreviewBundleRefusal::AfterFileIo(format!(
+                "{}: {e}",
+                path.display()
+            )));
+        }
+    };
+    let ft = meta.file_type();
+    if ft.is_symlink() {
+        return Err(PreviewBundleRefusal::AfterFileSymlink);
+    }
+    if !ft.is_file() {
+        return Err(PreviewBundleRefusal::AfterFileNotRegular);
+    }
+    Ok(meta.len())
+}
+
+/// Create a directory with best-effort 0700 permissions on Unix. The
+/// parent chain is created idempotently. Mirrors the runner's
+/// `create_dir_recursive_0700` semantics without re-exporting it.
+fn create_dir_0700(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o700);
+        // Best-effort; ignore "operation not permitted" so cross-FS
+        // tempdir tests on platforms that reject chmod still pass.
+        let _ = std::fs::set_permissions(path, perms);
+    }
+    Ok(())
+}
+
+/// Write `bytes` to `path` atomically (tmp + rename) with best-effort
+/// 0600 permissions on Unix.
+fn write_file_0600_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Operator entry point for `claw plan preview-bundle <workspace-root>
+/// <target-relative-path> <after-file>`.
+///
+/// Performs:
+///
+/// 1. Workspace-root canonicalization (must be a directory).
+/// 2. After-file inspection (regular, non-symlink, ≤ payload cap).
+/// 3. After-file read into memory.
+/// 4. Target resolution through Slice-1
+///    [`a2_plan_runner::write_runtime::resolve_write_target`].
+/// 5. Before-bytes read iff the resolved target already exists.
+/// 6. Checkpoint creation through Slice-2
+///    [`a2_plan_runner::CheckpointStore::create_checkpoint`] under a
+///    freshly generated run-id ULID.
+/// 7. Preview construction through Slice-3a
+///    [`a2_plan_runner::build_preview`].
+/// 8. Payload artifact write (atomic `after.bin` + sidecar
+///    `after.sha256`) under
+///    `<workspace-root>/.claw/l2b-payloads/<run-id>/<step-id>/`.
+/// 9. Payload verify (re-read `after.bin`, recompute sha256, compare
+///    against `preview_record.after_sha256`).
+/// 10. Preview-bundle write (atomic) under
+///     `<workspace-root>/.claw/l2b-preview-bundles/<run-id>/<step-id>/preview-bundle.json`.
+/// 11. Single JSON envelope on `stdout`.
+///
+/// Returns:
+///
+/// * `0` on success.
+/// * [`EXIT_PREVIEW_BUNDLE_REFUSED`] on any refusal arm; the structured
+///   envelope on stdout carries the specific refusal token.
+fn run_plan_preview_bundle(
+    workspace_root: &Path,
+    target_relative_path: &str,
+    after_file: &Path,
+    stdout: &mut dyn Write,
+) -> i32 {
+    match try_run_plan_preview_bundle(workspace_root, target_relative_path, after_file) {
+        Ok(envelope) => {
+            if let Err(e) = serde_json::to_writer(&mut *stdout, &envelope) {
+                eprintln!("claw plan preview-bundle: failed to write envelope: {e}");
+                return EXIT_PREVIEW_BUNDLE_REFUSED;
+            }
+            let _ = stdout.write_all(b"\n");
+            0
+        }
+        Err(refusal) => emit_preview_bundle_refusal(&refusal, stdout),
+    }
+}
+
+/// Successful generator envelope. Mirrors the
+/// `a2-l2b-preview-bundle-generator-result.v1` contract documented in
+/// the lane plan.
+///
+/// `is_binary`/`is_redacted`/`is_truncated` come from the embedded
+/// [`a2_plan_runner::PreviewRecord`] flags; they MUST stay surfaced as
+/// separate booleans so operators can refuse non-approvable previews
+/// without re-parsing the embedded bundle.
+#[derive(Debug, serde::Serialize)]
+#[allow(clippy::struct_excessive_bools)]
+struct PreviewBundleGeneratorResultV1 {
+    schema_version: &'static str,
+    ok: bool,
+    run_id: String,
+    step_id: String,
+    preview_id: String,
+    target_relative_path: String,
+    preview_bundle_path: PathBuf,
+    payload_path: PathBuf,
+    payload_sha256_path: PathBuf,
+    payload_sha256: String,
+    payload_size_bytes: u64,
+    checkpoint_manifest_path: PathBuf,
+    is_binary: bool,
+    is_redacted: bool,
+    is_truncated: bool,
+    audit_markers: Vec<&'static str>,
+}
+
+/// Refusal envelope. Same `schema_version`, `ok = false`, structured
+/// reason fields. No leakage of internal stack traces.
+#[derive(Debug, serde::Serialize)]
+struct PreviewBundleGeneratorRefusalV1<'a> {
+    schema_version: &'a str,
+    ok: bool,
+    refusal: &'a str,
+    reason: String,
+    audit_markers: Vec<&'static str>,
+}
+
+fn emit_preview_bundle_refusal(refusal: &PreviewBundleRefusal, stdout: &mut dyn Write) -> i32 {
+    let envelope = PreviewBundleGeneratorRefusalV1 {
+        schema_version: PREVIEW_BUNDLE_GENERATOR_RESULT_SCHEMA_V1,
+        ok: false,
+        refusal: refusal.short(),
+        reason: refusal.reason(),
+        audit_markers: vec!["a2-l2b-preview-bundle-refused"],
+    };
+    if let Err(e) = serde_json::to_writer(&mut *stdout, &envelope) {
+        eprintln!("claw plan preview-bundle: failed to write refusal envelope: {e}");
+    }
+    let _ = stdout.write_all(b"\n");
+    EXIT_PREVIEW_BUNDLE_REFUSED
+}
+
+#[allow(clippy::too_many_lines)]
+fn try_run_plan_preview_bundle(
+    workspace_root: &Path,
+    target_relative_path: &str,
+    after_file: &Path,
+) -> Result<PreviewBundleGeneratorResultV1, PreviewBundleRefusal> {
+    // 1. Workspace-root canonicalize + must-be-directory.
+    let workspace_root_canonical = workspace_root
+        .canonicalize()
+        .map_err(|e| PreviewBundleRefusal::WorkspaceRootInvalid(format!("{e}")))?;
+    let workspace_meta = std::fs::symlink_metadata(&workspace_root_canonical)
+        .map_err(|e| PreviewBundleRefusal::WorkspaceRootInvalid(format!("{e}")))?;
+    if !workspace_meta.is_dir() {
+        return Err(PreviewBundleRefusal::WorkspaceRootInvalid(
+            "not a directory".to_string(),
+        ));
+    }
+
+    // 2. After-file inspection (regular, not symlink, not too big).
+    let after_size = inspect_after_file(after_file)?;
+    if after_size > a2_plan_runner::MAX_APPROVED_PAYLOAD_BYTES {
+        return Err(PreviewBundleRefusal::AfterFileTooLarge {
+            actual: after_size,
+            cap: a2_plan_runner::MAX_APPROVED_PAYLOAD_BYTES,
+        });
+    }
+
+    // 3. Read after-file bytes.
+    let after_bytes = std::fs::read(after_file)
+        .map_err(|e| PreviewBundleRefusal::AfterFileIo(format!("{}: {e}", after_file.display())))?;
+    // Defense-in-depth: re-check size after the read (race-free
+    // boundary against TOCTOU on the inspect step).
+    let after_len_u64 = after_bytes.len() as u64;
+    if after_len_u64 > a2_plan_runner::MAX_APPROVED_PAYLOAD_BYTES {
+        return Err(PreviewBundleRefusal::AfterFileTooLarge {
+            actual: after_len_u64,
+            cap: a2_plan_runner::MAX_APPROVED_PAYLOAD_BYTES,
+        });
+    }
+
+    // 4. Resolve target through Slice-1.
+    let write_target = a2_plan_schema::WriteTarget {
+        path: target_relative_path.to_string(),
+        create_if_absent: true,
+    };
+    let resolved = a2_plan_runner::write_runtime::resolve_write_target(
+        &workspace_root_canonical,
+        &write_target,
+    )
+    .map_err(|refusal| PreviewBundleRefusal::TargetResolveRefused {
+        marker: refusal.marker(),
+        kind: write_target_refusal_kind(&refusal),
+    })?;
+
+    // 5. Read before-bytes only if the target already exists.
+    let before_bytes: Option<Vec<u8>> = if resolved.already_exists {
+        Some(std::fs::read(&resolved.absolute).map_err(|e| {
+            PreviewBundleRefusal::BeforeReadIo(format!("{}: {e}", resolved.absolute.display()))
+        })?)
+    } else {
+        None
+    };
+
+    // 6. Capture a Slice-2 checkpoint under a freshly-generated run-id.
+    let store = a2_plan_runner::CheckpointStore::new_with_generated_run_id(
+        workspace_root_canonical.clone(),
+    );
+    let run_id_str = store.run_id().to_string();
+    let step_id = PREVIEW_BUNDLE_GENERATOR_STEP_ID;
+    let target_relative = Path::new(target_relative_path);
+    let handle = store
+        .create_checkpoint(step_id, &resolved.absolute, target_relative)
+        .map_err(|e| PreviewBundleRefusal::CheckpointFailed(format!("{e}")))?;
+
+    // 7. Build the Slice-3a preview.
+    let inputs = a2_plan_runner::PreviewInputs {
+        step_id,
+        target_relative_path: target_relative,
+        target_absolute_path: &resolved.absolute,
+        before: before_bytes.as_deref(),
+        after: &after_bytes,
+        checkpoint_run_id: store.run_id(),
+        checkpoint_step_id: step_id,
+        created_at_utc: &now_utc_rfc3339_nanos(),
+    };
+    let (record, display) = a2_plan_runner::build_preview(&inputs)
+        .map_err(|e| PreviewBundleRefusal::PreviewBuildFailed(format!("{e}")))?;
+
+    // 8. Write the payload artifact (atomic) + sha256 sidecar.
+    let payload_dir = workspace_root_canonical
+        .join(PREVIEW_BUNDLE_PAYLOAD_ROOT_REL)
+        .join(&run_id_str)
+        .join(step_id);
+    create_dir_0700(&payload_dir)
+        .map_err(|e| PreviewBundleRefusal::PayloadIo(format!("{}: {e}", payload_dir.display())))?;
+    let payload_path = payload_dir.join("after.bin");
+    write_file_0600_atomic(&payload_path, &after_bytes)
+        .map_err(|e| PreviewBundleRefusal::PayloadIo(format!("{}: {e}", payload_path.display())))?;
+    let payload_sha256_path = payload_dir.join("after.sha256");
+    let payload_sha256_content = format!("{}\n", record.after_sha256);
+    write_file_0600_atomic(&payload_sha256_path, payload_sha256_content.as_bytes()).map_err(
+        |e| PreviewBundleRefusal::PayloadIo(format!("{}: {e}", payload_sha256_path.display())),
+    )?;
+
+    // 9. Verify the on-disk payload's bytes still hash to
+    //    `record.after_sha256`. This is the round-trip that catches
+    //    any drift between the operator's after-file and the runner-
+    //    owned copy.
+    let payload_bytes_redux = std::fs::read(&payload_path)
+        .map_err(|e| PreviewBundleRefusal::PayloadIo(format!("{}: {e}", payload_path.display())))?;
+    let actual_sha = cli_sha256_hex(&payload_bytes_redux);
+    if actual_sha != record.after_sha256 {
+        return Err(PreviewBundleRefusal::PayloadVerifyMismatch {
+            expected: record.after_sha256.clone(),
+            actual: actual_sha,
+        });
+    }
+
+    // 10. Write the preview-bundle.json (atomic) under runner-owned
+    //     storage. Shape mirrors `PreviewBundleV1` so this bundle is
+    //     consumable by `claw plan approve` without any schema
+    //     widening.
+    let bundle_dir = workspace_root_canonical
+        .join(PREVIEW_BUNDLE_BUNDLE_ROOT_REL)
+        .join(&run_id_str)
+        .join(step_id);
+    create_dir_0700(&bundle_dir).map_err(|e| {
+        PreviewBundleRefusal::PreviewBundleIo(format!("{}: {e}", bundle_dir.display()))
+    })?;
+    let preview_bundle_path = bundle_dir.join("preview-bundle.json");
+    let bundle_out = PreviewBundleV1Output {
+        schema_version: PREVIEW_BUNDLE_SCHEMA_V1,
+        preview_record: &record,
+        preview_display: &display,
+        checkpoint_baseline_unchanged: true,
+    };
+    let bundle_bytes = serde_json::to_vec_pretty(&bundle_out)
+        .map_err(|e| PreviewBundleRefusal::PreviewBundleIo(format!("serde_json error: {e}")))?;
+    write_file_0600_atomic(&preview_bundle_path, &bundle_bytes).map_err(|e| {
+        PreviewBundleRefusal::PreviewBundleIo(format!("{}: {e}", preview_bundle_path.display()))
+    })?;
+
+    Ok(PreviewBundleGeneratorResultV1 {
+        schema_version: PREVIEW_BUNDLE_GENERATOR_RESULT_SCHEMA_V1,
+        ok: true,
+        run_id: run_id_str,
+        step_id: step_id.to_string(),
+        preview_id: record.preview_id.clone(),
+        target_relative_path: target_relative_path.to_string(),
+        preview_bundle_path,
+        payload_path,
+        payload_sha256_path,
+        payload_sha256: record.after_sha256.clone(),
+        payload_size_bytes: after_len_u64,
+        checkpoint_manifest_path: handle.manifest_path.clone(),
+        is_binary: record.is_binary,
+        is_redacted: record.is_redacted,
+        is_truncated: record.is_truncated,
+        audit_markers: vec![
+            PREVIEW_BUNDLE_MARKER_CHECKPOINT_WRITTEN,
+            PREVIEW_BUNDLE_MARKER_PAYLOAD_CAPTURED,
+            PREVIEW_BUNDLE_MARKER_CREATED,
+        ],
+    })
+}
+
+fn write_target_refusal_kind(
+    refusal: &a2_plan_runner::write_runtime::WriteTargetRefusal,
+) -> &'static str {
+    use a2_plan_runner::write_runtime::WriteTargetRefusal;
+    match refusal {
+        WriteTargetRefusal::PathEscape => "target-path-escape",
+        WriteTargetRefusal::ParentMissing => "target-parent-missing",
+        WriteTargetRefusal::DenyComponent => "target-deny-component",
+        WriteTargetRefusal::DenyGlobFilename => "target-deny-glob-filename",
+        WriteTargetRefusal::SymlinkTarget => "target-symlink-target",
+        WriteTargetRefusal::SymlinkParent => "target-symlink-parent",
+    }
+}
+
+// =========================================================================
+// END A2-L2b Slice L2b-CLI-Preview-Bundle — scope sentinel
+// =========================================================================
+//
+// The source-grep tests in `plan_preview_bundle_tests` use this sentinel
+// to bound the implementation region they scan for forbidden APIs. Do not
+// move or rename it without updating those tests.
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CliAction {
     DumpManifests {
@@ -1802,6 +2379,18 @@ enum CliAction {
     // more than the single resolved target file.
     PlanApply {
         bundle_path: PathBuf,
+    },
+    // A2-L2b Slice L2b-CLI-Preview-Bundle: operator-facing upstream
+    // artifact producer. Resolves the target through Slice-1, captures
+    // a Slice-2 checkpoint, copies the operator-provided after-file
+    // into runner-owned payload storage, builds a Slice-3a preview, and
+    // writes a `preview-bundle.json` compatible with `claw plan
+    // approve`. NEVER mutates the target file. NEVER approves. NEVER
+    // applies. NEVER spawns subprocesses. NEVER calls the broker.
+    PlanPreviewBundle {
+        workspace_root: PathBuf,
+        target_relative_path: String,
+        after_file: PathBuf,
     },
 }
 
@@ -2457,18 +3046,25 @@ fn parse_plan_subcommand_args(args: &[String]) -> Result<CliAction, String> {
         Some("run") => {}
         Some("approve") => return parse_plan_approve_subcommand_args(&args[1..]),
         Some("apply") => return parse_plan_apply_subcommand_args(&args[1..]),
+        Some("preview-bundle") => {
+            return parse_plan_preview_bundle_subcommand_args(&args[1..]);
+        }
         Some(other) => {
             return Err(format!(
                 "unsupported `claw plan` subcommand: {other}. \
                  Use `claw plan run <file>`, `claw plan approve <preview-bundle.json>`, \
-                 or `claw plan apply <apply-bundle.json>`."
+                 `claw plan apply <apply-bundle.json>`, or \
+                 `claw plan preview-bundle <workspace-root> <target-relative-path> <after-file>`."
             ));
         }
         None => {
-            return Err("missing `claw plan` subcommand. \
+            return Err(
+                "missing `claw plan` subcommand. \
                  Use `claw plan run <file>`, `claw plan approve <preview-bundle.json>`, \
-                 or `claw plan apply <apply-bundle.json>`."
-                .to_string());
+                 `claw plan apply <apply-bundle.json>`, or \
+                 `claw plan preview-bundle <workspace-root> <target-relative-path> <after-file>`."
+                    .to_string(),
+            );
         }
     }
     let tail = &args[1..];
@@ -2647,6 +3243,49 @@ fn parse_plan_apply_subcommand_args(args: &[String]) -> Result<CliAction, String
         "missing apply bundle. Usage: `claw plan apply <apply-bundle.json>`.".to_string()
     })?;
     Ok(CliAction::PlanApply { bundle_path })
+}
+
+/// A2-L2b Slice L2b-CLI-Preview-Bundle: parse
+/// `claw plan preview-bundle <workspace-root> <target-relative-path> <after-file>`.
+///
+/// Exactly three positional arguments, no flags. Every pre-approval /
+/// batch flag (`--yes`, `--auto`, `--force`, `--allow-write`,
+/// `--preapproved`, `--batch`) is refused outright before any
+/// filesystem touch. The generator never reads stdin and never accepts
+/// inline payload bytes; the after-file path is the only supported
+/// payload source.
+fn parse_plan_preview_bundle_subcommand_args(args: &[String]) -> Result<CliAction, String> {
+    let usage = "Usage: `claw plan preview-bundle <workspace-root> \
+                 <target-relative-path> <after-file>`.";
+    let mut positionals: Vec<&str> = Vec::with_capacity(3);
+    for arg in args {
+        let v = arg.as_str();
+        if v.starts_with("--") {
+            return Err(format!(
+                "unsupported flag for `claw plan preview-bundle`: {v}. {usage}"
+            ));
+        }
+        if positionals.len() >= 3 {
+            return Err(format!(
+                "unexpected positional argument after after-file: {v}. {usage}"
+            ));
+        }
+        positionals.push(v);
+    }
+    if positionals.len() != 3 {
+        return Err(format!(
+            "expected 3 positional arguments (got {}). {usage}",
+            positionals.len()
+        ));
+    }
+    let workspace_root = PathBuf::from(positionals[0]);
+    let target_relative_path = positionals[1].to_string();
+    let after_file = PathBuf::from(positionals[2]);
+    Ok(CliAction::PlanPreviewBundle {
+        workspace_root,
+        target_relative_path,
+        after_file,
+    })
 }
 
 fn try_resolve_bare_skill_prompt(cwd: &Path, trimmed: &str) -> Option<String> {
@@ -16935,10 +17574,17 @@ mod approval_interaction_tests {
     /// Extract the slice-3c helper region from this binary's source so
     /// the source-grep tests above scope their assertions to the region
     /// this lane is allowed to edit.
+    ///
+    /// The end marker is the next slice's section header (Slice 3d).
+    /// When Slice 3c was the only A2-L2b CLI block, this scoping was
+    /// bounded by the `CliAction` enum; later slices (3d, L2b-CLI-Apply,
+    /// L2b-CLI-Preview-Bundle) ship between Slice 3c and that enum, so
+    /// the old enum-anchored end marker incorrectly captured all of
+    /// them. Anchoring on the next Slice header keeps the scope tight.
     fn slice_3c_helper_section(src: &str) -> &str {
         let start_marker =
             "// A2-L2b Slice 3c — CLI-local approval UX plumbing (hidden test-only seam)";
-        let end_marker = "#[derive(Debug, Clone, PartialEq, Eq)]\nenum CliAction {";
+        let end_marker = "// A2-L2b Slice 3d — `claw plan approve <preview-bundle.json>` command";
         let start = src
             .find(start_marker)
             .expect("slice-3c helper section start marker should be present in main.rs");
