@@ -67,7 +67,11 @@ use a2_plan_schema::{validate_plan, Plan, PlanStep};
 use serde::Deserialize;
 
 use crate::markers;
-use crate::preflight::{precheck, PrecheckRefusal, READ_ONLY_TOOLS};
+use crate::preflight::{
+    is_workspace_write_step, precheck, precheck_with_write_preview, PrecheckRefusal,
+    READ_ONLY_TOOLS,
+};
+use crate::write_preview::{produce_write_preview, WritePreviewArtifacts, WritePreviewRefusal};
 
 // -----------------------------------------------------------------------------
 // Claw argument construction — the load-bearing safety boundary
@@ -592,6 +596,383 @@ pub fn substrate_unavailable_report(plan_name: &str) -> PlanReport {
         ],
         step_reports: Vec::new(),
     }
+}
+
+// -----------------------------------------------------------------------------
+// A2-L2b run-plan write-preview wiring
+// -----------------------------------------------------------------------------
+
+/// CLI exit code reserved for `run_plan_with_write_preview` when the plan
+/// halts in `write_preview_ready`. Mirrors
+/// [`crate::approval::EXIT_APPROVAL_DENIED`] (`7`) — both surface a
+/// "halted pre-apply, awaiting operator approval" state.
+pub const EXIT_RUN_PLAN_WRITE_PREVIEW_READY: i32 = 7;
+
+/// CLI exit code reserved for `run_plan_with_write_preview` refusal arms
+/// that do not map cleanly onto an existing L1b code. Pinned at `5`
+/// (the runner-family parse / refusal slot) so operator tooling can
+/// rely on a stable non-zero discriminator that is distinct from the
+/// `write_preview_ready` exit (`7`).
+pub const EXIT_RUN_PLAN_WRITE_PREVIEW_REFUSED: i32 = 5;
+
+/// Status of a `run_plan_with_write_preview` run. The structured value
+/// is authoritative; the [`WritePreviewRunReport`] marker stream is
+/// audit-only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WritePreviewPlanStatus {
+    /// The plan had no workspace-write step. Behavior was equivalent to
+    /// [`run_plan`]; the embedded [`PlanReport`] carries the standard
+    /// L1b outcome.
+    ReadOnlyComplete,
+    /// Exactly one workspace-write step was detected and the preview
+    /// artifacts are on disk. The plan halted before approval / apply.
+    WritePreviewReady,
+    /// The runner refused before producing any write-preview artifact.
+    /// Read-only steps that ran before the refusal are still surfaced in
+    /// the embedded step reports.
+    Refused,
+    /// A read-only step before the workspace-write step failed. The plan
+    /// did not reach the write step and no preview artifacts were
+    /// produced.
+    ReadOnlyFailedBeforeWrite,
+}
+
+/// Structured refusal context for a `run_plan_with_write_preview` run
+/// whose status is [`WritePreviewPlanStatus::Refused`].
+///
+/// Refusal arms are coarse on purpose: the marker stream and the
+/// embedded [`WritePreviewRefusal`] (when present) carry the fine-grained
+/// reason. This enum exists so the CLI can pick an operator-facing
+/// summary without re-walking the marker stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WritePreviewPlanRefusal {
+    /// Schema validator marked the plan refused (mirrors
+    /// [`PrecheckRefusal::ValidatorRefused`]).
+    ValidatorRefused,
+    /// A tool outside [`READ_ONLY_TOOLS`] (and not the relaxed
+    /// `Write` on a workspace-write step) was declared.
+    ToolDisallowed { step_id: String, tool: String },
+    /// The plan declared more than one workspace-write step. Refused
+    /// before any step executed.
+    MultipleWorkspaceWriteSteps { count: usize },
+    /// The workspace-write step's artifact production refused — see the
+    /// embedded [`WritePreviewRefusal`] for the specific cause.
+    PreviewProduction(WritePreviewRefusal),
+}
+
+/// Full report from a single `run_plan_with_write_preview` run.
+///
+/// The structured fields are authoritative. The marker stream is audit-
+/// only. CLI consumers should switch on [`WritePreviewRunReport::status`]
+/// to render operator output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WritePreviewRunReport {
+    pub plan_name: String,
+    pub status: WritePreviewPlanStatus,
+    pub markers: Vec<String>,
+    pub step_reports: Vec<StepReport>,
+    /// Number of workspace-write steps detected in the plan (`0` for
+    /// read-only-only plans, `1` for valid write-preview runs, `>1` for
+    /// the multi-write refusal arm).
+    pub write_step_count: usize,
+    /// Preview artifacts produced for the lone workspace-write step;
+    /// `None` for every other status.
+    pub preview_artifacts: Option<WritePreviewArtifacts>,
+    /// Refusal context when `status == Refused`; `None` otherwise.
+    pub refusal: Option<WritePreviewPlanRefusal>,
+    /// Operator-facing exit code hint. The CLI may map to its own code
+    /// space; this field is the runner's recommendation.
+    pub exit_code_hint: i32,
+    /// Operator-facing next-step command. Populated only on
+    /// `WritePreviewReady`. NEVER references `claw plan apply` or
+    /// `claw plan apply-bundle` directly — the next operator step is
+    /// always `claw plan approve <preview-bundle.json>`.
+    pub next_operator_command: Option<String>,
+}
+
+/// Top-level orchestrator: validate → write-preview-relaxed precheck →
+/// detect write-step count → run prior read-only steps → produce one
+/// preview artifact → halt.
+///
+/// # Hard contract
+///
+/// - Does NOT call [`crate::write_executor::execute_write`].
+/// - Does NOT call [`crate::bind_after_bytes`].
+/// - Does NOT invoke `claw plan approve`, `claw plan apply-bundle`, or
+///   `claw plan apply`.
+/// - Refuses any plan with more than one workspace-write step BEFORE any
+///   step executes.
+/// - Read-only steps that precede the workspace-write step run through
+///   the existing L1b path verbatim.
+/// - On a read-only-only plan, this function is behaviorally equivalent
+///   to [`run_plan`] — the embedded [`PlanReport`] markers and outcomes
+///   match.
+///
+/// # Arguments
+///
+/// - `workspace_root` — operator-supplied workspace root. The runner
+///   canonicalizes it inside `produce_write_preview`; callers may pass
+///   a non-canonical path.
+#[allow(clippy::too_many_lines)]
+#[must_use]
+pub fn run_plan_with_write_preview(
+    plan: &Plan,
+    wrapper_path: &Path,
+    substrate: Option<(&str, &str)>,
+    step_timeout: Duration,
+    workspace_root: &Path,
+) -> WritePreviewRunReport {
+    // 1. L1a validate. Same gate as `run_plan`.
+    let validator_report = validate_plan(plan);
+    if !validator_report.is_pass() {
+        return WritePreviewRunReport {
+            plan_name: plan.name.clone(),
+            status: WritePreviewPlanStatus::Refused,
+            markers: vec![
+                markers::RUNNER_START.to_string(),
+                markers::PLAN_REFUSED_PRECHECK.to_string(),
+            ],
+            step_reports: Vec::new(),
+            write_step_count: 0,
+            preview_artifacts: None,
+            refusal: Some(WritePreviewPlanRefusal::ValidatorRefused),
+            exit_code_hint: 2,
+            next_operator_command: None,
+        };
+    }
+
+    // 2. Workspace-write-relaxed precheck. Walk all steps so a stray
+    //    disallowed tool refuses before anything runs.
+    if let Err(refusal) = precheck_with_write_preview(plan, &validator_report) {
+        let (marker, exit, refusal_field) = match &refusal {
+            PrecheckRefusal::ValidatorRefused => (
+                markers::PLAN_REFUSED_PRECHECK,
+                2,
+                WritePreviewPlanRefusal::ValidatorRefused,
+            ),
+            PrecheckRefusal::ToolDisallowed { step_id, tool } => (
+                markers::TOOL_DISALLOWED,
+                3,
+                WritePreviewPlanRefusal::ToolDisallowed {
+                    step_id: step_id.clone(),
+                    tool: tool.clone(),
+                },
+            ),
+        };
+        return WritePreviewRunReport {
+            plan_name: plan.name.clone(),
+            status: WritePreviewPlanStatus::Refused,
+            markers: vec![markers::RUNNER_START.to_string(), marker.to_string()],
+            step_reports: Vec::new(),
+            write_step_count: 0,
+            preview_artifacts: None,
+            refusal: Some(refusal_field),
+            exit_code_hint: exit,
+            next_operator_command: None,
+        };
+    }
+
+    // 3. Detect workspace-write step indices.
+    let write_indices: Vec<usize> = plan
+        .steps
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| is_workspace_write_step(s))
+        .map(|(i, _)| i)
+        .collect();
+    let write_step_count = write_indices.len();
+
+    // 4. Read-only-only plan: delegate to existing run_plan for parity
+    //    with the L1b contract. Embed its PlanReport's markers + step
+    //    reports verbatim.
+    if write_step_count == 0 {
+        let underlying = run_plan(plan, wrapper_path, substrate, step_timeout);
+        let exit = exit_code_from_plan_report(&underlying);
+        let status = match underlying.outcome {
+            PlanOutcome::Pass => WritePreviewPlanStatus::ReadOnlyComplete,
+            PlanOutcome::Fail | PlanOutcome::RefusedPrecheck => {
+                // The L1b precheck above already rejected refusals; this
+                // path is reachable only via genuine step-execution
+                // failure on an opt-in run that turned out to have no
+                // write step. Surface the embedded PlanReport state
+                // directly via the read-only-failed status.
+                WritePreviewPlanStatus::ReadOnlyFailedBeforeWrite
+            }
+        };
+        return WritePreviewRunReport {
+            plan_name: underlying.plan_name,
+            status,
+            markers: underlying.markers,
+            step_reports: underlying.step_reports,
+            write_step_count: 0,
+            preview_artifacts: None,
+            refusal: None,
+            exit_code_hint: exit,
+            next_operator_command: None,
+        };
+    }
+
+    // 5. Multi-write refusal: surface BEFORE any step executes.
+    if write_step_count > 1 {
+        return WritePreviewRunReport {
+            plan_name: plan.name.clone(),
+            status: WritePreviewPlanStatus::Refused,
+            markers: vec![
+                markers::RUNNER_START.to_string(),
+                markers::L2B_PLAN_MULTI_WRITE_REFUSED.to_string(),
+            ],
+            step_reports: Vec::new(),
+            write_step_count,
+            preview_artifacts: None,
+            refusal: Some(WritePreviewPlanRefusal::MultipleWorkspaceWriteSteps {
+                count: write_step_count,
+            }),
+            exit_code_hint: EXIT_RUN_PLAN_WRITE_PREVIEW_REFUSED,
+            next_operator_command: None,
+        };
+    }
+
+    // 6. Exactly one workspace-write step. Run prior read-only steps
+    //    under the existing L1b substrate-probe + per-step path, then
+    //    halt at the write step.
+    let write_idx = write_indices[0];
+
+    // Substrate probe only when there is at least one prior read-only
+    // step (otherwise we'd burn a network round-trip for no execution).
+    if write_idx > 0 {
+        if let Some((url, fast_model)) = substrate {
+            if probe_substrate(url, fast_model).is_err() {
+                let mut markers_vec = vec![
+                    markers::RUNNER_START.to_string(),
+                    markers::SUBSTRATE_UNAVAILABLE.to_string(),
+                ];
+                markers_vec.push(markers::L2B_PLAN_HALTED.to_string());
+                return WritePreviewRunReport {
+                    plan_name: plan.name.clone(),
+                    status: WritePreviewPlanStatus::ReadOnlyFailedBeforeWrite,
+                    markers: markers_vec,
+                    step_reports: Vec::new(),
+                    write_step_count,
+                    preview_artifacts: None,
+                    refusal: None,
+                    exit_code_hint: 4,
+                    next_operator_command: None,
+                };
+            }
+        }
+    }
+
+    let mut step_outcomes: Vec<(String, StepOutcomeForReport)> =
+        Vec::with_capacity(plan.steps.len());
+    let mut aborted = false;
+    for (idx, step) in plan.steps.iter().enumerate() {
+        if idx == write_idx {
+            // Stop before executing the write step. Subsequent steps
+            // (write step + any steps after it) are recorded as
+            // skipped — they did not run.
+            break;
+        }
+        if aborted {
+            step_outcomes.push((step.id.clone(), StepOutcomeForReport::Skipped));
+            continue;
+        }
+        let cmd = build_claw_command(wrapper_path, step);
+        match run_step(&cmd, step, step_timeout) {
+            Ok(()) => step_outcomes.push((step.id.clone(), StepOutcomeForReport::Passed)),
+            Err(f) => {
+                step_outcomes.push((step.id.clone(), StepOutcomeForReport::Failed(f)));
+                aborted = true;
+            }
+        }
+    }
+    // Record the workspace-write step + later steps as skipped (they
+    // never ran in the preview-only path).
+    for step in plan.steps.iter().skip(write_idx) {
+        step_outcomes.push((step.id.clone(), StepOutcomeForReport::Skipped));
+    }
+
+    if aborted {
+        let mut report = aggregate_plan_report(&plan.name, step_outcomes);
+        report.markers.push(markers::L2B_PLAN_HALTED.to_string());
+        return WritePreviewRunReport {
+            plan_name: plan.name.clone(),
+            status: WritePreviewPlanStatus::ReadOnlyFailedBeforeWrite,
+            markers: report.markers,
+            step_reports: report.step_reports,
+            write_step_count,
+            preview_artifacts: None,
+            refusal: None,
+            exit_code_hint: 1,
+            next_operator_command: None,
+        };
+    }
+
+    // 7. Produce the preview artifact for the lone workspace-write step.
+    let write_step = &plan.steps[write_idx];
+    match produce_write_preview(workspace_root, &plan.name, write_step) {
+        Ok(artifacts) => {
+            // Build the marker stream. Read-only step markers are taken
+            // from the partial aggregate; we then append the L2b
+            // halt-pre-approval tokens.
+            let aggregate = aggregate_plan_report(&plan.name, step_outcomes);
+            // Drop the L1b PASS_FAIL token — we are *halted*, not pass,
+            // not fail. The structured `status` is authoritative.
+            let mut markers_vec: Vec<String> = aggregate
+                .markers
+                .iter()
+                .filter(|m| {
+                    m.as_str() != markers::PLAN_EXEC_PASS && m.as_str() != markers::PLAN_EXEC_FAIL
+                })
+                .cloned()
+                .collect();
+            markers_vec.push(markers::L2B_RUN_PLAN_WRITE_PREVIEW_READY.to_string());
+            markers_vec.push(markers::L2B_APPROVAL_PENDING.to_string());
+            markers_vec.push(markers::L2B_PLAN_HALTED.to_string());
+
+            let next_cmd = artifacts.next_operator_command.clone();
+
+            WritePreviewRunReport {
+                plan_name: plan.name.clone(),
+                status: WritePreviewPlanStatus::WritePreviewReady,
+                markers: markers_vec,
+                step_reports: aggregate.step_reports,
+                write_step_count,
+                preview_artifacts: Some(artifacts),
+                refusal: None,
+                exit_code_hint: EXIT_RUN_PLAN_WRITE_PREVIEW_READY,
+                next_operator_command: Some(next_cmd),
+            }
+        }
+        Err(refusal) => {
+            // Preview production refusal. Read-only steps that ran are
+            // preserved in the step reports.
+            let aggregate = aggregate_plan_report(&plan.name, step_outcomes);
+            let mut markers_vec: Vec<String> = aggregate
+                .markers
+                .iter()
+                .filter(|m| {
+                    m.as_str() != markers::PLAN_EXEC_PASS && m.as_str() != markers::PLAN_EXEC_FAIL
+                })
+                .cloned()
+                .collect();
+            markers_vec.push(markers::L2B_PLAN_HALTED.to_string());
+            WritePreviewRunReport {
+                plan_name: plan.name.clone(),
+                status: WritePreviewPlanStatus::Refused,
+                markers: markers_vec,
+                step_reports: aggregate.step_reports,
+                write_step_count,
+                preview_artifacts: None,
+                refusal: Some(WritePreviewPlanRefusal::PreviewProduction(refusal)),
+                exit_code_hint: EXIT_RUN_PLAN_WRITE_PREVIEW_REFUSED,
+                next_operator_command: None,
+            }
+        }
+    }
+}
+
+fn exit_code_from_plan_report(report: &PlanReport) -> i32 {
+    crate::report::exit_code_for(report)
 }
 
 /// Top-level orchestrator: validate → precheck → optional substrate probe

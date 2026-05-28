@@ -74,6 +74,7 @@ pub mod report;
 pub mod runner;
 pub mod write_executor;
 pub mod write_payload;
+pub mod write_preview;
 pub mod write_runtime;
 
 // Re-exports for the CLI entry point. Kept narrow on purpose so the CLI
@@ -96,11 +97,16 @@ pub use diff_preview::{
     PreviewRecord, CANONICAL_HEADER, HASH_DISPLAY_SEPARATOR, MAX_CONTENT_BYTES_FOR_DIFF,
     MAX_DIFF_BYTES, MAX_DIFF_LINES, PREVIEW_FORMAT_VERSION,
 };
-pub use preflight::{PrecheckRefusal, READ_ONLY_TOOLS};
+pub use preflight::{
+    is_workspace_write_step, precheck_with_write_preview, PrecheckRefusal, READ_ONLY_TOOLS,
+    WORKSPACE_WRITE_TOOL,
+};
 pub use report::{exit_code_for, write_json, write_markers, EXIT_PARSE_ERROR};
 pub use runner::{
-    parse_step_timeout_seconds, refused_precheck_report, run_plan, substrate_unavailable_report,
-    PlanOutcome, PlanReport, StepFailure, StepReport, DEFAULT_STEP_TIMEOUT, MAX_STEP_TIMEOUT_SECS,
+    parse_step_timeout_seconds, refused_precheck_report, run_plan, run_plan_with_write_preview,
+    substrate_unavailable_report, PlanOutcome, PlanReport, StepFailure, StepReport,
+    WritePreviewPlanStatus, WritePreviewRunReport, DEFAULT_STEP_TIMEOUT,
+    EXIT_RUN_PLAN_WRITE_PREVIEW_READY, EXIT_RUN_PLAN_WRITE_PREVIEW_REFUSED, MAX_STEP_TIMEOUT_SECS,
     MIN_STEP_TIMEOUT_SECS,
 };
 pub use write_executor::{
@@ -112,4 +118,9 @@ pub use write_executor::{
 };
 pub use write_payload::{
     bind_after_bytes, ApprovedWritePayload, BindError, MAX_APPROVED_PAYLOAD_BYTES,
+};
+pub use write_preview::{
+    produce_write_preview, WritePreviewArtifacts, WritePreviewRefusal, PAYLOAD_ROOT_REL,
+    PREVIEW_BUNDLE_ROOT_REL, PREVIEW_BUNDLE_SCHEMA_V1, PREVIEW_GENERATOR_RESULT_SCHEMA_V1,
+    RUN_MANIFEST_SCHEMA_V1, RUN_ROOT_REL, RUN_STATUS_SCHEMA_V1,
 };
