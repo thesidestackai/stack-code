@@ -228,6 +228,40 @@ pub const L2B_ROLLBACK_REFUSED: &str = "a2-l2b-rollback-refused";
 /// Audit-only; maps to exit code 8.
 pub const L2B_ROLLBACK_FAILED: &str = "a2-l2b-rollback-failed";
 
+// --- A2-L2b run_plan write-preview wiring markers (slice L2b-run-plan) ---
+//
+// Audit-only operator tokens emitted by
+// [`crate::runner::run_plan_with_write_preview`]. The structured
+// [`crate::runner::WritePreviewRunReport`] is authoritative; these tokens
+// exist for log scrapers and operator transcripts.
+//
+// The run-plan write-preview path is *preview-only*: it never executes
+// `execute_write`, never calls `claw plan approve`, `claw plan
+// apply-bundle`, or `claw plan apply`, and never mutates the target file.
+// `L2B_PLAN_HALTED` is the terminal marker that pins this contract — every
+// successful write-preview run ends on it.
+
+/// The runner detected a workspace-write step but the operator did not
+/// pass `--workspace-write-preview`. Audit-only; the structured refusal
+/// is authoritative.
+pub const L2B_PLAN_WRITE_OPT_IN_REQUIRED: &str = "a2-l2b-plan-write-opt-in-required";
+
+/// The runner refused a plan whose `mode: workspace-write` step count is
+/// greater than one. Audit-only.
+pub const L2B_PLAN_MULTI_WRITE_REFUSED: &str = "a2-l2b-plan-multi-write-refused";
+
+/// Preview-pending state for the lone workspace-write step. Emitted after
+/// the bundle is written and before [`L2B_PLAN_HALTED`]. Audit-only.
+pub const L2B_APPROVAL_PENDING: &str = "a2-l2b-approval-pending";
+
+/// The run-plan write-preview path halted before approval / apply.
+/// Audit-only terminal marker; pins the preview-only contract.
+pub const L2B_PLAN_HALTED: &str = "a2-l2b-plan-halted";
+
+/// Plan-level signal: preview artifacts for the lone workspace-write
+/// step are on disk and the plan halted before approval. Audit-only.
+pub const L2B_RUN_PLAN_WRITE_PREVIEW_READY: &str = "a2-l2b-run-plan-write-preview-ready";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,6 +465,44 @@ mod tests {
             assert!(
                 m.starts_with("a2-l2b-"),
                 "L2b slice-4 marker {m:?} must use a2-l2b- prefix"
+            );
+        }
+    }
+
+    /// L2b run-plan write-preview marker pinning. Every token is
+    /// audit-only; the structured `WritePreviewRunReport` is
+    /// authoritative. Renaming any of these breaks scrapers and is a
+    /// breaking change.
+    #[test]
+    fn l2b_run_plan_write_preview_marker_tokens_are_pinned() {
+        assert_eq!(
+            L2B_PLAN_WRITE_OPT_IN_REQUIRED,
+            "a2-l2b-plan-write-opt-in-required"
+        );
+        assert_eq!(
+            L2B_PLAN_MULTI_WRITE_REFUSED,
+            "a2-l2b-plan-multi-write-refused"
+        );
+        assert_eq!(L2B_APPROVAL_PENDING, "a2-l2b-approval-pending");
+        assert_eq!(L2B_PLAN_HALTED, "a2-l2b-plan-halted");
+        assert_eq!(
+            L2B_RUN_PLAN_WRITE_PREVIEW_READY,
+            "a2-l2b-run-plan-write-preview-ready"
+        );
+    }
+
+    #[test]
+    fn all_l2b_run_plan_write_preview_markers_use_a2_l2b_prefix() {
+        for m in [
+            L2B_PLAN_WRITE_OPT_IN_REQUIRED,
+            L2B_PLAN_MULTI_WRITE_REFUSED,
+            L2B_APPROVAL_PENDING,
+            L2B_PLAN_HALTED,
+            L2B_RUN_PLAN_WRITE_PREVIEW_READY,
+        ] {
+            assert!(
+                m.starts_with("a2-l2b-"),
+                "L2b run-plan write-preview marker {m:?} must use a2-l2b- prefix"
             );
         }
     }

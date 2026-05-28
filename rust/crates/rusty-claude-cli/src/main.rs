@@ -475,6 +475,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             fast_model,
             wrapper,
             step_timeout,
+            workspace_write_preview,
+            workspace_root,
         } => {
             let code = run_plan_subcommand(
                 &file,
@@ -484,11 +486,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 fast_model.as_deref(),
                 wrapper.as_deref(),
                 step_timeout,
+                workspace_write_preview,
+                workspace_root.as_deref(),
             );
             // Exit codes 0–5 form the operator-facing contract for `claw
-            // plan run`. Bypass the surrounding `Ok(())` flow because the
-            // exit code must surface verbatim (it discriminates pass /
-            // fail / refused / substrate-unavailable / parse-error).
+            // plan run`. With --workspace-write-preview the CLI may also
+            // emit 7 (preview-ready, halted pre-apply). Bypass the
+            // surrounding `Ok(())` flow because the exit code must
+            // surface verbatim.
             std::process::exit(code);
         }
         CliAction::PlanApprove { bundle_path } => {
@@ -569,7 +574,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 /// A2-L1b dispatcher. Wraps the `a2-plan-runner` crate exclusively — does
 /// NOT construct claw args, does NOT call the broker directly, does NOT
-/// spawn any subprocess of its own. Returns the CLI exit code (0–5).
+/// spawn any subprocess of its own. Returns the CLI exit code (0–7).
+///
+/// When `workspace_write_preview` is `true`, the dispatcher routes to
+/// [`a2_plan_runner::run_plan_with_write_preview`] which permits exactly
+/// one workspace-write step to produce preview-only artifacts and halt
+/// before approval. Without the flag, the existing L1b read-only-only
+/// path is unchanged.
+#[allow(clippy::too_many_arguments)]
 fn run_plan_subcommand(
     file: &Path,
     dry_run: bool,
@@ -578,6 +590,8 @@ fn run_plan_subcommand(
     fast_model: Option<&str>,
     wrapper: Option<&Path>,
     step_timeout: Option<std::time::Duration>,
+    workspace_write_preview: bool,
+    workspace_root: Option<&Path>,
 ) -> i32 {
     use a2_plan_runner::{
         exit_code_for, refused_precheck_report, substrate_unavailable_report, write_json,
@@ -617,7 +631,64 @@ fn run_plan_subcommand(
         }
     };
 
-    // -- 2. Build the PlanReport. Two paths depending on --dry-run.
+    // -- 2a. L2b write-preview branch. Live-only (dry-run + preview is a
+    //         contradiction: the artifacts are the deliverable). Producing
+    //         the preview requires real filesystem reads.
+    if workspace_write_preview {
+        if dry_run {
+            eprintln!(
+                "claw plan run: --dry-run is not supported with --workspace-write-preview. \
+                 The preview artifacts are the deliverable; a dry run would have nothing to emit."
+            );
+            return EXIT_PARSE_ERROR;
+        }
+        // NOTE: no wrapper-existence preflight here. The runner's
+        // write-preview path only spawns the wrapper for read-only steps
+        // BEFORE the lone workspace-write step. For a plan whose sole
+        // step is the workspace-write step, the wrapper is irrelevant
+        // and a missing-wrapper preflight would incorrectly refuse a
+        // valid request. When read-only steps DO exist, the runner
+        // surfaces missing-wrapper via its normal failure path
+        // (`StepFailure::SpawnError`).
+        let wrapper_path = wrapper.unwrap_or(&default_wrapper);
+        // Workspace root resolution: operator may pass --workspace-root;
+        // otherwise CWD is used. The runner canonicalizes either before
+        // touching the filesystem.
+        let workspace_root_owned: PathBuf = match workspace_root {
+            Some(p) => p.to_path_buf(),
+            None => match std::env::current_dir() {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("claw plan run: cannot read CWD as workspace root: {e}");
+                    return a2_plan_runner::EXIT_RUN_PLAN_WRITE_PREVIEW_REFUSED;
+                }
+            },
+        };
+        let substrate = Some((
+            substrate_url.unwrap_or(DEFAULT_SUBSTRATE_URL),
+            fast_model.unwrap_or(DEFAULT_FAST_MODEL),
+        ));
+        let report = a2_plan_runner::run_plan_with_write_preview(
+            &plan,
+            wrapper_path,
+            substrate,
+            effective_step_timeout,
+            &workspace_root_owned,
+        );
+        let stdout = std::io::stdout();
+        let mut handle = stdout.lock();
+        let write_result = match report_format {
+            PlanReportFormat::Markers => write_write_preview_markers(&report, &mut handle),
+            PlanReportFormat::Json => write_write_preview_json(&report, &mut handle),
+        };
+        if let Err(e) = write_result {
+            eprintln!("claw plan run: failed to write report: {e}");
+            return 1;
+        }
+        return report.exit_code_hint;
+    }
+
+    // -- 2b. Build the PlanReport. Two paths depending on --dry-run.
     let report = if dry_run {
         // Dry-run: validator + precheck only. No subprocess, no substrate
         // probe, no live broker. Exits 0/2/3 only.
@@ -670,6 +741,163 @@ fn run_plan_subcommand(
     }
 
     exit_code_for(&report)
+}
+
+/// L2b write-preview report writer (markers). Emits the
+/// runner-supplied marker stream followed by an operator-facing summary
+/// of the artifact paths (only on `WritePreviewReady`). Pure stdout — no
+/// file writes here; the artifacts are already on disk under runner-owned
+/// `.claw/l2b-*` directories.
+fn write_write_preview_markers<W: std::io::Write>(
+    report: &a2_plan_runner::WritePreviewRunReport,
+    mut writer: W,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    writeln!(writer, "# plan: {}", report.plan_name)?;
+    writeln!(
+        writer,
+        "# write_preview_status: {}",
+        write_preview_status_label(&report.status)
+    )?;
+    for marker in &report.markers {
+        writeln!(writer, "{marker}")?;
+    }
+    for sr in &report.step_reports {
+        writeln!(writer, "# step: {}", sr.step_id)?;
+        for marker in &sr.markers {
+            writeln!(writer, "{marker}")?;
+        }
+    }
+    if let Some(artifacts) = &report.preview_artifacts {
+        writeln!(writer, "# run_id: {}", artifacts.run_id)?;
+        writeln!(writer, "# pending_step_id: {}", artifacts.pending_step_id)?;
+        writeln!(
+            writer,
+            "# preview_bundle_path: {}",
+            artifacts.preview_bundle_path.display()
+        )?;
+        writeln!(
+            writer,
+            "# preview_generator_result_path: {}",
+            artifacts.preview_generator_result_path.display()
+        )?;
+        writeln!(
+            writer,
+            "# checkpoint_manifest_path: {}",
+            artifacts.checkpoint_manifest_path.display()
+        )?;
+        writeln!(
+            writer,
+            "# payload_path: {}",
+            artifacts.payload_path.display()
+        )?;
+        writeln!(writer, "# payload_sha256: {}", artifacts.payload_sha256)?;
+        writeln!(
+            writer,
+            "# run_manifest_path: {}",
+            artifacts.run_manifest_path.display()
+        )?;
+        writeln!(
+            writer,
+            "# next_operator_command: {}",
+            artifacts.next_operator_command
+        )?;
+    }
+    if let Some(refusal) = &report.refusal {
+        writeln!(
+            writer,
+            "# refusal: {}",
+            write_preview_refusal_label(refusal)
+        )?;
+    }
+    Ok(())
+}
+
+fn write_write_preview_json<W: std::io::Write>(
+    report: &a2_plan_runner::WritePreviewRunReport,
+    mut writer: W,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let steps: Vec<_> = report
+        .step_reports
+        .iter()
+        .map(|sr| {
+            let outcome = match &sr.outcome {
+                Ok(()) => "passed",
+                Err(_) => "failed",
+            };
+            serde_json::json!({
+                "step_id": sr.step_id,
+                "outcome": outcome,
+                "markers": sr.markers,
+            })
+        })
+        .collect();
+    let artifacts_json = report.preview_artifacts.as_ref().map(|a| {
+        serde_json::json!({
+            "run_id": a.run_id,
+            "pending_step_id": a.pending_step_id,
+            "preview_id": a.preview_id,
+            "workspace_root": a.workspace_root,
+            "target_relative_path": a.target_relative_path,
+            "preview_bundle_path": a.preview_bundle_path,
+            "preview_generator_result_path": a.preview_generator_result_path,
+            "checkpoint_manifest_path": a.checkpoint_manifest_path,
+            "payload_path": a.payload_path,
+            "payload_sha256_path": a.payload_sha256_path,
+            "payload_sha256": a.payload_sha256,
+            "payload_size_bytes": a.payload_size_bytes,
+            "run_manifest_path": a.run_manifest_path,
+            "run_status_path": a.run_status_path,
+            "is_binary": a.is_binary,
+            "is_redacted": a.is_redacted,
+            "is_truncated": a.is_truncated,
+            "next_operator_command": a.next_operator_command,
+        })
+    });
+    let refusal_json = report
+        .refusal
+        .as_ref()
+        .map(|r| serde_json::json!({"label": write_preview_refusal_label(r)}));
+    let doc = serde_json::json!({
+        "schema_version": "a2-l2b-run-plan-write-preview-report.v1",
+        "plan_name": report.plan_name,
+        "status": write_preview_status_label(&report.status),
+        "write_step_count": report.write_step_count,
+        "markers": report.markers,
+        "steps": steps,
+        "preview_artifacts": artifacts_json,
+        "refusal": refusal_json,
+        "exit_code_hint": report.exit_code_hint,
+        "next_operator_command": report.next_operator_command,
+    });
+    writeln!(writer, "{doc}")
+}
+
+fn write_preview_status_label(status: &a2_plan_runner::WritePreviewPlanStatus) -> &'static str {
+    use a2_plan_runner::WritePreviewPlanStatus;
+    match status {
+        WritePreviewPlanStatus::ReadOnlyComplete => "read_only_complete",
+        WritePreviewPlanStatus::WritePreviewReady => "write_preview_ready",
+        WritePreviewPlanStatus::Refused => "refused",
+        WritePreviewPlanStatus::ReadOnlyFailedBeforeWrite => "read_only_failed_before_write",
+    }
+}
+
+fn write_preview_refusal_label(
+    refusal: &a2_plan_runner::runner::WritePreviewPlanRefusal,
+) -> String {
+    use a2_plan_runner::runner::WritePreviewPlanRefusal;
+    match refusal {
+        WritePreviewPlanRefusal::ValidatorRefused => "validator-refused".to_string(),
+        WritePreviewPlanRefusal::ToolDisallowed { step_id, tool } => {
+            format!("tool-disallowed: step={step_id} tool={tool}")
+        }
+        WritePreviewPlanRefusal::MultipleWorkspaceWriteSteps { count } => {
+            format!("multi-write-refused: count={count}")
+        }
+        WritePreviewPlanRefusal::PreviewProduction(refusal) => refusal.reason(),
+    }
 }
 
 // =========================================================================
@@ -3170,6 +3398,14 @@ enum CliAction {
     // A2-L1b: additive read-only plan runner subcommand. Implementation
     // lives entirely in the `a2-plan-runner` crate; this variant only
     // carries parsed flags. No existing CliAction variant is modified.
+    //
+    // A2-L2b run-plan write-preview extension: when
+    // `workspace_write_preview` is set, the CLI dispatches to
+    // [`a2_plan_runner::run_plan_with_write_preview`] which permits exactly
+    // ONE workspace-write step to produce preview-only artifacts and halt
+    // before approval. Without the flag, the existing read-only-only
+    // `run_plan` contract is unchanged (workspace-write plans still
+    // refuse via precheck).
     Plan {
         file: PathBuf,
         dry_run: bool,
@@ -3181,6 +3417,14 @@ enum CliAction {
         /// runner's `DEFAULT_STEP_TIMEOUT`. Bounds enforced by
         /// [`a2_plan_runner::parse_step_timeout_seconds`].
         step_timeout: Option<std::time::Duration>,
+        /// L2b opt-in: enable workspace-write preview-only handling for a
+        /// plan that contains exactly one `mode: workspace-write` step.
+        /// Default `false` preserves L1b read-only-only behavior.
+        workspace_write_preview: bool,
+        /// L2b opt-in: optional workspace root override. Defaults to the
+        /// CLI's current working directory. The runner canonicalizes the
+        /// path internally before any filesystem read.
+        workspace_root: Option<PathBuf>,
     },
     // A2-L2b Slice 3d: operator-facing approval command. Reads ONE
     // preview bundle file from disk, renders the Slice-3b operator
@@ -3915,6 +4159,8 @@ fn parse_plan_subcommand_args(args: &[String]) -> Result<CliAction, String> {
     let mut fast_model: Option<String> = None;
     let mut wrapper: Option<PathBuf> = None;
     let mut step_timeout: Option<std::time::Duration> = None;
+    let mut workspace_write_preview = false;
+    let mut workspace_root: Option<PathBuf> = None;
 
     let mut i = 0;
     while i < tail.len() {
@@ -3984,13 +4230,35 @@ fn parse_plan_subcommand_args(args: &[String]) -> Result<CliAction, String> {
                 )?);
                 i += 1;
             }
+            // A2-L2b run-plan write-preview opt-in. Without this flag,
+            // workspace-write plans still refuse at precheck. With it,
+            // the runner permits exactly one workspace-write step to
+            // produce preview-only artifacts and halt.
+            "--workspace-write-preview" => {
+                workspace_write_preview = true;
+                i += 1;
+            }
+            "--workspace-root" => {
+                let value = tail
+                    .get(i + 1)
+                    .ok_or_else(|| "missing value for --workspace-root".to_string())?;
+                workspace_root = Some(PathBuf::from(value));
+                i += 2;
+            }
+            v if v.starts_with("--workspace-root=") => {
+                workspace_root = Some(PathBuf::from(&v["--workspace-root=".len()..]));
+                i += 1;
+            }
             // Explicitly reject flags that would bypass the runner's
             // construction guarantees. Spelled out so users get a clear
             // error instead of silent acceptance.
-            "--allow-write" | "--force" | "--permission-mode" | "--model" | "--allowed-tools" => {
+            "--allow-write" | "--force" | "--permission-mode" | "--model" | "--allowed-tools"
+            | "--yes" | "--auto" | "--preapproved" | "--batch" => {
                 return Err(format!(
                     "{arg} is not supported by `claw plan run`. The runner pins read-only \
-                     execution, FAST tier, and the static tool allowlist by construction."
+                     execution, FAST tier, and the static tool allowlist by construction. \
+                     Approval / apply must go through `claw plan approve` and \
+                     `claw plan apply-bundle` + `claw plan apply` — never bypassed."
                 ));
             }
             v if v.starts_with("--") => {
@@ -4011,9 +4279,27 @@ fn parse_plan_subcommand_args(args: &[String]) -> Result<CliAction, String> {
     let file = file.ok_or_else(|| {
         "missing plan file. Usage: `claw plan run <file> [--dry-run] \
          [--report-format markers|json] [--substrate-url URL] \
-         [--fast-model NAME] [--wrapper PATH] [--step-timeout SECONDS]`"
+         [--fast-model NAME] [--wrapper PATH] [--step-timeout SECONDS] \
+         [--workspace-write-preview] [--workspace-root PATH]`"
             .to_string()
     })?;
+
+    if workspace_write_preview && dry_run {
+        return Err(
+            "--workspace-write-preview cannot be combined with --dry-run. \
+             The preview artifacts are the deliverable; a dry run would have nothing to emit."
+                .to_string(),
+        );
+    }
+
+    if workspace_root.is_some() && !workspace_write_preview {
+        return Err(
+            "--workspace-root requires --workspace-write-preview. The L1b read-only \
+             path runs from the current working directory and ignores any workspace \
+             root override."
+                .to_string(),
+        );
+    }
 
     Ok(CliAction::Plan {
         file,
@@ -4023,6 +4309,8 @@ fn parse_plan_subcommand_args(args: &[String]) -> Result<CliAction, String> {
         fast_model,
         wrapper,
         step_timeout,
+        workspace_write_preview,
+        workspace_root,
     })
 }
 
@@ -17481,6 +17769,8 @@ mod plan_run_cli_tests {
                 fast_model,
                 wrapper,
                 step_timeout,
+                workspace_write_preview,
+                workspace_root,
             } => {
                 assert_eq!(file, plan);
                 assert!(dry_run);
@@ -17494,6 +17784,9 @@ mod plan_run_cli_tests {
                 // No --step-timeout in this invocation → None;
                 // run_plan_subcommand falls back to DEFAULT_STEP_TIMEOUT.
                 assert_eq!(step_timeout, None);
+                // No L2b opt-in flags in this invocation → defaults.
+                assert!(!workspace_write_preview);
+                assert!(workspace_root.is_none());
             }
             other => panic!("expected CliAction::Plan, got {other:?}"),
         }
@@ -17528,8 +17821,10 @@ mod plan_run_cli_tests {
             PlanReportFormat::Markers,
             None,
             None,
-            None, // wrapper unused in dry-run
-            None, // step_timeout unused in dry-run
+            None,  // wrapper unused in dry-run
+            None,  // step_timeout unused in dry-run
+            false, // workspace_write_preview: existing L1b path
+            None,  // workspace_root
         );
         assert_eq!(
             code, 2,
@@ -17551,6 +17846,8 @@ mod plan_run_cli_tests {
             None,
             None,
             None,
+            false,
+            None,
         );
         assert_eq!(code, 2, "DEEP plan must exit 2 (PLAN_REFUSED_PRECHECK)");
     }
@@ -17568,6 +17865,8 @@ mod plan_run_cli_tests {
             None,
             None,
             None,
+            None,
+            false,
             None,
         );
         assert_eq!(code, 3, "Edit tool must exit 3 (TOOL_DISALLOWED)");
@@ -17591,6 +17890,8 @@ mod plan_run_cli_tests {
             None,
             None,
             None,
+            None,
+            false,
             None,
         );
         assert_eq!(code, 0, "valid read-only plan must exit 0 in dry-run");
@@ -17617,7 +17918,9 @@ mod plan_run_cli_tests {
             None,
             None,
             Some(&missing_wrapper),
-            None, // step_timeout — irrelevant; wrapper check short-circuits first
+            None,  // step_timeout — irrelevant; wrapper check short-circuits first
+            false, // workspace_write_preview
+            None,  // workspace_root
         );
         assert_eq!(
             code, 4,
@@ -17638,6 +17941,8 @@ mod plan_run_cli_tests {
             None,
             None,
             None,
+            false,
+            None,
         );
         assert_eq!(code, 5, "yaml parse error must exit 5 (EXIT_PARSE_ERROR)");
     }
@@ -17652,6 +17957,8 @@ mod plan_run_cli_tests {
             None,
             None,
             None,
+            None,
+            false,
             None,
         );
         assert_eq!(code, 5, "missing plan file must exit 5 (EXIT_PARSE_ERROR)");
@@ -17826,6 +18133,8 @@ mod plan_run_cli_tests {
             None,
             None,
             Some(std::time::Duration::from_secs(5)),
+            false,
+            None,
         );
         assert_eq!(code, 0, "valid dry-run plan must exit 0");
     }
