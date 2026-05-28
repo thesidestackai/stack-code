@@ -652,6 +652,81 @@ fn write_executor_module_has_no_unsafe() {
     );
 }
 
+/// A2-L2b slice-4 EXDEV policy: the executor refuses cross-device
+/// rename failures rather than falling back to a byte-copy. The
+/// policy is enforced statically — there is no `fs::copy` / `io::copy`
+/// path in `write_executor.rs`. A future refactor that smuggles in a
+/// copy fallback must surface here.
+#[test]
+fn write_executor_module_has_no_cross_device_copy_fallback() {
+    let src = include_str!("../src/write_executor.rs");
+    // Reconstruct the forbidden tokens at runtime so this test source
+    // file does not itself contain the literal byte sequences (each
+    // test that greps its own source must dodge self-match — see the
+    // `tests/l2b_write_executor.rs` location vs the `src/` location
+    // that's actually being scanned).
+    let fs_dot = format!("{}::", "fs");
+    let io_dot = format!("{}::", "io");
+    let forbidden_tokens: [String; 6] = [
+        format!("{fs_dot}copy("),
+        format!("std::{fs_dot}copy"),
+        format!("{io_dot}copy("),
+        format!("std::{io_dot}copy"),
+        "copy_fallback".to_string(),
+        "EXDEV_FALLBACK".to_string(),
+    ];
+    for forbidden in &forbidden_tokens {
+        assert!(
+            !src.contains(forbidden.as_str()),
+            "write_executor.rs must not contain `{forbidden}` \
+             (slice-4 forbids cross-device copy fallback)"
+        );
+    }
+}
+
+/// Defensive: the executor source never mentions a multi-file write
+/// vocabulary (slice 4 commits to exactly-one-file writes).
+#[test]
+fn write_executor_module_has_no_multi_file_write_vocabulary() {
+    let src = include_str!("../src/write_executor.rs");
+    for forbidden in [
+        "multi_file",
+        "multi-file",
+        "batch_apply",
+        "batch-apply",
+        "write_many",
+        "apply_all(",
+    ] {
+        assert!(
+            !src.contains(forbidden),
+            "write_executor.rs must not reference `{forbidden}` \
+             (slice 4 is single-file only)"
+        );
+    }
+}
+
+/// Defensive: the executor's source must not reach into the CLI crate
+/// or the L1b read-only `run_plan` runner. Both are out of scope for
+/// slice 4 by hard contract.
+#[test]
+fn write_executor_module_has_no_cli_or_run_plan_wiring() {
+    let src = include_str!("../src/write_executor.rs");
+    for forbidden in [
+        "rusty_claude_cli",
+        "rusty-claude-cli",
+        "run_plan(",
+        "CliAction",
+        "plan apply ",
+        "plan approve ",
+    ] {
+        assert!(
+            !src.contains(forbidden),
+            "write_executor.rs must not reference `{forbidden}` \
+             (CLI / run_plan wiring is explicitly out of scope for slice 4)"
+        );
+    }
+}
+
 // -------------------------------------------------------------------------
 // Outcome-shape sanity: catch typo regressions in the request type
 // -------------------------------------------------------------------------
