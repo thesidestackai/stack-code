@@ -658,6 +658,7 @@ mod tests {
             expected_output: None,
             write_target: None,
             expected_post_write: None,
+            after_file: None,
         }
     }
 

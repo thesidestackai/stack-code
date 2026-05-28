@@ -58,6 +58,16 @@ pub struct ExpectedPostWriteContract {
 /// `tools` MUST be declared explicitly. An empty or missing list is a
 /// validation refusal, not a parse error, so the validator can attach
 /// the `a2-l1-missing-tools` marker to a specific step.
+///
+/// L2a (this lane) adds the `after_file` field: the workspace-root-relative
+/// path of a file whose bytes are the exact after-bytes for the workspace
+/// write. The schema validates `after_file` lexically only — it never
+/// opens, stat-s, or canonicalizes the path. Runtime file checks (existence,
+/// regular-file-ness, symlink rejection, size cap, byte read) are the
+/// future runner/materializer's responsibility.
+///
+/// `after_file` is required for `mode: workspace-write` and forbidden on
+/// `mode: read-only`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanStep {
@@ -75,6 +85,11 @@ pub struct PlanStep {
     pub write_target: Option<WriteTarget>,
     #[serde(default)]
     pub expected_post_write: Option<ExpectedPostWriteContract>,
+    /// L2a explicit exact-after-bytes source. Workspace-root-relative,
+    /// lexically validated (no I/O). Required for `mode: workspace-write`,
+    /// forbidden on `mode: read-only`. See [`crate::plan_validate`].
+    #[serde(default)]
+    pub after_file: Option<String>,
 }
 
 /// A static plan document.
@@ -258,6 +273,54 @@ steps:
             .expect("expected_post_write should be present");
         assert_eq!(post.must_contain, vec!["hello".to_string()]);
         assert_eq!(post.must_not_contain, vec!["secret".to_string()]);
+    }
+
+    #[test]
+    fn parses_workspace_write_step_with_after_file() {
+        // L2a: the explicit exact-after-bytes source field is a top-level
+        // `PlanStep` field (NOT nested under `write_target`). It is
+        // optional at parse time so unaffected legacy plans still parse;
+        // the validator decides whether absence/presence is acceptable.
+        let yaml = r"
+name: write-with-source
+mode: read-only
+steps:
+  - id: edit
+    description: edit a file
+    mode: workspace-write
+    tools: [Write]
+    write_target:
+      path: notes/scratch.md
+      create_if_absent: true
+    after_file: materialized/notes_scratch.after
+";
+        let plan = parse_plan(yaml).expect("workspace-write + after_file should parse");
+        let step = &plan.steps[0];
+        assert_eq!(
+            step.after_file.as_deref(),
+            Some("materialized/notes_scratch.after")
+        );
+    }
+
+    #[test]
+    fn missing_after_file_field_defaults_to_none() {
+        // Legacy workspace-write plans that pre-date the L2a after_file
+        // field must still parse cleanly — `after_file` defaults to
+        // `None`. The validator is what decides such a step is refused
+        // (missing exact-after-bytes source), not the parser.
+        let yaml = r"
+name: legacy-write
+mode: read-only
+steps:
+  - id: edit
+    description: edit a file
+    mode: workspace-write
+    tools: [Write]
+    write_target:
+      path: notes/scratch.md
+";
+        let plan = parse_plan(yaml).expect("legacy workspace-write parses without after_file");
+        assert!(plan.steps[0].after_file.is_none());
     }
 
     #[test]

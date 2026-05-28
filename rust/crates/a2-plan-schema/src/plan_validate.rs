@@ -28,6 +28,16 @@ pub mod markers {
     pub const WRITE_PATH_DENYGLOB: &str = "a2-l1-write-path-denyglob";
     pub const EXPECTED_POST_WRITE_ON_READONLY: &str = "a2-l1-expected-post-write-on-readonly";
 
+    // L2a `after_file` source markers. Distinct `a2-l2a-` prefix because
+    // the after-bytes source is a strictly L2a addition and downstream
+    // log scrapers may want to opt in to it without re-scoping their
+    // existing `a2-l1-*` regexes.
+    pub const AFTER_FILE_MISSING: &str = "a2-l2a-after-file-missing";
+    pub const AFTER_FILE_ON_READONLY: &str = "a2-l2a-after-file-on-readonly";
+    pub const AFTER_FILE_PATH_REFUSED: &str = "a2-l2a-after-file-path-refused";
+    pub const AFTER_FILE_PATH_DENYGLOB: &str = "a2-l2a-after-file-path-denyglob";
+    pub const AFTER_FILE_SHAPE_ACCEPTED: &str = "a2-l2a-after-file-shape-accepted";
+
     // Plan-level rollup markers.
     pub const REPORT_OK: &str = "a2-l1-plan-validation-pass";
     pub const REPORT_REFUSED: &str = "a2-l1-plan-validation-refused";
@@ -146,23 +156,41 @@ fn validate_step(plan: &Plan, step: &PlanStep) -> StepValidationResult {
                 step_markers.push(markers::EXPECTED_POST_WRITE_ON_READONLY.to_string());
                 accepted = false;
             }
+            if step.after_file.is_some() {
+                step_markers.push(markers::AFTER_FILE_ON_READONLY.to_string());
+                accepted = false;
+            }
         }
         PlanMode::WorkspaceWrite => {
-            match &step.write_target {
+            let target_path: Option<&str> = match &step.write_target {
                 None => {
                     step_markers.push(markers::WRITE_MISSING_TARGET.to_string());
                     accepted = false;
+                    None
                 }
                 Some(target) => {
                     if let Some(marker) = check_write_path(&target.path) {
                         step_markers.push(marker.to_string());
                         accepted = false;
                     }
+                    Some(target.path.as_str())
                 }
-            }
+            };
             if !declares_write_tool {
                 step_markers.push(markers::WRITE_TOOL_MISSING.to_string());
                 accepted = false;
+            }
+            match &step.after_file {
+                None => {
+                    step_markers.push(markers::AFTER_FILE_MISSING.to_string());
+                    accepted = false;
+                }
+                Some(after_file) => {
+                    if let Some(marker) = check_after_file_path(after_file, target_path) {
+                        step_markers.push(marker.to_string());
+                        accepted = false;
+                    }
+                }
             }
         }
     }
@@ -174,6 +202,7 @@ fn validate_step(plan: &Plan, step: &PlanStep) -> StepValidationResult {
             }
             PlanMode::WorkspaceWrite => {
                 step_markers.push(markers::ACCEPTED_WORKSPACE_WRITE.to_string());
+                step_markers.push(markers::AFTER_FILE_SHAPE_ACCEPTED.to_string());
             }
         }
     }
@@ -213,6 +242,48 @@ fn check_write_path(path: &str) -> Option<&'static str> {
         }
         if matches_deny_pattern(component) {
             return Some(markers::WRITE_PATH_DENYGLOB);
+        }
+    }
+
+    None
+}
+
+/// Lexical-only safety check for the L2a `after_file` source. Mirrors
+/// [`check_write_path`]'s rule set and additionally refuses
+/// `after_file == write_target.path`.
+///
+/// IMPORTANT: This function does **not** touch the filesystem. It does
+/// not stat, canonicalize, follow symlinks, or read bytes. The runner /
+/// materializer lane is responsible for runtime checks (existence,
+/// regular-file-ness, symlink rejection, size cap, byte read).
+fn check_after_file_path(after_file: &str, target_path: Option<&str>) -> Option<&'static str> {
+    if after_file.is_empty() {
+        return Some(markers::AFTER_FILE_PATH_REFUSED);
+    }
+    if after_file.starts_with('/') {
+        return Some(markers::AFTER_FILE_PATH_REFUSED);
+    }
+
+    let components: Vec<&str> = after_file.split('/').filter(|c| !c.is_empty()).collect();
+
+    for component in &components {
+        if *component == ".." {
+            return Some(markers::AFTER_FILE_PATH_REFUSED);
+        }
+    }
+
+    for component in &components {
+        if DENY_DIR_COMPONENTS.contains(component) {
+            return Some(markers::AFTER_FILE_PATH_DENYGLOB);
+        }
+        if matches_deny_pattern(component) {
+            return Some(markers::AFTER_FILE_PATH_DENYGLOB);
+        }
+    }
+
+    if let Some(target) = target_path {
+        if after_file == target {
+            return Some(markers::AFTER_FILE_PATH_REFUSED);
         }
     }
 
@@ -612,6 +683,7 @@ steps:
                 expected_output: None,
                 write_target: Some(write_target("notes/scratch.md")),
                 expected_post_write: None,
+                after_file: None,
             }],
         };
         let report = validate_plan(&plan);
@@ -620,5 +692,216 @@ steps:
         assert!(step
             .markers
             .contains(&markers::WRITE_TARGET_ON_READONLY.to_string()));
+    }
+
+    // --- L2a after_file unit coverage -------------------------------------------
+
+    #[test]
+    fn after_file_safety_rejects_empty_with_path_refused() {
+        assert_eq!(
+            check_after_file_path("", Some("notes/scratch.md")),
+            Some(markers::AFTER_FILE_PATH_REFUSED)
+        );
+    }
+
+    #[test]
+    fn after_file_safety_rejects_absolute_with_path_refused() {
+        assert_eq!(
+            check_after_file_path("/etc/passwd", Some("notes/scratch.md")),
+            Some(markers::AFTER_FILE_PATH_REFUSED)
+        );
+    }
+
+    #[test]
+    fn after_file_safety_rejects_traversal_with_path_refused() {
+        assert_eq!(
+            check_after_file_path("../escape.after", Some("notes/scratch.md")),
+            Some(markers::AFTER_FILE_PATH_REFUSED)
+        );
+        assert_eq!(
+            check_after_file_path("a/../b", Some("notes/scratch.md")),
+            Some(markers::AFTER_FILE_PATH_REFUSED)
+        );
+    }
+
+    #[test]
+    fn after_file_safety_rejects_same_as_target_with_path_refused() {
+        // A workspace-write step that names the live target as its own
+        // after-bytes source is incoherent: there'd be nothing to
+        // overwrite from. Lexical equality is enough at this layer.
+        assert_eq!(
+            check_after_file_path("notes/scratch.md", Some("notes/scratch.md")),
+            Some(markers::AFTER_FILE_PATH_REFUSED)
+        );
+    }
+
+    #[test]
+    fn after_file_safety_rejects_deny_dir_components_with_denyglob() {
+        assert_eq!(
+            check_after_file_path(".git/HEAD", None),
+            Some(markers::AFTER_FILE_PATH_DENYGLOB)
+        );
+        assert_eq!(
+            check_after_file_path(".claw/state", None),
+            Some(markers::AFTER_FILE_PATH_DENYGLOB)
+        );
+        assert_eq!(
+            check_after_file_path(".claude/settings.json", None),
+            Some(markers::AFTER_FILE_PATH_DENYGLOB)
+        );
+    }
+
+    #[test]
+    fn after_file_safety_rejects_env_secret_creds_with_denyglob() {
+        assert_eq!(
+            check_after_file_path(".env", None),
+            Some(markers::AFTER_FILE_PATH_DENYGLOB)
+        );
+        assert_eq!(
+            check_after_file_path(".env.local", None),
+            Some(markers::AFTER_FILE_PATH_DENYGLOB)
+        );
+        assert_eq!(
+            check_after_file_path("secrets.yaml", None),
+            Some(markers::AFTER_FILE_PATH_DENYGLOB)
+        );
+        assert_eq!(
+            check_after_file_path("credentials.json", None),
+            Some(markers::AFTER_FILE_PATH_DENYGLOB)
+        );
+        assert_eq!(
+            check_after_file_path("tls/server.pem", None),
+            Some(markers::AFTER_FILE_PATH_DENYGLOB)
+        );
+        assert_eq!(
+            check_after_file_path("tls/server.key", None),
+            Some(markers::AFTER_FILE_PATH_DENYGLOB)
+        );
+    }
+
+    #[test]
+    fn after_file_safety_accepts_relative_safe_paths() {
+        assert_eq!(
+            check_after_file_path("materialized/notes_scratch.after", None),
+            None
+        );
+        assert_eq!(
+            check_after_file_path(
+                "build/materialized/notes_scratch.after",
+                Some("notes/scratch.md")
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn workspace_write_without_after_file_is_refused() {
+        let plan = parse(
+            r"
+name: bad-write
+mode: read-only
+steps:
+  - id: s1
+    description: writes
+    mode: workspace-write
+    tools: [Write]
+    write_target:
+      path: notes/scratch.md
+",
+        );
+        let report = validate_plan(&plan);
+        assert_eq!(report.classification, PlanClassification::Refused);
+        let step = &report.step_results[0];
+        assert!(!step.accepted);
+        assert!(step
+            .markers
+            .contains(&markers::AFTER_FILE_MISSING.to_string()));
+        // The accepted markers must NOT have been emitted.
+        assert!(!step
+            .markers
+            .contains(&markers::ACCEPTED_WORKSPACE_WRITE.to_string()));
+        assert!(!step
+            .markers
+            .contains(&markers::AFTER_FILE_SHAPE_ACCEPTED.to_string()));
+    }
+
+    #[test]
+    fn read_only_with_after_file_is_refused() {
+        let plan = parse(
+            r"
+name: bad-readonly
+mode: read-only
+steps:
+  - id: s1
+    description: read with after_file
+    tools: [Read]
+    after_file: materialized/scratch.after
+",
+        );
+        let report = validate_plan(&plan);
+        assert_eq!(report.classification, PlanClassification::Refused);
+        let step = &report.step_results[0];
+        assert!(!step.accepted);
+        assert!(step
+            .markers
+            .contains(&markers::AFTER_FILE_ON_READONLY.to_string()));
+        // Read-only ACCEPTED marker must NOT have been emitted.
+        assert!(!step
+            .markers
+            .contains(&markers::ACCEPTED_READONLY.to_string()));
+    }
+
+    #[test]
+    fn workspace_write_with_after_file_equal_to_target_is_refused() {
+        let plan = parse(
+            r"
+name: bad-same
+mode: read-only
+steps:
+  - id: s1
+    description: writes
+    mode: workspace-write
+    tools: [Write]
+    write_target:
+      path: notes/scratch.md
+    after_file: notes/scratch.md
+",
+        );
+        let report = validate_plan(&plan);
+        assert_eq!(report.classification, PlanClassification::Refused);
+        let step = &report.step_results[0];
+        assert!(!step.accepted);
+        assert!(step
+            .markers
+            .contains(&markers::AFTER_FILE_PATH_REFUSED.to_string()));
+    }
+
+    #[test]
+    fn workspace_write_with_valid_after_file_passes() {
+        let plan = parse(
+            r"
+name: ok-write
+mode: read-only
+steps:
+  - id: edit
+    description: edit a file
+    mode: workspace-write
+    tools: [Write]
+    write_target:
+      path: notes/scratch.md
+      create_if_absent: true
+    after_file: materialized/notes_scratch.after
+",
+        );
+        let report = validate_plan(&plan);
+        assert!(report.is_pass(), "expected PASS, got {report:?}");
+        let step = &report.step_results[0];
+        assert!(step.accepted);
+        assert!(step
+            .markers
+            .contains(&markers::ACCEPTED_WORKSPACE_WRITE.to_string()));
+        assert!(step
+            .markers
+            .contains(&markers::AFTER_FILE_SHAPE_ACCEPTED.to_string()));
     }
 }

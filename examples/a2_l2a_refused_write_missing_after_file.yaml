@@ -1,0 +1,17 @@
+# A2 L2a example: workspace-write step missing the required after_file
+# source. L2a requires an explicit exact-after-bytes source on every
+# workspace-write step; the schema validator emits
+# `a2-l2a-after-file-missing` and refuses the plan.
+#
+# Expected validator result: REFUSED with marker a2-l2a-after-file-missing.
+name: write-without-after-file
+mode: read-only
+model_tier: FAST
+steps:
+  - id: write-step
+    description: Declares workspace-write + Write + write_target but no after_file
+    mode: workspace-write
+    tools: [Write]
+    write_target:
+      path: notes/scratch.md
+      create_if_absent: true

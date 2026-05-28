@@ -17700,6 +17700,7 @@ mod plan_run_cli_tests {
             expected_output: None,
             write_target: None,
             expected_post_write: None,
+            after_file: None,
         };
         let cmd = build_claw_command(std::path::Path::new("/tmp/wrapper"), &step);
         assert!(
