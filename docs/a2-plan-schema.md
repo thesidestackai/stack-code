@@ -50,6 +50,7 @@ steps:
     write_target:             # required on workspace-write
       path: notes/scratch.md  # workspace-relative, lexically safe
       create_if_absent: true  # optional
+    after_file: materialized/notes_scratch.after  # required on workspace-write
     expected_post_write:      # optional, advisory only
       must_contain: ["summary"]
       must_not_contain: ["TODO"]
@@ -78,7 +79,7 @@ only**:
   `credentials*`, `*.pem`, `*.key`.
 
 A workspace-write step that satisfies these rules emits
-`a2-l1-accepted-workspace-write`.
+`a2-l1-accepted-workspace-write` AND `a2-l2a-after-file-shape-accepted`.
 
 | Condition                                                           | Marker                                  |
 | ------------------------------------------------------------------- | --------------------------------------- |
@@ -89,6 +90,41 @@ A workspace-write step that satisfies these rules emits
 | read-only step declares `Write` in `tools`                          | `a2-l1-write-tool-on-readonly`          |
 | read-only step declares `write_target`                              | `a2-l1-write-target-on-readonly`        |
 | read-only step declares `expected_post_write`                       | `a2-l1-expected-post-write-on-readonly` |
+
+## L2a `after_file` rules (new in this lane)
+
+`after_file` is the workspace-root-relative path of the file whose bytes
+are the exact after-bytes for the workspace write. It is a top-level
+`PlanStep` field — **not** nested under `write_target`.
+
+- **Required** on every `mode: workspace-write` step.
+- **Forbidden** on every `mode: read-only` step.
+- Validated **lexically only** — the schema never opens, stat-s, or
+  canonicalizes the path. Runtime file checks (existence,
+  regular-file-ness, symlink rejection, size cap, byte read) are the
+  future runner/materializer lane's responsibility.
+- Same path-safety rule set as `write_target.path` (absolute / `..` /
+  `.git` / `.claw` / `.claude` / `.env*` / `secret*` / `credentials*` /
+  `*.pem` / `*.key` are refused). Note that `.claw` is denied
+  unconditionally at L2a — there is currently no carveout for
+  `.claw/l2b-materialized/…` and any future carveout must be a separate,
+  deliberate lane.
+- **`after_file` must not equal `write_target.path`** — a workspace-write
+  step that names the live target as its own after-bytes source is
+  incoherent and refused.
+
+| Condition                                                           | Marker                              |
+| ------------------------------------------------------------------- | ----------------------------------- |
+| workspace-write step missing `after_file`                           | `a2-l2a-after-file-missing`         |
+| read-only step declares `after_file`                                | `a2-l2a-after-file-on-readonly`     |
+| `after_file` empty / absolute / contains `..` / same as `write_target.path` | `a2-l2a-after-file-path-refused`    |
+| `after_file` matches deny-glob (`.git`, `.claw`, `.env`, `*.pem`, …) | `a2-l2a-after-file-path-denyglob`   |
+| workspace-write step's `after_file` is lexically valid              | `a2-l2a-after-file-shape-accepted`  |
+
+The `a2-l2a-` prefix on the new markers is intentional: existing log
+scrapers that key on `a2-l1-` see unchanged behavior, and tooling that
+wants to opt in to the L2a after-bytes contract can grep
+`^a2-l2a-after-file-` independently.
 
 Plan-level markers:
 
@@ -113,13 +149,19 @@ The canonical L1a corpus lives in `examples/`:
 
 The L2a corpus lives alongside it in `examples/`:
 
-- `a2_l2a_valid_workspace_write_plan.yaml` — passes validation
+- `a2_l2a_valid_workspace_write_plan.yaml` — passes validation (now
+  includes `after_file`; emits both `a2-l1-accepted-workspace-write` and
+  `a2-l2a-after-file-shape-accepted`)
 - `a2_l2a_refused_write_missing_target.yaml` — refused via
-  `a2-l1-write-missing-target`
+  `a2-l1-write-missing-target` (also now picks up
+  `a2-l2a-after-file-missing` because the step has no `after_file`)
 - `a2_l2a_refused_write_path_escape.yaml` — refused via
   `a2-l1-write-path-refused`
 - `a2_l2a_refused_write_denyglob.yaml` — refused via
   `a2-l1-write-path-denyglob`
+- `a2_l2a_refused_write_missing_after_file.yaml` — new; refused via
+  `a2-l2a-after-file-missing` (workspace-write step with valid target
+  but no `after_file`)
 
 These files are `include_str!`'d into the unit and integration tests, so
 renaming or deleting them breaks the build by design.

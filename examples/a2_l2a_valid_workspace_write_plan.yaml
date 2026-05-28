@@ -1,6 +1,13 @@
 # A2 L2a example: valid workspace-write plan.
-# Expected validator result: PASS with marker a2-l1-accepted-workspace-write.
-# L2a is schema-only — no runner writes happen at this layer.
+# Expected validator result: PASS with markers
+#   - a2-l1-accepted-workspace-write
+#   - a2-l2a-after-file-shape-accepted
+# on the workspace-write step.
+# L2a is schema-only — no runner writes happen at this layer. The
+# `after_file` is the workspace-root-relative path of the exact
+# after-bytes source; the schema validator never opens it. Runtime file
+# checks (existence, regular-file-ness, symlink rejection, size cap,
+# byte read) belong to the future runner/materializer lane.
 name: write-scratch-notes
 mode: read-only
 model_tier: FAST
@@ -15,6 +22,7 @@ steps:
     write_target:
       path: notes/scratch.md
       create_if_absent: true
+    after_file: materialized/notes_scratch.after
     expected_post_write:
       must_contain: ["summary"]
       must_not_contain: ["TODO"]
