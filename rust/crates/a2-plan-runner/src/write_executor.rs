@@ -18,9 +18,9 @@
 //! # Hard contract (slice 4)
 //!
 //! - This module mutates **exactly one** file when the full authority
-//!   chain matches, and otherwise mutates nothing. No multi-file
-//!   writes, no parent-directory creation, no chmod / chown, no
-//!   symlink creation, no special-file creation.
+//!   chain matches, and otherwise mutates nothing. Multiple-file
+//!   writes are out of scope. No parent-directory creation, no chmod /
+//!   chown, no symlink creation, no special-file creation.
 //! - Same-directory temp + atomic rename, followed by parent-directory
 //!   fsync. Cross-device rename is impossible by construction (same
 //!   directory); if `EXDEV` ever surfaces, the executor aborts the
@@ -408,6 +408,14 @@ pub fn execute_write(request: &WriteExecutionRequest<'_>) -> WriteExecutionResul
 
     // 5. Post-write validation: reopen target, hash bytes, compare
     //    against payload.after_sha256.
+    //
+    // Test-only seam: a hook may mutate the on-disk file between commit
+    // and the validation re-read. This is the only way to drive a real
+    // hash mismatch through the public surface on a healthy fs.
+    #[cfg(test)]
+    if let Some(hook) = test_hooks::snapshot().before_validate_hook {
+        hook(&commit.target_absolute);
+    }
     match validate_post_write(&commit.target_absolute, &request.payload.after_sha256) {
         Ok(()) => {
             markers.push(markers::L2B_WRITE_VALIDATED);
@@ -568,6 +576,7 @@ struct AtomicWriteError {
     message: String,
 }
 
+#[allow(clippy::too_many_lines)]
 fn atomic_write(
     req: &WriteExecutionRequest<'_>,
     markers: &mut Vec<&'static str>,
@@ -587,6 +596,13 @@ fn atomic_write(
 
     // 2. Create same-directory temp file with exclusive create.
     let temp_path = same_dir_temp_path(parent, &req.resolved.file_name);
+    #[cfg(test)]
+    if let Some(kind) = test_hooks::snapshot().inject_temp_create_err {
+        return Err(AtomicWriteError {
+            stage: WriteStage::TempCreate,
+            message: format!("test-injected: temp create {kind:?}"),
+        });
+    }
     let mut temp_file = create_new_temp(&temp_path).map_err(|e| AtomicWriteError {
         stage: WriteStage::TempCreate,
         message: format!("create temp {}: {e}", temp_path.display()),
@@ -594,6 +610,15 @@ fn atomic_write(
     markers.push(markers::L2B_WRITE_TEMP_CREATED);
 
     // 3. Write the bytes.
+    #[cfg(test)]
+    if let Some(kind) = test_hooks::snapshot().inject_temp_write_err {
+        drop(temp_file);
+        let _ = fs::remove_file(&temp_path);
+        return Err(AtomicWriteError {
+            stage: WriteStage::TempWrite,
+            message: format!("test-injected: temp write {kind:?}"),
+        });
+    }
     temp_file
         .write_all(req.payload.after_bytes())
         .map_err(|e| AtomicWriteError {
@@ -602,6 +627,15 @@ fn atomic_write(
         })?;
 
     // 4. fsync temp.
+    #[cfg(test)]
+    if let Some(kind) = test_hooks::snapshot().inject_temp_fsync_err {
+        drop(temp_file);
+        let _ = fs::remove_file(&temp_path);
+        return Err(AtomicWriteError {
+            stage: WriteStage::TempFsync,
+            message: format!("test-injected: temp fsync {kind:?}"),
+        });
+    }
     temp_file.sync_all().map_err(|e| AtomicWriteError {
         stage: WriteStage::TempFsync,
         message: format!("fsync temp: {e}"),
@@ -617,6 +651,23 @@ fn atomic_write(
             stage: WriteStage::Commit,
             message: format!("baseline drift before commit: {drift:?}"),
         });
+    }
+
+    // Test-only race window: AFTER baseline-recheck passes, BEFORE the
+    // commit primitive runs. The hook may create the target slot to
+    // exercise the no-clobber refusal on the new-file branch.
+    #[cfg(test)]
+    {
+        if let Some(hook) = test_hooks::snapshot().before_commit_hook {
+            hook(&target);
+        }
+        if let Some(kind) = test_hooks::snapshot().inject_commit_err {
+            let _ = fs::remove_file(&temp_path);
+            return Err(AtomicWriteError {
+                stage: WriteStage::Commit,
+                message: format!("test-injected: commit {kind:?}"),
+            });
+        }
     }
 
     // 6. Commit.
@@ -661,6 +712,13 @@ fn atomic_write(
     }
 
     // 7. fsync parent directory so the rename / link is durable.
+    #[cfg(test)]
+    if let Some(kind) = test_hooks::snapshot().inject_parent_fsync_err {
+        return Err(AtomicWriteError {
+            stage: WriteStage::ParentFsync,
+            message: format!("test-injected: parent fsync {kind:?}"),
+        });
+    }
     parent_dir.sync_all().map_err(|e| AtomicWriteError {
         stage: WriteStage::ParentFsync,
         message: format!("fsync parent {}: {e}", parent.display()),
@@ -673,6 +731,10 @@ fn atomic_write(
 }
 
 fn validate_post_write(target: &Path, expected_after_sha256: &str) -> Result<(), String> {
+    #[cfg(test)]
+    if test_hooks::snapshot().force_validation_mismatch {
+        return Err("test-injected: forced post-write validation mismatch".to_string());
+    }
     let actual = hash_file(target).map_err(|e| format!("reopen target for hash: {e}"))?;
     if actual != expected_after_sha256 {
         return Err(format!(
@@ -690,6 +752,14 @@ fn rollback_after_validation_failure(
     markers.push(markers::L2B_ROLLBACK_STARTED);
 
     let parent = req.resolved.parent.as_path();
+
+    // Test-only seam: an external process may mutate the on-disk file
+    // between commit-success and the pre-rollback drift gate. Used to
+    // drive the `ExternalMutationBeforeRollback` refusal deterministically.
+    #[cfg(test)]
+    if let Some(hook) = test_hooks::snapshot().before_rollback_rehash_hook {
+        hook(&commit.target_absolute);
+    }
 
     // Common pre-rollback drift check: the on-disk file must still
     // match what the executor just wrote (sha256 == payload.after_sha256).
@@ -890,6 +960,133 @@ fn path_strings_equal(manifest_str: &str, payload_path: &Path) -> bool {
 }
 
 // =========================================================================
+// Test-only fault-injection seams (private; `#[cfg(test)]`-only).
+// =========================================================================
+//
+// These hooks exist so the slice-4 unit suite can reach states inside
+// [`execute_write`] that a healthy filesystem will not otherwise produce:
+//
+//   - forced post-write validation mismatch (drives the rollback path),
+//   - synthesized I/O errors at each atomic-write stage (drives
+//     [`WriteStage`] discrimination),
+//   - a "between baseline-recheck and commit" hook (drives the
+//     [`std::fs::hard_link`] no-clobber refusal arm),
+//   - a "between commit and post-write validation" hook (drives a real
+//     hash-mismatch detection without unsafe),
+//   - a "between validation failure and rollback re-hash" hook (drives
+//     the rollback's pre-rollback drift gate).
+//
+// The module is `#[cfg(test)]`-only and never compiles for production
+// builds. Production callers (`run_plan`, the CLI, downstream crates)
+// see no surface change whatsoever — no public API, no feature flag,
+// no env-var, no `#[doc(hidden)] pub`. Integration tests in the sibling
+// `tests/` crate also cannot see these hooks; the fault-coverage tests
+// therefore live as unit tests in this same file (see [`fault_tests`]).
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::cell::RefCell;
+    use std::io;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    pub(crate) type PathHook = Arc<dyn Fn(&Path) + Send + Sync>;
+
+    /// Per-thread fault-injection state consulted by the executor at
+    /// `#[cfg(test)]`-only inspection points.
+    ///
+    /// Every field defaults to the "no fault" value; a healthy executor
+    /// run with default hooks behaves identically whether the module
+    /// is compiled with or without `#[cfg(test)]`.
+    #[derive(Default, Clone)]
+    pub(crate) struct TestHooks {
+        /// Force [`super::atomic_write`] to short-circuit with a
+        /// `WriteStage::TempCreate` failure carrying the given error
+        /// kind. The real temp file is never created.
+        pub inject_temp_create_err: Option<io::ErrorKind>,
+        /// Short-circuit with a `WriteStage::TempWrite` failure after
+        /// the real temp create succeeds. The temp file is cleaned up.
+        pub inject_temp_write_err: Option<io::ErrorKind>,
+        /// Short-circuit with a `WriteStage::TempFsync` failure after
+        /// the temp write succeeds. The temp file is cleaned up.
+        pub inject_temp_fsync_err: Option<io::ErrorKind>,
+        /// Short-circuit with a `WriteStage::Commit` failure after the
+        /// pre-commit baseline recheck passes — mimics e.g. an `EXDEV`
+        /// rename failure or a hard-link no-clobber refusal. The temp
+        /// file is cleaned up.
+        pub inject_commit_err: Option<io::ErrorKind>,
+        /// Short-circuit with a `WriteStage::ParentFsync` failure after
+        /// a successful commit, before the parent directory `sync_all`.
+        /// The target stays committed; the executor surfaces this as
+        /// `AtomicWriteIoFailed` so the operator re-runs.
+        pub inject_parent_fsync_err: Option<io::ErrorKind>,
+        /// Run between the second baseline recheck and the commit
+        /// rename/link. Used to model "another process raced us into
+        /// the target slot" deterministically.
+        pub before_commit_hook: Option<PathHook>,
+        /// Run between commit success and the post-write hash re-read.
+        /// Used to drive a real on-disk hash mismatch without
+        /// `unsafe`.
+        pub before_validate_hook: Option<PathHook>,
+        /// Run between post-write validation failure and the rollback's
+        /// pre-rollback re-hash check. Used to drive
+        /// `RollbackFailureCause::ExternalMutationBeforeRollback`.
+        pub before_rollback_rehash_hook: Option<PathHook>,
+        /// When `true`, the executor's [`super::validate_post_write`]
+        /// returns `Err` regardless of on-disk content. Combined with
+        /// the rollback hooks, drives both rollback-success and
+        /// rollback-refused exercises.
+        pub force_validation_mismatch: bool,
+    }
+
+    thread_local! {
+        static HOOKS: RefCell<TestHooks> = const { RefCell::new(TestHooks {
+            inject_temp_create_err: None,
+            inject_temp_write_err: None,
+            inject_temp_fsync_err: None,
+            inject_commit_err: None,
+            inject_parent_fsync_err: None,
+            before_commit_hook: None,
+            before_validate_hook: None,
+            before_rollback_rehash_hook: None,
+            force_validation_mismatch: false,
+        }) };
+    }
+
+    /// Mutate the per-thread hook state.
+    pub(crate) fn with<F, R>(f: F) -> R
+    where
+        F: FnOnce(&mut TestHooks) -> R,
+    {
+        HOOKS.with(|h| f(&mut h.borrow_mut()))
+    }
+
+    /// Cheap clone-snapshot of the current per-thread hook state. The
+    /// executor only reads hooks via this snapshot so a panicking hook
+    /// closure cannot leave the `RefCell` borrowed across calls.
+    pub(crate) fn snapshot() -> TestHooks {
+        HOOKS.with(|h| h.borrow().clone())
+    }
+
+    /// RAII guard that resets per-thread hooks to default both on
+    /// construction (so the test starts from a clean slate even if a
+    /// previous test on this thread panicked mid-flight) and on drop.
+    pub(crate) struct Reset;
+
+    impl Reset {
+        pub(crate) fn new() -> Self {
+            HOOKS.with(|h| *h.borrow_mut() = TestHooks::default());
+            Reset
+        }
+    }
+
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            HOOKS.with(|h| *h.borrow_mut() = TestHooks::default());
+        }
+    }
+}
+
+// =========================================================================
 // Unit tests (pure helpers — FS-touching behavior is covered by the
 // tests/l2b_write_executor.rs integration suite)
 // =========================================================================
@@ -935,5 +1132,594 @@ mod tests {
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("tmp")),
             "got {leaf}"
         );
+    }
+}
+
+// =========================================================================
+// Fault-injection coverage (cfg(test)-only, unix-only).
+// =========================================================================
+//
+// These tests sit inside the library crate so they can consult the
+// `test_hooks` module — that module is `pub(crate)` and only compiled
+// under `#[cfg(test)]`. The sibling integration suite in
+// `tests/l2b_write_executor.rs` cannot see the hooks (no public
+// surface change) and therefore cannot impersonate fault conditions;
+// the fault tests must live here.
+//
+// Coverage targets (P2 carryover from PR #28):
+//   A. Post-write validation failure triggers bounded rollback.
+//   B. Rollback refuses if the on-disk file changed externally
+//      between commit and the pre-rollback drift gate.
+//   C. New-file no-clobber race between baseline-recheck and the
+//      `hard_link` commit primitive.
+//   D. Per-stage error mapping for temp create / write / fsync /
+//      commit / parent fsync.
+//   E. EXDEV-class commit failures map to `AtomicWriteIoFailed`
+//      (no copy fallback exists).
+#[cfg(all(test, unix))]
+mod fault_tests {
+    use super::test_hooks;
+    use super::{
+        execute_write, AtomicWriteError, AuthorityMismatch, BaselineDrift, RollbackFailureCause,
+        WriteExecutionOutcome, WriteExecutionRequest, WriteStage, EXIT_ROLLBACK_FAILED,
+        EXIT_VALIDATION_ROLLED_BACK, EXIT_WRITE_IO_FAILED,
+    };
+
+    use std::fs;
+    use std::io;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use crate::approval::ApprovalDecision;
+    use crate::checkpoint::{CheckpointHandle, CheckpointStore};
+    use crate::diff_preview::{build_preview, PreviewInputs, PreviewRecord};
+    use crate::markers::{
+        L2B_ROLLBACK_FAILED, L2B_ROLLBACK_REFUSED, L2B_ROLLBACK_STARTED, L2B_ROLLBACK_SUCCEEDED,
+        L2B_WRITE_APPLIED, L2B_WRITE_PREFLIGHT_OK, L2B_WRITE_TEMP_CREATED, L2B_WRITE_VALIDATED,
+        L2B_WRITE_VALIDATION_FAILED,
+    };
+    use crate::write_payload::{bind_after_bytes, ApprovedWritePayload};
+    use crate::write_runtime::{resolve_write_target, ResolvedWriteTarget};
+    use a2_plan_schema::WriteTarget;
+
+    // -------------------------------------------------------------------
+    // Hand-rolled tempdir + fixture (parallel to tests/l2b_write_executor.rs)
+    // -------------------------------------------------------------------
+
+    struct TempWorkspace {
+        root: PathBuf,
+    }
+
+    impl TempWorkspace {
+        fn new(label: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock not before unix epoch")
+                .as_nanos();
+            let mut p = std::env::temp_dir();
+            p.push(format!(
+                "a2_l2b_write_executor_fault_{}_{}_{}",
+                label,
+                std::process::id(),
+                nanos
+            ));
+            fs::create_dir(&p).expect("tempdir create");
+            let root = p.canonicalize().expect("tempdir canonicalize");
+            Self { root }
+        }
+
+        fn root(&self) -> &Path {
+            &self.root
+        }
+    }
+
+    impl Drop for TempWorkspace {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    struct Fixture {
+        ws: TempWorkspace,
+        resolved: ResolvedWriteTarget,
+        checkpoint: CheckpointHandle,
+        preview: PreviewRecord,
+        approval: ApprovalDecision,
+        payload: ApprovedWritePayload,
+    }
+
+    impl Fixture {
+        fn target_absolute(&self) -> PathBuf {
+            self.resolved.absolute.clone()
+        }
+        fn workspace_root(&self) -> &Path {
+            self.ws.root()
+        }
+        fn request(&self) -> WriteExecutionRequest<'_> {
+            WriteExecutionRequest {
+                workspace_root: self.workspace_root(),
+                resolved: &self.resolved,
+                checkpoint: &self.checkpoint,
+                preview: &self.preview,
+                approval: &self.approval,
+                payload: &self.payload,
+            }
+        }
+    }
+
+    fn build_fixture(
+        label: &str,
+        target_rel: &str,
+        before: Option<&[u8]>,
+        after: &[u8],
+    ) -> Fixture {
+        let ws = TempWorkspace::new(label);
+        let target_abs = ws.root().join(target_rel);
+        if let Some(b) = before {
+            if let Some(parent) = target_abs.parent() {
+                fs::create_dir_all(parent).expect("create parent");
+            }
+            fs::write(&target_abs, b).expect("seed target");
+        } else if let Some(parent) = target_abs.parent() {
+            fs::create_dir_all(parent).expect("create parent");
+        }
+        let resolved = resolve_write_target(
+            ws.root(),
+            &WriteTarget {
+                path: target_rel.into(),
+                create_if_absent: before.is_none(),
+            },
+        )
+        .expect("resolve_write_target");
+        let store = CheckpointStore::new_with_generated_run_id(ws.root().to_path_buf());
+        let step_id = "fault-step";
+        let checkpoint = store
+            .create_checkpoint(step_id, &resolved.absolute, Path::new(target_rel))
+            .expect("create_checkpoint");
+        let run_id = *store.run_id();
+        let target_rel_path = PathBuf::from(target_rel);
+        let inputs = PreviewInputs {
+            step_id,
+            target_relative_path: &target_rel_path,
+            target_absolute_path: &resolved.absolute,
+            before,
+            after,
+            checkpoint_run_id: &run_id,
+            checkpoint_step_id: step_id,
+            created_at_utc: "2026-05-27T00:00:00.000000000Z",
+        };
+        let (preview, _display) = build_preview(&inputs).expect("build_preview");
+        let approval = ApprovalDecision::Approved {
+            step_id: preview.step_id.clone(),
+            preview_sha256: preview.preview_sha256.clone(),
+        };
+        let payload =
+            bind_after_bytes(&preview, target_rel_path, after.to_vec()).expect("bind_after_bytes");
+        Fixture {
+            ws,
+            resolved,
+            checkpoint,
+            preview,
+            approval,
+            payload,
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // A. Post-write validation failure → bounded rollback succeeds.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn fault_validation_failure_rolls_back_existing_file() {
+        let _r = test_hooks::Reset::new();
+        test_hooks::with(|h| h.force_validation_mismatch = true);
+
+        let fix = build_fixture(
+            "validfail-existing",
+            "src/lib.rs",
+            Some(b"baseline-bytes\n"),
+            b"approved-bytes\n",
+        );
+        let result = execute_write(&fix.request());
+
+        assert_eq!(result.exit_code, EXIT_VALIDATION_ROLLED_BACK);
+        match &result.outcome {
+            WriteExecutionOutcome::ValidationFailedRolledBack { message } => {
+                assert!(
+                    message.contains("test-injected"),
+                    "expected injected message, got {message:?}"
+                );
+            }
+            other => panic!("expected ValidationFailedRolledBack, got {other:?}"),
+        }
+        // Required markers in order: preflight, applied, validation-failed,
+        // rollback-started, rollback-succeeded.
+        let m = &result.markers;
+        assert!(m.contains(&L2B_WRITE_PREFLIGHT_OK), "markers: {m:?}");
+        assert!(m.contains(&L2B_WRITE_APPLIED), "markers: {m:?}");
+        assert!(m.contains(&L2B_WRITE_VALIDATION_FAILED), "markers: {m:?}");
+        assert!(m.contains(&L2B_ROLLBACK_STARTED), "markers: {m:?}");
+        assert!(m.contains(&L2B_ROLLBACK_SUCCEEDED), "markers: {m:?}");
+        assert!(!m.contains(&L2B_ROLLBACK_REFUSED), "markers: {m:?}");
+        assert!(!m.contains(&L2B_ROLLBACK_FAILED), "markers: {m:?}");
+        assert!(!m.contains(&L2B_WRITE_VALIDATED), "markers: {m:?}");
+
+        // Existing-file branch: rollback restores baseline bytes.
+        let restored = fs::read(fix.target_absolute()).expect("read target");
+        assert_eq!(restored, b"baseline-bytes\n");
+    }
+
+    #[test]
+    fn fault_validation_failure_rolls_back_new_file() {
+        let _r = test_hooks::Reset::new();
+        test_hooks::with(|h| h.force_validation_mismatch = true);
+
+        let fix = build_fixture("validfail-new", "docs/new.md", None, b"# new\n");
+        let result = execute_write(&fix.request());
+
+        assert_eq!(result.exit_code, EXIT_VALIDATION_ROLLED_BACK);
+        assert!(matches!(
+            result.outcome,
+            WriteExecutionOutcome::ValidationFailedRolledBack { .. }
+        ));
+        let m = &result.markers;
+        assert!(m.contains(&L2B_ROLLBACK_STARTED), "markers: {m:?}");
+        assert!(m.contains(&L2B_ROLLBACK_SUCCEEDED), "markers: {m:?}");
+
+        // New-file branch: rollback removes the target.
+        let exists = fs::symlink_metadata(fix.target_absolute()).is_ok();
+        assert!(
+            !exists,
+            "rollback on new-file branch should have removed target"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // B. Rollback refuses external mutation between commit and re-hash.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn fault_rollback_refuses_when_target_externally_mutated_existing() {
+        let _r = test_hooks::Reset::new();
+        test_hooks::with(|h| {
+            h.force_validation_mismatch = true;
+            h.before_rollback_rehash_hook = Some(Arc::new(|target: &Path| {
+                fs::write(target, b"external-third-party-content\n").expect("external mutation");
+            }));
+        });
+
+        let fix = build_fixture(
+            "extmut-existing",
+            "src/lib.rs",
+            Some(b"baseline\n"),
+            b"approved-after\n",
+        );
+        let result = execute_write(&fix.request());
+
+        assert_eq!(result.exit_code, EXIT_ROLLBACK_FAILED);
+        match &result.outcome {
+            WriteExecutionOutcome::RollbackFailed {
+                cause: RollbackFailureCause::ExternalMutationBeforeRollback,
+            } => {}
+            other => panic!("expected ExternalMutationBeforeRollback, got {other:?}"),
+        }
+        let m = &result.markers;
+        assert!(m.contains(&L2B_ROLLBACK_STARTED), "markers: {m:?}");
+        assert!(m.contains(&L2B_ROLLBACK_REFUSED), "markers: {m:?}");
+        assert!(!m.contains(&L2B_ROLLBACK_SUCCEEDED), "markers: {m:?}");
+
+        // Critically: rollback did NOT clobber the external write.
+        let on_disk = fs::read(fix.target_absolute()).expect("read target");
+        assert_eq!(on_disk, b"external-third-party-content\n");
+    }
+
+    #[test]
+    fn fault_rollback_refuses_when_new_file_externally_removed() {
+        let _r = test_hooks::Reset::new();
+        test_hooks::with(|h| {
+            h.force_validation_mismatch = true;
+            h.before_rollback_rehash_hook = Some(Arc::new(|target: &Path| {
+                let _ = fs::remove_file(target);
+            }));
+        });
+
+        let fix = build_fixture("extmut-new", "docs/draft.md", None, b"# draft\n");
+        let result = execute_write(&fix.request());
+
+        assert_eq!(result.exit_code, EXIT_ROLLBACK_FAILED);
+        match &result.outcome {
+            WriteExecutionOutcome::RollbackFailed {
+                cause: RollbackFailureCause::ExternalMutationBeforeRollback,
+            } => {}
+            other => panic!("expected ExternalMutationBeforeRollback, got {other:?}"),
+        }
+        assert!(result.markers.contains(&L2B_ROLLBACK_REFUSED));
+        // Target was externally removed; we don't recreate it.
+        assert!(fs::symlink_metadata(fix.target_absolute()).is_err());
+    }
+
+    // -------------------------------------------------------------------
+    // C. New-file no-clobber race at the commit primitive.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn fault_no_clobber_race_between_baseline_recheck_and_hard_link() {
+        // After the second baseline-recheck passes (target slot is
+        // empty), an external process drops a file into the slot
+        // before the executor's `hard_link` runs. The hard_link must
+        // refuse — that's the slice-4 no-clobber guarantee.
+        let _r = test_hooks::Reset::new();
+        test_hooks::with(|h| {
+            h.before_commit_hook = Some(Arc::new(|target: &Path| {
+                fs::write(target, b"racer-was-here\n").expect("racer write");
+            }));
+        });
+
+        let fix = build_fixture("noclobber-race", "docs/race.md", None, b"# our-new\n");
+        let result = execute_write(&fix.request());
+
+        // The hard_link refusal surfaces as AtomicWriteIoFailed at the
+        // Commit stage; the target file was not overwritten.
+        assert_eq!(result.exit_code, EXIT_WRITE_IO_FAILED);
+        match &result.outcome {
+            WriteExecutionOutcome::AtomicWriteIoFailed {
+                stage: WriteStage::Commit,
+                message,
+            } => {
+                assert!(
+                    message.contains("hard_link") || message.contains("no-clobber"),
+                    "expected hard_link refusal message, got {message:?}"
+                );
+            }
+            other => panic!("expected AtomicWriteIoFailed{{Commit}}, got {other:?}"),
+        }
+        // The racer's content is intact.
+        let on_disk = fs::read(fix.target_absolute()).expect("read target");
+        assert_eq!(on_disk, b"racer-was-here\n");
+        // No stray executor temp left behind.
+        let stale = find_stale_temps(fix.workspace_root());
+        assert!(stale.is_empty(), "stale temps: {stale:?}");
+    }
+
+    fn find_stale_temps(root: &Path) -> Vec<PathBuf> {
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(entries) = fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                    let looks_like_executor_temp = name.starts_with(".a2-l2b-write-");
+                    let has_tmp_extension = Path::new(name)
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("tmp"));
+                    if looks_like_executor_temp && has_tmp_extension {
+                        out.push(p);
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, &mut out);
+        out
+    }
+
+    // -------------------------------------------------------------------
+    // D. Per-stage atomic-write error mapping.
+    // -------------------------------------------------------------------
+
+    fn run_with_injected_stage_err(
+        label: &str,
+        target_rel: &str,
+        before: Option<&[u8]>,
+        after: &[u8],
+        set_hook: impl FnOnce(&mut test_hooks::TestHooks),
+    ) -> (super::WriteExecutionResult, Fixture) {
+        let _r = test_hooks::Reset::new();
+        test_hooks::with(set_hook);
+        let fix = build_fixture(label, target_rel, before, after);
+        let result = execute_write(&fix.request());
+        (result, fix)
+    }
+
+    #[test]
+    fn fault_temp_create_failure_maps_to_temp_create_stage() {
+        let (result, fix) = run_with_injected_stage_err(
+            "tempcreate-err",
+            "src/lib.rs",
+            Some(b"a\n"),
+            b"b\n",
+            |h| h.inject_temp_create_err = Some(io::ErrorKind::PermissionDenied),
+        );
+        assert_eq!(result.exit_code, EXIT_WRITE_IO_FAILED);
+        match &result.outcome {
+            WriteExecutionOutcome::AtomicWriteIoFailed {
+                stage: WriteStage::TempCreate,
+                ..
+            } => {}
+            other => panic!("expected TempCreate stage, got {other:?}"),
+        }
+        // Target unchanged (no temp was ever created).
+        assert_eq!(fs::read(fix.target_absolute()).unwrap(), b"a\n");
+        assert!(find_stale_temps(fix.workspace_root()).is_empty());
+        // The temp-created marker must NOT have been emitted.
+        assert!(!result.markers.contains(&L2B_WRITE_TEMP_CREATED));
+    }
+
+    #[test]
+    fn fault_temp_write_failure_maps_to_temp_write_stage_and_cleans_up() {
+        let (result, fix) =
+            run_with_injected_stage_err("tempwrite-err", "src/lib.rs", Some(b"a\n"), b"b\n", |h| {
+                h.inject_temp_write_err = Some(io::ErrorKind::Other);
+            });
+        assert_eq!(result.exit_code, EXIT_WRITE_IO_FAILED);
+        match &result.outcome {
+            WriteExecutionOutcome::AtomicWriteIoFailed {
+                stage: WriteStage::TempWrite,
+                ..
+            } => {}
+            other => panic!("expected TempWrite stage, got {other:?}"),
+        }
+        assert_eq!(fs::read(fix.target_absolute()).unwrap(), b"a\n");
+        assert!(
+            find_stale_temps(fix.workspace_root()).is_empty(),
+            "temp must be cleaned up on TempWrite failure"
+        );
+    }
+
+    #[test]
+    fn fault_temp_fsync_failure_maps_to_temp_fsync_stage_and_cleans_up() {
+        let (result, fix) =
+            run_with_injected_stage_err("tempfsync-err", "src/lib.rs", Some(b"a\n"), b"b\n", |h| {
+                h.inject_temp_fsync_err = Some(io::ErrorKind::Other);
+            });
+        assert_eq!(result.exit_code, EXIT_WRITE_IO_FAILED);
+        match &result.outcome {
+            WriteExecutionOutcome::AtomicWriteIoFailed {
+                stage: WriteStage::TempFsync,
+                ..
+            } => {}
+            other => panic!("expected TempFsync stage, got {other:?}"),
+        }
+        assert_eq!(fs::read(fix.target_absolute()).unwrap(), b"a\n");
+        assert!(find_stale_temps(fix.workspace_root()).is_empty());
+    }
+
+    #[test]
+    fn fault_commit_failure_maps_to_commit_stage_and_cleans_up_temp() {
+        let (result, fix) =
+            run_with_injected_stage_err("commit-err", "src/lib.rs", Some(b"a\n"), b"b\n", |h| {
+                h.inject_commit_err = Some(io::ErrorKind::CrossesDevices);
+            });
+        assert_eq!(result.exit_code, EXIT_WRITE_IO_FAILED);
+        match &result.outcome {
+            WriteExecutionOutcome::AtomicWriteIoFailed {
+                stage: WriteStage::Commit,
+                ..
+            } => {}
+            other => panic!("expected Commit stage, got {other:?}"),
+        }
+        // Target unchanged — commit never ran.
+        assert_eq!(fs::read(fix.target_absolute()).unwrap(), b"a\n");
+        assert!(find_stale_temps(fix.workspace_root()).is_empty());
+    }
+
+    #[test]
+    fn fault_parent_fsync_failure_maps_to_parent_fsync_stage() {
+        // Inject on the overwrite branch so commit has already
+        // happened — the rename is durable in the page cache but the
+        // parent sync_all has not yet been confirmed.
+        let (result, fix) = run_with_injected_stage_err(
+            "parentfsync-err",
+            "src/lib.rs",
+            Some(b"a\n"),
+            b"b\n",
+            |h| h.inject_parent_fsync_err = Some(io::ErrorKind::Other),
+        );
+        assert_eq!(result.exit_code, EXIT_WRITE_IO_FAILED);
+        match &result.outcome {
+            WriteExecutionOutcome::AtomicWriteIoFailed {
+                stage: WriteStage::ParentFsync,
+                ..
+            } => {}
+            other => panic!("expected ParentFsync stage, got {other:?}"),
+        }
+        // The bytes are on disk (rename completed); ParentFsync only
+        // signals durability uncertainty.
+        let on_disk = fs::read(fix.target_absolute()).unwrap();
+        assert_eq!(on_disk, b"b\n");
+    }
+
+    // -------------------------------------------------------------------
+    // E. EXDEV policy: commit failure (incl. EXDEV-class) maps to
+    //    AtomicWriteIoFailed at the Commit stage. No copy fallback
+    //    is permitted; the executor refuses rather than copying
+    //    bytes across a device boundary.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn fault_exdev_class_commit_failure_surfaces_as_io_failed_commit() {
+        // Synthesize an EXDEV-class error at the commit step. The
+        // executor must surface AtomicWriteIoFailed{Commit} and leave
+        // the target unchanged — no copy fallback path exists.
+        let (result, fix) = run_with_injected_stage_err(
+            "exdev",
+            "src/lib.rs",
+            Some(b"baseline\n"),
+            b"after\n",
+            |h| h.inject_commit_err = Some(io::ErrorKind::CrossesDevices),
+        );
+        assert_eq!(result.exit_code, EXIT_WRITE_IO_FAILED);
+        let WriteExecutionOutcome::AtomicWriteIoFailed { stage, .. } = &result.outcome else {
+            panic!("expected AtomicWriteIoFailed, got {:?}", result.outcome);
+        };
+        assert_eq!(*stage, WriteStage::Commit);
+        // Target untouched — exactly the no-copy-fallback guarantee.
+        assert_eq!(fs::read(fix.target_absolute()).unwrap(), b"baseline\n");
+    }
+
+    // (Static-source scan for the no-copy-fallback policy lives in
+    // tests/l2b_write_executor.rs — placing it here would self-grep
+    // and false-positive on the forbidden literals.)
+
+    // -------------------------------------------------------------------
+    // Hook hygiene: ensure the Reset guard restores defaults between
+    // tests on the same thread (cargo's test runner reuses worker
+    // threads).
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_hooks_reset_guard_restores_defaults_on_drop() {
+        {
+            let _r = test_hooks::Reset::new();
+            test_hooks::with(|h| {
+                h.force_validation_mismatch = true;
+                h.inject_temp_create_err = Some(io::ErrorKind::PermissionDenied);
+            });
+            let snap = test_hooks::snapshot();
+            assert!(snap.force_validation_mismatch);
+            assert_eq!(
+                snap.inject_temp_create_err,
+                Some(io::ErrorKind::PermissionDenied)
+            );
+        }
+        // After drop, state is back to default for the next test on
+        // this worker thread.
+        let snap = test_hooks::snapshot();
+        assert!(!snap.force_validation_mismatch);
+        assert!(snap.inject_temp_create_err.is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // Sanity: an `AtomicWriteError` from injection still surfaces with
+    // a populated message (defensive — prevents a future refactor from
+    // accidentally collapsing the message field).
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn injected_atomic_write_error_message_is_non_empty() {
+        let (result, _fix) =
+            run_with_injected_stage_err("msg-non-empty", "src/lib.rs", Some(b"a\n"), b"b\n", |h| {
+                h.inject_temp_create_err = Some(io::ErrorKind::PermissionDenied);
+            });
+        let WriteExecutionOutcome::AtomicWriteIoFailed { message, stage } = &result.outcome else {
+            panic!("expected AtomicWriteIoFailed, got {:?}", result.outcome);
+        };
+        assert_eq!(*stage, WriteStage::TempCreate);
+        assert!(message.contains("test-injected"), "got {message:?}");
+        // Round-trip the message via Debug on the error type to pin
+        // that the struct shape didn't change.
+        let synthesized = AtomicWriteError {
+            stage: WriteStage::TempCreate,
+            message: message.clone(),
+        };
+        let _debug_round_trip = format!("{synthesized:?}");
+        // Reference unused enum variants so future code-removal lints
+        // surface explicitly here, not as dead-code warnings on
+        // production-side types.
+        let _ = AuthorityMismatch::PreviewNotApprovable;
+        let _ = BaselineDrift::ExpectedAbsentButPresent;
     }
 }
