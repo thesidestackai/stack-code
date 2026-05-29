@@ -213,6 +213,8 @@ cargo test --workspace
 - [`ROADMAP.md`](./ROADMAP.md) — active roadmap and open cleanup work
 - [`PHILOSOPHY.md`](./PHILOSOPHY.md) — why the project exists and how it is operated
 - [`docs/editor-vscode.md`](./docs/editor-vscode.md) — read-only VS Code task wrapper (Command Palette entry points; no extension required)
+- [`docs/a2-plan-schema.md`](./docs/a2-plan-schema.md) — A2 plan YAML schema (L1a/L2a offline validator surface)
+- [`docs/a2-l2b-run-plan-preview-operator-handoff.md`](./docs/a2-l2b-run-plan-preview-operator-handoff.md) — runtime-proven A2-L2b `claw plan run --workspace-write-preview` → `approve` → `apply-bundle` → `apply` operator flow. Documents the gated operator chain only; does not authorize autonomous workspace-write execution.
 
 ## Ecosystem
 
