@@ -173,3 +173,7 @@ renaming or deleting them breaks the build by design.
   symlink-escape detection, parent-dir existence checks, write-time TOCTOU
   checks, checkpointing, rollback, approval prompts
 - DEEP tier wiring
+
+## See also
+
+- [`a2-l2b-run-plan-preview-operator-handoff.md`](./a2-l2b-run-plan-preview-operator-handoff.md) — operator-facing handoff for the runtime-proven A2-L2b `claw plan run --workspace-write-preview` → `approve` → `apply-bundle` → `apply` chain. Documents the gated operator flow only; does not authorize autonomous workspace-write execution from this schema crate.
