@@ -219,3 +219,5 @@ those operator gaps before adding any autonomous behavior keeps the
 
 A2-L2c design is the next lane only after operator docs/readme
 integration. It is explicitly out of scope of this handoff.
+
+See [`a2-l2c-operator-quickref.md`](./a2-l2c-operator-quickref.md) for the A2-L2c operator quick reference (exit-code `7` disambiguation, TTY approval EOF note, per-step artifact map). Docs-only; does not authorize autonomous workspace-write execution.
