@@ -568,6 +568,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
             std::process::exit(code);
         }
+        CliAction::PlanStatus {
+            workspace_root,
+            approval_result_path,
+        } => {
+            // A2-L2d Read-Only Artifact Inspector: aggregate state from
+            // existing `<workspace>/.claw/l2b-*` artifacts and emit an
+            // a2-l2d-status.v1 envelope. NEVER mutates state. NEVER
+            // calls the broker, model, or Ollama. cf. `run_plan_status`.
+            let stdout = std::io::stdout();
+            let mut stdout_lock = stdout.lock();
+            let code = run_plan_status(
+                &workspace_root,
+                approval_result_path.as_deref(),
+                &mut stdout_lock,
+            );
+            std::process::exit(code);
+        }
     }
     Ok(())
 }
@@ -3294,6 +3311,35 @@ fn try_run_plan_apply_bundle(
 // bound the implementation region they scan for forbidden APIs. Do not move
 // or rename it without updating those tests.
 
+// =========================================================================
+// BEGIN A2-L2d Read-Only Artifact Inspector / Status Contract
+// =========================================================================
+//
+// `claw plan status <workspace> [<approval-result.json>]` — read-only
+// state inspector for the A2-L2b preview-to-apply chain. Emits an
+// `a2-l2d-status.v1` JSON envelope on stdout. NEVER mutates state.
+// NEVER calls broker, model, or Ollama. NEVER approves or applies.
+
+/// CLI-level emitter for the A2-L2d status command. Calls the library
+/// `read_status` (which performs all reads and the entire phase / STOP
+/// derivation) and serializes the envelope to stdout with stable key
+/// order and trailing newline. Returns the recommended process exit
+/// code (0 on success, `EXIT_STATUS_REFUSED` on read-time refusal).
+fn run_plan_status<W: Write>(
+    workspace_root: &Path,
+    approval_result_path: Option<&Path>,
+    stdout: &mut W,
+) -> i32 {
+    let result = a2_plan_runner::read_status(workspace_root, approval_result_path);
+    let json = serde_json::to_string_pretty(&result.envelope).unwrap_or_else(|_| "{}".to_string());
+    let _ = writeln!(stdout, "{json}");
+    result.exit_code
+}
+
+// =========================================================================
+// END A2-L2d Read-Only Artifact Inspector — scope sentinel
+// =========================================================================
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CliAction {
     DumpManifests {
@@ -3469,6 +3515,18 @@ enum CliAction {
     PlanApplyBundle {
         preview_result_path: PathBuf,
         approval_result_path: PathBuf,
+    },
+    // A2-L2d Read-Only Artifact Inspector / Status Contract:
+    // read-only state inspector. Aggregates state from existing
+    // `<workspace>/.claw/l2b-*` artifacts and emits an
+    // `a2-l2d-status.v1` JSON envelope on stdout. NEVER mutates the
+    // filesystem. NEVER calls the broker, model, or Ollama. NEVER
+    // approves or applies. The optional `approval_result_path` is the
+    // ONLY permitted read outside `<workspace>/.claw/**`; it is on a
+    // distinct code branch from automatic artifact discovery.
+    PlanStatus {
+        workspace_root: PathBuf,
+        approval_result_path: Option<PathBuf>,
     },
 }
 
@@ -4130,24 +4188,25 @@ fn parse_plan_subcommand_args(args: &[String]) -> Result<CliAction, String> {
         Some("apply-bundle") => {
             return parse_plan_apply_bundle_subcommand_args(&args[1..]);
         }
+        Some("status") => return parse_plan_status_subcommand_args(&args[1..]),
         Some(other) => {
             return Err(format!(
                 "unsupported `claw plan` subcommand: {other}. \
                  Use `claw plan run <file>`, `claw plan approve <preview-bundle.json>`, \
                  `claw plan apply <apply-bundle.json>`, \
                  `claw plan preview-bundle <workspace-root> <target-relative-path> <after-file>`, \
-                 or `claw plan apply-bundle <preview-generator-result.json> <approval-result.json>`."
+                 `claw plan apply-bundle <preview-generator-result.json> <approval-result.json>`, \
+                 or `claw plan status <workspace> [<approval-result.json>]`."
             ));
         }
         None => {
-            return Err(
-                "missing `claw plan` subcommand. \
+            return Err("missing `claw plan` subcommand. \
                  Use `claw plan run <file>`, `claw plan approve <preview-bundle.json>`, \
                  `claw plan apply <apply-bundle.json>`, \
                  `claw plan preview-bundle <workspace-root> <target-relative-path> <after-file>`, \
-                 or `claw plan apply-bundle <preview-generator-result.json> <approval-result.json>`."
-                    .to_string(),
-            );
+                 `claw plan apply-bundle <preview-generator-result.json> <approval-result.json>`, \
+                 or `claw plan status <workspace> [<approval-result.json>]`."
+                .to_string());
         }
     }
     let tail = &args[1..];
@@ -4451,6 +4510,44 @@ fn parse_plan_apply_bundle_subcommand_args(args: &[String]) -> Result<CliAction,
     let approval_result_path = PathBuf::from(positionals[1]);
     Ok(CliAction::PlanApplyBundle {
         preview_result_path,
+        approval_result_path,
+    })
+}
+
+/// A2-L2d Read-Only Artifact Inspector: parse
+/// `claw plan status <workspace> [<approval-result.json>]`.
+///
+/// One required and one optional positional argument, no flags. Every
+/// write-adjacent flag (`--apply`, `--approve`, `--yes`, `--auto`,
+/// `--clean`, `--rollback`, `--mutate`, `--all-runs`, `--no-prompt`,
+/// `--skip-approval`, `--cache`) is refused outright. The command is
+/// read-only by construction.
+fn parse_plan_status_subcommand_args(args: &[String]) -> Result<CliAction, String> {
+    let usage = "Usage: `claw plan status <workspace> [<approval-result.json>]`.";
+    let mut positionals: Vec<&str> = Vec::with_capacity(2);
+    for arg in args {
+        let v = arg.as_str();
+        if v.starts_with("--") {
+            return Err(format!(
+                "unsupported flag for `claw plan status`: {v}. \
+                 The status command is read-only and accepts no flags. \
+                 {usage}"
+            ));
+        }
+        if positionals.len() >= 2 {
+            return Err(format!(
+                "unexpected positional argument after approval-result: {v}. {usage}"
+            ));
+        }
+        positionals.push(v);
+    }
+    if positionals.is_empty() {
+        return Err(format!("missing workspace argument. {usage}"));
+    }
+    let workspace_root = PathBuf::from(positionals[0]);
+    let approval_result_path = positionals.get(1).map(|s| PathBuf::from(*s));
+    Ok(CliAction::PlanStatus {
+        workspace_root,
         approval_result_path,
     })
 }
