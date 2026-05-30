@@ -216,3 +216,8 @@ for it.
   language, and validation plan.
 - [`a2-plan-schema.md`](./a2-plan-schema.md) — A2 plan YAML schema
   (the L1a/L2a offline validator surface).
+- [`a2-l2d-status-schema.md`](./a2-l2d-status-schema.md) — A2-L2d
+  `a2-l2d-status.v1` read-only state schema and the `claw plan status
+  <workspace> [<approval-result.json>]` command surface. Read-only by
+  construction; does not authorize autonomous workspace-write
+  execution, approval bypass, or IDE write controls.

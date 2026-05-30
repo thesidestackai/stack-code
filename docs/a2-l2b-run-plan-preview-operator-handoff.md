@@ -221,3 +221,5 @@ A2-L2c design is the next lane only after operator docs/readme
 integration. It is explicitly out of scope of this handoff.
 
 See [`a2-l2c-operator-quickref.md`](./a2-l2c-operator-quickref.md) for the A2-L2c operator quick reference (exit-code `7` disambiguation, TTY approval EOF note, per-step artifact map). Docs-only; does not authorize autonomous workspace-write execution.
+
+See [`a2-l2d-status-schema.md`](./a2-l2d-status-schema.md) for the A2-L2d `a2-l2d-status.v1` read-only state schema and the `claw plan status <workspace> [<approval-result.json>]` command surface. Read-only by construction; does not authorize autonomous workspace-write execution, approval bypass, or IDE write controls.

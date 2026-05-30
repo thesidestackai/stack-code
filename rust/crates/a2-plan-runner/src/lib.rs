@@ -72,6 +72,7 @@ pub mod markers;
 pub mod preflight;
 pub mod report;
 pub mod runner;
+pub mod status;
 pub mod write_executor;
 pub mod write_payload;
 pub mod write_preview;
@@ -108,6 +109,10 @@ pub use runner::{
     WritePreviewPlanStatus, WritePreviewRunReport, DEFAULT_STEP_TIMEOUT,
     EXIT_RUN_PLAN_WRITE_PREVIEW_READY, EXIT_RUN_PLAN_WRITE_PREVIEW_REFUSED, MAX_STEP_TIMEOUT_SECS,
     MIN_STEP_TIMEOUT_SECS,
+};
+pub use status::{
+    read_status, Phase as StatusPhase, StatusEnvelope, StatusResult, StopCondition,
+    EXIT_STATUS_REFUSED, READ_ONLY_INVARIANT_LITERAL, STATUS_SCHEMA_V1,
 };
 pub use write_executor::{
     execute_write, ApprovalRefusalCause as WriteApprovalRefusalCause, AuthorityMismatch,

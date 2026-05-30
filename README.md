@@ -216,6 +216,7 @@ cargo test --workspace
 - [`docs/a2-plan-schema.md`](./docs/a2-plan-schema.md) — A2 plan YAML schema (L1a/L2a offline validator surface)
 - [`docs/a2-l2b-run-plan-preview-operator-handoff.md`](./docs/a2-l2b-run-plan-preview-operator-handoff.md) — runtime-proven A2-L2b `claw plan run --workspace-write-preview` → `approve` → `apply-bundle` → `apply` operator flow. Documents the gated operator chain only; does not authorize autonomous workspace-write execution.
 - [`docs/a2-l2c-operator-quickref.md`](./docs/a2-l2c-operator-quickref.md) — A2-L2c operator quick reference: copy-pasteable A2-L2b chain, exit-code `7` disambiguation, TTY approval EOF note, and per-step artifact map. Docs-only; does not authorize autonomous workspace-write execution.
+- [`docs/a2-l2d-status-schema.md`](./docs/a2-l2d-status-schema.md) — A2-L2d `a2-l2d-status.v1` schema-of-record for the read-only `claw plan status <workspace> [<approval-result.json>]` command. Read-only by construction; does not authorize autonomous workspace-write execution, approval bypass, or IDE write controls.
 
 ## Ecosystem
 
