@@ -242,6 +242,9 @@ lane.
 * [`a2-l2c-operator-quickref.md`](./a2-l2c-operator-quickref.md)
   — A2-L2c operator quick reference; the operator-facing surface
   A2-L2d augments with read-only state recovery.
+* [`a2-l2d-operator-quickref.md`](./a2-l2d-operator-quickref.md)
+  — A2-L2d operator quick reference; the at-the-keyboard companion
+  to this schema-of-record for `claw plan status`.
 * `rust/crates/a2-plan-runner/src/status.rs` — implementation
   source-of-record.
 * `rust/crates/a2-plan-runner/tests/l2d_status.rs` — library

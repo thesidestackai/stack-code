@@ -551,6 +551,7 @@ remain bounded by the A2-L2b and A2-L2c safety properties.
 - PR #36 (`86dc37f`) — README and schema cross-links to the handoff.
 - PR #37 (`9cedbb0`) — A2-L2c scope card.
 - PR #38 (`17967e6`) — A2-L2c operator quick reference.
+- [`a2-l2d-operator-quickref.md`](./a2-l2d-operator-quickref.md) — A2-L2d operator quick reference (docs-only; copy-pasteable `claw plan status` usage within this scope card's boundary).
 
 ## 18. Status
 
