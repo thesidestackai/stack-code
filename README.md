@@ -218,6 +218,7 @@ cargo test --workspace
 - [`docs/a2-l2c-operator-quickref.md`](./docs/a2-l2c-operator-quickref.md) — A2-L2c operator quick reference: copy-pasteable A2-L2b chain, exit-code `7` disambiguation, TTY approval EOF note, and per-step artifact map. Docs-only; does not authorize autonomous workspace-write execution.
 - [`docs/a2-l2d-status-schema.md`](./docs/a2-l2d-status-schema.md) — A2-L2d `a2-l2d-status.v1` schema-of-record for the read-only `claw plan status <workspace> [<approval-result.json>]` command. Read-only by construction; does not authorize autonomous workspace-write execution, approval bypass, or IDE write controls.
 - [`docs/a2-l2d-operator-quickref.md`](./docs/a2-l2d-operator-quickref.md) — A2-L2d operator quick reference: copy-pasteable `claw plan status` usage, phase meanings, STOP-condition handling, and the optional `<approval-result.json>` read. Docs-only; does not authorize autonomous workspace-write execution, approval bypass, or IDE write controls.
+- [`docs/a2-l3-harness-adapter-usage.md`](./docs/a2-l3-harness-adapter-usage.md) — A2-L3 harness adapter usage guide: purpose, what the adapter consumes, disposable-workspace AND-semantics classifier, STOP-signal taxonomy, CI consumption pattern, and explicit non-authorisations for the merged read-only crate at `rust/crates/a2-harness-adapter/`. Docs-only; does not authorize autonomous workspace-write execution, approval bypass, or IDE write controls.
 
 ## Ecosystem
 
