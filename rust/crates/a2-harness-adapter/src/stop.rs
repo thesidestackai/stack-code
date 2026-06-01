@@ -45,6 +45,19 @@ pub enum StopKind {
     IdempotencyMismatch,
     /// Producer subprocess exited with `EXIT_STATUS_REFUSED == 12`.
     ProducerRefused,
+    /// Producer subprocess exited with `EXIT_STATUS_REFUSED == 12`
+    /// but the envelope's `audit_markers` did not include the pinned
+    /// `a2-l2d-status-refused` literal. The producer is authoritative
+    /// on the refusal contract; absence of the marker is producer-
+    /// broken drift and the harness surfaces the observed marker list
+    /// verbatim.
+    ExitRefusedMissingMarker { observed_markers: Vec<String> },
+    /// Producer emitted a non-null `stop_condition` but `evidence_paths`
+    /// was empty. The A2-L2d producer always populates at least one
+    /// evidence path when a STOP fires; an empty list under a non-null
+    /// STOP is a producer-broken signal the harness raises in its own
+    /// right. Carries the offending `stop_condition` verbatim.
+    EvidencePathsEmptyUnderStopCondition(StopCondition),
     /// Caller configuration referenced a chain-write subcommand. The
     /// harness refuses such configs at parse time, not at invocation
     /// time.
@@ -92,6 +105,12 @@ impl StopSignal {
             StopKind::SchemaDrift(_) => "schema drift".into(),
             StopKind::IdempotencyMismatch => "idempotency mismatch".into(),
             StopKind::ProducerRefused => "producer refusal envelope".into(),
+            StopKind::ExitRefusedMissingMarker { .. } => {
+                "exit 12 envelope missing `a2-l2d-status-refused` marker".into()
+            }
+            StopKind::EvidencePathsEmptyUnderStopCondition(_) => {
+                "non-null stop_condition with empty evidence_paths".into()
+            }
             StopKind::ConfigReferencedChainWriteCommand(_) => {
                 "config referenced chain-write subcommand".into()
             }

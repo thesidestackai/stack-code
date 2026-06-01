@@ -52,7 +52,7 @@ pub use cycle::{run_cycle, CycleError};
 pub use envelope::{
     classify_next_operator_command, parse_envelope, EnvelopeParseError, NextOpCommandShape, Phase,
     StatusEnvelope, StopCondition, EXIT_STATUS_REFUSED, READ_ONLY_INVARIANT_LITERAL,
-    STATUS_SCHEMA_V1,
+    REFUSED_AUDIT_MARKER, STATUS_SCHEMA_V1,
 };
 pub use invoker::{
     build_status_argv, ClawPlanStatusInvoker, MockInvocationRecord, MockStatusInvoker,

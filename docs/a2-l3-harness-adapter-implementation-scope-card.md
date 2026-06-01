@@ -533,6 +533,42 @@ expected per-assertion entries.
   `stop_condition` matches the expected value; otherwise FAIL
   classified `wrong-STOP`
 
+**Producer-broken / PR #43 preservation fixtures**:
+
+- `non_null_stop_condition_with_empty_evidence_paths_is_stop` — an
+  envelope carrying a non-null `stop_condition` together with an
+  empty `evidence_paths` array MUST classify the cycle as STOP and
+  surface the offending `stop_condition` verbatim. The A2-L2d
+  producer always populates at least one evidence path when a STOP
+  fires; an empty list is producer-broken drift the harness raises
+  in its own right (it does not collapse with the underlying
+  `ProducerStopCondition` STOP).
+- `exit_12_with_refused_marker_is_accepted_as_refusal` — an envelope
+  with `EXIT_STATUS_REFUSED == 12` whose `audit_markers` contains the
+  pinned `a2-l2d-status-refused` literal MUST classify the cycle as
+  STOP (the refusal itself) and MUST NOT raise the missing-marker
+  STOP.
+- `exit_12_without_refused_marker_is_stop` — an envelope with
+  `EXIT_STATUS_REFUSED == 12` whose `audit_markers` does NOT contain
+  the pinned `a2-l2d-status-refused` literal MUST surface an
+  additional STOP carrying the observed marker list verbatim,
+  alongside the underlying `ProducerRefused` STOP.
+- `unparseable_stdout_is_stop` — synthetic raw stdout that is not
+  valid JSON MUST surface as a STOP, MUST attach no parsed envelope
+  to the invocation record, and MUST preserve the raw stdout bytes
+  verbatim on the invocation record for the operator escalation
+  report.
+- `missing_read_only_invariant_fixture_is_stop` — a synthetic
+  envelope whose `read_only_invariant` field is absent MUST classify
+  the cycle as STOP (the parser surfaces this as schema drift
+  because the required field is missing).
+- `substituted_read_only_invariant_fixture_is_stop` — a synthetic
+  envelope whose `read_only_invariant` literal is replaced by any
+  string other than the pinned literal MUST classify the cycle as
+  STOP and MUST preserve the substituted literal verbatim on the
+  emitted STOP signal; no coercion to the pinned literal is
+  permitted.
+
 The implementation lane MAY add additional fixtures beyond this
 minimum. It MUST NOT ship with fewer.
 

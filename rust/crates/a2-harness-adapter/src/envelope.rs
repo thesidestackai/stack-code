@@ -18,6 +18,11 @@ pub const READ_ONLY_INVARIANT_LITERAL: &str = "this command does not mutate stat
 /// A2-L2d refusal exit code.
 pub const EXIT_STATUS_REFUSED: i32 = 12;
 
+/// Pinned audit marker the producer emits on every refusal envelope.
+/// The harness asserts presence on `EXIT_STATUS_REFUSED` and surfaces a
+/// STOP when absent.
+pub const REFUSED_AUDIT_MARKER: &str = "a2-l2d-status-refused";
+
 /// Closed `phase` enum mirroring the producer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
