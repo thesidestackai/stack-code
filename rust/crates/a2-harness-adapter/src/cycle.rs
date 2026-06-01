@@ -14,7 +14,7 @@ use crate::classifier::{classify_workspace, ClassifierConfig};
 use crate::config::{ConfigError, ExpectedOutcome, HarnessAssertionConfig};
 use crate::envelope::{
     classify_next_operator_command, parse_envelope, EnvelopeParseError, NextOpCommandShape,
-    EXIT_STATUS_REFUSED,
+    EXIT_STATUS_REFUSED, REFUSED_AUDIT_MARKER,
 };
 use crate::invoker::StatusInvoker;
 use crate::report::{AssertionEntry, CycleClassification, HarnessRunReport, InvocationRecord};
@@ -106,6 +106,11 @@ pub fn run_cycle<I: StatusInvoker>(
                 run_envelope_assertions(cfg, &env, &mut assertions, &mut stops);
                 if exit_code == EXIT_STATUS_REFUSED {
                     stops.push(StopSignal::new(StopKind::ProducerRefused));
+                    if !env.audit_markers.iter().any(|m| m == REFUSED_AUDIT_MARKER) {
+                        stops.push(StopSignal::new(StopKind::ExitRefusedMissingMarker {
+                            observed_markers: env.audit_markers.clone(),
+                        }));
+                    }
                 }
             }
             Err(err) => {
@@ -198,6 +203,15 @@ fn run_envelope_assertions(
     // Producer stop_condition.
     if let Some(sc) = env.stop_condition {
         stops.push(StopSignal::new(StopKind::ProducerStopCondition(sc)));
+        // Producer always populates at least one evidence path when a
+        // STOP fires. An empty `evidence_paths` under a non-null
+        // `stop_condition` is producer-broken drift; the harness
+        // raises an additional STOP in its own right.
+        if env.evidence_paths.is_empty() {
+            stops.push(StopSignal::new(
+                StopKind::EvidencePathsEmptyUnderStopCondition(sc),
+            ));
+        }
     }
 
     // Producer STOP — escalate next-op string (verbatim literal).
