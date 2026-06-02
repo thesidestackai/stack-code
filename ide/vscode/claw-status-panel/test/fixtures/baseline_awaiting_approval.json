@@ -1,0 +1,24 @@
+{
+  "schema_version": "a2-l2d-status.v1",
+  "workspace_root": "/disposable/wks",
+  "run_id": "run-0001",
+  "step_id": "step-001",
+  "phase": "awaiting_approval",
+  "next_operator_command": "claw plan approve /disposable/wks/.claw/l2b-preview-bundles/run-0001/step-001/preview-bundle.json",
+  "is_approvable": true,
+  "is_apply_ready": false,
+  "before_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "after_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "payload_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "live_target_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "stop_condition": null,
+  "evidence_paths": [
+    "/disposable/wks/.claw/l2b-runs/run-0001/run-manifest.json",
+    "/disposable/wks/.claw/l2b-preview-bundles/run-0001/step-001/preview-bundle.json"
+  ],
+  "audit_markers": [
+    "a2-l2d-status-idempotent-emit",
+    "a2-l2d-status-read"
+  ],
+  "read_only_invariant": "this command does not mutate state"
+}
