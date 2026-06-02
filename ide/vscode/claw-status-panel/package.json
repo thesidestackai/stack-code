@@ -1,0 +1,52 @@
+{
+  "name": "claw-status-panel",
+  "displayName": "Claw Status Panel",
+  "description": "Read-only VS Code observer for a2-l2d-status.v1 envelopes emitted by `claw plan status`. Surfaces chain state, evidence paths, and STOP conditions verbatim. No approve / apply / run / write controls. Bounded by the A2-L3 IDE adapter scope card and implementation scope card.",
+  "version": "0.0.1",
+  "publisher": "ultraworkers",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.80.0",
+    "node": ">=18"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:clawStatus.refresh"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "clawStatus.refresh",
+        "title": "Claw Status: Refresh",
+        "category": "Claw Status"
+      }
+    ],
+    "configuration": {
+      "title": "Claw Status",
+      "properties": {
+        "clawStatus.binaryPath": {
+          "type": "string",
+          "default": "claw",
+          "description": "Path to the `claw` binary. The extension only ever invokes `claw plan status <workspace> [<approval-result.json>]`."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "build": "tsc -p .",
+    "lint": "node ./scripts/run-guards.js",
+    "test": "tsc -p ./tsconfig.test.json && mocha --reporter spec --recursive ./out-test/test"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.6",
+    "@types/node": "^18.19.0",
+    "@types/vscode": "^1.80.0",
+    "mocha": "^10.2.0",
+    "typescript": "^5.4.0"
+  }
+}

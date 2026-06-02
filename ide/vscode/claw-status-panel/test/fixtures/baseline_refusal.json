@@ -1,0 +1,22 @@
+{
+  "schema_version": "a2-l2d-status.v1",
+  "workspace_root": "/no/such/path",
+  "run_id": null,
+  "step_id": null,
+  "phase": "unknown",
+  "next_operator_command": "STOP — escalate",
+  "is_approvable": false,
+  "is_apply_ready": false,
+  "before_sha256": null,
+  "after_sha256": null,
+  "payload_sha256": null,
+  "live_target_sha256": null,
+  "stop_condition": "workspace-root-invalid",
+  "evidence_paths": [],
+  "audit_markers": [
+    "a2-l2d-status-read",
+    "a2-l2d-status-refused",
+    "a2-l2d-status-stop-condition-detected"
+  ],
+  "read_only_invariant": "this command does not mutate state"
+}
