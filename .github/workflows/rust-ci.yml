@@ -19,6 +19,8 @@ on:
       - rust/**
       - schemas/**
       - scripts/claw-sidestack-local
+      - scripts/validate_planner_output_schema.py
+      - tests/a2_l4/**
       - tests/shell/**
       - examples/sidestack-local.env
   pull_request:
@@ -37,6 +39,8 @@ on:
       - rust/**
       - schemas/**
       - scripts/claw-sidestack-local
+      - scripts/validate_planner_output_schema.py
+      - tests/a2_l4/**
       - tests/shell/**
       - examples/sidestack-local.env
   workflow_dispatch:
@@ -127,3 +131,19 @@ jobs:
           shellcheck tests/shell/test_claw_sidestack_local.sh
       - name: Run shell tests
         run: bash tests/shell/test_claw_sidestack_local.sh
+
+  planner-output-validator:
+    name: planner-output validator
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Validator unit tests
+        run: python -m unittest discover -s tests/a2_l4 -p 'test_*.py'
+      - name: Validator fixture self-test
+        run: python scripts/validate_planner_output_schema.py --self-test
