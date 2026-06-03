@@ -1,0 +1,14 @@
+{
+  "schema_version": "a2-l4-planner-output.v1",
+  "task_id": "task-0001",
+  "workspace_root": "stack-code",
+  "task_summary": "Document the read-only planner output contract fixtures.",
+  "plan_steps": [
+    {
+      "step_id": "s1",
+      "description": "Read the existing planner output schema and summarize its required fields."
+    }
+  ],
+  "risk_notes": [],
+  "operator_next_steps": []
+}

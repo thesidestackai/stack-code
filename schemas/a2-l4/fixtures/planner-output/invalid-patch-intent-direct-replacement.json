@@ -1,0 +1,21 @@
+{
+  "schema_version": "a2-l4-planner-output.v1",
+  "task_id": "task-0010",
+  "workspace_root": "stack-code",
+  "task_summary": "This document smuggles an applyable replacement into patch_intent and must be rejected by its closed-object policy.",
+  "plan_steps": [
+    {
+      "step_id": "s1",
+      "description": "A well-formed step, but patch_intent carries a forbidden direct file-replacement payload."
+    }
+  ],
+  "risk_notes": [],
+  "operator_next_steps": [],
+  "patch_intent": {
+    "summary": "Intended edit described as prose.",
+    "notes": [
+      "Descriptive intent only."
+    ],
+    "replacement": "placeholder; patch_intent must not carry an applyable diff or staged file-replacement body"
+  }
+}

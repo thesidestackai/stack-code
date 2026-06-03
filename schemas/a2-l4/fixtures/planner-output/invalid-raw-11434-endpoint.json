@@ -1,0 +1,15 @@
+{
+  "schema_version": "a2-l4-planner-output.v1",
+  "task_id": "task-0007",
+  "workspace_root": "stack-code",
+  "task_summary": "This document attempts to smuggle a raw_11434_endpoint and must be rejected by the forbidden-field policy.",
+  "plan_steps": [
+    {
+      "step_id": "s1",
+      "description": "A well-formed step, but the document carries a forbidden raw_11434_endpoint field that would bypass LAW 1 routing."
+    }
+  ],
+  "risk_notes": [],
+  "operator_next_steps": [],
+  "raw_11434_endpoint": "placeholder for a forbidden raw-inference endpoint; all app inference must route through the broker"
+}

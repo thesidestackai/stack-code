@@ -1,0 +1,15 @@
+{
+  "schema_version": "a2-l4-planner-output.v1",
+  "task_id": "task-0006",
+  "workspace_root": "stack-code",
+  "task_summary": "This document attempts to smuggle a shell_command and must be rejected by the forbidden-field policy.",
+  "plan_steps": [
+    {
+      "step_id": "s1",
+      "description": "A well-formed step, but the document carries a forbidden shell_command field."
+    }
+  ],
+  "risk_notes": [],
+  "operator_next_steps": [],
+  "shell_command": "placeholder string; planner output must never carry an executable command"
+}

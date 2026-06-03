@@ -1,0 +1,13 @@
+{
+  "schema_version": "a2-l4-planner-output.v1",
+  "task_id": "task-0003",
+  "workspace_root": "stack-code",
+  "plan_steps": [
+    {
+      "step_id": "s1",
+      "description": "This document omits the required task_summary field and must be rejected."
+    }
+  ],
+  "risk_notes": [],
+  "operator_next_steps": []
+}
