@@ -1,0 +1,154 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.thesidestackai.dev/a2-l4/planner-output.schema.json",
+  "title": "A2-L4 Planner Output Contract",
+  "description": "Inert, read-only planner-output contract for the A2-L4 read-only local-model task planner. A conforming document is well-formed and inert; conformance is necessary for well-formedness and never sufficient for action. The schema validates shape only: it does not grant write, approve, or apply authority, and it carries no executable command, approval line, raw localhost:11434 endpoint, or secret. The A2-L2b preview/approve/apply chain remains the only write authority. Value-level checks (workspace-relative path/no-escape, :11434 URL refusal, secret/token pattern refusal) are performed by the separately-scoped read-only validator lane, not by this schema.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "task_id",
+    "workspace_root",
+    "task_summary",
+    "plan_steps",
+    "risk_notes",
+    "operator_next_steps"
+  ],
+  "properties": {
+    "schema_version": {
+      "description": "Pinned contract version literal. Consumers reject any output whose schema_version is not a known value. A breaking change to the field sets, semantics, or constraints requires a new literal and a scope-card amendment.",
+      "const": "a2-l4-planner-output.v1"
+    },
+    "task_id": {
+      "description": "Opaque identifier for the planning task. Inert text.",
+      "type": "string",
+      "minLength": 1
+    },
+    "workspace_root": {
+      "description": "Workspace root path the plan is scoped to. A path string; the validator lane enforces workspace-relative, no-path-escape semantics.",
+      "type": "string",
+      "minLength": 1
+    },
+    "task_summary": {
+      "description": "Descriptive summary of the task. Inert text, never a command.",
+      "type": "string",
+      "minLength": 1
+    },
+    "plan_steps": {
+      "description": "Ordered, inert, descriptive plan steps. Each step is descriptive text, never an argv/command structure.",
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/planStep" }
+    },
+    "risk_notes": {
+      "description": "Inert descriptive risk notes for operator review. Arrays of text, not command structures.",
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "operator_next_steps": {
+      "description": "Inert descriptive next steps the operator may consider. Arrays of text, never executable invocations.",
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "repo_context_summary": {
+      "description": "Optional inert summary of repository context the planner read. Descriptive text only.",
+      "type": "string"
+    },
+    "candidate_files": {
+      "description": "Optional list of candidate file paths the operator may inspect. Path strings; the validator lane enforces workspace-relative, no-path-escape semantics.",
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "test_suggestions": {
+      "description": "Optional inert test suggestions for operator review. May name tests or suggest commands as descriptive text; never structured as an executable runner and never auto-executed.",
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "patch_intent": { "$ref": "#/$defs/patchIntent" },
+    "preview_request": { "$ref": "#/$defs/previewRequest" },
+    "external_verifier_handoff": { "$ref": "#/$defs/externalVerifierHandoff" },
+    "status_snapshot": { "$ref": "#/$defs/statusSnapshot" }
+  },
+  "not": {
+    "description": "Explicit forbidden top-level field intent. These names are rejected both here and by the closed-object (additionalProperties:false) policy. They would carry execution, approval, routing-bypass, or secret payloads, which a planner output must never express.",
+    "anyOf": [
+      { "required": ["approval_line"] },
+      { "required": ["approval_command"] },
+      { "required": ["apply_command"] },
+      { "required": ["apply_bundle_command"] },
+      { "required": ["run_command"] },
+      { "required": ["shell_command"] },
+      { "required": ["write_command"] },
+      { "required": ["autonomous_apply"] },
+      { "required": ["auto_approve"] },
+      { "required": ["raw_11434_endpoint"] },
+      { "required": ["secret_value"] },
+      { "required": ["token_value"] },
+      { "required": ["env_secret"] },
+      { "required": ["private_key"] }
+    ]
+  },
+  "$defs": {
+    "planStep": {
+      "description": "A single inert, descriptive plan step. Closed object: descriptive text only, no command/argv structure.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["step_id", "description"],
+      "properties": {
+        "step_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        },
+        "rationale": {
+          "type": "string"
+        }
+      }
+    },
+    "patchIntent": {
+      "description": "Inert prose/structured notes describing intended edits and why. NOT a patch file and NOT an applyable artifact: it must not carry an applyable diff or a staged file-replacement body. Closed object so no replacement/diff/content payload can be smuggled.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "summary": { "type": "string" },
+        "notes": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "previewRequest": {
+      "description": "An inert request for the operator (or a future, separately authorized A2-integration lane) to consider running a preview. It is not, and must not contain or template, a run of claw plan run or any chain command, a generated preview artifact, or an approval line. Closed object so no command/artifact/approval payload can be smuggled.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "requested": { "type": "boolean" },
+        "reason": { "type": "string" }
+      }
+    },
+    "externalVerifierHandoff": {
+      "description": "Operator-gated, secret-free review input for an optional external verifier (ChatGPT/Claude). Advisory only: it grants no write authority and is not an authority field. Must not contain secrets, token values, env secrets, or private keys. Closed object so no secret-bearing field can be smuggled.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "summary": { "type": "string" },
+        "context": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "statusSnapshot": {
+      "description": "Optional inert summary of a2-l2d-status.v1 read-only plan status. No authority; descriptive text only. Closed object.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "summary": { "type": "string" },
+        "plan_state": { "type": "string" }
+      }
+    }
+  }
+}
