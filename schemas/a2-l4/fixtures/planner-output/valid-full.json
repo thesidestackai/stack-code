@@ -1,0 +1,61 @@
+{
+  "schema_version": "a2-l4-planner-output.v1",
+  "task_id": "task-0002",
+  "workspace_root": "stack-code",
+  "task_summary": "Plan a read-only refactor of the status reporting helper with operator-reviewable steps.",
+  "plan_steps": [
+    {
+      "step_id": "s1",
+      "description": "Identify the modules that read plan status and summarize their responsibilities.",
+      "rationale": "Establishes scope before any edit is proposed."
+    },
+    {
+      "step_id": "s2",
+      "description": "Describe the proposed extraction of the shared status formatter into a single helper.",
+      "rationale": "Reduces duplication while keeping behavior identical."
+    },
+    {
+      "step_id": "s3",
+      "description": "List the tests an operator may run to confirm the refactor is behavior-preserving."
+    }
+  ],
+  "risk_notes": [
+    "Refactor touches a shared code path; operator should review test coverage before approving any apply.",
+    "No behavior change is intended; conformance to this contract grants no write authority."
+  ],
+  "operator_next_steps": [
+    "Review the proposed plan steps and candidate files.",
+    "Decide whether to request an A2-L2b preview for any edit."
+  ],
+  "repo_context_summary": "stack-code Rust workspace with a CLI surface and a read-only plan status helper; the planner only read source files.",
+  "candidate_files": [
+    "rust/src/status.rs",
+    "rust/src/cli/report.rs"
+  ],
+  "test_suggestions": [
+    "cargo test --workspace",
+    "cargo test status_formatter"
+  ],
+  "patch_intent": {
+    "summary": "Extract the duplicated status formatter into a single read-only helper function.",
+    "notes": [
+      "This is descriptive intent only and carries no applyable diff.",
+      "Any actual edit must go through the A2-L2b preview/approve/apply chain."
+    ]
+  },
+  "preview_request": {
+    "requested": true,
+    "reason": "Operator may wish to preview the proposed extraction before approving."
+  },
+  "external_verifier_handoff": {
+    "summary": "Optional secret-free summary an operator may share with an external verifier for a second opinion.",
+    "context": [
+      "Refactor is behavior-preserving and limited to the status formatter.",
+      "No secrets, tokens, or endpoints are included in this handoff."
+    ]
+  },
+  "status_snapshot": {
+    "summary": "No plan has been previewed or applied yet; this is planning output only.",
+    "plan_state": "draft"
+  }
+}

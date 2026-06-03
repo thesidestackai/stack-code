@@ -1,0 +1,15 @@
+{
+  "schema_version": "a2-l4-planner-output.v1",
+  "task_id": "task-0004",
+  "workspace_root": "stack-code",
+  "task_summary": "This document adds an unrecognized top-level field and must be rejected by additionalProperties:false.",
+  "plan_steps": [
+    {
+      "step_id": "s1",
+      "description": "A well-formed step, but the surrounding document carries an unknown field."
+    }
+  ],
+  "risk_notes": [],
+  "operator_next_steps": [],
+  "unexpected_extra_field": "Not part of the planner-output contract."
+}
