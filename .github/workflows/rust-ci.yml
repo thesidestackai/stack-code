@@ -17,6 +17,7 @@ on:
       - ROADMAP.md
       - docs/**
       - rust/**
+      - schemas/**
       - scripts/claw-sidestack-local
       - tests/shell/**
       - examples/sidestack-local.env
@@ -34,6 +35,7 @@ on:
       - ROADMAP.md
       - docs/**
       - rust/**
+      - schemas/**
       - scripts/claw-sidestack-local
       - tests/shell/**
       - examples/sidestack-local.env
