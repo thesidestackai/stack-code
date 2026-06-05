@@ -1,0 +1,19 @@
+{
+  "schema_version": "a2-l4-planner-output.v1",
+  "task_id": "task-s2c1a-valid",
+  "workspace_root": "stack-code",
+  "task_summary": "Validate the Stack-Code A2 preview wiring configuration (read-only inspection).",
+  "plan_steps": [
+    { "step_id": "s1", "description": "Inspect the A2 preview wiring configuration files for misconfiguration." },
+    { "step_id": "s2", "description": "Summarize findings for operator review; propose no write." }
+  ],
+  "risk_notes": [
+    "Misconfiguration in preview wiring may lead to incorrect behavior during A2 operations."
+  ],
+  "operator_next_steps": [
+    "Operator reviews the inspection summary and decides whether a follow-up write plan is warranted."
+  ],
+  "candidate_files": [
+    "docs/a2-l2b-run-plan-preview-operator-handoff.md"
+  ]
+}

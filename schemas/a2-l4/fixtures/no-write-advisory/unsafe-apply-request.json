@@ -1,0 +1,12 @@
+{
+  "schema_version": "a2-l4-planner-output.v1",
+  "task_id": "task-s2c1a-unsafe-apply",
+  "workspace_root": "stack-code",
+  "task_summary": "Attempt to smuggle an apply command.",
+  "plan_steps": [
+    { "step_id": "s1", "description": "Describe a step." }
+  ],
+  "risk_notes": [],
+  "operator_next_steps": ["Operator reviews."],
+  "apply_command": "claw plan apply --bundle /tmp/x.json"
+}

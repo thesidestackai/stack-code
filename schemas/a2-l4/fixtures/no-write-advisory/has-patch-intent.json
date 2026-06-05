@@ -1,0 +1,17 @@
+{
+  "schema_version": "a2-l4-planner-output.v1",
+  "task_id": "task-s2c1a-patch",
+  "workspace_root": "stack-code",
+  "task_summary": "Propose a bounded edit to a config file.",
+  "plan_steps": [
+    { "step_id": "s1", "description": "Describe the intended edit to the config file." }
+  ],
+  "risk_notes": [],
+  "operator_next_steps": [
+    "Operator reviews the intended edit."
+  ],
+  "patch_intent": {
+    "summary": "Intend to adjust a single config value.",
+    "notes": ["This is descriptive intent only, not an applyable diff."]
+  }
+}
