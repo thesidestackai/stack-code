@@ -1,0 +1,16 @@
+{
+  "schema_version": "a2-l4-planner-output.v1",
+  "task_id": "task-s2c1b-dangerous-cmd",
+  "workspace_root": "stack-code",
+  "task_summary": "Attempt to smuggle a shell run command alongside a write intent.",
+  "plan_steps": [
+    { "step_id": "s1", "description": "Describe a bounded edit." }
+  ],
+  "risk_notes": [],
+  "operator_next_steps": ["Operator reviews."],
+  "patch_intent": {
+    "summary": "Adjust a single bounded value.",
+    "notes": ["Descriptive intent only."]
+  },
+  "run_command": "rm -rf build && cargo build"
+}

@@ -1,0 +1,14 @@
+{
+  "schema_version": "a2-l4-planner-output.v1",
+  "task_id": "task-s2c1b-missing-objective",
+  "workspace_root": "stack-code",
+  "plan_steps": [
+    { "step_id": "s1", "description": "A step with no top-level task_summary present." }
+  ],
+  "risk_notes": [],
+  "operator_next_steps": ["Operator reviews."],
+  "patch_intent": {
+    "summary": "Adjust a single bounded value.",
+    "notes": ["Descriptive intent only."]
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "schema_version": "a2-l4-planner-output.v1",
+  "task_id": "task-s2c1b-preview-bypass",
+  "workspace_root": "stack-code",
+  "task_summary": "Attempt to smuggle a fabricated preview hash to bypass the A2-L2b preview authority.",
+  "plan_steps": [
+    { "step_id": "s1", "description": "Describe a bounded edit." }
+  ],
+  "risk_notes": [],
+  "operator_next_steps": ["Operator reviews."],
+  "patch_intent": {
+    "summary": "Adjust a single bounded value.",
+    "notes": ["Descriptive intent only."]
+  },
+  "preview_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+}

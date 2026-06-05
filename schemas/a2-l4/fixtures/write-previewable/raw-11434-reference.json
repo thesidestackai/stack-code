@@ -1,0 +1,17 @@
+{
+  "schema_version": "a2-l4-planner-output.v1",
+  "task_id": "task-s2c1b-raw-port",
+  "workspace_root": "stack-code",
+  "task_summary": "Propose an edit but (incorrectly) reference a raw upstream inference endpoint.",
+  "plan_steps": [
+    { "step_id": "s1", "description": "Edit the config and check the model endpoint at http://localhost:11434 directly." }
+  ],
+  "risk_notes": [
+    "Bypassing the broker via http://localhost:11434 would violate LAW 1."
+  ],
+  "operator_next_steps": ["Operator reviews."],
+  "patch_intent": {
+    "summary": "Adjust a single bounded value.",
+    "notes": ["Descriptive intent only."]
+  }
+}
