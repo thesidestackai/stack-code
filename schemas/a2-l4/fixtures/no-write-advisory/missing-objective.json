@@ -1,0 +1,10 @@
+{
+  "schema_version": "a2-l4-planner-output.v1",
+  "task_id": "task-s2c1a-missing-objective",
+  "workspace_root": "stack-code",
+  "plan_steps": [
+    { "step_id": "s1", "description": "A step with no task_summary present at the top level." }
+  ],
+  "risk_notes": [],
+  "operator_next_steps": ["Operator reviews."]
+}

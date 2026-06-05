@@ -1,0 +1,13 @@
+{
+  "schema_version": "a2-l4-planner-output.v1",
+  "task_id": "task-s2c1a-raw-port",
+  "workspace_root": "stack-code",
+  "task_summary": "Inspect routing and (incorrectly) reference a raw upstream endpoint.",
+  "plan_steps": [
+    { "step_id": "s1", "description": "Check the model endpoint at http://localhost:11434 directly." }
+  ],
+  "risk_notes": [
+    "Bypassing the broker via http://localhost:11434 would violate LAW 1."
+  ],
+  "operator_next_steps": ["Operator reviews."]
+}
