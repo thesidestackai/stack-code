@@ -1,0 +1,16 @@
+{
+  "schema_version": "a2-l4-planner-output.v1",
+  "task_id": "task-s2c1b-no-patch-intent",
+  "workspace_root": "stack-code",
+  "task_summary": "A read-only inspection candidate that proposes no workspace write.",
+  "plan_steps": [
+    { "step_id": "s1", "description": "Inspect the status helper and summarize findings for operator review." }
+  ],
+  "risk_notes": [],
+  "operator_next_steps": [
+    "Operator reviews the inspection summary."
+  ],
+  "candidate_files": [
+    "notes/scratch.md"
+  ]
+}

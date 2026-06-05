@@ -1,0 +1,25 @@
+{
+  "schema_version": "a2-l4-planner-output.v1",
+  "task_id": "task-s2c1b-valid",
+  "workspace_root": "stack-code",
+  "task_summary": "Propose a bounded edit to a single notes file, described as inert intent only.",
+  "plan_steps": [
+    { "step_id": "s1", "description": "Describe the intended single-file edit and its rationale for operator review." }
+  ],
+  "risk_notes": [
+    "The edit is bounded to one file; the operator must review and supply the exact after-bytes before any preview."
+  ],
+  "operator_next_steps": [
+    "Operator confirms the write_target and supplies the exact after_file bytes, then runs the A2-L2b preview."
+  ],
+  "candidate_files": [
+    "notes/scratch.md"
+  ],
+  "patch_intent": {
+    "summary": "Adjust a single bounded value in the notes file.",
+    "notes": [
+      "This is descriptive intent only and carries no applyable diff.",
+      "Any actual edit must go through the A2-L2b preview/approve/apply chain."
+    ]
+  }
+}
