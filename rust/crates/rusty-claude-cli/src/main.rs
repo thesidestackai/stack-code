@@ -496,11 +496,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // surface verbatim.
             std::process::exit(code);
         }
-        CliAction::PlanApprove { bundle_path } => {
+        CliAction::PlanApprove {
+            bundle_path,
+            approval_result_output,
+        } => {
             // A2-L2b Slice 3d: read bundle, render prompt to stderr,
             // read approval line from stdin, emit approval-result JSON
             // on stdout, exit with operator-facing code (0/5/7). The
             // command never writes target files; cf. `run_plan_approve`.
+            // Option C: when --approval-result-output <path> is given,
+            // also persist the emitted approval-result JSON to that path
+            // (only on a successful approval); cf. `run_plan_approve_with_output`.
             let stdin = std::io::stdin();
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
@@ -508,8 +514,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mut stdin_lock = stdin.lock();
             let mut stdout_lock = stdout.lock();
             let mut stderr_lock = stderr.lock();
-            let code = run_plan_approve(
+            let code = run_plan_approve_with_output(
                 &bundle_path,
+                approval_result_output.as_deref(),
                 stdin_is_tty,
                 &mut stdin_lock,
                 &mut stdout_lock,
@@ -1373,6 +1380,103 @@ fn run_plan_approve<R: Read, W1: Write, W2: Write>(
 // The source-grep tests in `plan_approve_tests` use this sentinel to bound
 // the implementation region they scan for forbidden APIs. Do not move or
 // rename it without updating those tests.
+
+// =========================================================================
+// Option C — approval-result persistence (guard-preserving)
+// =========================================================================
+//
+// `--approval-result-output <path>` on `claw plan approve` persists the EXACT
+// approval-result JSON the command already emits on stdout to an
+// operator-specified file, but ONLY after a successful approved decision.
+//
+// This wrapper lives OUTSIDE the Slice-3d scope sentinel region on purpose:
+// the file-write APIs it uses are forbidden INSIDE that region by the
+// `plan_approve_tests` source-grep guards. It changes none of the approval
+// semantics — it calls `run_plan_approve` unchanged into a capture buffer,
+// relays that buffer verbatim to the real stdout, and writes the same bytes
+// to the output file only when the approval exit code is 0 (approved).
+//
+// It NEVER relaxes the TTY guard, NEVER accepts pre-approval flags, NEVER
+// applies, and NEVER writes the workspace target file.
+
+/// Exit code when an approval succeeded but persisting the approval-result to
+/// `--approval-result-output <path>` failed (or the path already exists).
+/// Distinct from the approval namespace (0 approved / 5 parse / 7 denied) so
+/// the operator can tell "approved but not persisted" from "not approved".
+const EXIT_APPROVAL_OUTPUT_IO: i32 = 12;
+
+/// Persist `bytes` to `path`, refusing to overwrite an existing file.
+///
+/// Uses `create_new(true)` so an existing file is an error (never clobber
+/// prior approval evidence) and requires the parent directory to already
+/// exist (no broad directory creation). The approval-result is a single small
+/// JSON line, so a direct create + write + flush is sufficient.
+fn persist_approval_result_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.flush()?;
+    Ok(())
+}
+
+/// Guard-preserving wrapper around [`run_plan_approve`] that optionally
+/// persists the emitted approval-result JSON to `approval_result_output`.
+///
+/// * If an output path is supplied and already exists, refuse up front (exit
+///   [`EXIT_APPROVAL_OUTPUT_IO`]) WITHOUT running the approval — never clobber
+///   existing evidence, and never make the operator approve only to fail
+///   persistence afterward.
+/// * Otherwise run [`run_plan_approve`] unchanged into a capture buffer and
+///   relay that buffer verbatim to `real_stdout` (stdout behavior unchanged).
+/// * Only when the approval exit code is `0` (approved) AND an output path was
+///   supplied, write the SAME bytes to the file. A write failure surfaces on
+///   `stderr` and returns [`EXIT_APPROVAL_OUTPUT_IO`]; the stdout JSON still
+///   shows the approved decision.
+/// * On any non-approved exit code, no file is written.
+fn run_plan_approve_with_output<R: Read, W1: Write, W2: Write>(
+    bundle_path: &Path,
+    approval_result_output: Option<&Path>,
+    stdin_is_tty: bool,
+    stdin: &mut R,
+    real_stdout: &mut W1,
+    stderr: &mut W2,
+) -> i32 {
+    if let Some(path) = approval_result_output {
+        if path.exists() {
+            let _ = writeln!(
+                stderr,
+                "claw plan approve: --approval-result-output path already exists, \
+                 refusing to overwrite: {}",
+                path.display()
+            );
+            return EXIT_APPROVAL_OUTPUT_IO;
+        }
+    }
+
+    let mut captured: Vec<u8> = Vec::new();
+    let code = run_plan_approve(bundle_path, stdin_is_tty, stdin, &mut captured, stderr);
+
+    let _ = real_stdout.write_all(&captured);
+    let _ = real_stdout.flush();
+
+    if code == 0 {
+        if let Some(path) = approval_result_output {
+            if let Err(e) = persist_approval_result_file(path, &captured) {
+                let _ = writeln!(
+                    stderr,
+                    "claw plan approve: approved, but failed to write \
+                     --approval-result-output {}: {e}",
+                    path.display()
+                );
+                return EXIT_APPROVAL_OUTPUT_IO;
+            }
+        }
+    }
+
+    code
+}
 
 // =========================================================================
 // A2-L2b Slice L2b-CLI-Apply — `claw plan apply <apply-bundle.json>` command
@@ -3481,6 +3585,10 @@ enum CliAction {
     // purely a renderer + input reader + Slice-3a evaluator wrapper.
     PlanApprove {
         bundle_path: PathBuf,
+        /// Optional guard-preserving sink for the emitted approval-result
+        /// JSON (`--approval-result-output <path>`). `None` = stdout only
+        /// (unchanged behavior). Written only on a successful approval.
+        approval_result_output: Option<PathBuf>,
     },
     // A2-L2b Slice L2b-CLI-Apply: operator-facing single-file write
     // command. Reads ONE apply bundle file from disk, validates every
@@ -4375,31 +4483,68 @@ fn parse_plan_subcommand_args(args: &[String]) -> Result<CliAction, String> {
 
 /// A2-L2b Slice 3d: parse `claw plan approve <preview-bundle.json>`.
 ///
-/// Exactly one positional argument, no flags. Any `--*` flag — including
+/// Exactly one positional argument (the preview bundle). The only accepted
+/// flag is the OPT-IN `--approval-result-output <path>` (or
+/// `--approval-result-output=<path>`), which is NOT a pre-approval flag and
+/// does not relax any approval guard. Any OTHER `--*` flag — including
 /// pre-approval flags like `--yes`, `--auto`, `--force`, `--allow-write`
 /// — is refused outright before any filesystem touch.
 fn parse_plan_approve_subcommand_args(args: &[String]) -> Result<CliAction, String> {
+    const USAGE: &str =
+        "Usage: `claw plan approve <preview-bundle.json> [--approval-result-output <path>]`.";
     let mut bundle: Option<PathBuf> = None;
-    for arg in args {
+    let mut approval_result_output: Option<PathBuf> = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
         let v = arg.as_str();
+        if let Some(rest) = v.strip_prefix("--approval-result-output") {
+            let path = if let Some(inline) = rest.strip_prefix('=') {
+                inline.to_string()
+            } else if rest.is_empty() {
+                match iter.next() {
+                    Some(p) => p.clone(),
+                    None => {
+                        return Err(format!(
+                            "`--approval-result-output` requires a path argument. {USAGE}"
+                        ))
+                    }
+                }
+            } else {
+                // e.g. `--approval-result-outputX` — an unknown flag, not ours.
+                return Err(format!(
+                    "unsupported flag for `claw plan approve`: {v}. {USAGE}"
+                ));
+            };
+            if approval_result_output.is_some() {
+                return Err(format!(
+                    "`--approval-result-output` specified more than once. {USAGE}"
+                ));
+            }
+            if path.is_empty() {
+                return Err(format!(
+                    "`--approval-result-output` requires a non-empty path. {USAGE}"
+                ));
+            }
+            approval_result_output = Some(PathBuf::from(path));
+            continue;
+        }
         if v.starts_with("--") {
             return Err(format!(
-                "unsupported flag for `claw plan approve`: {v}. \
-                 Usage: `claw plan approve <preview-bundle.json>`."
+                "unsupported flag for `claw plan approve`: {v}. {USAGE}"
             ));
         }
         if bundle.is_some() {
             return Err(format!(
-                "unexpected positional argument after preview bundle: {v}. \
-                 Usage: `claw plan approve <preview-bundle.json>`."
+                "unexpected positional argument after preview bundle: {v}. {USAGE}"
             ));
         }
         bundle = Some(PathBuf::from(v));
     }
-    let bundle_path = bundle.ok_or_else(|| {
-        "missing preview bundle. Usage: `claw plan approve <preview-bundle.json>`.".to_string()
-    })?;
-    Ok(CliAction::PlanApprove { bundle_path })
+    let bundle_path = bundle.ok_or_else(|| format!("missing preview bundle. {USAGE}"))?;
+    Ok(CliAction::PlanApprove {
+        bundle_path,
+        approval_result_output,
+    })
 }
 
 /// A2-L2b Slice L2b-CLI-Apply: parse `claw plan apply <apply-bundle.json>`.
@@ -18890,10 +19035,10 @@ mod plan_approve_tests {
     use super::{
         emit_approval_result, emit_bundle_load_failure, emit_non_tty_refusal, load_preview_bundle,
         parse_plan_subcommand_args, run_approval_interaction, run_plan_approve,
-        verify_record_display_binding, BundleLoadError, CliAction, CliApprovalInteractionResult,
-        APPROVAL_RESULT_AUDIT_BUNDLE_REJECTED, APPROVAL_RESULT_AUDIT_NON_TTY,
-        APPROVAL_RESULT_SCHEMA_V1, EXIT_APPROVAL_DENIED, EXIT_BUNDLE_PARSE_ERROR,
-        PREVIEW_BUNDLE_SCHEMA_V1,
+        run_plan_approve_with_output, verify_record_display_binding, BundleLoadError, CliAction,
+        CliApprovalInteractionResult, APPROVAL_RESULT_AUDIT_BUNDLE_REJECTED,
+        APPROVAL_RESULT_AUDIT_NON_TTY, APPROVAL_RESULT_SCHEMA_V1, EXIT_APPROVAL_DENIED,
+        EXIT_APPROVAL_OUTPUT_IO, EXIT_BUNDLE_PARSE_ERROR, PREVIEW_BUNDLE_SCHEMA_V1,
     };
     use a2_plan_runner::{
         canonical_preview_record_for_approval, preview_hash_from_parts, CanonicalSubset,
@@ -19014,8 +19159,12 @@ mod plan_approve_tests {
     fn plan_approve_subcommand_parses_with_bundle_path() {
         let action = parse_plan_subcommand_args(&args(&["approve", "/tmp/x.json"])).unwrap();
         match action {
-            CliAction::PlanApprove { bundle_path } => {
+            CliAction::PlanApprove {
+                bundle_path,
+                approval_result_output,
+            } => {
                 assert_eq!(bundle_path, PathBuf::from("/tmp/x.json"));
+                assert_eq!(approval_result_output, None);
             }
             other => panic!("expected PlanApprove, got {other:?}"),
         }
@@ -19184,6 +19333,184 @@ mod plan_approve_tests {
             &mut stderr,
         );
         (code, stdout, stderr)
+    }
+
+    // -- Option C: --approval-result-output persistence ------------------
+
+    /// Drive `run_plan_approve_with_output` into in-memory streams with an
+    /// optional persistence path. Mirrors `run_with` plus the output sink.
+    fn run_with_output(
+        bundle_path: &std::path::Path,
+        approval_result_output: Option<&std::path::Path>,
+        stdin_is_tty: bool,
+        input_bytes: &[u8],
+    ) -> (i32, Vec<u8>, Vec<u8>) {
+        let mut stdin = Cursor::new(input_bytes.to_vec());
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        let code = run_plan_approve_with_output(
+            bundle_path,
+            approval_result_output,
+            stdin_is_tty,
+            &mut stdin,
+            &mut stdout,
+            &mut stderr,
+        );
+        (code, stdout, stderr)
+    }
+
+    #[test]
+    fn approve_output_flag_persists_approval_result_on_success() {
+        let dir = unique_temp_dir();
+        let (rec, disp) = build_bound_pair();
+        let path = write_bundle_json(&dir, &rec, &disp, true);
+        let out_path = dir.join("approval-result.json");
+        let approval = format!("apply {} {}\n", rec.step_id, rec.preview_sha256);
+        let (code, stdout, _stderr) =
+            run_with_output(&path, Some(out_path.as_path()), true, approval.as_bytes());
+        assert_eq!(code, 0, "approved decision exits 0");
+        // The persisted file equals the stdout bytes exactly.
+        let file_bytes = std::fs::read(&out_path).expect("approval-result file written");
+        assert_eq!(file_bytes, stdout, "persisted file must equal stdout bytes");
+        let json = parse_stdout_json(&file_bytes);
+        assert_eq!(json["schema_version"], APPROVAL_RESULT_SCHEMA_V1);
+        assert_eq!(json["decision"], "approved");
+        assert_eq!(json["step_id"], rec.step_id);
+        assert_eq!(json["preview_sha256"], rec.preview_sha256);
+    }
+
+    #[test]
+    fn approve_without_output_flag_writes_no_file_and_preserves_stdout() {
+        let dir = unique_temp_dir();
+        let (rec, disp) = build_bound_pair();
+        let path = write_bundle_json(&dir, &rec, &disp, true);
+        let approval = format!("apply {} {}\n", rec.step_id, rec.preview_sha256);
+        let (code, stdout, _stderr) = run_with_output(&path, None, true, approval.as_bytes());
+        assert_eq!(code, 0);
+        // Stdout still carries the approval-result JSON (behavior unchanged).
+        let json = parse_stdout_json(&stdout);
+        assert_eq!(json["decision"], "approved");
+        assert!(
+            !dir.join("approval-result.json").exists(),
+            "no file should be created without the flag"
+        );
+    }
+
+    #[test]
+    fn approve_output_flag_writes_no_file_on_refusal() {
+        let dir = unique_temp_dir();
+        let (rec, disp) = build_bound_pair();
+        let path = write_bundle_json(&dir, &rec, &disp, true);
+        let out_path = dir.join("approval-result.json");
+        let bad_hash = "f".repeat(64);
+        let approval = format!("apply {} {bad_hash}\n", rec.step_id);
+        let (code, stdout, _stderr) =
+            run_with_output(&path, Some(out_path.as_path()), true, approval.as_bytes());
+        assert_eq!(code, EXIT_APPROVAL_DENIED);
+        let json = parse_stdout_json(&stdout);
+        assert_eq!(json["decision"], "refused");
+        assert!(!out_path.exists(), "no file written on a refused approval");
+    }
+
+    #[test]
+    fn approve_output_flag_writes_no_file_on_non_tty() {
+        let dir = unique_temp_dir();
+        let (rec, disp) = build_bound_pair();
+        let path = write_bundle_json(&dir, &rec, &disp, true);
+        let out_path = dir.join("approval-result.json");
+        let approval = format!("apply {} {}\n", rec.step_id, rec.preview_sha256);
+        // stdin_is_tty = false → approvable bundle refuses (exit 7); no file.
+        let (code, stdout, _stderr) =
+            run_with_output(&path, Some(out_path.as_path()), false, approval.as_bytes());
+        assert_eq!(code, EXIT_APPROVAL_DENIED);
+        let json = parse_stdout_json(&stdout);
+        assert_eq!(json["decision"], "refused");
+        assert_eq!(json["reason"].as_str().unwrap(), "approval-stdin-not-tty");
+        assert!(
+            !out_path.exists(),
+            "no file written when the TTY guard fails"
+        );
+    }
+
+    #[test]
+    fn approve_output_flag_refuses_to_overwrite_existing_file() {
+        let dir = unique_temp_dir();
+        let (rec, disp) = build_bound_pair();
+        let path = write_bundle_json(&dir, &rec, &disp, true);
+        let out_path = dir.join("approval-result.json");
+        std::fs::write(&out_path, b"PREEXISTING").expect("seed existing output file");
+        let approval = format!("apply {} {}\n", rec.step_id, rec.preview_sha256);
+        let (code, stdout, _stderr) =
+            run_with_output(&path, Some(out_path.as_path()), true, approval.as_bytes());
+        assert_eq!(code, EXIT_APPROVAL_OUTPUT_IO, "refuse-overwrite exit code");
+        // Existing file is untouched and the approval never ran (no stdout JSON).
+        let existing = std::fs::read(&out_path).expect("existing file still present");
+        assert_eq!(existing, b"PREEXISTING");
+        assert!(
+            stdout.is_empty(),
+            "approval must not run when the output path already exists"
+        );
+    }
+
+    // -- Option C parser tests -------------------------------------------
+
+    #[test]
+    fn plan_approve_subcommand_parses_approval_result_output_separate_arg() {
+        let action = parse_plan_subcommand_args(&args(&[
+            "approve",
+            "/tmp/x.json",
+            "--approval-result-output",
+            "/tmp/out.json",
+        ]))
+        .unwrap();
+        match action {
+            CliAction::PlanApprove {
+                bundle_path,
+                approval_result_output,
+            } => {
+                assert_eq!(bundle_path, PathBuf::from("/tmp/x.json"));
+                assert_eq!(approval_result_output, Some(PathBuf::from("/tmp/out.json")));
+            }
+            other => panic!("expected PlanApprove, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_approve_subcommand_parses_approval_result_output_equals_form() {
+        let action = parse_plan_subcommand_args(&args(&[
+            "approve",
+            "--approval-result-output=/tmp/out.json",
+            "/tmp/x.json",
+        ]))
+        .unwrap();
+        match action {
+            CliAction::PlanApprove {
+                bundle_path,
+                approval_result_output,
+            } => {
+                assert_eq!(bundle_path, PathBuf::from("/tmp/x.json"));
+                assert_eq!(approval_result_output, Some(PathBuf::from("/tmp/out.json")));
+            }
+            other => panic!("expected PlanApprove, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_approve_subcommand_rejects_output_flag_without_path() {
+        let err = parse_plan_subcommand_args(&args(&[
+            "approve",
+            "/tmp/x.json",
+            "--approval-result-output",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("requires a path"), "err was {err:?}");
+    }
+
+    #[test]
+    fn plan_approve_subcommand_still_rejects_yes_flag_with_output_support() {
+        let err =
+            parse_plan_subcommand_args(&args(&["approve", "--yes", "/tmp/x.json"])).unwrap_err();
+        assert!(err.contains("unsupported flag"), "err was {err:?}");
     }
 
     #[test]
