@@ -123,6 +123,154 @@
         "echo": true
       },
       "problemMatcher": []
+    },
+    {
+      "label": "A2: Help",
+      "detail": "Print/validate only. Shows the A2-L2b chain and how to drive it safely.",
+      "type": "process",
+      "command": "${workspaceFolder}/scripts/a2-ide-harness.sh",
+      "args": ["help"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true,
+        "showReuseMessage": false
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "A2: Validate Input",
+      "detail": "Read-only checks on workspace + plan.yaml (refuses absolute after_file).",
+      "type": "process",
+      "command": "${workspaceFolder}/scripts/a2-ide-harness.sh",
+      "args": [
+        "validate-input",
+        "--workspace", "${input:a2Workspace}",
+        "--plan", "${input:a2Plan}"
+      ],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true,
+        "showReuseMessage": false
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "A2: Print Preview Command",
+      "detail": "STEP 1. Prints the preview command. Does NOT run it. Writes no target.",
+      "type": "process",
+      "command": "${workspaceFolder}/scripts/a2-ide-harness.sh",
+      "args": [
+        "print-preview",
+        "--workspace", "${input:a2Workspace}",
+        "--plan", "${input:a2Plan}"
+      ],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true,
+        "showReuseMessage": false
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "A2: Find Artifacts",
+      "detail": "Read-only. Locates .claw preview/approval/apply artifacts and shows hashes.",
+      "type": "process",
+      "command": "${workspaceFolder}/scripts/a2-ide-harness.sh",
+      "args": [
+        "find-artifacts",
+        "--workspace", "${input:a2Workspace}"
+      ],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true,
+        "showReuseMessage": false
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "A2: Print Approval Command",
+      "detail": "STEP 2. Prints the REAL-terminal approval command. Does NOT run it.",
+      "type": "process",
+      "command": "${workspaceFolder}/scripts/a2-ide-harness.sh",
+      "args": [
+        "print-approval",
+        "--workspace", "${input:a2Workspace}",
+        "--preview-bundle", "${input:a2PreviewBundle}",
+        "--approval-output", "${input:a2ApprovalOutput}"
+      ],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true,
+        "showReuseMessage": false
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "A2: Print Apply-Bundle Command",
+      "detail": "STEP 3. Prints the apply-bundle GENERATOR command. Writes no target.",
+      "type": "process",
+      "command": "${workspaceFolder}/scripts/a2-ide-harness.sh",
+      "args": [
+        "print-apply-bundle",
+        "--preview-generator-result", "${input:a2GeneratorResult}",
+        "--approval-result", "${input:a2ApprovalResult}"
+      ],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true,
+        "showReuseMessage": false
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "A2: Print Apply Command",
+      "detail": "STEP 4. Prints the plan apply EXECUTOR command (the only target writer). Does NOT run it.",
+      "type": "process",
+      "command": "${workspaceFolder}/scripts/a2-ide-harness.sh",
+      "args": [
+        "print-apply",
+        "--apply-bundle", "${input:a2ApplyBundle}"
+      ],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true,
+        "showReuseMessage": false
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "A2: Verify Final Target",
+      "detail": "STEP 5. Read-only. Confirms the target hash equals the expected after_sha256.",
+      "type": "process",
+      "command": "${workspaceFolder}/scripts/a2-ide-harness.sh",
+      "args": [
+        "verify-final",
+        "--workspace", "${input:a2Workspace}",
+        "--target", "${input:a2Target}",
+        "--after-sha", "${input:a2AfterSha}"
+      ],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true,
+        "showReuseMessage": false
+      },
+      "problemMatcher": []
     }
   ],
   "inputs": [
@@ -130,6 +278,51 @@
       "id": "promptText",
       "type": "promptString",
       "description": "Read-only prompt to send to Stack-Code via the SideStackAI broker."
+    },
+    {
+      "id": "a2Workspace",
+      "type": "promptString",
+      "description": "A2 workspace root (the directory that contains .claw and the target)."
+    },
+    {
+      "id": "a2Plan",
+      "type": "promptString",
+      "description": "A2 plan.yaml path (after_file must be relative, never absolute)."
+    },
+    {
+      "id": "a2PreviewBundle",
+      "type": "promptString",
+      "description": "Path to preview-bundle.json (from A2: Find Artifacts)."
+    },
+    {
+      "id": "a2ApprovalOutput",
+      "type": "promptString",
+      "description": "Path to write the new approval-result.json (must not already exist)."
+    },
+    {
+      "id": "a2GeneratorResult",
+      "type": "promptString",
+      "description": "Path to preview-generator-result.json (from A2: Find Artifacts)."
+    },
+    {
+      "id": "a2ApprovalResult",
+      "type": "promptString",
+      "description": "Path to the persisted approval-result.json."
+    },
+    {
+      "id": "a2ApplyBundle",
+      "type": "promptString",
+      "description": "Path to apply-bundle.json (from A2: Find Artifacts)."
+    },
+    {
+      "id": "a2Target",
+      "type": "promptString",
+      "description": "Path to the target file written by plan apply."
+    },
+    {
+      "id": "a2AfterSha",
+      "type": "promptString",
+      "description": "Expected after_sha256 of the target (from the preview evidence)."
     }
   ]
 }
