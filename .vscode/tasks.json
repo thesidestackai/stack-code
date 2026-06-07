@@ -271,6 +271,24 @@
         "showReuseMessage": false
       },
       "problemMatcher": []
+    },
+    {
+      "label": "A2: Audit Workspace",
+      "detail": "Read-only. Reports chain state from .claw artifacts + a next-step hint. Does NOT run claw.",
+      "type": "process",
+      "command": "${workspaceFolder}/scripts/a2-ide-harness.sh",
+      "args": [
+        "audit-workspace",
+        "--workspace", "${input:a2Workspace}"
+      ],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true,
+        "showReuseMessage": false
+      },
+      "problemMatcher": []
     }
   ],
   "inputs": [

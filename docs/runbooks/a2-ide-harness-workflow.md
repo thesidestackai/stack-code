@@ -58,11 +58,12 @@ plan apply    = EXECUTOR.  The ONLY command that writes the target. Run it once.
 | A2: Help | Shows the chain and safety rules | No |
 | A2: Validate Input | Read-only checks on workspace + plan.yaml | No |
 | A2: Print Preview Command | Prints STEP 1 | No (prints only) |
-| A2: Find Artifacts | Lists `.claw` artifacts + hashes | No |
+| A2: Find Artifacts | Lists `.claw` artifacts + hashes + a next-step hint | No |
 | A2: Print Approval Command | Prints STEP 2 (real-terminal approval) | No (prints only) |
 | A2: Print Apply-Bundle Command | Prints STEP 3 (generator) | No (prints only) |
 | A2: Print Apply Command | Prints STEP 4 (executor) | No (prints only) |
 | A2: Verify Final Target | Read-only hash check | No |
+| A2: Audit Workspace | Read-only chain-state audit from `.claw` artifacts (+ optional target hash) | No |
 
 You can also call the helper directly:
 
@@ -75,7 +76,29 @@ scripts/a2-ide-harness.sh print-approval --workspace <ws> --preview-bundle <pb.j
 scripts/a2-ide-harness.sh print-apply-bundle --preview-generator-result <gen.json> --approval-result <appr.json>
 scripts/a2-ide-harness.sh print-apply --apply-bundle <ab.json>
 scripts/a2-ide-harness.sh verify-final --workspace <ws> --target <target> --after-sha <sha>
+scripts/a2-ide-harness.sh audit-workspace --workspace <ws> [--target <target> --after-sha <sha>]
 ```
+
+### Chain state & next-step hints (artifact/hash-based)
+
+`find-artifacts` and `audit-workspace` derive the chain state from the **`.claw` artifacts
+themselves** — `preview-bundle.json`, `preview-generator-result.json`, `approval-result.json`,
+`apply-bundle.json`, and `apply-result.json` — plus the target **hash**. They report one of:
+
+```text
+not-started | preview-ready | approval-ready | apply-bundle-ready | applied | unknown
+```
+
+and print the precise next subcommand for that state.
+
+**Why artifact/hash-based, not free-text logs:** `verify-final` (and the runbook) print A2 marker
+names such as `a2-l2b-write-applied` and `a2-l2b-write-validated` as *operator guidance* — what to
+look for in a real apply. Those names are useful, so they stay. But a broad grep over free-text
+helper output would match that guidance text and *falsely* conclude an apply ran. The reliable
+evidence is the presence of the executor-written `apply-result.json` artifact and a target hash that
+matches the expected `after_sha256`. `audit-workspace` checks exactly those; it never greps free-text
+logs and never executes `claw`. Do not use a free-text log grep as the sole source of truth for
+whether an apply happened — audit the artifacts and the hash instead.
 
 Set `A2_CLAW=/path/to/claw` to point the printed commands at a specific `claw` binary.
 The default is the dated build artifact noted in the merged scope.
