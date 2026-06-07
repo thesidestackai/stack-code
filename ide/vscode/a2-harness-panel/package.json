@@ -1,0 +1,52 @@
+{
+  "name": "a2-harness-panel",
+  "displayName": "A2 Harness Panel",
+  "description": "Read-only / command-generating VS Code + Cursor panel for the A2 IDE harness v0. Drives scripts/a2-ide-harness.sh in print/validate-only modes through an argv-bounded wrapper, renders its stdout, and offers copy-to-clipboard for the helper-printed chain commands. The panel never spawns claw, never executes preview/approval/apply-bundle/apply, never composes the approval line, and has no Run-* execution buttons. Bounded by docs/a2-l4-ide-extension-panel-scope.md.",
+  "version": "0.0.1",
+  "publisher": "ultraworkers",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.80.0",
+    "node": ">=18"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:a2HarnessPanel.open"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "a2HarnessPanel.open",
+        "title": "A2 Harness: Open Panel",
+        "category": "A2 Harness"
+      }
+    ],
+    "configuration": {
+      "title": "A2 Harness Panel",
+      "properties": {
+        "a2HarnessPanel.helperPath": {
+          "type": "string",
+          "default": "scripts/a2-ide-harness.sh",
+          "description": "Path to the print/validate-only A2 IDE harness helper. Relative paths resolve against the workspace folder. The panel only ever invokes this helper with a read-only/print subcommand; it never invokes `claw` or any chain-write command."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "build": "tsc -p .",
+    "lint": "node ./scripts/run-guards.js",
+    "test": "tsc -p ./tsconfig.test.json && mocha --reporter spec --recursive ./out-test/test"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.6",
+    "@types/node": "^18.19.0",
+    "@types/vscode": "^1.80.0",
+    "mocha": "^10.2.0",
+    "typescript": "^5.4.0"
+  }
+}
