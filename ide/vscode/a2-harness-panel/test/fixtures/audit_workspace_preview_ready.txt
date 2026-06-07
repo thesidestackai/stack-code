@@ -1,0 +1,11 @@
+----------------------------------------------------------------
+A2 audit-workspace (read-only; artifact/hash-based) — workspace: /disposable/wks
+----------------------------------------------------------------
+chain state: preview-ready
+  present : preview-bundle.json  (/disposable/wks/.claw/l2b-preview-bundles/run/step/preview-bundle.json)
+  absent  : approval-result.json
+  absent  : apply-bundle.json
+  absent  : apply-result.json
+
+## next-step hint (state: preview-ready)
+  Preview present, approval-result missing. Next: print-approval (REAL terminal required).
