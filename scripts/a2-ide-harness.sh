@@ -78,6 +78,55 @@ sha_or_note() {
   fi
 }
 
+# Echo the first matching artifact path under .claw (read-only), or empty.
+_first_artifact() {
+  local claw_dir=$1 name=$2
+  find "$claw_dir" -type f -name "$name" 2>/dev/null | sort | head -n1
+}
+
+# Detect the chain state from .claw ARTIFACTS (not free-text logs). This is the
+# reliable, artifact-based evidence the smoke false-positive note calls for: an
+# apply-result.json is written by the executor, so its presence (and the
+# a2-l2b-write-applied marker inside that artifact) is real evidence of an apply.
+# Echoes exactly one of:
+#   not-started | preview-ready | approval-ready | apply-bundle-ready | applied | unknown
+detect_chain_state() {
+  local ws=$1
+  local claw_dir="$ws/.claw"
+  if [[ ! -d "$claw_dir" ]]; then
+    printf 'not-started'
+    return 0
+  fi
+  local apply_result apply_bundle approval_result preview_bundle
+  apply_result=$(_first_artifact "$claw_dir" 'apply-result.json')
+  apply_bundle=$(_first_artifact "$claw_dir" 'apply-bundle.json')
+  approval_result=$(_first_artifact "$claw_dir" 'approval-result.json')
+  preview_bundle=$(_first_artifact "$claw_dir" 'preview-bundle.json')
+
+  # An apply-result artifact (written by the executor) is the strongest signal.
+  if [[ -n "$apply_result" ]]; then printf 'applied'; return 0; fi
+  if [[ -n "$apply_bundle" ]]; then printf 'apply-bundle-ready'; return 0; fi
+  if [[ -n "$approval_result" ]]; then printf 'approval-ready'; return 0; fi
+  if [[ -n "$preview_bundle" ]]; then printf 'preview-ready'; return 0; fi
+  printf 'unknown'
+}
+
+# Print the operator's next-step hint for a chain state. Read-only guidance; it
+# never executes claw and never decides state from free-text logs.
+print_next_step_hint() {
+  local state=$1
+  info ""
+  info "## next-step hint (state: $state)"
+  case "$state" in
+    not-started)        info "  No .claw yet. Next: print-preview, then run the preview command yourself." ;;
+    preview-ready)      info "  Preview present, approval-result missing. Next: print-approval (REAL terminal required)." ;;
+    approval-ready)     info "  Approval-result present, apply-bundle missing. Next: print-apply-bundle (GENERATOR; writes no target)." ;;
+    apply-bundle-ready) info "  Apply-bundle present, no apply-result yet. Next: print-apply (the target-writing EXECUTOR; runs once)." ;;
+    applied)            info "  Chain appears applied (apply-result present). Next: verify-final with the expected after_sha256." ;;
+    *)                  info "  .claw exists but no recognized artifacts found. Re-check the workspace, or print-preview to start." ;;
+  esac
+}
+
 # ---- usage -----------------------------------------------------------------
 
 usage() {
@@ -104,11 +153,18 @@ Subcommands (all read-only / print-only):
   help
   validate-input    --workspace <path> --plan <path>
   print-preview     --workspace <path> --plan <path>
-  find-artifacts    --workspace <path>
+  find-artifacts    --workspace <path>                 (lists .claw artifacts + a next-step hint)
   print-approval    --workspace <path> --preview-bundle <path> --approval-output <path>
   print-apply-bundle --preview-generator-result <path> --approval-result <path>
   print-apply       --apply-bundle <path>
   verify-final      --workspace <path> --target <path> --after-sha <sha>
+  audit-workspace   --workspace <path> [--target <path> --after-sha <sha>]
+                    (read-only chain-state audit from .claw ARTIFACTS + optional target hash check)
+
+Detection note: chain state and "applied" evidence come from .claw ARTIFACTS
+(apply-result.json, apply-bundle.json, approval-result.json, preview-bundle.json)
+and the target HASH — never from grepping free-text logs. Marker names such as
+a2-l2b-write-applied are printed as human guidance, not treated as evidence.
 
 Environment:
   A2_CLAW   path to the built claw binary (default: the dated build artifact).
@@ -225,6 +281,7 @@ cmd_find_artifacts() {
   if [[ ! -d "$claw_dir" ]]; then
     warn "no .claw directory found yet at: $claw_dir"
     warn "run STEP 1 (print-preview) first, then re-run find-artifacts."
+    print_next_step_hint "$(detect_chain_state "$ws")"
     return $EXIT_OK
   fi
 
@@ -248,6 +305,8 @@ cmd_find_artifacts() {
   info ""
   info "## checkpoints (rollback baselines) and payloads (read-only):"
   find "$claw_dir" -type d \( -name 'l2b-checkpoints' -o -name 'l2b-payloads' \) 2>/dev/null | sort | sed 's/^/  /' || true
+
+  print_next_step_hint "$(detect_chain_state "$ws")"
   return $EXIT_OK
 }
 
@@ -348,6 +407,69 @@ cmd_verify_final() {
   return $rc
 }
 
+cmd_audit_workspace() {
+  parse_opts "$@"
+  require_opt workspace
+  local ws=${OPT[workspace]}
+  local target=${OPT[target]:-}
+  local after=${OPT[after-sha]:-}
+  local rc=$EXIT_OK
+  local claw_dir="$ws/.claw"
+
+  rule; info "A2 audit-workspace (read-only; artifact/hash-based) — workspace: $ws"; rule
+
+  local state
+  state=$(detect_chain_state "$ws")
+  info "chain state: $state"
+
+  # Artifact presence map (real .claw files — this IS the evidence, not free-text logs).
+  if [[ -d "$claw_dir" ]]; then
+    local n found
+    for n in preview-bundle.json preview-generator-result.json approval-result.json apply-bundle.json apply-result.json; do
+      found=$(_first_artifact "$claw_dir" "$n")
+      if [[ -n "$found" ]]; then
+        info "  present : $n  ($found)"
+      else
+        info "  absent  : $n"
+      fi
+    done
+  else
+    info "  no .claw directory under $ws"
+  fi
+
+  print_next_step_hint "$state"
+
+  # Optional read-only target hash check. Both flags are required together.
+  if [[ -n "$target" || -n "$after" ]]; then
+    info ""
+    info "## target hash check"
+    if [[ -z "$target" || -z "$after" ]]; then
+      err "both --target and --after-sha are required together for the hash check."
+      rc=$EXIT_VALIDATION
+    elif [[ ! -f "$target" ]]; then
+      err "target file not found: $target"
+      rc=$EXIT_VALIDATION
+    else
+      local actual
+      actual=$(sha_or_note "$target")
+      info "  target   : $target"
+      info "  expected : $after"
+      info "  actual   : $actual"
+      if [[ "$actual" == "$after" ]]; then
+        info "  MATCH — target is at the expected after_sha256."
+      else
+        err "MISMATCH — target hash does not equal the expected after_sha256."
+        rc=$EXIT_VALIDATION
+      fi
+    fi
+  fi
+
+  rule
+  info "Note: this audit inspects .claw ARTIFACTS and target HASH only — never free-text logs, and it"
+  info "never executes claw. Marker names printed as guidance are NOT treated as execution evidence."
+  return $rc
+}
+
 # ---- dispatch --------------------------------------------------------------
 
 main() {
@@ -362,6 +484,7 @@ main() {
     print-apply-bundle)  cmd_print_apply_bundle "$@" ;;
     print-apply)         cmd_print_apply "$@" ;;
     verify-final)        cmd_verify_final "$@" ;;
+    audit-workspace)     cmd_audit_workspace "$@" ;;
     *)
       err "unknown subcommand: $sub"
       info ""
