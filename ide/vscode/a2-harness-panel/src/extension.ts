@@ -7,9 +7,24 @@ import {
   HelperOutput,
   NavView,
   DiscoveryView,
+  FoundationView,
   emptyInputs,
   renderHtml,
 } from "./render";
+import {
+  PERMISSION_TIERS,
+  TierId,
+  defaultEffectiveTier,
+  assertEffectiveTierSafe,
+} from "./permissionTiers";
+import { deniedFamilyLabels } from "./deniedCommands";
+import { computeReadiness, dirtyCheckoutWarning, AgentReadiness } from "./agentReadiness";
+import {
+  AgentLedgerEvent,
+  ledgerEvent,
+  appendLedger,
+  formatLedger,
+} from "./agentEvidence";
 import {
   ALLOWED_FLAGS,
   HelperSubcommand,
@@ -80,6 +95,8 @@ interface SessionState {
   clawPath: string | null;
   // plan.yaml candidates from the last read-only vscode search.
   planCandidates: string[];
+  // A2 Local Coding Agent Foundation v0: session-local agent evidence ledger.
+  agentLedger: AgentLedgerEvent[];
 }
 
 const session: SessionState = {
@@ -96,7 +113,81 @@ const session: SessionState = {
   helperProbe: "not-run",
   clawPath: null,
   planCandidates: [],
+  agentLedger: [],
 };
+
+// Build the read-only A2 Local Coding Agent Foundation v0 view from the pure
+// foundation modules. This adds NO capability: it computes the current
+// (read-only) permission tier, an honest readiness view (git state stays
+// not-checked — v0 wires no guard-safe git probe), the denied-command registry
+// vocabulary, the agent evidence ledger lines, and the proposed next lane
+// (which enables no mutation).
+function readinessRows(r: AgentReadiness): Array<{ label: string; value: string }> {
+  return [
+    { label: "workspace root", value: r.workspaceRoot },
+    { label: "repo detected", value: r.repoDetected },
+    { label: "git branch", value: r.gitBranch },
+    { label: "dirty checkout", value: r.dirtyState },
+    { label: "staged changes", value: r.stagedChanges },
+    { label: "unstaged changes", value: r.unstagedChanges },
+    { label: "untracked files", value: r.untrackedFiles },
+    { label: "current tier", value: "Tier " + String(r.currentTier) },
+    { label: "denied registry loaded", value: r.deniedRegistryLoaded },
+    { label: "safe executor mode", value: r.safeExecutorMode },
+  ];
+}
+
+function buildFoundationView(): FoundationView {
+  const ws = session.inputs.workspace ?? defaultWorkspace();
+  const readOnlyHelperUsed = session.helperProbe === "ran";
+  const currentTier: TierId = assertEffectiveTierSafe(defaultEffectiveTier(readOnlyHelperUsed));
+
+  // v0: no git facts are supplied (no guard-safe probe is wired), so git
+  // readiness renders honestly as not-checked.
+  const readiness = computeReadiness({
+    workspaceRoot: ws,
+    currentTier,
+    deniedRegistryLoaded: true,
+    safeExecutorMode: "print-validate-only",
+  });
+
+  return {
+    currentTier,
+    readiness: {
+      rows: readinessRows(readiness),
+      dirtyWarning: dirtyCheckoutWarning(readiness),
+      gitProbeNote: readiness.gitProbeNote,
+    },
+    tiers: PERMISSION_TIERS.map((t) => ({
+      id: t.id,
+      name: t.name,
+      current: t.id === currentTier,
+      deniedByDefault: t.deniedByDefault,
+      requiresExplicitApproval: t.requiresExplicitApproval,
+      summary: t.summary,
+    })),
+    deniedFamilies: deniedFamilyLabels(),
+    ledgerLines: formatLedger(session.agentLedger),
+    nextLane: {
+      name: "A2 Local Coding Agent Foundation v0 Review / Push PR",
+      summary:
+        "Review the foundation control plane, then push the branch and open a PR for operator review. No mutation lane is enabled until v0 is merged and a separate, explicitly-approved mutation lane is opened.",
+      mutationEnabled: false,
+      blocked: [
+        "file editing by the panel",
+        "PR creation by the panel",
+        "branch deletion by the panel",
+        "live A2 chain execution (preview/approval/apply-bundle/apply)",
+        "runtime/model/broker/service actions and raw :11434 inference",
+        "hidden command execution",
+      ],
+    },
+  };
+}
+
+function recordLedger(ev: AgentLedgerEvent): void {
+  session.agentLedger = appendLedger(session.agentLedger, ev);
+}
 
 function model(): RenderModel {
   return {
@@ -107,6 +198,7 @@ function model(): RenderModel {
     nav: session.nav,
     discovery: session.discovery,
     timeline: session.timeline.length > 0 ? formatTimeline(session.timeline) : null,
+    foundation: buildFoundationView(),
   };
 }
 
@@ -391,6 +483,17 @@ async function refreshWorkspaceStatus(): Promise<void> {
 
   session.notice = null;
   record(timelineEvent("status", "workspace status refreshed (read-only)"));
+  // Foundation v0: note the readiness refresh and that git state stays
+  // not-checked (no guard-safe git probe is wired in v0).
+  recordLedger(
+    ledgerEvent({
+      kind: "readiness",
+      tier: defaultEffectiveTier(session.helperProbe === "ran"),
+      action: "refresh agent readiness",
+      status: "ok",
+      summary: "workspace/tier readiness refreshed; git readiness not-checked (no guard-safe probe in v0)",
+    }),
+  );
   recomputeViews();
   rerender();
 }
@@ -548,6 +651,19 @@ async function handleMessage(msg: PanelMessage): Promise<void> {
 function openPanel(): void {
   if (!session.panel) {
     session.panel = new A2HarnessPanel({ onMessage: handleMessage });
+  }
+  // A2 Local Coding Agent Foundation v0: record the session-open gesture in the
+  // agent evidence ledger (read-only; no mutation, no execution).
+  if (session.agentLedger.length === 0) {
+    recordLedger(
+      ledgerEvent({
+        kind: "session",
+        tier: defaultEffectiveTier(session.helperProbe === "ran"),
+        action: "open agent cockpit (Foundation v0)",
+        status: "info",
+        summary: "read-only control plane; no mutation lane enabled",
+      }),
+    );
   }
   session.panel.show(model());
   // Workspace-first: kick off a single read-only status refresh on open so the
