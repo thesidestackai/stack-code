@@ -1,9 +1,11 @@
 // Pure HTML renderer for the A2 Harness Panel. Given the current panel state
-// (operator-selected inputs + the most recent helper output), it returns the
+// (operator-selected inputs + the most recent helper output + the workspace-
+// first setup status / next-step / discovery / evidence views), it returns the
 // full webview HTML. It renders ONLY the safe button catalog, an output area
-// that shows helper stdout verbatim, and an always-visible Safety / Stop Gates
-// section. It computes no chain state of its own — the helper's stdout (e.g.
-// audit-workspace's next-step hint) is the state surface, rendered as text.
+// that shows helper stdout verbatim, an always-visible Safety / Stop Gates
+// section, and the read-only workspace-first sections. It computes no chain
+// state of its own — the setup/next-step/discovery views are computed by the
+// extension from the helper's read-only output and passed in.
 
 import {
   PanelButton,
@@ -12,6 +14,7 @@ import {
   fieldSetterButtons,
   workflowUiButtons,
 } from "./buttons";
+import { SetupStatus } from "./setupStatus";
 
 export interface PanelInputs {
   workspace: string | null;
@@ -32,12 +35,35 @@ export interface HelperOutput {
   stderr: string;
 }
 
+// Read-only view of the next-step state machine result.
+export interface NavView {
+  state: string;
+  stepLabel: string;
+  // The existing safe button id the operator should click next, or null for a
+  // guidance-only step (open a workspace / done / stop).
+  stepButtonId: string | null;
+}
+
+// Read-only discovery summary lines (e.g. "plan.yaml: auto-selected /a/plan.yaml",
+// "preview-bundle.json: /d/.claw/preview-bundle.json"). Already formatted by the
+// extension; every discovered path is shown here before it is used.
+export interface DiscoveryView {
+  lines: string[];
+}
+
 export interface RenderModel {
   inputs: PanelInputs;
   output: HelperOutput | null;
   // A non-load-bearing status line (e.g. "refused: workspace not set"). Never
   // a substitute for the helper stdout or the Safety section.
   notice: string | null;
+  // Workspace-first read-only views. All optional: when absent (e.g. before the
+  // first Refresh, or in unit fixtures) the sections degrade to a muted hint.
+  setup?: SetupStatus | null;
+  nav?: NavView | null;
+  discovery?: DiscoveryView | null;
+  // Pre-formatted evidence-timeline lines.
+  timeline?: string[] | null;
 }
 
 export function emptyInputs(): PanelInputs {
@@ -109,6 +135,89 @@ function safetyBlock(): string {
 </section>`;
 }
 
+// Workspace-first SETUP STATUS section. Always rendered; degrades to a muted
+// hint when no status has been computed yet (before the first Refresh). Each
+// row carries a data-status attribute for testability.
+function statusRow(label: string, value: string): string {
+  return `    <tr data-status="${escapeHtml(label)}"><th>${escapeHtml(label)}</th><td data-status-value="${escapeHtml(label)}">${escapeHtml(value)}</td></tr>`;
+}
+
+function setupBlock(setup: SetupStatus | null | undefined): string {
+  if (!setup) {
+    return `<section class="setup" data-testid="setup-status">
+  <h3>Workspace status</h3>
+  <p class="muted" data-testid="setup-status-empty">Not inspected yet. Open a workspace, then click <strong>Refresh Workspace Status</strong> (read-only).</p>
+</section>`;
+  }
+  const rows = [
+    statusRow("helper path", setup.helperPath),
+    statusRow("claw binary", setup.clawBinary),
+    statusRow("workspace root", setup.workspaceRoot),
+    statusRow("plan.yaml", setup.plan),
+    statusRow("target", setup.target),
+    statusRow("after_sha", setup.afterSha),
+    statusRow("preview bundle", setup.previewBundle),
+    statusRow("approval result", setup.approvalResult),
+    statusRow("apply bundle", setup.applyBundle),
+    statusRow("final verification", setup.finalVerification),
+  ].join("\n");
+  return `<section class="setup" data-testid="setup-status">
+  <h3>Workspace status</h3>
+  <table>
+${rows}
+  </table>
+  <p class="muted">Read-only, one-shot detection (open + Refresh). claw binary is shown as <code>configured</code>/<code>unknown</code> — the panel never verifies or runs claw.</p>
+</section>`;
+}
+
+// NEXT SAFE STEP section. Guidance only — it names the recommended safe step and
+// (when applicable) the existing safe button to click. It never runs anything.
+function navBlock(nav: NavView | null | undefined): string {
+  if (!nav) {
+    return "";
+  }
+  const btn = nav.stepButtonId
+    ? `  <p data-testid="next-step-button">Recommended button: <code>${escapeHtml(nav.stepButtonId)}</code></p>`
+    : "";
+  return `<section class="nav" data-testid="next-step">
+  <h3>Next safe step</h3>
+  <p data-testid="next-step-state">state: <code>${escapeHtml(nav.state)}</code></p>
+  <p data-testid="next-step-label">${escapeHtml(nav.stepLabel)}</p>
+${btn}
+  <p class="muted">This is a read-only recommendation. Print/validate steps print or copy a command; you run preview/approval/apply yourself at a real terminal.</p>
+</section>`;
+}
+
+// DISCOVERY section. Lists every discovered path before it is used.
+function discoveryBlock(discovery: DiscoveryView | null | undefined): string {
+  if (!discovery || discovery.lines.length === 0) {
+    return "";
+  }
+  const items = discovery.lines.map((l) => `    <li>${escapeHtml(l)}</li>`).join("\n");
+  return `<section class="discovery" data-testid="discovery">
+  <h3>Discovered (read-only)</h3>
+  <ul>
+${items}
+  </ul>
+  <p class="muted">Discovered paths are shown before use. A field is auto-filled only when there is exactly one unambiguous candidate; otherwise you pick it.</p>
+</section>`;
+}
+
+// EVIDENCE TIMELINE section (read-only, session-local).
+function timelineBlock(lines: string[] | null | undefined): string {
+  if (!lines || lines.length === 0) {
+    return "";
+  }
+  const items = lines.map((l) => `    <li>${escapeHtml(l)}</li>`).join("\n");
+  return `<section class="timeline" data-testid="evidence-timeline">
+  <h3>Evidence timeline</h3>
+  <ol>
+${items}
+  </ol>
+  <p class="muted">Read-only, session-local. Print steps are recorded as printed, not run. No file is written.</p>
+</section>`;
+}
+
 export function renderHtml(model: RenderModel): string {
   const i = model.inputs;
   const inputRows = [
@@ -148,11 +257,18 @@ export function renderHtml(model: RenderModel): string {
   .muted { color: var(--vscode-descriptionForeground, #999); }
   .btn { margin: 0.2rem; }
   .actions { margin: 0.5rem 0; }
+  .setup table, .inputs table { border-collapse: collapse; }
+  .setup th { text-align: left; padding-right: 1rem; font-family: monospace; }
+  .setup td { font-family: monospace; }
+  .nav { border-left: 3px solid var(--vscode-textLink-foreground, #3794ff); padding-left: 0.75rem; }
 </style>
 </head><body data-testid="a2-harness-panel">
 <h2>A2 Harness Panel</h2>
 <p class="muted">Visual driver for the print/validate-only A2 IDE harness v0. Each button runs one read-only/print helper subcommand or copies its printed command — nothing executes the A2 chain.</p>
 ${safetyBlock()}
+${setupBlock(model.setup)}
+${navBlock(model.nav)}
+${discoveryBlock(model.discovery)}
 <section class="inputs" data-testid="inputs">
   <h3>Workspace / Plan / Artifact selection</h3>
   <table>
@@ -169,5 +285,6 @@ ${actionButtons}
 </section>
 ${notice}
 ${outputBlock(model.output)}
+${timelineBlock(model.timeline)}
 </body></html>`;
 }
