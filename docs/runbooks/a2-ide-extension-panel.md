@@ -34,8 +34,28 @@ apply-bundle, or apply.
 
 1. Build the package once (see below) or install it from source.
 2. Command Palette → **A2 Harness: Open Panel**.
-3. Use **Select Workspace** / **Select Plan** and the artifact selectors to set paths.
+3. In the **Workspace / Plan / Artifact selection** section, use the field-setter controls to set the
+   fields each action needs. These controls set fields only — they never run a chain command.
 4. Click the action buttons in chain order.
+
+### Field-setter controls (set fields only)
+
+The selection section exposes one control per input field, shown next to the field table:
+
+| Control | Field it sets |
+| --- | --- |
+| Select Workspace | workspace root (contains `.claw` + the target) |
+| Select Plan | `plan.yaml` (after_file must be relative) |
+| Select Target | the target file `plan apply` writes (for Verify Final) |
+| Set After SHA | expected `after_sha256` of the target (for Verify Final) |
+| Select Preview Bundle | `preview-bundle.json` (for Show/Copy Approval Command) |
+| Select Generator Result | `preview-generator-result.json` (for Show/Copy Apply-Bundle Command) |
+| Select Approval Result | persisted `approval-result.json` (for Show/Copy Apply-Bundle Command) |
+| Set Approval Output | path to write the new `approval-result.json` (for Show/Copy Approval Command) |
+| Select Apply Bundle | `apply-bundle.json` (for Show/Copy Apply Command) |
+
+Each control only stores a path/hash in the panel session; nothing is executed. Verify Final, Show/Copy
+Approval, and Show/Copy Apply stay blocked (with a notice) until their fields are set — set them here.
 
 | Button | Helper subcommand | Runs an A2 command? |
 | --- | --- | --- |

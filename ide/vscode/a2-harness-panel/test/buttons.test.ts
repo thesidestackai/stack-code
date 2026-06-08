@@ -4,8 +4,29 @@ import {
   FORBIDDEN_BUTTON_LABELS,
   helperButtons,
   allHelperButtonsAreAllowlisted,
+  fieldSetterButtons,
+  workflowUiButtons,
+  isFieldSetterAction,
+  FIELD_SETTER_ACTIONS,
 } from "../src/buttons";
 import { ALLOWED_SUBCOMMANDS, ALLOWED_FLAGS } from "../src/helperRunner";
+
+// The exact UI actions extension.ts handleUiAction implements. A field-setter
+// button must map to one of these, so a new button can never reach a missing
+// handler. (Kept in sync with extension.ts by review; asserted structurally.)
+const HANDLED_UI_ACTIONS = new Set([
+  "selectWorkspace",
+  "selectPlan",
+  "selectPreviewBundle",
+  "selectGeneratorResult",
+  "selectApprovalResult",
+  "selectApprovalOutput",
+  "selectApplyBundle",
+  "selectTarget",
+  "setAfterSha",
+  "openRunbook",
+  "exportEvidence",
+]);
 
 describe("buttons — only read-only/print helper subcommands", () => {
   it("every helper button maps to an allowlisted subcommand", () => {
@@ -80,5 +101,86 @@ describe("buttons — required safe buttons are present", () => {
     // The catalog carries no literal approval line.
     const blob = JSON.stringify(PANEL_BUTTONS);
     assert.ok(!/apply\s+\$\{.*step.*\}\s+\$\{.*preview.*\}/.test(blob));
+  });
+});
+
+describe("buttons — artifact field-setter controls (UX polish)", () => {
+  const requiredFieldSetters = [
+    { label: "Select Workspace", action: "selectWorkspace" },
+    { label: "Select Plan", action: "selectPlan" },
+    { label: "Select Target", action: "selectTarget" },
+    { label: "Set After SHA", action: "setAfterSha" },
+    { label: "Select Preview Bundle", action: "selectPreviewBundle" },
+    { label: "Select Generator Result", action: "selectGeneratorResult" },
+    { label: "Select Approval Result", action: "selectApprovalResult" },
+    { label: "Set Approval Output", action: "selectApprovalOutput" },
+    { label: "Select Apply Bundle", action: "selectApplyBundle" },
+  ];
+
+  it("exposes a visible control for every artifact/hash field", () => {
+    const setters = fieldSetterButtons();
+    for (const want of requiredFieldSetters) {
+      const found = setters.find((b) => b.label === want.label);
+      assert.ok(found, `missing field-setter control: ${want.label}`);
+      if (found) {
+        assert.strictEqual(found.action, want.action);
+      }
+    }
+  });
+
+  it("covers exactly the FIELD_SETTER_ACTIONS set (9 setters)", () => {
+    const actions = new Set<string>(fieldSetterButtons().map((b) => b.action));
+    assert.strictEqual(actions.size, 9);
+    for (const a of FIELD_SETTER_ACTIONS) {
+      assert.ok(actions.has(a), `no button for field-setter action ${a}`);
+    }
+  });
+
+  it("every field-setter button maps to an action extension.ts handles", () => {
+    for (const b of fieldSetterButtons()) {
+      assert.ok(HANDLED_UI_ACTIONS.has(b.action), `unhandled action: ${b.action}`);
+      assert.ok(isFieldSetterAction(b.action));
+    }
+  });
+
+  it("field setters cover the fields the later-stage buttons need", () => {
+    // The flags that previously had no visible control.
+    const formerlyUnreachable = [
+      "target",
+      "after-sha",
+      "preview-bundle",
+      "preview-generator-result",
+      "approval-result",
+      "approval-output",
+      "apply-bundle",
+    ];
+    const flagToAction: Record<string, string> = {
+      "target": "selectTarget",
+      "after-sha": "setAfterSha",
+      "preview-bundle": "selectPreviewBundle",
+      "preview-generator-result": "selectGeneratorResult",
+      "approval-result": "selectApprovalResult",
+      "approval-output": "selectApprovalOutput",
+      "apply-bundle": "selectApplyBundle",
+    };
+    const setterActions = new Set<string>(fieldSetterButtons().map((b) => b.action));
+    for (const flag of formerlyUnreachable) {
+      assert.ok(setterActions.has(flagToAction[flag]), `no control for field ${flag}`);
+    }
+  });
+
+  it("no field-setter or workflow UI button runs a chain command (still no Run-*)", () => {
+    const uiLabels = [...fieldSetterButtons(), ...workflowUiButtons()].map((b) => b.label);
+    for (const forbidden of FORBIDDEN_BUTTON_LABELS) {
+      assert.ok(!uiLabels.includes(forbidden), `forbidden UI button: ${forbidden}`);
+    }
+    for (const b of [...fieldSetterButtons(), ...workflowUiButtons()]) {
+      assert.ok(!/^run\s/i.test(b.label), `Run button label: ${b.label}`);
+    }
+  });
+
+  it("workflow UI buttons are only Open Runbook + Export Evidence", () => {
+    const labels = workflowUiButtons().map((b) => b.label).sort();
+    assert.deepStrictEqual(labels, ["Export Evidence Summary", "Open Runbook"]);
   });
 });

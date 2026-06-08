@@ -32,6 +32,35 @@ describe("render — structure", () => {
     assert.ok(!/>\s*Run Apply-Bundle\s*</.test(html));
     assert.ok(!/>\s*Run Apply\s*</.test(html));
   });
+
+  it("renders a field-setter control for every artifact/hash field", () => {
+    const html = renderHtml(baseModel());
+    assert.ok(html.includes('data-testid="field-setters"'));
+    for (const action of [
+      "selectTarget",
+      "setAfterSha",
+      "selectPreviewBundle",
+      "selectGeneratorResult",
+      "selectApprovalResult",
+      "selectApprovalOutput",
+      "selectApplyBundle",
+    ]) {
+      assert.ok(
+        html.includes(`data-ui-action="${action}"`),
+        `missing field-setter control in markup: ${action}`,
+      );
+    }
+  });
+
+  it("places field-setter controls inside the inputs section (next to fields)", () => {
+    const html = renderHtml(baseModel());
+    const inputsIdx = html.indexOf('data-testid="inputs"');
+    const actionsIdx = html.indexOf('data-testid="actions"');
+    const targetIdx = html.indexOf('data-ui-action="selectTarget"');
+    assert.ok(inputsIdx >= 0 && actionsIdx >= 0 && targetIdx >= 0);
+    // The Select Target control renders within the inputs section, before Actions.
+    assert.ok(targetIdx > inputsIdx && targetIdx < actionsIdx);
+  });
 });
 
 describe("render — helper output", () => {
