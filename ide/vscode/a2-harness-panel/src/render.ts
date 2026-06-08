@@ -51,6 +51,45 @@ export interface DiscoveryView {
   lines: string[];
 }
 
+// A2 Local Coding Agent Foundation v0 — read-only control-plane view. All data
+// is pre-computed by the extension from the pure foundation modules
+// (permissionTiers / deniedCommands / agentSession / agentEvidence /
+// agentReadiness). The render layer only displays it; it adds no capability and
+// no action buttons.
+export interface FoundationTierView {
+  id: number;
+  name: string;
+  current: boolean;
+  deniedByDefault: boolean;
+  requiresExplicitApproval: boolean;
+  summary: string;
+}
+
+export interface FoundationReadinessView {
+  rows: Array<{ label: string; value: string }>;
+  // True only when a real dirty fact says so (never fabricated).
+  dirtyWarning: boolean;
+  // Stated reason git readiness is not-checked (v0 has no guard-safe probe).
+  gitProbeNote: string | null;
+}
+
+export interface FoundationNextLaneView {
+  name: string;
+  summary: string;
+  // Always false in v0: no mutation lane is enabled.
+  mutationEnabled: boolean;
+  blocked: string[];
+}
+
+export interface FoundationView {
+  currentTier: number;
+  readiness: FoundationReadinessView;
+  tiers: FoundationTierView[];
+  deniedFamilies: string[];
+  ledgerLines: string[];
+  nextLane: FoundationNextLaneView;
+}
+
 export interface RenderModel {
   inputs: PanelInputs;
   output: HelperOutput | null;
@@ -64,6 +103,9 @@ export interface RenderModel {
   discovery?: DiscoveryView | null;
   // Pre-formatted evidence-timeline lines.
   timeline?: string[] | null;
+  // A2 Local Coding Agent Foundation v0 control-plane view (optional; degrades
+  // to a muted hint when absent).
+  foundation?: FoundationView | null;
 }
 
 export function emptyInputs(): PanelInputs {
@@ -218,6 +260,117 @@ ${items}
 </section>`;
 }
 
+// ---- A2 Local Coding Agent Foundation v0 sections (read-only) --------------
+//
+// These sections are status-only. They add NO action buttons — no agent-run,
+// agent-execute, or chain-control button exists here. They make the control
+// plane legible: the current permission tier, agent readiness (honest tri-state),
+// the denied-command registry vocabulary, the agent evidence ledger, and the
+// proposed next agent lane (which, in v0, enables no mutation).
+
+function foundationReadinessBlock(f: FoundationView): string {
+  const rows = f.readiness.rows
+    .map(
+      (r) =>
+        `    <tr data-readiness="${escapeHtml(r.label)}"><th>${escapeHtml(r.label)}</th><td data-readiness-value="${escapeHtml(r.label)}">${escapeHtml(r.value)}</td></tr>`,
+    )
+    .join("\n");
+  const warn = f.readiness.dirtyWarning
+    ? `  <p class="muted" data-testid="dirty-checkout-warning"><strong>Dirty checkout warning:</strong> the workspace reports uncommitted changes. No mutation lane is enabled in v0; resolve before any future mutation lane.</p>`
+    : "";
+  const note = f.readiness.gitProbeNote
+    ? `  <p class="muted" data-testid="git-probe-note">Git readiness: not-checked — ${escapeHtml(f.readiness.gitProbeNote)}</p>`
+    : "";
+  return `<section class="agent-readiness" data-testid="agent-readiness">
+  <h3>Agent Readiness</h3>
+  <table>
+${rows}
+  </table>
+${warn}
+${note}
+  <p class="muted">Honest tri-state. Git/dirty state is shown as <code>not-checked</code> rather than fabricated when no guard-safe probe is wired (v0).</p>
+</section>`;
+}
+
+function permissionTierBlock(f: FoundationView): string {
+  const rows = f.tiers
+    .map((t) => {
+      const flags: string[] = [];
+      if (t.current) {
+        flags.push("current");
+      }
+      if (t.deniedByDefault) {
+        flags.push("denied-by-default");
+      }
+      if (t.requiresExplicitApproval) {
+        flags.push("requires-explicit-approval");
+      }
+      const flagText = flags.length > 0 ? ` (${flags.join(", ")})` : "";
+      return `    <li data-tier="${escapeHtml(String(t.id))}"${t.current ? ' data-current-tier="true"' : ""}><code>Tier ${escapeHtml(String(t.id))}</code> — ${escapeHtml(t.name)}${escapeHtml(flagText)}: ${escapeHtml(t.summary)}</li>`;
+    })
+    .join("\n");
+  return `<section class="permission-tier" data-testid="permission-tier">
+  <h3>Permission Tier</h3>
+  <p data-testid="current-tier">Current effective tier: <code>Tier ${escapeHtml(String(f.currentTier))}</code> (read-only). Tier 5 (runtime / model / service) is denied by default and external to this cockpit.</p>
+  <ul>
+${rows}
+  </ul>
+</section>`;
+}
+
+function deniedRegistryBlock(f: FoundationView): string {
+  const items = f.deniedFamilies.map((d) => `    <li>${escapeHtml(d)}</li>`).join("\n");
+  return `<section class="denied-registry" data-testid="denied-command-registry">
+  <h3>Denied Command Registry</h3>
+  <p class="muted">These command families are denied globally regardless of tier — denials win over any allowlist.</p>
+  <ul>
+${items}
+  </ul>
+</section>`;
+}
+
+function agentLedgerBlock(f: FoundationView): string {
+  const items = f.ledgerLines.map((l) => `    <li>${escapeHtml(l)}</li>`).join("\n");
+  return `<section class="agent-ledger" data-testid="agent-evidence-ledger">
+  <h3>Agent Evidence Ledger</h3>
+  <ol>
+${items}
+  </ol>
+  <p class="muted">Read-only, session-local. Print-only steps are marked <code>printed-not-run</code>. No file is written.</p>
+</section>`;
+}
+
+function nextAgentLaneBlock(f: FoundationView): string {
+  const blocked = f.nextLane.blocked.map((b) => `    <li>${escapeHtml(b)}</li>`).join("\n");
+  return `<section class="next-agent-lane" data-testid="proposed-next-agent-lane">
+  <h3>Proposed Next Agent Lane</h3>
+  <p data-testid="next-agent-lane-name"><strong>${escapeHtml(f.nextLane.name)}</strong></p>
+  <p>${escapeHtml(f.nextLane.summary)}</p>
+  <p data-testid="mutation-enabled">Mutation enabled: <code>${f.nextLane.mutationEnabled ? "yes" : "no"}</code> — No mutation lane is enabled in v0. No autonomous source edits, no live A2 chain execution, no PR packaging here.</p>
+  <p class="muted">Still blocked in v0:</p>
+  <ul>
+${blocked}
+  </ul>
+</section>`;
+}
+
+function foundationBlock(foundation: FoundationView | null | undefined): string {
+  if (!foundation) {
+    return `<section class="foundation" data-testid="agent-foundation">
+  <h3>A2 Local Coding Agent Foundation v0</h3>
+  <p class="muted" data-testid="agent-foundation-empty">Foundation control plane not computed yet. It renders the current Permission Tier, Agent Readiness, the Denied Command Registry, the Agent Evidence Ledger, and the Proposed Next Agent Lane — all read-only.</p>
+</section>`;
+  }
+  return `<section class="foundation" data-testid="agent-foundation">
+  <h3>A2 Local Coding Agent Foundation v0 (read-only)</h3>
+${permissionTierBlock(foundation)}
+${foundationReadinessBlock(foundation)}
+${deniedRegistryBlock(foundation)}
+${agentLedgerBlock(foundation)}
+${nextAgentLaneBlock(foundation)}
+</section>`;
+}
+
 export function renderHtml(model: RenderModel): string {
   const i = model.inputs;
   const inputRows = [
@@ -286,5 +439,6 @@ ${actionButtons}
 ${notice}
 ${outputBlock(model.output)}
 ${timelineBlock(model.timeline)}
+${foundationBlock(model.foundation)}
 </body></html>`;
 }

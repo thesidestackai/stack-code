@@ -128,6 +128,55 @@ by you at a real TTY — the panel never composes the approval line and never ca
 
 ---
 
+## A2 Local Coding Agent Foundation v0 (read-only control plane)
+
+Foundation v0 is a **state/control-plane foundation** layered on the read-only panel. It is the
+first step toward a true local coding-agent cockpit (Claude Code / Codex / Cursor-like workflow
+feel) **with Stack-Code permission tiers, evidence, and operator control**. It adds **no**
+autonomous editing, **no** live A2 chain execution, and **no** PR packaging.
+
+What Foundation v0 adds — all read-only, all status-only (no new buttons):
+
+```text
+[ A2 Local Coding Agent Foundation v0 ]
+  [ Permission Tier ]            current effective tier (read-only) + the full Tier 0–5 model
+  [ Agent Readiness ]            honest tri-state: workspace, repo/git, dirty/staged/untracked,
+                                 current tier, denied-registry loaded, safe-executor mode
+  [ Denied Command Registry ]    command families denied globally (denials win over allowlists)
+  [ Agent Evidence Ledger ]      session-local, read-only record; print-only steps marked printed-not-run
+  [ Proposed Next Agent Lane ]   what comes next, and why no mutation is enabled in v0
+```
+
+Permission tiers (described; only Tier 0–2 are reachable as the effective tier in v0):
+
+```text
+Tier 0 — Observe Only
+Tier 1 — Print Commands Only          (default effective tier)
+Tier 2 — Safe Read-Only Execution     (effective only after a read-only helper call)
+Tier 3 — Disposable Worktree Mutation (requires explicit future approval; not enabled in v0)
+Tier 4 — PR Packaging                 (requires explicit future approval; not enabled in v0)
+Tier 5 — Runtime / Model / Service    (denied by default; external to this cockpit)
+```
+
+Agent readiness honesty: the panel has **no guard-safe git probe in v0** (panel source forbids
+`fs`, process spawn, watchers, and timers). Git/dirty state is rendered as `not-checked` with a
+stated reason — never fabricated green, and never a false all-clear. A future, separately approved
+lane may supply guard-safe git facts (e.g. via the read-only VS Code Git API) to the same pure
+readiness model.
+
+What Foundation v0 does NOT do:
+
+```text
+- No mutation lane is enabled. No file editing by the panel.
+- No autonomous source edits.
+- No PR creation / branch deletion by the panel.
+- No live A2 chain execution (preview / approval / apply-bundle / apply).
+- No model / broker / runtime / service calls. No raw :11434 inference. No secret reads.
+- No hidden command execution; no watcher / polling / timer; no new spawn boundary.
+```
+
+---
+
 ## Build and test (from source)
 
 ```bash
