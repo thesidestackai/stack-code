@@ -46,8 +46,20 @@ export type PanelButton = HelperButton | UiButton;
 // the chain-write stages. These produce or copy command TEXT; they never
 // execute the command.
 export const PANEL_BUTTONS: readonly PanelButton[] = [
+  // Field-setter controls. Each sets one session input field via its existing
+  // handleUiAction handler in extension.ts (no new handler logic). These are
+  // the controls the artifact-field UX polish makes discoverable so later-stage
+  // buttons (Verify Final, Show/Copy Approval, Show/Copy Apply) can be satisfied
+  // from the GUI. They SET fields only; they never run a chain command.
   { id: "select-workspace", label: "Select Workspace", kind: "ui", action: "selectWorkspace" },
   { id: "select-plan", label: "Select Plan", kind: "ui", action: "selectPlan" },
+  { id: "select-target", label: "Select Target", kind: "ui", action: "selectTarget" },
+  { id: "set-after-sha", label: "Set After SHA", kind: "ui", action: "setAfterSha" },
+  { id: "select-preview-bundle", label: "Select Preview Bundle", kind: "ui", action: "selectPreviewBundle" },
+  { id: "select-generator-result", label: "Select Generator Result", kind: "ui", action: "selectGeneratorResult" },
+  { id: "select-approval-result", label: "Select Approval Result", kind: "ui", action: "selectApprovalResult" },
+  { id: "set-approval-output", label: "Set Approval Output", kind: "ui", action: "selectApprovalOutput" },
+  { id: "select-apply-bundle", label: "Select Apply Bundle", kind: "ui", action: "selectApplyBundle" },
 
   { id: "validate-input", label: "Validate Input", kind: "helper", subcommand: "validate-input", needs: ["workspace", "plan"] },
   { id: "audit-workspace", label: "Audit Workspace", kind: "helper", subcommand: "audit-workspace", needs: ["workspace"] },
@@ -73,8 +85,43 @@ export const FORBIDDEN_BUTTON_LABELS = [
   "Run Apply",
 ] as const;
 
+// UI actions that SET an input field (vs. workflow UI actions like opening the
+// runbook or exporting evidence). Used by render.ts to group the field-setter
+// controls next to the field table they populate, improving discoverability.
+export const FIELD_SETTER_ACTIONS: ReadonlySet<string> = new Set([
+  "selectWorkspace",
+  "selectPlan",
+  "selectTarget",
+  "setAfterSha",
+  "selectPreviewBundle",
+  "selectGeneratorResult",
+  "selectApprovalResult",
+  "selectApprovalOutput",
+  "selectApplyBundle",
+]);
+
+export function isFieldSetterAction(action: string): boolean {
+  return FIELD_SETTER_ACTIONS.has(action);
+}
+
 export function helperButtons(): HelperButton[] {
   return PANEL_BUTTONS.filter((b): b is HelperButton => b.kind === "helper");
+}
+
+// UI buttons that set an input field (Select Workspace/Plan/Target/…, Set After
+// SHA, Set Approval Output). Rendered in the inputs section next to the fields.
+export function fieldSetterButtons(): UiButton[] {
+  return PANEL_BUTTONS.filter(
+    (b): b is UiButton => b.kind === "ui" && isFieldSetterAction(b.action),
+  );
+}
+
+// UI buttons that are workflow actions, not field setters (Open Runbook, Export
+// Evidence Summary). Rendered in the actions section.
+export function workflowUiButtons(): UiButton[] {
+  return PANEL_BUTTONS.filter(
+    (b): b is UiButton => b.kind === "ui" && !isFieldSetterAction(b.action),
+  );
 }
 
 // True only if every helper button maps to a subcommand in the read-only

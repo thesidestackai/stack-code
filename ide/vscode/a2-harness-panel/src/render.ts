@@ -6,9 +6,11 @@
 // audit-workspace's next-step hint) is the state surface, rendered as text.
 
 import {
-  PANEL_BUTTONS,
   PanelButton,
   HelperButton,
+  helperButtons,
+  fieldSetterButtons,
+  workflowUiButtons,
 } from "./buttons";
 
 export interface PanelInputs {
@@ -121,7 +123,12 @@ export function renderHtml(model: RenderModel): string {
     inputRow("after-sha", "after-sha", i.afterSha),
   ].join("\n");
 
-  const buttons = PANEL_BUTTONS.map(buttonHtml).join("\n");
+  // Field-setter controls render next to the field table (discoverability);
+  // helper + workflow actions render in the Actions section.
+  const fieldButtons = fieldSetterButtons().map(buttonHtml).join("\n");
+  const actionButtons = [...helperButtons(), ...workflowUiButtons()]
+    .map((b) => buttonHtml(b as PanelButton))
+    .join("\n");
   const notice = model.notice
     ? `<section class="notice" data-testid="notice"><p>${escapeHtml(model.notice)}</p></section>`
     : "";
@@ -151,10 +158,14 @@ ${safetyBlock()}
   <table>
 ${inputRows}
   </table>
+  <div class="field-setters" data-testid="field-setters">
+    <p class="muted">Set a field, then run the action that needs it. These controls set fields only — they never run a chain command.</p>
+${fieldButtons}
+  </div>
 </section>
 <section class="actions" data-testid="actions">
   <h3>Actions</h3>
-${buttons}
+${actionButtons}
 </section>
 ${notice}
 ${outputBlock(model.output)}
