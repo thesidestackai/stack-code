@@ -36,6 +36,7 @@ export interface UiButton {
     | "selectApplyBundle"
     | "selectTarget"
     | "setAfterSha"
+    | "refreshStatus"
     | "openRunbook"
     | "exportEvidence";
 }
@@ -71,6 +72,12 @@ export const PANEL_BUTTONS: readonly PanelButton[] = [
   { id: "show-apply-command", label: "Show/Copy Apply Command", kind: "helper", subcommand: "print-apply", needs: ["apply-bundle"] },
 
   { id: "verify-final", label: "Verify Final Target", kind: "helper", subcommand: "verify-final", needs: ["workspace", "target", "after-sha"] },
+
+  // Workspace-first: one-shot, read-only re-detection of setup status,
+  // discovery, and the next safe step. It runs only read-only helper
+  // subcommands (audit-workspace / help) + a vscode file search; it sets no
+  // input field destructively and runs no chain command.
+  { id: "refresh-status", label: "Refresh Workspace Status", kind: "ui", action: "refreshStatus" },
 
   { id: "open-runbook", label: "Open Runbook", kind: "ui", action: "openRunbook" },
   { id: "export-evidence", label: "Export Evidence Summary", kind: "ui", action: "exportEvidence" },

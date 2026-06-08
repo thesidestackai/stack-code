@@ -24,6 +24,7 @@ const HANDLED_UI_ACTIONS = new Set([
   "selectApplyBundle",
   "selectTarget",
   "setAfterSha",
+  "refreshStatus",
   "openRunbook",
   "exportEvidence",
 ]);
@@ -179,8 +180,21 @@ describe("buttons — artifact field-setter controls (UX polish)", () => {
     }
   });
 
-  it("workflow UI buttons are only Open Runbook + Export Evidence", () => {
+  it("workflow UI buttons are Open Runbook + Export Evidence + Refresh Status", () => {
     const labels = workflowUiButtons().map((b) => b.label).sort();
-    assert.deepStrictEqual(labels, ["Export Evidence Summary", "Open Runbook"]);
+    assert.deepStrictEqual(labels, [
+      "Export Evidence Summary",
+      "Open Runbook",
+      "Refresh Workspace Status",
+    ]);
+  });
+
+  it("the Refresh Workspace Status button runs no chain command and is not a Run-*", () => {
+    const refresh = PANEL_BUTTONS.find((b) => b.id === "refresh-status");
+    assert.ok(refresh && refresh.kind === "ui");
+    if (refresh && refresh.kind === "ui") {
+      assert.strictEqual(refresh.action, "refreshStatus");
+    }
+    assert.ok(!/^run\s/i.test("Refresh Workspace Status"));
   });
 });

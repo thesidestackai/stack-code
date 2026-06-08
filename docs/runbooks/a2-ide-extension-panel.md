@@ -16,9 +16,13 @@ A single panel with labeled sections and buttons, instead of separate command-pa
 
 ```text
 [ Safety / Stop Gates ]   always-on banner of the invariants + STOP conditions
+[ Workspace status ]      read-only setup status (helper, claw, plan, artifacts, verification)
+[ Next safe step ]        read-only recommendation of the next safe action
+[ Discovered (read-only) ]discovered plan/artifact paths, shown before use
 [ Workspace / Plan / Artifact selection ]  set the paths the helper needs
 [ Actions ]               one button per read-only/print helper subcommand
 [ Helper output ]         the helper's stdout, verbatim, with a Copy button
+[ Evidence timeline ]     read-only, session-local record of safe actions
 ```
 
 Each **helper button** runs exactly one read-only/print subcommand through an argv-bounded wrapper and
@@ -27,6 +31,28 @@ copy it and run it yourself at a real terminal.
 
 The panel never executes the A2 chain. It shows/copies commands; it does not run preview, approval,
 apply-bundle, or apply.
+
+### Workspace-first status (read-only)
+
+On open — and whenever you click **Refresh Workspace Status** — the panel runs a single, read-only
+inspection and fills in three sections without you typing a path:
+
+- **Workspace status** — an honest tri-state for each setup dimension: `helper path`
+  (found/missing/not-checked), `claw binary` (`configured`/`unknown` — the panel never verifies or runs
+  claw), `workspace root`, `plan.yaml`, `target`, `after_sha`, `preview bundle`, `approval result`,
+  `apply bundle`, and `final verification` (match/mismatch/not-checked). Status is never green-by-default.
+- **Next safe step** — a read-only recommendation (e.g. `Validate Input`, `Print Preview Command`,
+  `Verify Final Target`) derived from the helper-reported chain state. It only points you at an existing
+  safe button; it never runs the chain.
+- **Discovered (read-only)** — plan.yaml candidates (found via the editor's file index, not node `fs`)
+  and `.claw` artifact paths (parsed from the helper's read-only `audit-workspace`). A field is
+  auto-filled only when there is exactly one unambiguous candidate; otherwise you pick it. Every
+  discovered path is shown before it is used.
+
+How the detection stays safe: it runs only the allowlisted read-only helper subcommands (`help`,
+`audit-workspace`) plus a one-shot editor file search. It spawns no `claw`, writes nothing, creates no
+`.claw` artifact, and adds no filesystem watcher, polling, or timer — every refresh is one explicit
+gesture.
 
 ---
 
@@ -67,8 +93,9 @@ Approval, and Show/Copy Apply stay blocked (with a notice) until their fields ar
 | Show/Copy Apply-Bundle Command | `print-apply-bundle` | No (prints generator command) |
 | Show/Copy Apply Command | `print-apply` | No (prints executor command) |
 | Verify Final Target | `verify-final` | No (read-only hash check) |
+| Refresh Workspace Status | `help` + `audit-workspace` | No (read-only status/discovery refresh) |
 | Open Runbook | — | No (opens this/the v0 runbook) |
-| Export Evidence Summary | — | No (opens an unsaved summary doc) |
+| Export Evidence Summary | — | No (opens an unsaved summary doc incl. status + timeline) |
 
 There is intentionally **no** Run Preview / Run Approval / Run Apply-Bundle / Run Apply button.
 
