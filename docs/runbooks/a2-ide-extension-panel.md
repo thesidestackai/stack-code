@@ -261,3 +261,43 @@ npm test         # mocha unit tests
 ```
 
 The package is not packaged as a `.vsix` in this lane.
+
+---
+
+## Tier 3 write-capable orchestrator v0 (`scripts/a2-tier3-write-orchestrator.sh`)
+
+The panel stays read-only. The write-capable step lives OUTSIDE the panel as an operator-run
+orchestrator that DRIVES the existing, tested `claw plan apply` / `a2-plan-runner` write-executor +
+checkpoint chain — it does NOT duplicate the Rust write logic, and the panel never spawns it (the
+panel's `helperRunner` allowlists exactly one basename, `a2-ide-harness.sh`).
+
+Source of truth: `docs/a2-tier3-write-executor-reconciliation.md` (drive, don't duplicate) and the
+revised DRAFT `handoffs/a2_tier3_mutation_executor_write_capable_implementation_prompt_DRAFT_2026-06-09.md`.
+
+Two subcommands:
+
+```text
+validate-lane  --approved-lane <lane.json> --dry-run-evidence <evidence.json> [--plan <plan.yaml>]
+   Pure gate check. No git, no claw, no worktree, no writes. Safe to run anywhere. Confirms the lane
+   WOULD be drivable: operator-approved, dry-run-ready, exact-path scope, denials win over the Tier-3
+   allowlist, worktree-plan rules (base origin/main, under /mnt/vast-data/git-worktrees/, never the
+   control checkout, branch != main), and plan after_file targets inside the declared set.
+
+apply-lane     --approved-lane <lane.json> --dry-run-evidence <evidence.json> --plan <plan.yaml>
+   Runs validate-lane, then — only at a REAL interactive terminal (exit 7 off-TTY), with a clean
+   control checkout, origin/main, and a free worktree path — creates exactly ONE disposable worktree
+   from origin/main and drives the existing chain inside it (run -> approve -> apply-bundle -> apply).
+   `claw plan apply` remains the only writer. Approval is human-typed at your terminal (never composed,
+   captured, faked, or batched). After apply it prints checkpoint/apply-result evidence and a git diff
+   summary, then STOPS for review. It never pushes, opens a PR, merges, deletes a branch, or
+   force-removes a worktree; rollback is by ABANDONING the disposable worktree.
+```
+
+Gate-matrix test (offline; no claw, no writes):
+
+```bash
+bash tests/shell/test_a2_tier3_write_orchestrator.sh
+```
+
+Note: `scripts/a2-tier3-write-orchestrator.sh` and `tests/shell/test_a2_tier3_write_orchestrator.sh`
+are outside the `rust-ci.yml` path filter, so CI does not run them automatically; run the test locally.
