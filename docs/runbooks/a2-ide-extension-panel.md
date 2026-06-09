@@ -281,7 +281,8 @@ validate-lane  --approved-lane <lane.json> --dry-run-evidence <evidence.json> [-
    Pure gate check. No git, no claw, no worktree, no writes. Safe to run anywhere. Confirms the lane
    WOULD be drivable: operator-approved, dry-run-ready, exact-path scope, denials win over the Tier-3
    allowlist, worktree-plan rules (base origin/main, under /mnt/vast-data/git-worktrees/, never the
-   control checkout, branch != main), and plan after_file targets inside the declared set.
+   control checkout, branch != main), and each plan step's write_target.path (the file actually
+   written) inside the declared set (after_file, the byte source, must be workspace-relative).
 
 apply-lane     --approved-lane <lane.json> --dry-run-evidence <evidence.json> --plan <plan.yaml>
    Runs validate-lane, then — only at a REAL interactive terminal (exit 7 off-TTY), with a clean

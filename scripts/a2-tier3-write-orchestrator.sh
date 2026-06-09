@@ -260,6 +260,65 @@ if isinstance(cur, list):
 PY
 }
 
+# Echo the plan's write paths, one per line, tagged: "target<TAB><path>" for each
+# step's write_target.path (the file actually written) and "source<TAB><path>" for
+# each step's after_file (the byte source). Prefers PyYAML; if it is unavailable or
+# the parse fails, falls back to a conservative line scanner (fail toward extracting
+# more, so an out-of-scope target is still caught by the caller).
+plan_paths() {
+  local file=$1
+  python3 - "$file" <<'PY'
+import sys, re
+f = sys.argv[1]
+try:
+    text = open(f).read()
+except Exception:
+    sys.exit(0)
+targets, sources = [], []
+parsed = False
+try:
+    import yaml
+    data = yaml.safe_load(text)
+    steps = (data or {}).get('steps') if isinstance(data, dict) else None
+    if isinstance(steps, list):
+        parsed = True
+        for st in steps:
+            if not isinstance(st, dict):
+                continue
+            wt = st.get('write_target')
+            if isinstance(wt, dict) and isinstance(wt.get('path'), str):
+                targets.append(wt['path'])
+            af = st.get('after_file')
+            if isinstance(af, str):
+                sources.append(af)
+except Exception:
+    parsed = False
+if not parsed:
+    # conservative fallback: a write_target: block's next deeper path:, plus after_file:.
+    in_wt, wt_indent = False, -1
+    for ln in text.splitlines():
+        m_af = re.match(r'\s*-?\s*after_file\s*:\s*(.+?)\s*$', ln)
+        if m_af:
+            sources.append(m_af.group(1).strip().strip('\'"'))
+        m_wt = re.match(r'(\s*)-?\s*write_target\s*:\s*$', ln)
+        if m_wt:
+            in_wt, wt_indent = True, len(m_wt.group(1))
+            continue
+        if in_wt:
+            indent = len(ln) - len(ln.lstrip())
+            m_p = re.match(r'\s*path\s*:\s*(.+?)\s*$', ln)
+            if m_p and indent > wt_indent:
+                targets.append(m_p.group(1).strip().strip('\'"'))
+                in_wt = False
+            elif ln.strip() and indent <= wt_indent:
+                in_wt = False
+for t in targets:
+    print("target\t" + t)
+for s in sources:
+    print("source\t" + s)
+PY
+}
+
 # ---- worktree-plan validation (mirror of disposableWorktreePlan.ts) --------
 
 # Echoes problems (one per line); empty output means valid.
@@ -336,23 +395,33 @@ gate_validate_lane() {
     [[ "$res" == "allowed" ]] || reject "proposed command [$c] -> $res"
   done < <(json_array "$lane" "proposedCommands")
 
-  # --- plan targets must be inside the declared set (if a plan is provided) ---
+  # --- plan write targets must be inside the declared set (if a plan is provided) ---
+  # The file actually written is each step's write_target.path (workspace-relative);
+  # after_file is the byte SOURCE, not the target. Validate the real write target
+  # against the declared exact-path set; sanity-check after_file is relative.
   if [[ -n "$plan" ]]; then
     [[ -f "$plan" ]] || reject "plan file not found: $plan"
     if [[ -f "$plan" ]]; then
-      local line val
-      while IFS= read -r line; do
-        val=$(printf '%s' "$line" | sed -E 's/^[0-9]+:[[:space:]]*-?[[:space:]]*after_file[[:space:]]*:[[:space:]]*//; s/^["'\'']//; s/["'\''][[:space:]]*$//')
+      local target_count=0 kind val
+      while IFS=$'\t' read -r kind val; do
         [[ -z "$val" ]] && continue
-        if [[ ${val:0:1} == "/" ]]; then
-          reject "plan after_file must be workspace-relative, not absolute: $val"
-        else
-          # resolve relative to the worktree root and require it in the declared set
-          local abs; abs=$(normalize_abs "$WT_PATH/$val")
-          local res; res=$(classify_write "$abs" "$WT_PATH" "${DECLARED[@]}")
-          [[ "$res" == accepted:* ]] || reject "plan target $val ($abs) -> $res"
+        if [[ "$kind" == "target" ]]; then
+          target_count=$((target_count + 1))
+          if [[ ${val:0:1} == "/" ]]; then
+            reject "plan write_target.path must be workspace-relative, not absolute: $val"
+          else
+            local abs; abs=$(normalize_abs "$WT_PATH/$val")
+            local res; res=$(classify_write "$abs" "$WT_PATH" "${DECLARED[@]}")
+            [[ "$res" == accepted:* ]] || reject "plan write_target $val ($abs) -> $res"
+          fi
+        elif [[ "$kind" == "source" ]]; then
+          # after_file is the byte source; it must be workspace-relative too.
+          [[ ${val:0:1} == "/" ]] && reject "plan after_file (byte source) must be workspace-relative, not absolute: $val"
         fi
-      done < <(grep -nE '^[[:space:]]*-?[[:space:]]*after_file[[:space:]]*:' "$plan" || true)
+      done < <(plan_paths "$plan")
+      # A write lane whose plan declares no write_target writes nothing — flag it
+      # rather than silently driving a no-op apply.
+      [[ $target_count -gt 0 ]] || reject "plan declares no write_target.path; nothing for apply-lane to write"
     fi
   fi
 

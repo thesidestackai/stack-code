@@ -63,9 +63,22 @@ with open(f, "w") as fh: json.dump(obj, fh)
 PY
 }
 
-# write_plan <file> <after_file-value>
+# write_plan <file> <write_target.path> [after_file]
+# Emits a realistic workspace-write plan. The file actually written is
+# write_target.path; after_file is the byte source.
 write_plan() {
-  printf 'steps:\n  - after_file: %s\n' "$2" >"$1"
+  local f=$1 target=$2 after=${3:-materialized/x.after}
+  {
+    printf 'name: t\nmode: read-only\nmodel_tier: FAST\nsteps:\n'
+    printf '  - id: w\n    mode: workspace-write\n    tools: [Write]\n'
+    printf '    write_target:\n      path: %s\n      create_if_absent: true\n' "$target"
+    printf '    after_file: %s\n' "$after"
+  } >"$f"
+}
+
+# write_plan_no_target <file> — a read-only plan with NO write_target.
+write_plan_no_target() {
+  printf 'name: t\nmode: read-only\nmodel_tier: FAST\nsteps:\n  - id: r\n    description: read only\n    tools: [Read]\n' >"$1"
 }
 
 # run_case <name> <expected-exit> <subcmd...> -- runs the orchestrator, compares $?.
@@ -132,12 +145,26 @@ run_case "refuse: worktree is control checkout" 4 validate-lane --approved-lane 
 write_lane "$D/brmain.json" true origin/main main "$WT" "$DECL" '[]' '[]'
 run_case "refuse: mutation branch is main"   4 validate-lane --approved-lane "$D/brmain.json" --dry-run-evidence "$D/ready.json"
 
-# ---- plan target gates -----------------------------------------------------
-write_plan "$D/plan_abs.yaml" "/etc/evil.conf"
-run_case "refuse: plan after_file absolute"  4 validate-lane --approved-lane "$D/good.json" --dry-run-evidence "$D/ready.json" --plan "$D/plan_abs.yaml"
+# ---- plan write_target gates (the file actually written is write_target.path) ---
+write_plan "$D/plan_wtabs.yaml" "/etc/evil.conf"
+run_case "refuse: plan write_target absolute" 4 validate-lane --approved-lane "$D/good.json" --dry-run-evidence "$D/ready.json" --plan "$D/plan_wtabs.yaml"
 
 write_plan "$D/plan_outside.yaml" "src/zzz.ts"
-run_case "refuse: plan target not in declared set" 4 validate-lane --approved-lane "$D/good.json" --dry-run-evidence "$D/ready.json" --plan "$D/plan_outside.yaml"
+run_case "refuse: plan write_target not in declared set" 4 validate-lane --approved-lane "$D/good.json" --dry-run-evidence "$D/ready.json" --plan "$D/plan_outside.yaml"
+
+write_plan "$D/plan_wtesc.yaml" "../escape.ts"
+run_case "refuse: plan write_target traversal escape" 4 validate-lane --approved-lane "$D/good.json" --dry-run-evidence "$D/ready.json" --plan "$D/plan_wtesc.yaml"
+
+# after_file (byte source) must be workspace-relative even when the target is OK.
+write_plan "$D/plan_afabs.yaml" "src/a.ts" "/etc/passwd"
+run_case "refuse: plan after_file (source) absolute" 4 validate-lane --approved-lane "$D/good.json" --dry-run-evidence "$D/ready.json" --plan "$D/plan_afabs.yaml"
+
+# a write lane whose plan declares no write_target writes nothing.
+write_plan_no_target "$D/plan_notarget.yaml"
+run_case "refuse: plan declares no write_target" 4 validate-lane --approved-lane "$D/good.json" --dry-run-evidence "$D/ready.json" --plan "$D/plan_notarget.yaml"
+
+# the GOOD plan's write_target (src/a.ts) IS in the declared set -> accepted.
+run_case "accept: plan write_target in declared set" 0 validate-lane --approved-lane "$D/good.json" --dry-run-evidence "$D/ready.json" --plan "$D/plan_ok.yaml"
 
 # ---- apply-lane TTY guard (non-interactive context) ------------------------
 # stdin/stdout are not a TTY under the test runner, so apply-lane must refuse at
