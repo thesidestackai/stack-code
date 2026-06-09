@@ -177,6 +177,28 @@ else
   PASS_COUNT=$((PASS_COUNT + 1)); printf 'PASS  %-52s (no worktree)\n' "apply-lane created no worktree"
 fi
 
+# ---- static invariants: approval gate must not be weakened by UX changes ---
+# These guard the real-TTY human-typed approval against accidental regression:
+# the drive step must never pipe into claw approve, never compose the approval
+# line, and the apply-lane TTY gate + clear "not stuck" UX must remain.
+static_assert() {
+  local name=$1 pattern=$2 want=$3   # want = present|absent
+  if grep -nEq -- "$pattern" "$ORCH"; then got=present; else got=absent; fi
+  if [[ "$got" == "$want" ]]; then
+    PASS_COUNT=$((PASS_COUNT + 1)); printf 'PASS  %-52s (%s)\n' "$name" "$got"
+  else
+    FAIL_COUNT=$((FAIL_COUNT + 1)); printf 'FAIL  %-52s (got %s, want %s)\n' "$name" "$got" "$want"
+  fi
+}
+
+static_assert "real-TTY gate present (apply-lane)"        '! -t 0 \|\| ! -t 1'                            present
+static_assert "TTY refusal returns EXIT_TTY"              'return \$EXIT_TTY'                             present
+static_assert "no pipe of echo/printf/yes into claw"      '(echo|printf|yes)[^|]*\|[[:space:]]*"\$A2_CLAW"' absent
+static_assert "no composed apply <id> <hex> line"         'appl[y][[:space:]]+[^[:space:]<]+[[:space:]]+[0-9a-f]{16,}' absent
+static_assert "approval not auto-typed (explicit note)"   'never types, pipes, or composes'              present
+static_assert "interactive 'not stuck' banner present"    'it is NOT stuck'                              present
+static_assert "per-step approve exit diagnostics present" 'approval REFUSED by claw'                     present
+
 # ---- summary ---------------------------------------------------------------
 printf -- '----\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]

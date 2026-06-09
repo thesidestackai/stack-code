@@ -455,30 +455,75 @@ drive_chain_for_plan() {
   local ws=$1 plan=$2
   local claw_dir="$ws/.claw"
 
+  # ---- STEP 1 / PREVIEW (writes NO target) --------------------------------
   rule; info "STEP 1 / PREVIEW (writes NO target)"; rule
   info "+ $(shq "$A2_CLAW") plan run $(shq "$plan") --workspace-root $(shq "$ws") --workspace-write-preview"
-  "$A2_CLAW" plan run "$plan" --workspace-root "$ws" --workspace-write-preview
+  local rc=0
+  "$A2_CLAW" plan run "$plan" --workspace-root "$ws" --workspace-write-preview || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    err "STEP 1 preview (claw plan run) failed (rc=$rc) — no target was written. STOP."
+    return $EXIT_GATE
+  fi
 
   local preview_bundle gen_result
   preview_bundle=$(find "$claw_dir" -type f -name 'preview-bundle.json' 2>/dev/null | sort | head -n1 || true)
   gen_result=$(find "$claw_dir" -type f -name 'preview-generator-result.json' 2>/dev/null | sort | head -n1 || true)
-  [[ -n "$preview_bundle" ]] || { err "preview did not produce preview-bundle.json under $claw_dir"; return $EXIT_GATE; }
+  [[ -n "$preview_bundle" ]] || { err "preview produced no preview-bundle.json under $claw_dir — STOP (nothing written)."; return $EXIT_GATE; }
 
+  # ---- STEP 2 / APPROVE — human-typed at the real terminal ----------------
   local approval_out="$claw_dir/approval-result.json"
-  rule; info "STEP 2 / APPROVE — REAL terminal; you type:  $APPROVAL_GRAMMAR  (writes NO target)"; rule
+  rule; info "STEP 2 / APPROVE — HUMAN APPROVAL REQUIRED AT THIS TERMINAL (writes NO target)"; rule
+  info "What happens next (this is interactive — the terminal will WAIT for YOU, it is NOT stuck):"
+  info "  1. claw prints the diff preview for the declared write, then a line that reads:"
+  info "         To approve, type exactly:"
+  info "         $APPROVAL_GRAMMAR"
+  info "     with the REAL step-id and 64-char preview hash filled in by claw."
+  info "  2. After the diff, the cursor waits for your input. Type that EXACT line claw printed"
+  info "     (case-sensitive, three tokens) and press Enter. Scroll up if the diff pushed it off-screen."
+  info "  3. To ABORT safely (nothing is written), press Ctrl-C — no worktree write occurs."
+  info "  NOTE: this script never types, pipes, or composes the approval for you; you must type it."
+  info ""
   info "+ $(shq "$A2_CLAW") plan approve $(shq "$preview_bundle") --approval-result-output $(shq "$approval_out")"
-  "$A2_CLAW" plan approve "$preview_bundle" --approval-result-output "$approval_out"
-  [[ -f "$approval_out" ]] || { err "approval did not produce $approval_out (approval not granted) — STOP"; return $EXIT_GATE; }
+  info "(waiting for claw's approval prompt below — type your approval line when the diff finishes)"
+  rc=0
+  "$A2_CLAW" plan approve "$preview_bundle" --approval-result-output "$approval_out" || rc=$?
+  if [[ $rc -eq $EXIT_TTY ]]; then
+    err "STEP 2 approval REFUSED by claw (exit $EXIT_TTY / approval-denied). Common causes:"
+    err "  - the typed line did not EXACTLY match '$APPROVAL_GRAMMAR' (wrong case / token count / a replayed hash);"
+    err "  - this is not a real interactive terminal (off-TTY / piped / batch input);"
+    err "  - a preapproval form (--yes / --auto / auto-apply) was used (always refused)."
+    err "  Nothing was written. Re-run apply-lane at a REAL terminal and type the exact line claw prints."
+    return $EXIT_GATE
+  elif [[ $rc -ne 0 ]]; then
+    err "STEP 2 approval failed (claw plan approve rc=$rc) before recording an approval — nothing written. STOP."
+    return $EXIT_GATE
+  fi
+  [[ -f "$approval_out" ]] || { err "STEP 2 approval exited 0 but produced no approval-result at $approval_out — STOP (nothing written)."; return $EXIT_GATE; }
+  info "approval recorded: $approval_out — continuing to apply-bundle + apply."
 
+  # ---- STEP 3 / APPLY-BUNDLE — GENERATOR only (writes NO target) -----------
   rule; info "STEP 3 / APPLY-BUNDLE — GENERATOR only (writes NO target)"; rule
   info "+ $(shq "$A2_CLAW") plan apply-bundle $(shq "$gen_result") $(shq "$approval_out")"
-  "$A2_CLAW" plan apply-bundle "$gen_result" "$approval_out"
+  rc=0
+  "$A2_CLAW" plan apply-bundle "$gen_result" "$approval_out" || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    err "STEP 3 apply-bundle (generator) failed (rc=$rc) — no target was written. STOP."
+    return $EXIT_GATE
+  fi
   local apply_bundle; apply_bundle=$(find "$claw_dir" -type f -name 'apply-bundle.json' 2>/dev/null | sort | head -n1 || true)
-  [[ -n "$apply_bundle" ]] || { err "apply-bundle did not produce apply-bundle.json — STOP"; return $EXIT_GATE; }
+  [[ -n "$apply_bundle" ]] || { err "apply-bundle produced no apply-bundle.json — STOP (nothing written)."; return $EXIT_GATE; }
 
+  # ---- STEP 4 / APPLY — the ONLY writer; runs once ------------------------
   rule; info "STEP 4 / APPLY — EXECUTOR (the existing claw write_executor; the ONLY writer; runs once)"; rule
   info "+ $(shq "$A2_CLAW") plan apply $(shq "$apply_bundle")"
-  "$A2_CLAW" plan apply "$apply_bundle"
+  rc=0
+  "$A2_CLAW" plan apply "$apply_bundle" || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    err "STEP 4 apply (claw plan apply) failed (rc=$rc). Review the disposable worktree before re-running;"
+    err "  do not run apply twice for the same approved preview. STOP."
+    return $EXIT_GATE
+  fi
+  info "STEP 4 apply completed — see the evidence + diff summary below."
   return $EXIT_OK
 }
 
