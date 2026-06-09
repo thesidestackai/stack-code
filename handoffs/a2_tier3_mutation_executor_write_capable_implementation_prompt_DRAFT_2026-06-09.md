@@ -1,10 +1,17 @@
 # A2 Tier 3 Mutation Executor — Write-Capable Step v0 — Implementation Prompt (DRAFT, 2026-06-09)
 
+> REVISION (2026-06-09, post-reconciliation): redirected from a NEW external write executor to an
+> external ORCHESTRATOR that DRIVES the existing, tested `claw plan apply` / `a2-plan-runner`
+> write-executor + checkpoint chain inside a disposable worktree. Reconciliation source of truth:
+> `docs/a2-tier3-write-executor-reconciliation.md` (PR #113, merged). Do NOT build a new write executor
+> or re-implement file writing — reuse the hardened Rust surface. All STOP gates are preserved.
+
 > DRAFT implementation prompt for a FUTURE code lane. Hand this to Claude Code only after the
-> write-capable design scope (`docs/a2-tier3-mutation-executor-write-capable-design-scope.md`) is
-> reviewed/merged AND the operator opens a SEPARATE, explicitly-approved implementation lane. This is
-> the first lane that would actually create a disposable worktree and write files into it — it is the
-> highest-risk lane in the chain and must not be started on a generic "continue".
+> write-capable design scope (`docs/a2-tier3-mutation-executor-write-capable-design-scope.md`) and the
+> reconciliation note (`docs/a2-tier3-write-executor-reconciliation.md`) are reviewed/merged AND the
+> operator opens a SEPARATE, explicitly-approved implementation lane. This is the first lane that would
+> actually create a disposable worktree and (by driving the existing claw apply chain) write files into
+> it — it is the highest-risk lane in the chain and must not be started on a generic "continue".
 
 ---
 
@@ -13,22 +20,50 @@
 You are operating as a careful Stack-Code local coding-agent safety implementer.
 
 Your job is to implement **Tier 3 Mutation Executor — Write-Capable Step v0 (minimal)**: an EXTERNAL,
-operator-invoked tool that, only after a passing dry-run AND an explicit per-lane operator approval,
-creates ONE disposable worktree from origin/main and writes ONLY the declared exact-path files INTO
-that disposable worktree, then produces a diff, runs approved validation, records evidence inside the
-worktree, and STOPS. The panel stays read-only. The external script's file location requires SEPARATE
-operator approval before you create it.
+operator-invoked **orchestrator** that, only after a passing dry-run AND an explicit per-lane operator
+approval, creates ONE disposable worktree from origin/main and, INSIDE that worktree, DRIVES THE
+EXISTING `claw plan apply` chain (`a2-plan-runner` `write_executor` + `checkpoint`) once per declared
+exact-path file, then produces a diff, runs approved validation, records evidence inside the worktree,
+and STOPS. **It does NOT re-implement file writing and it does NOT add a new write executor** — the
+write + checkpoint + rollback + approval core already exists and is reused as-is. The panel stays
+read-only. The external orchestrator script's file location requires SEPARATE operator approval before
+you create it.
 
 ---
 
 ## Objective
 
-Add the minimal write-capable executor as an external tool with a mandatory dry-run precondition and
-runtime enforcement of every Foundation v0 gate, while the panel remains read-only (it may add at most
-a read-only "Proposed Write-Capable Executor Plan" section that PRINTS the command and renders
-evidence; it never spawns the executor, creates a worktree, or writes a file).
+Add the minimal write-capable **orchestrator** as an external tool with a mandatory dry-run
+precondition and runtime enforcement of every Foundation v0 gate. The orchestrator's only genuinely-new
+work is the **disposable-worktree lane** (create from origin/main; iterate the declared exact-path set;
+diff; approved validation; STOP; rollback-by-abandon) — the actual per-file write is delegated to the
+EXISTING `claw plan apply` / `a2-plan-runner` `write_executor` (with `checkpoint`). The panel remains
+read-only (it may add at most a read-only "Proposed Write-Capable Orchestrator Plan" section that PRINTS
+the command and renders evidence; it never spawns the orchestrator, creates a worktree, or writes a
+file).
 
-Source of truth: `docs/a2-tier3-mutation-executor-write-capable-design-scope.md`.
+Sources of truth (read both):
+- `docs/a2-tier3-mutation-executor-write-capable-design-scope.md` (PR #112) — design scope; remains
+  valid in spirit with the one reconciliation correction below.
+- `docs/a2-tier3-write-executor-reconciliation.md` (PR #113, merged) — the binding correction: DRIVE the
+  existing claw apply chain; do NOT build a new write executor. Its §3–§5 (options + recommendation) and
+  §6 (impact) govern this prompt.
+
+### Approach selected by the reconciliation (`§4–§5`)
+
+```text
+Option 1 (PRIMARY, this lane): external orchestrator that DRIVES the existing `claw plan apply` chain
+  (run -> approve -> apply-bundle -> apply) once per declared file inside a disposable worktree. No new
+  write executor. Reuses the full authority chain, checkpoint, atomic write, bounded rollback, and the
+  proven Rust test suite.
+Option 2 (FALLBACK): a still-minimal external wrapper is acceptable ONLY if it wraps the existing
+  executor (never re-implements writing); its exact location/name needs separate approval; the panel
+  never spawns it. Option 1 and Option 2 are both "external orchestrator over the existing chain"; the
+  distinction is only how thin the wrapper is.
+Option 3 (DEFERRED): extending the Rust `a2-plan-runner` write executor is a separate, explicitly-
+  approved Rust lane (largest blast radius; edits hardened `unsafe_code = forbid` Rust). OUT OF SCOPE
+  here.
+```
 
 ---
 
@@ -36,7 +71,7 @@ Source of truth: `docs/a2-tier3-mutation-executor-write-capable-design-scope.md`
 
 ```text
 1. This implementation lane must be explicitly opened by the operator (not a generic "continue").
-2. Before creating the external executor script, STOP and obtain explicit approval of its exact file
+2. Before creating the external orchestrator script, STOP and obtain explicit approval of its exact file
    location and name (it must live OUTSIDE the panel and must NOT be spawnable by the panel).
 ```
 
@@ -57,9 +92,22 @@ safeMutationPolicy (evaluateTier3Command/Write, denials win), mutationEvidence, 
 (computeDryRun -> DryRunResult.ready + per-step would-accept).
 Package : ide/vscode/a2-harness-panel/   Helper: scripts/a2-ide-harness.sh (panel's only spawned binary)
 Guards  : ide/vscode/a2-harness-panel/scripts/run-guards.js (authoritative; strips comments/strings)
+
+ALREADY-BUILT WRITE SURFACE (reuse, do NOT duplicate) — see reconciliation §2:
+  rust/crates/a2-plan-runner/src/write_executor.rs   (~1725 lines)  A2-L2b single-file write executor
+  rust/crates/a2-plan-runner/src/checkpoint.rs       (~864 lines)   A2-L2b checkpoint store
+  rust/crates/a2-plan-runner/src/{write_preview,diff_preview,approval,write_runtime,write_payload}.rs
+  rust/crates/a2-plan-runner/tests/{l2b_write_executor,l2b_checkpoint_store}.rs
+The `claw plan run/approve/apply-bundle/apply` chain the panel already PRINTS drives THIS executor;
+`claw plan apply` is the real, only command that writes a target. The full authority chain
+(ResolvedWriteTarget + CheckpointHandle + PreviewRecord + ApprovalDecision::Approved + ApprovedWritePayload,
+hash-bound), atomic temp+rename write, post-write re-hash, and bounded rollback are already enforced and
+tested there. The orchestrator REUSES this; it adds only the disposable-worktree lane + per-file iteration
+over the declared set (the Rust executor is single-file-per-call by design).
 ```
 
-You MUST verify actual file names and the current guard set yourself before editing.
+You MUST verify actual file names (TS models AND the Rust crate above) and the current guard set yourself
+before editing.
 
 ---
 
@@ -68,12 +116,15 @@ You MUST verify actual file names and the current guard set yourself before edit
 Do NOT:
 
 ```text
+build a NEW write executor or re-implement file writing (DRIVE the existing claw plan apply /
+  a2-plan-runner write_executor + checkpoint chain instead — reconciliation §5, Option 1)
+extend the Rust a2-plan-runner write executor here (Option 3 is a separate, explicitly-approved Rust lane)
 write to the control checkout or any real/live target (writes go ONLY into a fresh disposable worktree)
 proceed without a passing dry-run for the exact lane (hard precondition) + explicit per-lane approval
-place the executor inside the panel, or make it spawnable by the panel (the panel stays read-only)
+place the orchestrator inside the panel, or make it spawnable by the panel (the panel stays read-only)
 add a create/write/agent-run/agent-execute/apply/approve control to the panel
 add fs use or a process spawn to the panel outside helperRunner
-create the external executor script before its exact location/name is separately approved (STOP)
+create the external orchestrator script before its exact location/name is separately approved (STOP)
 push / open a PR / merge / delete a branch / remove a worktree by force (Tier 4, separate)
 add network/broker/model/runtime calls or raw :11434 app inference
 run live A2 (preview/approval/apply-bundle/apply)
@@ -94,10 +145,11 @@ Allowed:
 
 ```text
 create a fresh isolated worktree from origin/main (for THIS implementation lane's own work)
-read files; inspect repo/panel/helper/docs/tests
-add the external write-capable executor tool ONLY at the separately-approved location (outside the
-  panel), with a mandatory dry-run precondition and runtime enforcement of all Foundation v0 gates
-add (at most) a read-only panel "Proposed Write-Capable Executor Plan" section (PRINTS command +
+read files; inspect repo/panel/helper/docs/tests AND the existing a2-plan-runner Rust write surface
+add the external write-capable ORCHESTRATOR tool ONLY at the separately-approved location (outside the
+  panel); it DRIVES the existing `claw plan apply` chain (it does not re-implement writing), with a
+  mandatory dry-run precondition and runtime enforcement of all Foundation v0 gates
+add (at most) a read-only panel "Proposed Write-Capable Orchestrator Plan" section (PRINTS command +
   renders evidence; no spawn/create/write)
 add unit tests; add runbook documentation + the implementation report
 run npm install --ignore-scripts; npm run lint; npm run compile; npm test
@@ -109,8 +161,8 @@ commit exact approved files locally
 ## Fresh Worktree Setup
 
 ```text
-Branch   : feat/a2-tier3-mutation-executor-write-capable-v0-<date>
-Worktree : /mnt/vast-data/git-worktrees/stack-code-a2-tier3-mutation-executor-write-capable-v0-<date>
+Branch   : feat/a2-tier3-write-capable-orchestrator-v0-<date>
+Worktree : /mnt/vast-data/git-worktrees/stack-code-a2-tier3-write-capable-orchestrator-v0-<date>
 ```
 
 Do not edit `/home/suki/stack-code` (control checkout only).
@@ -134,15 +186,19 @@ STOP if: control checkout dirty; dry-run base missing; worktree/branch exists; e
 
 ```text
 Phase 0  Preflight + authorization gates + fresh worktree. STOP on any gate.
-Phase 1  Inventory: read the Foundation v0 + dry-run modules + guards + runbook; confirm filenames.
-Phase 2  External write-capable executor (at the approved location, OUTSIDE the panel):
+Phase 1  Inventory: read the Foundation v0 + dry-run modules + guards + runbook; confirm TS filenames
+           AND the existing a2-plan-runner write_executor/checkpoint + the claw plan apply chain it backs.
+Phase 2  External write-capable ORCHESTRATOR (at the approved location, OUTSIDE the panel):
            * refuses unless the dry-run for the exact lane returns ready (re-checked at runtime),
            * verifies clean control checkout + creates ONE disposable worktree from origin/main,
-           * writes ONLY declared exact-path files INTO the worktree (classifyWrite-gated),
+           * for each declared exact-path file (classifyWrite-gated), DRIVES the EXISTING `claw plan
+             apply` chain (run -> approve -> apply-bundle -> apply) inside the worktree — it does NOT
+             open files for writing itself and adds NO new write/checkpoint/rollback code,
            * produces a diff inside the worktree, runs ONLY approved validation,
            * records evidence INSIDE the worktree, STOPS for review,
-           * performs no push/PR/merge/branch-delete/force-remove; touches no control checkout/real target.
-Phase 3  (Optional, panel-side) read-only "Proposed Write-Capable Executor Plan" section: PRINTS the
+           * rollback-by-abandon (abandon the disposable worktree); performs no push/PR/merge/branch-
+             delete/force-remove; touches no control checkout/real target.
+Phase 3  (Optional, panel-side) read-only "Proposed Write-Capable Orchestrator Plan" section: PRINTS the
            exact command + renders evidence. No spawn/create/write control.
 Phase 4  Tests: dry-run precondition enforced; exact-path gating (reject-outside / control-checkout);
            denials win; writes confined to the disposable worktree; panel adds no spawn/create/write
@@ -157,10 +213,13 @@ Phase 7  Commit exact approved files locally. No push.
 ## STOP Gates
 
 ```text
+STOP if the implementation would add a NEW write executor or re-implement file writing instead of driving
+  the existing `claw plan apply` / a2-plan-runner chain (reconciliation §5, Option 1).
+STOP if it would edit/extend the Rust a2-plan-runner write executor (Option 3 is a separate Rust lane).
 STOP if any write would land outside a fresh disposable worktree (control checkout / real target / out-of-scope path).
 STOP if the dry-run precondition or the per-lane approval is absent.
-STOP before creating the external script if its location/name is not separately approved.
-STOP if the executor is placed inside the panel, or the panel gains a spawn/fs/create/write surface.
+STOP before creating the external orchestrator script if its location/name is not separately approved.
+STOP if the orchestrator is placed inside the panel, or the panel gains a spawn/fs/create/write surface.
 STOP if denials do not win over the Tier-3 allowlist.
 STOP if any step would push / open a PR / merge / delete a branch / remove a worktree by force.
 STOP if any step would touch runtime/model/broker/service state or raw :11434 app inference.
@@ -174,10 +233,12 @@ STOP if changed files differ from the approved surfaces.
 
 ```text
 - npm install --ignore-scripts; npm run lint (run-guards.js PASS); npm run compile; npm test green.
-- changed-file scope = the approved surfaces only.
+- changed-file scope = the approved surfaces only (no new Rust write executor; a2-plan-runner unchanged).
 - git diff --check clean.
 - Confirm (with evidence) that any write performed by tests/validation landed only inside a disposable
   worktree and never the control checkout or a real target.
+- Confirm the orchestrator DRIVES the existing `claw plan apply` chain (no new/duplicated write,
+  checkpoint, or rollback code introduced).
 - Guard-surface scan on panel src (run-guards.js authoritative; verify intent against the diff).
 ```
 
@@ -191,17 +252,20 @@ MODE: A2_TIER3_MUTATION_EXECUTOR_WRITE_CAPABLE_V0_IMPLEMENTATION
 BRANCH / WORKTREE / BASE / COMMIT:
 FILES CHANGED:
 WHAT WAS ADDED:
-  external write-capable executor (location; approved?):
+  external write-capable orchestrator (location; approved?):
+  drives existing claw plan apply chain (no new write executor):
   dry-run precondition enforcement:
   exact-path write enforcement:
   diff + approved validation:
   evidence-in-disposable-worktree:
-  read-only panel Proposed-Write-Capable-Executor-Plan section (if any):
+  read-only panel Proposed-Write-Capable-Orchestrator-Plan section (if any):
 SAFETY:
+  new write executor created (must be NO):
+  a2-plan-runner Rust modified (must be NO):
   control checkout written:
   real/live target written:
   writes confined to disposable worktree:
-  executor placed in panel:
+  orchestrator placed in panel:
   panel spawn/fs/create/write surface added:
   push/PR/merge/branch-delete/force-remove:
   runtime/model/broker/:11434:
@@ -223,7 +287,7 @@ NEXT BEST LANE:
 
 ```text
 Name      : Tier 3 Mutation Executor Write-Capable Step v0 Review / Push PR
-Why       : the write-capable executor must be reviewed before any Tier 4 (stage/commit/PR-packaging) lane.
+Why       : the write-capable orchestrator must be reviewed before any Tier 4 (stage/commit/PR-packaging) lane.
 STOP gate : do not design or implement Tier 4 packaging until this lane is merged AND a separate,
             explicitly-approved Tier 4 lane is opened; the panel stays read-only.
 ```
