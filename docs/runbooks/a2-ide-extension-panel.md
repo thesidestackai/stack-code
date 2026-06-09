@@ -177,6 +177,43 @@ What Foundation v0 does NOT do:
 
 ---
 
+## Tier 3 — Disposable Worktree Mutation (Foundation v0, read-only)
+
+Tier 3 Foundation v0 is the **readiness/state/render layer** for the future disposable-worktree
+mutation path (scope: `docs/a2-tier3-disposable-worktree-mutation-scope.md`). It adds **no** mutation
+executor, **no** worktree-creation control, and **no** write button. It only makes the Tier 3 control
+plane legible and honest.
+
+Read-only sections (all status-only):
+
+```text
+[ Tier 3 Readiness ]              control-checkout-clean / origin-main / worktree-path-free /
+                                  branch-name-free / operator-approved / plan-valid / declared-scope /
+                                  denied-registry — honest tri-state; overall ready/not-ready.
+[ Disposable Worktree Plan ]      intended worktree path + mutation branch + base (plan only; never created).
+[ Declared Touched Files ]        the exact declared path set (empty in v0); mutation is limited to it.
+[ Mutation Approval Gate ]        operator-approved? (no in v0); read-only until explicit per-lane approval.
+[ Diff Summary ]                  placeholder — a diff would be computed in the disposable worktree before any apply.
+[ Validation Results ]            placeholder — only explicitly-approved validation would run in the worktree.
+[ Rollback / Abandon Worktree ]   rollback prefers abandoning the disposable worktree (never force-remove/force-delete).
+[ Mutation Evidence Ledger ]      session-local, read-only; checkpoint/print steps marked printed-not-run.
+```
+
+Honesty + safety in v0:
+
+```text
+- No guard-safe Tier 3 probe is wired; control-checkout/origin/worktree/branch readiness renders
+  not-checked (never fabricated green), and overall is not-ready by default.
+- A dirty control checkout is a hard block, surfaced prominently.
+- The safe-mutation policy is classification only: denials win over the Tier-3 allowlist, and writes
+  are limited to the declared exact-path set inside the disposable worktree.
+- No mutation lane is enabled. No file editing by the panel. No worktree creation. No mutation
+  executor. No agent-run / agent-execute / apply / approve control. No live A2 / runtime / model /
+  broker / :11434. No new spawn boundary, fs use, watcher, polling, or timer.
+```
+
+---
+
 ## Build and test (from source)
 
 ```bash

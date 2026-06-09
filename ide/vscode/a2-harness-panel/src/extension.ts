@@ -8,9 +8,18 @@ import {
   NavView,
   DiscoveryView,
   FoundationView,
+  Tier3View,
   emptyInputs,
   renderHtml,
 } from "./render";
+import {
+  computeTier3Readiness,
+  dirtyControlCheckoutBlock,
+  Tier3Readiness,
+} from "./tier3Readiness";
+import { validateWorktreePlan, summarizePlan } from "./disposableWorktreePlan";
+import { formatMutationLedger, MutationLedgerEvent } from "./mutationEvidence";
+import { policyInvariant } from "./safeMutationPolicy";
 import {
   PERMISSION_TIERS,
   TierId,
@@ -97,6 +106,8 @@ interface SessionState {
   planCandidates: string[];
   // A2 Local Coding Agent Foundation v0: session-local agent evidence ledger.
   agentLedger: AgentLedgerEvent[];
+  // Tier 3 Foundation v0: session-local mutation evidence ledger (read-only).
+  mutationLedger: MutationLedgerEvent[];
 }
 
 const session: SessionState = {
@@ -114,6 +125,7 @@ const session: SessionState = {
   clawPath: null,
   planCandidates: [],
   agentLedger: [],
+  mutationLedger: [],
 };
 
 // Build the read-only A2 Local Coding Agent Foundation v0 view from the pure
@@ -189,6 +201,48 @@ function recordLedger(ev: AgentLedgerEvent): void {
   session.agentLedger = appendLedger(session.agentLedger, ev);
 }
 
+// Build the read-only Tier 3 Foundation v0 view from the pure Tier 3 modules.
+// v0 supplies NO facts (no guard-safe probe is wired), declares no plan and no
+// touched files, and grants no approval — so readiness renders not-checked /
+// not-ready, no mutation is enabled, and nothing is created or written.
+function tier3ReadinessRows(r: Tier3Readiness): Array<{ label: string; value: string }> {
+  return [
+    { label: "control checkout clean", value: r.controlCheckoutClean },
+    { label: "origin/main confirmed", value: r.originMainConfirmed },
+    { label: "worktree path free", value: r.worktreePathFree },
+    { label: "branch name free", value: r.branchNameFree },
+    { label: "operator approved", value: r.operatorApproved },
+    { label: "plan valid", value: r.planValid },
+    { label: "declared scope present", value: r.declaredScopePresent },
+    { label: "denied registry loaded", value: r.deniedRegistryLoaded },
+  ];
+}
+
+function buildTier3View(): Tier3View {
+  // v0: no worktree plan is proposed yet (plan only; never created).
+  const planValidation = validateWorktreePlan(null);
+  const readiness = computeTier3Readiness({
+    // No facts supplied in v0 → honest not-checked.
+    planValid: planValidation.valid,
+    declaredScopePresent: false,
+    deniedRegistryLoaded: true,
+  });
+  const ledger: MutationLedgerEvent[] = session.mutationLedger;
+  return {
+    readinessRows: tier3ReadinessRows(readiness),
+    overall: readiness.overall,
+    dirtyControlCheckoutBlock: dirtyControlCheckoutBlock(readiness),
+    probeNote: readiness.probeNote,
+    planLines: summarizePlan(null),
+    planValid: planValidation.valid,
+    planProblems: planValidation.problems,
+    declaredPaths: [],
+    policyInvariant: policyInvariant(),
+    ledgerLines: formatMutationLedger(ledger),
+    operatorApproved: false,
+  };
+}
+
 function model(): RenderModel {
   return {
     inputs: session.inputs,
@@ -199,6 +253,7 @@ function model(): RenderModel {
     discovery: session.discovery,
     timeline: session.timeline.length > 0 ? formatTimeline(session.timeline) : null,
     foundation: buildFoundationView(),
+    tier3: buildTier3View(),
   };
 }
 
