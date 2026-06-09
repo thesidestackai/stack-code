@@ -90,6 +90,31 @@ export interface FoundationView {
   nextLane: FoundationNextLaneView;
 }
 
+// Tier 3 Foundation v0 — read-only control-plane view for the disposable
+// worktree mutation path. All data is pre-computed by the extension from the
+// pure Tier 3 modules (tier3Readiness / disposableWorktreePlan / mutationScope /
+// safeMutationPolicy / mutationEvidence). The render layer only displays it; it
+// adds NO mutation executor, NO worktree-creation control, and NO write button.
+export interface Tier3View {
+  // Honest readiness rows (label/value); git/worktree facts render not-checked.
+  readinessRows: Array<{ label: string; value: string }>;
+  overall: string; // "ready" | "not-ready"
+  dirtyControlCheckoutBlock: boolean;
+  probeNote: string | null;
+  // Disposable worktree plan summary (plan only; never created).
+  planLines: string[];
+  planValid: boolean;
+  planProblems: string[];
+  // Declared exact-path touched-file set (shown before any mutation).
+  declaredPaths: string[];
+  // The safe-mutation policy invariant (denials win; exact-path).
+  policyInvariant: string;
+  // Mutation evidence ledger lines (printed-not-run markers).
+  ledgerLines: string[];
+  // Whether the operator has explicitly approved this exact lane (gate display).
+  operatorApproved: boolean;
+}
+
 export interface RenderModel {
   inputs: PanelInputs;
   output: HelperOutput | null;
@@ -106,6 +131,9 @@ export interface RenderModel {
   // A2 Local Coding Agent Foundation v0 control-plane view (optional; degrades
   // to a muted hint when absent).
   foundation?: FoundationView | null;
+  // Tier 3 Foundation v0 control-plane view (optional; degrades to a muted hint
+  // when absent). Read-only; adds no mutation/worktree-creation control.
+  tier3?: Tier3View | null;
 }
 
 export function emptyInputs(): PanelInputs {
@@ -371,6 +399,105 @@ ${nextAgentLaneBlock(foundation)}
 </section>`;
 }
 
+// ---- Tier 3 Foundation v0 sections (read-only) -----------------------------
+//
+// Status-only sections for the disposable worktree mutation path. They add NO
+// mutation executor, NO worktree-creation control, and NO write button. They
+// make the Tier 3 control plane legible: readiness, the disposable worktree
+// plan, the declared touched files, the approval gate, diff/validation
+// placeholders, rollback/abandon guidance, and the mutation evidence ledger.
+
+function tier3Block(t: Tier3View | null | undefined): string {
+  if (!t) {
+    return `<section class="tier3" data-testid="tier3-foundation">
+  <h3>Tier 3 — Disposable Worktree Mutation (Foundation v0, read-only)</h3>
+  <p class="muted" data-testid="tier3-foundation-empty">Tier 3 control plane not computed yet. It renders Tier 3 Readiness, the Disposable Worktree Plan, Declared Touched Files, the Mutation Approval Gate, Diff Summary, Validation Results, Rollback/Abandon guidance, and the Mutation Evidence Ledger — all read-only. No mutation is enabled in v0.</p>
+</section>`;
+  }
+  const readinessRows = t.readinessRows
+    .map(
+      (r) =>
+        `    <tr data-tier3-readiness="${escapeHtml(r.label)}"><th>${escapeHtml(r.label)}</th><td data-tier3-readiness-value="${escapeHtml(r.label)}">${escapeHtml(r.value)}</td></tr>`,
+    )
+    .join("\n");
+  const dirtyWarn = t.dirtyControlCheckoutBlock
+    ? `  <p class="muted" data-testid="tier3-dirty-block"><strong>Blocked:</strong> the control checkout reports uncommitted changes. Tier 3 requires a clean control checkout; resolve before any (future) mutation lane.</p>`
+    : "";
+  const probe = t.probeNote
+    ? `  <p class="muted" data-testid="tier3-probe-note">Tier 3 readiness: not-checked — ${escapeHtml(t.probeNote)}</p>`
+    : "";
+  const planProblems =
+    t.planProblems.length > 0
+      ? `  <ul data-testid="tier3-plan-problems">\n${t.planProblems.map((p) => `    <li>${escapeHtml(p)}</li>`).join("\n")}\n  </ul>`
+      : "";
+  const declared =
+    t.declaredPaths.length > 0
+      ? t.declaredPaths.map((p) => `    <li>${escapeHtml(p)}</li>`).join("\n")
+      : `    <li class="muted">(none declared)</li>`;
+  const ledger = t.ledgerLines.map((l) => `    <li>${escapeHtml(l)}</li>`).join("\n");
+
+  return `<section class="tier3" data-testid="tier3-foundation">
+  <h3>Tier 3 — Disposable Worktree Mutation (Foundation v0, read-only)</h3>
+
+  <section data-testid="tier3-readiness">
+  <h4>Tier 3 Readiness</h4>
+  <table>
+${readinessRows}
+  </table>
+  <p data-testid="tier3-overall">Overall: <code>${escapeHtml(t.overall)}</code></p>
+${dirtyWarn}
+${probe}
+  <p class="muted">Honest tri-state. Control-checkout/origin/worktree/branch state is shown as <code>not-checked</code> rather than fabricated when no guard-safe probe is wired (v0).</p>
+  </section>
+
+  <section data-testid="tier3-worktree-plan">
+  <h4>Disposable Worktree Plan</h4>
+  <ul>
+${t.planLines.map((l) => `    <li>${escapeHtml(l)}</li>`).join("\n")}
+  </ul>
+  <p data-testid="tier3-plan-valid">Plan valid: <code>${t.planValid ? "yes" : "no"}</code> — creation is not performed (plan only in v0).</p>
+${planProblems}
+  </section>
+
+  <section data-testid="tier3-declared-files">
+  <h4>Declared Touched Files</h4>
+  <ul>
+${declared}
+  </ul>
+  <p class="muted">Mutation is limited to this exact declared set, inside the disposable worktree. Paths outside it are denied.</p>
+  </section>
+
+  <section data-testid="tier3-approval-gate">
+  <h4>Mutation Approval Gate</h4>
+  <p data-testid="tier3-operator-approved">Operator approved this exact lane: <code>${t.operatorApproved ? "yes" : "no"}</code>.</p>
+  <p class="muted">Read-only until the operator explicitly approves the exact lane. No mutation lane is enabled in v0; there is no agent-run / agent-execute / apply / approve control here. ${escapeHtml(t.policyInvariant)}</p>
+  </section>
+
+  <section data-testid="tier3-diff-summary">
+  <h4>Diff Summary</h4>
+  <p class="muted" data-testid="tier3-diff-placeholder">(no diff — no mutation has occurred; a diff summary would be computed inside the disposable worktree and shown before any apply.)</p>
+  </section>
+
+  <section data-testid="tier3-validation-results">
+  <h4>Validation Results</h4>
+  <p class="muted" data-testid="tier3-validation-placeholder">(no validation run — only explicitly-approved validation commands would run inside the disposable worktree.)</p>
+  </section>
+
+  <section data-testid="tier3-rollback">
+  <h4>Rollback / Abandon Worktree Guidance</h4>
+  <p class="muted">Rollback prefers abandoning the disposable worktree (leave it for a separate, safe, non-force cleanup lane). The cockpit never force-removes a worktree and never force-deletes a branch.</p>
+  </section>
+
+  <section data-testid="tier3-mutation-ledger">
+  <h4>Mutation Evidence Ledger</h4>
+  <ol>
+${ledger}
+  </ol>
+  <p class="muted">Read-only, session-local. Checkpoint/print-only steps are marked <code>printed-not-run</code>. No file is written.</p>
+  </section>
+</section>`;
+}
+
 export function renderHtml(model: RenderModel): string {
   const i = model.inputs;
   const inputRows = [
@@ -440,5 +567,6 @@ ${notice}
 ${outputBlock(model.output)}
 ${timelineBlock(model.timeline)}
 ${foundationBlock(model.foundation)}
+${tier3Block(model.tier3)}
 </body></html>`;
 }
