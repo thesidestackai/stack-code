@@ -155,6 +155,17 @@ bash /home/suki/stack-code/scripts/a2-tier3-write-orchestrator.sh apply-lane \
 Do NOT run `apply-lane` in a non-interactive context — it will (correctly) refuse at the TTY gate
 (exit 7) and create no worktree.
 
+### The approval step is interactive — it is NOT stuck
+
+At STEP 2 the orchestrator prints a "what happens next" banner, then runs `claw plan approve`. claw shows
+the diff preview and then **waits for your input at this terminal** — after a long diff the cursor can
+look idle, but it is waiting, not hung. Look for claw's line `To approve, type exactly:` followed by the
+real `apply <step-id> <preview_sha256>` (scroll up if the diff pushed it off-screen), type that EXACT
+line, and press Enter. To abort with no write, press Ctrl-C. The orchestrator never types, pipes, or
+composes the approval for you — you must type it. If claw refuses (exit 7 / approval-denied: wrong line,
+replayed hash, off-TTY, or a `--yes`/`--auto`/batch form), the orchestrator now prints a specific
+diagnostic and STOPs with nothing written; re-run at a real terminal and type the exact line claw prints.
+
 ---
 
 ## 6. Pass criteria
