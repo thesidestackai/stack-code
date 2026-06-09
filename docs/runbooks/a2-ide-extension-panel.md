@@ -214,6 +214,42 @@ Honesty + safety in v0:
 
 ---
 
+## Tier 3 Mutation Executor v0 (dry-run, read-only)
+
+Tier 3 Mutation Executor v0 is the **plan / dry-run only** first lane of the executor (scope:
+`docs/a2-tier3-mutation-executor-design-scope.md`). It adds **no** worktree creation, **no** writes,
+and keeps the panel read-only — the executor is external and operator-invoked; the panel never spawns
+it.
+
+Read-only "Proposed Executor Plan" section:
+
+```text
+[ Proposed Executor Plan ]  Tier 3 Mutation Executor v0 — dry-run, read-only:
+  - PRINTS the exact external dry-run command the operator would run (operator-run; printed only).
+  - Renders the dry-run RESULT: would the lane proceed (readiness + plan + scope + approval),
+    and per-step classification (each proposed write/command shown would-accept / would-reject).
+  - Shows would-create-worktree: no and would-write-files: no (dry-run creates/writes nothing in v0).
+  - Renders dry-run evidence (printed-not-run).
+```
+
+The dry-run model (`src/executorDryRun.ts`) is pure: given an operator-approved lane (objective +
+worktree plan + declared exact-path set + proposed writes/commands), it reuses the Foundation v0
+models — `tier3Readiness`, `disposableWorktreePlan`, `mutationScope` (exact-path / control-checkout
+reject), `safeMutationPolicy` (denials win over the Tier-3 allowlist) — to classify what an external
+executor WOULD do. It creates nothing and writes nothing.
+
+What v0 does NOT do:
+
+```text
+- No worktree creation. No file write by the executor or the panel.
+- No executor inside the panel; the panel never spawns the executor.
+- No create / write / agent-run / agent-execute / apply / approve control.
+- No live A2 / runtime / model / broker / :11434. No new spawn boundary, fs use, watcher, polling, timer.
+- An actual write-capable executor step is a separate, explicitly-approved later lane.
+```
+
+---
+
 ## Build and test (from source)
 
 ```bash

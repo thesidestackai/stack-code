@@ -134,6 +134,28 @@ export interface RenderModel {
   // Tier 3 Foundation v0 control-plane view (optional; degrades to a muted hint
   // when absent). Read-only; adds no mutation/worktree-creation control.
   tier3?: Tier3View | null;
+  // Tier 3 Mutation Executor v0 (dry-run) view (optional; degrades to a muted
+  // hint when absent). Read-only; PRINTS the dry-run command + renders the
+  // dry-run result. The panel never spawns the executor and never writes.
+  executorDryRun?: ExecutorDryRunView | null;
+}
+
+// Tier 3 Mutation Executor v0 (dry-run) — read-only view. All data is
+// pre-computed by the extension from the pure executorDryRun model. The render
+// layer only displays it; it adds NO executor spawn, NO worktree-creation
+// control, NO write button. The "command" is PRINTED for the operator to run an
+// external tool themselves; the dry-run itself creates nothing and writes nothing.
+export interface ExecutorDryRunView {
+  // The exact external dry-run command the operator would run (printed only).
+  printedCommand: string;
+  // Pre-formatted dry-run result lines (ready / readiness / plan / scope / steps).
+  resultLines: string[];
+  // Honest one-line summary.
+  summary: string;
+  wouldCreateWorktree: boolean; // always false in v0
+  wouldWriteFiles: boolean; // always false in v0
+  // Pre-formatted dry-run evidence lines (printed-not-run).
+  evidenceLines: string[];
 }
 
 export function emptyInputs(): PanelInputs {
@@ -498,6 +520,39 @@ ${ledger}
 </section>`;
 }
 
+// ---- Tier 3 Mutation Executor v0 (dry-run) section (read-only) -------------
+//
+// Status-only. It PRINTS the exact external dry-run command (operator-run) and
+// renders the dry-run result + evidence. It adds NO executor spawn, NO
+// worktree-creation control, and NO write button. The dry-run creates nothing
+// and writes nothing.
+function executorDryRunBlock(v: ExecutorDryRunView | null | undefined): string {
+  if (!v) {
+    return `<section class="executor-dryrun" data-testid="executor-dryrun">
+  <h3>Proposed Executor Plan (Tier 3 Mutation Executor v0 — dry-run, read-only)</h3>
+  <p class="muted" data-testid="executor-dryrun-empty">No approved lane proposed. When one is approved, this section would PRINT the external dry-run command and render what the executor WOULD do — it creates no worktree and writes nothing. The panel never spawns the executor.</p>
+</section>`;
+  }
+  const result = v.resultLines.map((l) => `    <li>${escapeHtml(l)}</li>`).join("\n");
+  const evidence = v.evidenceLines.map((l) => `    <li>${escapeHtml(l)}</li>`).join("\n");
+  return `<section class="executor-dryrun" data-testid="executor-dryrun">
+  <h3>Proposed Executor Plan (Tier 3 Mutation Executor v0 — dry-run, read-only)</h3>
+  <p data-testid="executor-dryrun-summary">${escapeHtml(v.summary)}</p>
+  <p data-testid="executor-dryrun-would">would create worktree: <code>${v.wouldCreateWorktree ? "yes" : "no"}</code> · would write files: <code>${v.wouldWriteFiles ? "yes" : "no"}</code> — dry-run creates nothing and writes nothing in v0.</p>
+  <h4>External dry-run command (operator-run; printed only)</h4>
+  <pre data-testid="executor-dryrun-command">${escapeHtml(v.printedCommand)}</pre>
+  <h4>Dry-run result</h4>
+  <ul data-testid="executor-dryrun-result">
+${result}
+  </ul>
+  <h4>Dry-run evidence</h4>
+  <ol data-testid="executor-dryrun-evidence">
+${evidence}
+  </ol>
+  <p class="muted">Read-only. The panel PRINTS the command for you to run an external tool yourself; it never spawns the executor, creates a worktree, or writes a file. Print/checkpoint steps are marked printed-not-run.</p>
+</section>`;
+}
+
 export function renderHtml(model: RenderModel): string {
   const i = model.inputs;
   const inputRows = [
@@ -568,5 +623,6 @@ ${outputBlock(model.output)}
 ${timelineBlock(model.timeline)}
 ${foundationBlock(model.foundation)}
 ${tier3Block(model.tier3)}
+${executorDryRunBlock(model.executorDryRun)}
 </body></html>`;
 }

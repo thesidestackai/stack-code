@@ -9,6 +9,7 @@ import {
   DiscoveryView,
   FoundationView,
   Tier3View,
+  ExecutorDryRunView,
   emptyInputs,
   renderHtml,
 } from "./render";
@@ -18,8 +19,13 @@ import {
   Tier3Readiness,
 } from "./tier3Readiness";
 import { validateWorktreePlan, summarizePlan } from "./disposableWorktreePlan";
-import { formatMutationLedger, MutationLedgerEvent } from "./mutationEvidence";
+import {
+  formatMutationLedger,
+  MutationLedgerEvent,
+  mutationEvent,
+} from "./mutationEvidence";
 import { policyInvariant } from "./safeMutationPolicy";
+import { ApprovedLane, computeDryRun, summarizeDryRun } from "./executorDryRun";
 import {
   PERMISSION_TIERS,
   TierId,
@@ -243,6 +249,41 @@ function buildTier3View(): Tier3View {
   };
 }
 
+// Build the read-only Tier 3 Mutation Executor v0 (dry-run) view. v0 has no
+// approved lane loaded (objective/plan/declared-scope empty; operator not
+// approved), so the dry-run is not-ready and prints the external command only —
+// it creates no worktree and writes nothing.
+function buildExecutorDryRunView(): ExecutorDryRunView {
+  const emptyLane: ApprovedLane = {
+    objective: null,
+    worktreePlan: null,
+    declaredPaths: [],
+    proposedWrites: [],
+    proposedCommands: [],
+    operatorApproved: false,
+  };
+  // No facts are supplied in v0 (no guard-safe probe), so readiness is not-ready.
+  const result = computeDryRun(emptyLane);
+  const evidence: MutationLedgerEvent[] = [
+    mutationEvent({
+      kind: "decision",
+      tier: 3,
+      action: "dry-run computed (no approved lane)",
+      status: "info",
+      summary: result.summary,
+      printedNotRun: true,
+    }),
+  ];
+  return {
+    printedCommand: result.printedCommand,
+    resultLines: summarizeDryRun(result),
+    summary: result.summary,
+    wouldCreateWorktree: result.wouldCreateWorktree,
+    wouldWriteFiles: result.wouldWriteFiles,
+    evidenceLines: formatMutationLedger(evidence),
+  };
+}
+
 function model(): RenderModel {
   return {
     inputs: session.inputs,
@@ -254,6 +295,7 @@ function model(): RenderModel {
     timeline: session.timeline.length > 0 ? formatTimeline(session.timeline) : null,
     foundation: buildFoundationView(),
     tier3: buildTier3View(),
+    executorDryRun: buildExecutorDryRunView(),
   };
 }
 
