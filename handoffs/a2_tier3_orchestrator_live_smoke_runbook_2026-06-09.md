@@ -144,7 +144,8 @@ bash /home/suki/stack-code/scripts/a2-tier3-write-orchestrator.sh validate-lane 
 bash /home/suki/stack-code/scripts/a2-tier3-write-orchestrator.sh apply-lane \
   --approved-lane lane.json --dry-run-evidence evidence.json --plan plan.yaml
 
-# 3. Review the printed diff + .claw/.../apply-result.json inside the disposable worktree.
+# 3. Review the printed diff + the apply-result JSON (emitted to STDOUT by claw plan apply; it may not
+#    be persisted as a .claw/.../apply-result.json file) + the persisted .claw artifacts in the worktree.
 #    Confirm SMOKE_NOTES.md landed ONLY inside the throwaway worktree.
 
 # 4. Rollback-by-abandon — leave the worktree for inspection, or retire it later with a
@@ -160,11 +161,24 @@ Do NOT run `apply-lane` in a non-interactive context — it will (correctly) ref
 At STEP 2 the orchestrator prints a "what happens next" banner, then runs `claw plan approve`. claw shows
 the diff preview and then **waits for your input at this terminal** — after a long diff the cursor can
 look idle, but it is waiting, not hung. Look for claw's line `To approve, type exactly:` followed by the
-real `apply <step-id> <preview_sha256>` (scroll up if the diff pushed it off-screen), type that EXACT
-line, and press Enter. To abort with no write, press Ctrl-C. The orchestrator never types, pipes, or
-composes the approval for you — you must type it. If claw refuses (exit 7 / approval-denied: wrong line,
-replayed hash, off-TTY, or a `--yes`/`--auto`/batch form), the orchestrator now prints a specific
-diagnostic and STOPs with nothing written; re-run at a real terminal and type the exact line claw prints.
+real `apply <step-id> <preview_sha256>` (scroll up if the diff pushed it off-screen), type/paste that
+EXACT line, then:
+
+1. **press Enter**, and
+2. **if the terminal still appears to wait, press Ctrl+D once** to send EOF and end stdin.
+
+Do not type shell commands while `claw plan approve` is waiting, and do not pipe/script/fake-TTY the
+approval — you must type it (the orchestrator never types, pipes, or composes it for you). To abort with
+no write, press Ctrl-C.
+
+> **2026-06-09/10 finding (verified live):** the successful end-to-end smoke required pressing **Ctrl+D**
+> once after the approval line — claw's reader continued waiting for EOF until stdin was closed. If you
+> type the exact line, press Enter, and nothing advances, send Ctrl+D before assuming a failure.
+
+If claw refuses (exit 7 / approval-denied: wrong line, replayed hash, off-TTY/EOF-with-no-input, or a
+`--yes`/`--auto`/batch form), the orchestrator prints a specific per-exit-code diagnostic (and a `.claw`
+artifact-presence dump) and STOPs with nothing written; re-run at a real terminal and type the exact
+line claw prints, then Enter + Ctrl+D.
 
 ---
 
@@ -172,8 +186,13 @@ diagnostic and STOPs with nothing written; re-run at a real terminal and type th
 
 ```text
 - apply-lane reaches STEP 4 and claw writes SMOKE_NOTES.md inside the disposable worktree only.
-- An apply-result artifact (.claw/.../apply-result.json) and a checkpoint exist under the worktree.
-- git diff --stat (printed) shows exactly SMOKE_NOTES.md changed, inside the worktree.
+- These artifacts MUST be persisted under <worktree>/.claw/: approval-result.json; the per-step
+  apply-bundle.json and preview-bundle.json + preview-generator-result.json; the checkpoint manifest;
+  the payload (after.bin + after.sha256); and the run manifest/status.
+- `claw plan apply` may EMIT the apply-result JSON (schema a2-l2b-apply-result.v1, exit_code 0,
+  outcome "applied") to STDOUT rather than persist an apply-result.json FILE. Do NOT require a persisted
+  apply-result.json file unless your build actually creates one — capture the stdout JSON as the evidence.
+- git diff/SMOKE_NOTES check shows exactly SMOKE_NOTES.md present, inside the worktree.
 - The control checkout (/home/suki/stack-code) is unchanged; no real/live target was written.
 - No push/PR/merge/branch-delete/force-remove occurred.
 ```
