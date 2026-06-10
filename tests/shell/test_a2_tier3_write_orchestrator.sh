@@ -201,6 +201,16 @@ static_assert "per-step approve exit diagnostics present" 'approval REFUSED by c
 # preview rc=7 (write-preview-ready) handling must be artifact-gated; approve/apply stay strict.
 static_assert "preview rc=7 accepted only via artifacts"  'preview_ready_artifacts_present'              present
 static_assert "preview rc=7 uses EXIT_PREVIEW_READY"      'rc -eq \$EXIT_PREVIEW_READY'                   present
+# approval stdin/result diagnostics: non-approval steps isolate stdin; approve keeps the real TTY.
+static_assert "preview step isolates stdin (/dev/null)"   'plan run .*--workspace-write-preview < /dev/null' present
+static_assert "apply-bundle step isolates stdin"          'plan apply-bundle .*< /dev/null'              present
+static_assert "apply step isolates stdin"                 'plan apply "\$apply_bundle" < /dev/null'       present
+static_assert "approve step does NOT redirect stdin"      'plan approve .*< /dev/null'                    absent
+static_assert "approve classifies rc (classify_approve_rc)" 'classify_approve_rc'                         present
+static_assert "approve names EOF / non-TTY cause"         'EOF / drift / non-TTY'                         present
+static_assert "approve handles output-io (rc 12)"         'approval-result IO error'                      present
+static_assert "approve pre-checks output path exists"     'approval-result path already exists'          present
+static_assert "failure shows .claw artifact presence"     'diagnose_claw_dir'                            present
 
 # ---- preview rc=7 artifact-detection (accept/reject decision) --------------
 # claw signals a READY write preview (approval pending) with exit code 7. The
@@ -232,6 +242,24 @@ preview_ready_case "reject: preview rc=7 with no artifacts"      1 0 0 0
 preview_ready_case "reject: preview rc=7 bundle+gen, no status"  1 1 1 0
 preview_ready_case "reject: preview rc=7 status, no bundle"      1 0 0 1
 # (the "unchanged off-TTY approval refusal" case is the apply-lane exit-7 test above.)
+
+# ---- approve exit-code classification (precise diagnostics) ----------------
+# claw plan approve exits 0=approved, 5=bundle-error, 7=denied/EOF/non-TTY,
+# 12=approval-result-output IO. The orchestrator must categorize each distinctly.
+approve_rc_case() {
+  local name=$1 code=$2 want=$3 got
+  got=$(classify_approve_rc "$code")
+  if [[ "$got" == "$want" ]]; then
+    PASS_COUNT=$((PASS_COUNT + 1)); printf 'PASS  %-52s (%s)\n' "$name" "$got"
+  else
+    FAIL_COUNT=$((FAIL_COUNT + 1)); printf 'FAIL  %-52s (got %s, want %s)\n' "$name" "$got" "$want"
+  fi
+}
+approve_rc_case "approve rc=0  -> approved"           0  approved
+approve_rc_case "approve rc=5  -> bundle-error"       5  bundle-error
+approve_rc_case "approve rc=7  -> denied/eof/non-tty" 7  denied-eof-nontty
+approve_rc_case "approve rc=12 -> output-io"          12 output-io
+approve_rc_case "approve rc=3  -> unknown"            3  unknown
 
 # ---- summary ---------------------------------------------------------------
 printf -- '----\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
