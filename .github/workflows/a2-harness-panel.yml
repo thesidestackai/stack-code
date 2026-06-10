@@ -1,0 +1,44 @@
+name: A2 Harness Panel CI
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ide/vscode/a2-harness-panel/**
+      - .github/workflows/a2-harness-panel.yml
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ide/vscode/a2-harness-panel/**
+      - .github/workflows/a2-harness-panel.yml
+  workflow_dispatch:
+
+concurrency:
+  group: a2-harness-panel-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: ide/vscode/a2-harness-panel
+
+jobs:
+  a2-harness-panel:
+    name: a2 harness panel (guards + tests + build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: ide/vscode/a2-harness-panel/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Guard scan (no fs/network/spawn/exec controls)
+        run: npm run lint
+      - name: Panel test suite
+        run: npm test
+      - name: TypeScript build
+        run: npm run build
