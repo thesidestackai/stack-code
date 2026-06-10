@@ -67,6 +67,15 @@ readonly EXIT_USAGE=2
 readonly EXIT_GATE=4   # a safety gate refused the lane
 readonly EXIT_TTY=7    # interactive-terminal guard (mirrors claw's off-TTY fail-closed)
 
+# claw reuses exit code 7 for TWO distinct meanings, disambiguated by STAGE and
+# on-disk artifacts (never by the numeric code alone):
+#   - at `plan run --workspace-write-preview`: EXIT_RUN_PLAN_WRITE_PREVIEW_READY —
+#     the write preview is READY and approval is PENDING (a success-with-pending
+#     signal, NOT a failure). Accepted ONLY when the preview-ready artifacts/status
+#     are present (see preview_ready_artifacts_present).
+#   - at `plan approve`: EXIT_APPROVAL_DENIED — approval refused. Always STRICT.
+readonly EXIT_PREVIEW_READY=7
+
 # Denied-command registry mirror (deniedCommands.ts). Stored as ERE source
 # strings; sensitive tokens are written with a trailing one-character class
 # (e.g. broke[r]) so the regex still matches a real command while this script's
@@ -448,6 +457,27 @@ gate_clean_control_checkout() {
   return $EXIT_OK
 }
 
+# Artifact-based detection that `plan run --workspace-write-preview` produced a
+# READY write preview (approval pending). Returns 0 only when ALL required
+# preview artifacts exist under <ws>/.claw: a preview-bundle.json, a
+# preview-generator-result.json, AND a run status/manifest artifact carrying
+# "status": "write_preview_ready". This is artifact/status-based (the same
+# discipline a2-ide-harness.sh uses) — never free-text log parsing — and is what
+# lets the orchestrator accept the preview stage's exit-code-7 signal SAFELY,
+# while approve/apply exit 7 stays strict.
+preview_ready_artifacts_present() {
+  local claw_dir=$1
+  [[ -n "$(find "$claw_dir" -type f -name 'preview-bundle.json' 2>/dev/null | head -n1)" ]] || return 1
+  [[ -n "$(find "$claw_dir" -type f -name 'preview-generator-result.json' 2>/dev/null | head -n1)" ]] || return 1
+  local f
+  while IFS= read -r f; do
+    if grep -q '"status"[[:space:]]*:[[:space:]]*"write_preview_ready"' "$f" 2>/dev/null; then
+      return 0
+    fi
+  done < <(find "$claw_dir" -type f \( -name 'status.json' -o -name 'run-manifest.json' \) 2>/dev/null)
+  return 1
+}
+
 drive_chain_for_plan() {
   # Drives the EXISTING chain inside the disposable worktree. Delegates ALL
   # writing to `claw plan apply`; reimplements nothing. Each command is printed
@@ -460,7 +490,25 @@ drive_chain_for_plan() {
   info "+ $(shq "$A2_CLAW") plan run $(shq "$plan") --workspace-root $(shq "$ws") --workspace-write-preview"
   local rc=0
   "$A2_CLAW" plan run "$plan" --workspace-root "$ws" --workspace-write-preview || rc=$?
-  if [[ $rc -ne 0 ]]; then
+  # claw signals a READY write preview (approval pending) with exit code 7
+  # (EXIT_RUN_PLAN_WRITE_PREVIEW_READY) — the same numeric value it uses for
+  # approval-denied at the approve stage. Disambiguate by STAGE + ARTIFACTS, not
+  # by the code: accept rc=7 HERE only when the preview-ready artifacts/status are
+  # present; otherwise treat it as a genuine refusal. Any other non-zero is a
+  # hard preview failure. (approve/apply keep strict rc=7 handling below.)
+  if [[ $rc -eq 0 ]]; then
+    : # clean exit — fall through to the artifact presence check
+  elif [[ $rc -eq $EXIT_PREVIEW_READY ]]; then
+    if preview_ready_artifacts_present "$claw_dir"; then
+      info "STEP 1 preview exited $EXIT_PREVIEW_READY = write-preview-ready (approval pending); preview-ready"
+      info "  artifacts present — accepting and continuing to approval. No target was written."
+    else
+      err "STEP 1 preview exited $rc but NO preview-ready artifacts/status were produced"
+      err "  (no preview-bundle + preview-generator-result + status 'write_preview_ready' under $claw_dir/.claw)."
+      err "  Treating as a genuine preview refusal — no target was written. STOP."
+      return $EXIT_GATE
+    fi
+  else
     err "STEP 1 preview (claw plan run) failed (rc=$rc) — no target was written. STOP."
     return $EXIT_GATE
   fi
