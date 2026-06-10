@@ -76,6 +76,16 @@ readonly EXIT_TTY=7    # interactive-terminal guard (mirrors claw's off-TTY fail
 #   - at `plan approve`: EXIT_APPROVAL_DENIED — approval refused. Always STRICT.
 readonly EXIT_PREVIEW_READY=7
 
+# `claw plan approve` exit codes (rusty-claude-cli/src/main.rs):
+#   0  approved — approval-result JSON persisted to the EXACT --approval-result-output path.
+#   5  bundle read / parse / schema / integrity error (EXIT_APPROVAL_BUNDLE_ERR).
+#   7  refused / non-approvable / EOF (zero bytes) / drift / non-TTY (EXIT_APPROVAL_DENIED).
+#   12 approval-result-output IO: the output path ALREADY EXISTED (refuses, no approval run),
+#      OR approved-but-the-file-write-failed (the approval JSON still went to stdout) — EXIT_APPROVAL_OUTPUT_IO.
+# (codes 5 and 7 are matched as literals in classify_approve_rc; only 12 needs a named
+#  constant because the STEP 2 pre-flight message references it.)
+readonly EXIT_APPROVAL_OUTPUT_IO=12
+
 # Denied-command registry mirror (deniedCommands.ts). Stored as ERE source
 # strings; sensitive tokens are written with a trailing one-character class
 # (e.g. broke[r]) so the regex still matches a real command while this script's
@@ -478,6 +488,30 @@ preview_ready_artifacts_present() {
   return 1
 }
 
+# Map a `claw plan approve` exit code to a category, so the approve step can give
+# the operator a precise, actionable diagnostic instead of a generic "rc=N".
+classify_approve_rc() {
+  case "$1" in
+    0)  printf 'approved' ;;
+    5)  printf 'bundle-error' ;;
+    7)  printf 'denied-eof-nontty' ;;
+    12) printf 'output-io' ;;
+    *)  printf 'unknown' ;;
+  esac
+}
+
+# Read-only: show which key A2-L2b artifacts are present/absent under .claw, so a
+# failed step makes it obvious to the operator exactly where the chain halted
+# (e.g. preview present but approval-result absent => approval did not persist).
+diagnose_claw_dir() {
+  local claw_dir=$1 n found
+  info "## .claw artifact presence under $claw_dir:"
+  for n in preview-bundle.json preview-generator-result.json approval-result.json apply-bundle.json apply-result.json; do
+    found=$(find "$claw_dir" -type f -name "$n" 2>/dev/null | sort | head -n1 || true)
+    if [[ -n "$found" ]]; then info "   present : $n  ($found)"; else info "   absent  : $n"; fi
+  done
+}
+
 drive_chain_for_plan() {
   # Drives the EXISTING chain inside the disposable worktree. Delegates ALL
   # writing to `claw plan apply`; reimplements nothing. Each command is printed
@@ -489,7 +523,9 @@ drive_chain_for_plan() {
   rule; info "STEP 1 / PREVIEW (writes NO target)"; rule
   info "+ $(shq "$A2_CLAW") plan run $(shq "$plan") --workspace-root $(shq "$ws") --workspace-write-preview"
   local rc=0
-  "$A2_CLAW" plan run "$plan" --workspace-root "$ws" --workspace-write-preview || rc=$?
+  # stdin from /dev/null: the preview reads no operator input, and this guarantees
+  # it can never consume the terminal stdin that STEP 2's human approval needs.
+  "$A2_CLAW" plan run "$plan" --workspace-root "$ws" --workspace-write-preview < /dev/null || rc=$?
   # claw signals a READY write preview (approval pending) with exit code 7
   # (EXIT_RUN_PLAN_WRITE_PREVIEW_READY) — the same numeric value it uses for
   # approval-denied at the approve stage. Disambiguate by STAGE + ARTIFACTS, not
@@ -532,28 +568,66 @@ drive_chain_for_plan() {
   info "  NOTE: this script never types, pipes, or composes the approval for you; you must type it."
   info ""
   info "+ $(shq "$A2_CLAW") plan approve $(shq "$preview_bundle") --approval-result-output $(shq "$approval_out")"
+  # Pre-flight: claw refuses (rc $EXIT_APPROVAL_OUTPUT_IO) if --approval-result-output already exists.
+  # Surface that clearly BEFORE running, so a reused/partial worktree is obvious.
+  if [[ -e "$approval_out" ]]; then
+    err "STEP 2 PRE-CHECK: approval-result path already exists: $approval_out"
+    err "  claw plan approve refuses to clobber it (would exit $EXIT_APPROVAL_OUTPUT_IO). apply-lane creates a"
+    err "  FRESH disposable worktree per run — use a new run, not a reused/partial worktree. Nothing written. STOP."
+    return $EXIT_GATE
+  fi
+  # The approval is read from THIS real terminal. stdin is deliberately NOT
+  # redirected here (unlike the other steps) — the human must type the line.
   info "(waiting for claw's approval prompt below — type your approval line when the diff finishes)"
   rc=0
   "$A2_CLAW" plan approve "$preview_bundle" --approval-result-output "$approval_out" || rc=$?
-  if [[ $rc -eq $EXIT_TTY ]]; then
-    err "STEP 2 approval REFUSED by claw (exit $EXIT_TTY / approval-denied). Common causes:"
-    err "  - the typed line did not EXACTLY match '$APPROVAL_GRAMMAR' (wrong case / token count / a replayed hash);"
-    err "  - this is not a real interactive terminal (off-TTY / piped / batch input);"
-    err "  - a preapproval form (--yes / --auto / auto-apply) was used (always refused)."
-    err "  Nothing was written. Re-run apply-lane at a REAL terminal and type the exact line claw prints."
-    return $EXIT_GATE
-  elif [[ $rc -ne 0 ]]; then
-    err "STEP 2 approval failed (claw plan approve rc=$rc) before recording an approval — nothing written. STOP."
-    return $EXIT_GATE
-  fi
-  [[ -f "$approval_out" ]] || { err "STEP 2 approval exited 0 but produced no approval-result at $approval_out — STOP (nothing written)."; return $EXIT_GATE; }
-  info "approval recorded: $approval_out — continuing to apply-bundle + apply."
+  local approve_cat; approve_cat=$(classify_approve_rc "$rc")
+  case "$approve_cat" in
+    approved)
+      if [[ -f "$approval_out" ]]; then
+        info "approval recorded (rc 0): $approval_out — continuing to apply-bundle + apply."
+      else
+        err "STEP 2 reported approved (rc 0) but no approval-result file at $approval_out — unexpected"
+        err "  (claw persists on success). Treating as a failure; nothing applied. STOP."
+        diagnose_claw_dir "$claw_dir"
+        return $EXIT_GATE
+      fi
+      ;;
+    denied-eof-nontty)
+      err "STEP 2 approval REFUSED by claw (exit $rc = refused / non-approvable / EOF / drift / non-TTY)."
+      err "  If you DID type the approval line and still see this, the likeliest causes are:"
+      err "  - claw read EOF / your keystrokes did not reach claw's stdin: a wrapper, terminal multiplexer,"
+      err "    backgrounding, or redirected stdin can detach it — run apply-lane DIRECTLY in a real terminal;"
+      err "  - the typed line did not EXACTLY match claw's 'apply <step-id> <preview_sha256>' (case/tokens/replayed hash);"
+      err "  - a preapproval form (--yes / --auto / auto-apply) was used (always refused)."
+      err "  Nothing was written. (approval-result.json absent below confirms the approval was not captured.)"
+      diagnose_claw_dir "$claw_dir"
+      return $EXIT_GATE
+      ;;
+    output-io)
+      err "STEP 2 approval-result IO error (exit $rc). Either --approval-result-output already existed"
+      err "  (claw refuses to clobber; no approval run), OR claw APPROVED but failed to write the file"
+      err "  (the approval JSON went to stdout only). Path: $approval_out. Use a fresh worktree; check perms."
+      diagnose_claw_dir "$claw_dir"
+      return $EXIT_GATE
+      ;;
+    bundle-error)
+      err "STEP 2 preview-bundle read/parse/schema/integrity error (exit $rc) — approval not attempted. STOP."
+      diagnose_claw_dir "$claw_dir"
+      return $EXIT_GATE
+      ;;
+    *)
+      err "STEP 2 approval failed (claw plan approve rc=$rc, uncategorized) — nothing written. STOP."
+      diagnose_claw_dir "$claw_dir"
+      return $EXIT_GATE
+      ;;
+  esac
 
   # ---- STEP 3 / APPLY-BUNDLE — GENERATOR only (writes NO target) -----------
   rule; info "STEP 3 / APPLY-BUNDLE — GENERATOR only (writes NO target)"; rule
   info "+ $(shq "$A2_CLAW") plan apply-bundle $(shq "$gen_result") $(shq "$approval_out")"
   rc=0
-  "$A2_CLAW" plan apply-bundle "$gen_result" "$approval_out" || rc=$?
+  "$A2_CLAW" plan apply-bundle "$gen_result" "$approval_out" < /dev/null || rc=$?
   if [[ $rc -ne 0 ]]; then
     err "STEP 3 apply-bundle (generator) failed (rc=$rc) — no target was written. STOP."
     return $EXIT_GATE
@@ -565,7 +639,7 @@ drive_chain_for_plan() {
   rule; info "STEP 4 / APPLY — EXECUTOR (the existing claw write_executor; the ONLY writer; runs once)"; rule
   info "+ $(shq "$A2_CLAW") plan apply $(shq "$apply_bundle")"
   rc=0
-  "$A2_CLAW" plan apply "$apply_bundle" || rc=$?
+  "$A2_CLAW" plan apply "$apply_bundle" < /dev/null || rc=$?
   if [[ $rc -ne 0 ]]; then
     err "STEP 4 apply (claw plan apply) failed (rc=$rc). Review the disposable worktree before re-running;"
     err "  do not run apply twice for the same approved preview. STOP."
