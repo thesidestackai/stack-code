@@ -198,6 +198,40 @@ static_assert "no composed apply <id> <hex> line"         'appl[y][[:space:]]+[^
 static_assert "approval not auto-typed (explicit note)"   'never types, pipes, or composes'              present
 static_assert "interactive 'not stuck' banner present"    'it is NOT stuck'                              present
 static_assert "per-step approve exit diagnostics present" 'approval REFUSED by claw'                     present
+# preview rc=7 (write-preview-ready) handling must be artifact-gated; approve/apply stay strict.
+static_assert "preview rc=7 accepted only via artifacts"  'preview_ready_artifacts_present'              present
+static_assert "preview rc=7 uses EXIT_PREVIEW_READY"      'rc -eq \$EXIT_PREVIEW_READY'                   present
+
+# ---- preview rc=7 artifact-detection (accept/reject decision) --------------
+# claw signals a READY write preview (approval pending) with exit code 7. The
+# orchestrator must accept that ONLY when the preview-ready artifacts/status are
+# present, and reject a bare rc=7 with no artifacts. We unit-test the pure
+# detector by loading the orchestrator's functions (without dispatching main).
+# shellcheck disable=SC1090
+eval "$(sed '/^main "\$@"$/d' "$ORCH")"
+
+# preview_ready_case <name> <want 0|1> <bundle 0|1> <gen 0|1> <status 0|1>
+preview_ready_case() {
+  local name=$1 want=$2 b=$3 g=$4 s=$5
+  local d c rc=0
+  d="$(mktemp -d -p "$WORK_DIR")"; c="$d/.claw"
+  mkdir -p "$c/l2b-preview-bundles/r/s" "$c/l2b-runs/r"
+  if [[ "$b" == 1 ]]; then : > "$c/l2b-preview-bundles/r/s/preview-bundle.json"; fi
+  if [[ "$g" == 1 ]]; then : > "$c/l2b-preview-bundles/r/s/preview-generator-result.json"; fi
+  if [[ "$s" == 1 ]]; then printf '{"status": "write_preview_ready"}\n' > "$c/l2b-runs/r/status.json"; fi
+  preview_ready_artifacts_present "$c" || rc=1
+  if [[ "$rc" == "$want" ]]; then
+    PASS_COUNT=$((PASS_COUNT + 1)); printf 'PASS  %-52s (rc %s)\n' "$name" "$rc"
+  else
+    FAIL_COUNT=$((FAIL_COUNT + 1)); printf 'FAIL  %-52s (got %s, want %s)\n' "$name" "$rc" "$want"
+  fi
+}
+
+preview_ready_case "accept: preview rc=7 with bundle+gen+status" 0 1 1 1
+preview_ready_case "reject: preview rc=7 with no artifacts"      1 0 0 0
+preview_ready_case "reject: preview rc=7 bundle+gen, no status"  1 1 1 0
+preview_ready_case "reject: preview rc=7 status, no bundle"      1 0 0 1
+# (the "unchanged off-TTY approval refusal" case is the apply-lane exit-7 test above.)
 
 # ---- summary ---------------------------------------------------------------
 printf -- '----\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
