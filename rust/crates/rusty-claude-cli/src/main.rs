@@ -984,19 +984,25 @@ struct CliApprovalInteractionResult {
 ///    `is_truncated`) short-circuit: **no bytes are read from `input`**.
 ///    The returned decision mirrors the refusal the Slice-3a parser
 ///    would have produced on the matching preview-state branch.
-/// 5. Approvable previews read `input` to EOF, strip *exactly one*
-///    trailing `\n` or `\r\n` (priority: `\r\n` first, then `\n`), and
-///    pass the residue verbatim to
+/// 5. Approvable previews read ONE line from `input` so an interactive
+///    operator who types the approval line and presses Enter gets a
+///    verdict without having to signal EOF (Ctrl-D). When the underlying
+///    read delivered more than that first line (a paste or piped
+///    payload), the already-buffered remainder is appended so the full
+///    content reaches the parser — those extra bytes are consumed here
+///    rather than left for the shell. The residue then has *exactly one*
+///    trailing `\n` or `\r\n` stripped (priority: `\r\n` first, then
+///    `\n`) and is passed verbatim to
 ///    [`a2_plan_runner::evaluate_operator_input`]. Embedded newlines,
-///    pasted approval markers, batch syntax, etc. are all refused by
-///    the underlying strict parser.
+///    pasted approval markers, batch syntax, etc. are all refused by the
+///    underlying strict parser exactly as before.
 /// 6. EOF (operator supplies zero bytes) flows through the parser path
 ///    and is refused via [`a2_plan_runner::ApprovalRefusal::ArgCount`].
 fn run_approval_interaction<R: std::io::Read, W: std::io::Write>(
     preview_record: &a2_plan_runner::PreviewRecord,
     preview_display: &a2_plan_runner::PreviewDisplay,
     checkpoint_baseline_unchanged: bool,
-    mut input: R,
+    input: R,
     mut output: W,
 ) -> std::io::Result<CliApprovalInteractionResult> {
     use a2_plan_runner::markers::{L2B_APPROVAL_REFUSED, L2B_APPROVED};
@@ -1004,6 +1010,7 @@ fn run_approval_interaction<R: std::io::Read, W: std::io::Write>(
         evaluate_operator_input, render_approval_prompt, render_non_approvable_summary,
         ApprovalDecision, ApprovalRefusal,
     };
+    use std::io::BufRead;
 
     if !preview_record.is_approvable() {
         let render = render_non_approvable_summary(preview_record);
@@ -1040,8 +1047,25 @@ fn run_approval_interaction<R: std::io::Read, W: std::io::Write>(
     write!(output, "{}", render.text)?;
     output.flush()?;
 
+    // Interactive Enter-to-approve: read ONE line so a TTY operator who types
+    // the exact `apply <step-id> <preview_sha256>` line and presses Enter gets
+    // a verdict immediately, without having to signal EOF (Ctrl-D).
+    //
+    // Safety is preserved by draining any bytes that arrived *together with*
+    // the first line. `BufReader` pulls a full chunk in one underlying read;
+    // for a clean single-line submission that chunk is exactly the line and
+    // `buffer()` is empty afterward, so no second (blocking) read occurs. For
+    // a multi-line paste / piped payload the remainder is already buffered, so
+    // we append it and hand the full content to the strict parser — which
+    // refuses embedded newlines exactly as the prior read-to-EOF path did, and
+    // those extra bytes are consumed here rather than leaking back to the
+    // shell.
+    let mut buffered = std::io::BufReader::new(input);
     let mut raw = String::new();
-    input.read_to_string(&mut raw)?;
+    buffered.read_line(&mut raw)?;
+    if !buffered.buffer().is_empty() {
+        buffered.read_to_string(&mut raw)?;
+    }
     let stripped = strip_one_trailing_newline(&raw);
     let decision = evaluate_operator_input(preview_record, stripped, checkpoint_baseline_unchanged);
 
@@ -18873,6 +18897,157 @@ mod approval_interaction_tests {
             .contains(&"a2-l2b-approval-refused"));
     }
 
+    // -- Enter-to-approve: interactive single-line submission --------------
+    //
+    // The interactive operator types the exact `apply <step-id>
+    // <preview_sha256>` line and presses Enter ONCE. The helper must reach a
+    // verdict on that single line WITHOUT waiting for a second read (which on
+    // a real TTY means waiting for EOF / Ctrl-D). These tests use readers that
+    // panic if read a second time, so they fail loudly if the helper ever
+    // falls back to read-to-EOF on a clean single-line submission.
+
+    /// Reader that serves a fixed payload on its first `read` call and then
+    /// panics on any subsequent `read`. Proves the helper consumes a clean
+    /// single-line submission without a second (EOF-seeking) read.
+    struct SingleServeThenPanicReader {
+        payload: Vec<u8>,
+        served: bool,
+    }
+
+    impl SingleServeThenPanicReader {
+        fn new(payload: &[u8]) -> Self {
+            Self {
+                payload: payload.to_vec(),
+                served: false,
+            }
+        }
+    }
+
+    impl Read for SingleServeThenPanicReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            assert!(
+                !self.served,
+                "run_approval_interaction read a second time on a single-line \
+                 submission — Enter alone must suffice (no Ctrl-D / read-to-EOF)"
+            );
+            self.served = true;
+            let n = self.payload.len().min(buf.len());
+            // Test payloads are far smaller than any BufReader fill, so a
+            // single serve always delivers the whole line.
+            assert_eq!(n, self.payload.len(), "test payload exceeded one read");
+            buf[..n].copy_from_slice(&self.payload[..n]);
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn enter_alone_approves_without_waiting_for_eof() {
+        let rec = mk_record(false, false, false);
+        let display = mk_display();
+        let line = format!("{}\n", approvable_input());
+        let reader = SingleServeThenPanicReader::new(line.as_bytes());
+        let mut output = Vec::<u8>::new();
+        let result = run_approval_interaction(&rec, &display, true, reader, &mut output).unwrap();
+        assert_eq!(
+            result.decision,
+            ApprovalDecision::Approved {
+                step_id: STEP.to_string(),
+                preview_sha256: HASH.to_string(),
+            }
+        );
+        assert_eq!(result.exit_code_hint, 0);
+    }
+
+    #[test]
+    fn enter_with_crlf_approves_without_waiting_for_eof() {
+        let rec = mk_record(false, false, false);
+        let display = mk_display();
+        let line = format!("{}\r\n", approvable_input());
+        let reader = SingleServeThenPanicReader::new(line.as_bytes());
+        let mut output = Vec::<u8>::new();
+        let result = run_approval_interaction(&rec, &display, true, reader, &mut output).unwrap();
+        assert_eq!(
+            result.decision,
+            ApprovalDecision::Approved {
+                step_id: STEP.to_string(),
+                preview_sha256: HASH.to_string(),
+            }
+        );
+        assert_eq!(result.exit_code_hint, 0);
+    }
+
+    /// Reader that returns EOF (`Ok(0)`) on its first read and panics if read
+    /// again. Proves the empty-input refusal path also stops after one read.
+    struct EofThenPanicReader {
+        served: bool,
+    }
+
+    impl Read for EofThenPanicReader {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            assert!(
+                !self.served,
+                "run_approval_interaction read again after EOF on empty input"
+            );
+            self.served = true;
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn eof_refuses_via_arg_count_without_extra_read() {
+        let rec = mk_record(false, false, false);
+        let display = mk_display();
+        let reader = EofThenPanicReader { served: false };
+        let mut output = Vec::<u8>::new();
+        let result = run_approval_interaction(&rec, &display, true, reader, &mut output).unwrap();
+        assert_eq!(
+            result.decision,
+            ApprovalDecision::Refused(ApprovalRefusal::ArgCount)
+        );
+        assert_eq!(result.exit_code_hint, EXIT_APPROVAL_DENIED);
+    }
+
+    #[test]
+    fn bad_approval_line_refuses_on_single_enter() {
+        // A malformed-but-single-line submission (Enter pressed once) must
+        // refuse on that line alone, without waiting for EOF.
+        let rec = mk_record(false, false, false);
+        let display = mk_display();
+        let reader = SingleServeThenPanicReader::new(b"approve now please\n");
+        let mut output = Vec::<u8>::new();
+        let result = run_approval_interaction(&rec, &display, true, reader, &mut output).unwrap();
+        assert!(
+            matches!(result.decision, ApprovalDecision::Refused(_)),
+            "expected refusal, got {:?}",
+            result.decision
+        );
+        assert_eq!(result.exit_code_hint, EXIT_APPROVAL_DENIED);
+    }
+
+    #[test]
+    fn multiline_paste_still_refused_no_enter_bypass() {
+        // SAFETY: a pasted blob whose first line is a valid approval but which
+        // carries an extra command line MUST still be refused (the embedded
+        // newline trips the strict parser), and the extra bytes must be
+        // consumed by the helper rather than left for the shell. Reading only
+        // the first line would approve here and leak the trailing command line
+        // (here a harmless `id`) to the shell — this test pins that the
+        // fallback drains the remainder and refuses.
+        let rec = mk_record(false, false, false);
+        let display = mk_display();
+        let input = format!("{}\nid\n", approvable_input());
+        let (result, _) = run_with_buffers(&rec, &display, true, input.as_bytes());
+        assert!(
+            matches!(
+                result.decision,
+                ApprovalDecision::Refused(ApprovalRefusal::ControlChars)
+            ),
+            "expected ControlChars refusal for multi-line paste, got {:?}",
+            result.decision
+        );
+        assert_eq!(result.exit_code_hint, EXIT_APPROVAL_DENIED);
+    }
+
     // -- 17. no target write APIs introduced (slice-3c helper section) -
 
     /// Source-grep test scoped to the slice-3c helper region of this
@@ -19772,6 +19947,69 @@ mod plan_approve_tests {
         assert!(markers
             .iter()
             .any(|m| m.as_str() == Some(APPROVAL_RESULT_AUDIT_NON_TTY)));
+    }
+
+    /// Reader that serves a fixed payload on the first read and panics if
+    /// read again — proves `run_plan_approve` reaches a verdict on a single
+    /// interactive Enter without a second (EOF-seeking / Ctrl-D) read.
+    struct ServeOnceThenPanicReader {
+        payload: Vec<u8>,
+        served: bool,
+    }
+    impl std::io::Read for ServeOnceThenPanicReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            assert!(
+                !self.served,
+                "run_plan_approve read a second time on a single-line submission \
+                 — Enter alone must suffice (no Ctrl-D)"
+            );
+            self.served = true;
+            let n = self.payload.len().min(buf.len());
+            assert_eq!(n, self.payload.len(), "test payload exceeded one read");
+            buf[..n].copy_from_slice(&self.payload[..n]);
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn run_plan_approve_enter_to_approve_single_line_no_ctrl_d() {
+        let dir = unique_temp_dir();
+        let (rec, disp) = build_bound_pair();
+        let path = write_bundle_json(&dir, &rec, &disp, true);
+        let line = format!("apply {} {}\n", rec.step_id, rec.preview_sha256);
+        let mut stdin = ServeOnceThenPanicReader {
+            payload: line.into_bytes(),
+            served: false,
+        };
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        // tty=true and only ONE line served: must approve without a second read.
+        let code = run_plan_approve(&path, true, &mut stdin, &mut stdout, &mut stderr);
+        assert_eq!(code, 0);
+        let json = parse_stdout_json(&stdout);
+        assert_eq!(json["decision"], "approved");
+        assert_eq!(json["preview_sha256"], rec.preview_sha256);
+        assert_eq!(json["exit_code_hint"], 0);
+    }
+
+    #[test]
+    fn run_plan_approve_tty_multiline_paste_refused_no_bypass() {
+        // SAFETY: even on a TTY, a pasted blob whose first line is a valid
+        // approval but which carries a trailing command line must be refused
+        // (embedded newline → strict parser), so single-line reading can never
+        // be abused to approve-and-leak the remainder to the shell.
+        let dir = unique_temp_dir();
+        let (rec, disp) = build_bound_pair();
+        let path = write_bundle_json(&dir, &rec, &disp, true);
+        let approval = format!("apply {} {}\nid\n", rec.step_id, rec.preview_sha256);
+        let (code, stdout, _stderr) = run_with(&path, true, approval.as_bytes());
+        assert_eq!(code, EXIT_APPROVAL_DENIED);
+        let json = parse_stdout_json(&stdout);
+        assert_eq!(json["decision"], "refused");
+        assert_eq!(
+            json["reason"].as_str().unwrap(),
+            "control-chars-in-approval"
+        );
     }
 
     #[test]
