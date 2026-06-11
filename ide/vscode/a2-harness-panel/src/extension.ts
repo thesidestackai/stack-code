@@ -14,6 +14,10 @@ import {
   renderHtml,
 } from "./render";
 import {
+  EvidenceSnapshotView,
+  parseEvidenceSnapshot,
+} from "./tier3EvidenceSnapshot";
+import {
   computeTier3Readiness,
   dirtyControlCheckoutBlock,
   Tier3Readiness,
@@ -114,6 +118,10 @@ interface SessionState {
   agentLedger: AgentLedgerEvent[];
   // Tier 3 Foundation v0: session-local mutation evidence ledger (read-only).
   mutationLedger: MutationLedgerEvent[];
+  // Operator-provided a2-tier3-evidence-snapshot.v0 text (Option A acquisition).
+  // The operator runs the read-only collector themselves and pastes the output;
+  // the panel obtains it by no spawn. null until provided.
+  evidenceSnapshotText: string | null;
 }
 
 const session: SessionState = {
@@ -132,6 +140,7 @@ const session: SessionState = {
   planCandidates: [],
   agentLedger: [],
   mutationLedger: [],
+  evidenceSnapshotText: null,
 };
 
 // Build the read-only A2 Local Coding Agent Foundation v0 view from the pure
@@ -284,6 +293,19 @@ function buildExecutorDryRunView(): ExecutorDryRunView {
   };
 }
 
+// Build the read-only Tier 3 evidence snapshot view (Option A). The SOLE input
+// is operator-provided snapshot text held in session; nothing is acquired here
+// (no fs, no spawn, no network). When no text is set, the view is absent and the
+// section degrades to a muted placeholder. A bad/mismatched snapshot yields the
+// pure renderer's fail-closed view (it never fabricates readiness).
+function buildEvidenceSnapshotView(): EvidenceSnapshotView | null {
+  const text = session.evidenceSnapshotText;
+  if (typeof text !== "string" || text.trim().length === 0) {
+    return null;
+  }
+  return parseEvidenceSnapshot(text);
+}
+
 function model(): RenderModel {
   return {
     inputs: session.inputs,
@@ -296,6 +318,7 @@ function model(): RenderModel {
     foundation: buildFoundationView(),
     tier3: buildTier3View(),
     executorDryRun: buildExecutorDryRunView(),
+    evidenceSnapshot: buildEvidenceSnapshotView(),
   };
 }
 
@@ -426,6 +449,25 @@ async function pickPath(prompt: string, key: keyof PanelInputs): Promise<void> {
     }
     record(timelineEvent("field-set", `${String(key)} = ${v ?? "(cleared)"}`));
     recomputeViews();
+    rerender();
+  }
+}
+
+// Option A acquisition: capture the operator-provided evidence-snapshot text.
+// The operator runs the read-only collector themselves and pastes its output;
+// this only stores the text on the session and re-renders. It spawns nothing,
+// reads no file, and runs no helper subcommand. Clearing the input removes it.
+async function pasteEvidenceSnapshot(): Promise<void> {
+  const value = await vscode.window.showInputBox({
+    prompt:
+      "Paste the read-only a2-tier3-evidence-snapshot.v0 JSON (run the collector yourself; the panel obtains nothing). Empty clears it.",
+    ignoreFocusOut: true,
+  });
+  if (value !== undefined) {
+    const v = value.trim().length > 0 ? value.trim() : null;
+    session.evidenceSnapshotText = v;
+    session.notice = null;
+    record(timelineEvent("field-set", `evidence-snapshot = ${v ? "(provided)" : "(cleared)"}`));
     rerender();
   }
 }
@@ -772,6 +814,11 @@ function openPanel(): void {
 export function activate(context: vscode.ExtensionContext): void {
   const disposable = vscode.commands.registerCommand("a2HarnessPanel.open", openPanel);
   context.subscriptions.push(disposable);
+  const pasteSnapshot = vscode.commands.registerCommand(
+    "a2HarnessPanel.pasteEvidenceSnapshot",
+    pasteEvidenceSnapshot,
+  );
+  context.subscriptions.push(pasteSnapshot);
 }
 
 export function deactivate(): void {

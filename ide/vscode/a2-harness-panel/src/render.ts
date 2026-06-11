@@ -15,6 +15,10 @@ import {
   workflowUiButtons,
 } from "./buttons";
 import { SetupStatus } from "./setupStatus";
+import {
+  EvidenceSnapshotView,
+  renderEvidenceSnapshotHtml,
+} from "./tier3EvidenceSnapshot";
 
 export interface PanelInputs {
   workspace: string | null;
@@ -138,6 +142,11 @@ export interface RenderModel {
   // hint when absent). Read-only; PRINTS the dry-run command + renders the
   // dry-run result. The panel never spawns the executor and never writes.
   executorDryRun?: ExecutorDryRunView | null;
+  // Tier 3 read-only evidence snapshot view (optional; degrades to a muted hint
+  // when absent). Read-only; rendered by the pure tier3EvidenceSnapshot module
+  // from an operator-provided a2-tier3-evidence-snapshot.v0. The panel acquires
+  // the snapshot as text and obtains it by no spawn; this view adds no control.
+  evidenceSnapshot?: EvidenceSnapshotView | null;
 }
 
 // Tier 3 Mutation Executor v0 (dry-run) — read-only view. All data is
@@ -553,6 +562,23 @@ ${evidence}
 </section>`;
 }
 
+// ---- Tier 3 read-only evidence snapshot section ---------------------------
+//
+// Status-only. When a parsed view is present it embeds the pure renderer's
+// read-only fragment (renderEvidenceSnapshotHtml — which exposes ZERO controls
+// and is fail-closed); when absent it renders a muted placeholder whose body is
+// guidance text, NOT a control. The snapshot is acquired as operator-provided
+// text; the panel obtains it by no spawn and renders it read-only.
+function evidenceSnapshotBlock(view: EvidenceSnapshotView | null | undefined): string {
+  if (!view) {
+    return `<section class="evidence-snapshot" data-testid="evidence-snapshot">
+  <h3>Tier 3 evidence snapshot (read-only)</h3>
+  <p class="muted" data-testid="evidence-snapshot-empty">No snapshot provided. Run the read-only collector yourself and paste its <code>a2-tier3-evidence-snapshot.v0</code> output (A2 Harness: Paste Tier 3 Evidence Snapshot). This section then renders it read-only. The panel obtains nothing on its own and shows no control here.</p>
+</section>`;
+  }
+  return renderEvidenceSnapshotHtml(view);
+}
+
 export function renderHtml(model: RenderModel): string {
   const i = model.inputs;
   const inputRows = [
@@ -624,5 +650,6 @@ ${timelineBlock(model.timeline)}
 ${foundationBlock(model.foundation)}
 ${tier3Block(model.tier3)}
 ${executorDryRunBlock(model.executorDryRun)}
+${evidenceSnapshotBlock(model.evidenceSnapshot)}
 </body></html>`;
 }
