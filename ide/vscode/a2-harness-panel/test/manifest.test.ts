@@ -16,11 +16,14 @@ function loadManifest(): Manifest {
   return JSON.parse(fs.readFileSync(PACKAGE_JSON_PATH, "utf8")) as Manifest;
 }
 
-describe("manifest — contributes only a read-only open command", () => {
-  it("declares exactly one command: a2HarnessPanel.open", () => {
+describe("manifest — contributes only read-only commands", () => {
+  it("declares exactly the read-only commands: open + pasteEvidenceSnapshot", () => {
     const m = loadManifest();
-    assert.strictEqual(m.contributes.commands.length, 1);
-    assert.strictEqual(m.contributes.commands[0].command, "a2HarnessPanel.open");
+    const ids = m.contributes.commands.map((c) => c.command).sort();
+    assert.deepStrictEqual(ids, [
+      "a2HarnessPanel.open",
+      "a2HarnessPanel.pasteEvidenceSnapshot",
+    ]);
   });
 
   it("no contributed command title is a Run-* / approve / apply control", () => {
@@ -30,9 +33,12 @@ describe("manifest — contributes only a read-only open command", () => {
     }
   });
 
-  it("activates only on its own command (no '*', no file-system events)", () => {
+  it("activates only on its own commands (no '*', no file-system events)", () => {
     const m = loadManifest();
-    assert.deepStrictEqual(m.activationEvents, ["onCommand:a2HarnessPanel.open"]);
+    assert.deepStrictEqual(m.activationEvents, [
+      "onCommand:a2HarnessPanel.open",
+      "onCommand:a2HarnessPanel.pasteEvidenceSnapshot",
+    ]);
     for (const ev of m.activationEvents) {
       assert.ok(!/onDidChange|workspaceContains|\*/.test(ev), `broad activation: ${ev}`);
     }

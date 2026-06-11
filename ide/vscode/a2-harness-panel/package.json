@@ -14,7 +14,8 @@
     "Other"
   ],
   "activationEvents": [
-    "onCommand:a2HarnessPanel.open"
+    "onCommand:a2HarnessPanel.open",
+    "onCommand:a2HarnessPanel.pasteEvidenceSnapshot"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -22,6 +23,11 @@
       {
         "command": "a2HarnessPanel.open",
         "title": "A2 Harness: Open Panel",
+        "category": "A2 Harness"
+      },
+      {
+        "command": "a2HarnessPanel.pasteEvidenceSnapshot",
+        "title": "A2 Harness: Paste Tier 3 Evidence Snapshot (read-only)",
         "category": "A2 Harness"
       }
     ],
