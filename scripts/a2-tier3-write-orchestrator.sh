@@ -963,7 +963,7 @@ EOF
 
 main() {
   local sub=${1:-help}
-  [[ $# -gt 0 ]] && shift || true
+  if [[ $# -gt 0 ]]; then shift; fi
   case "$sub" in
     help|-h|--help) usage ;;
     validate-lane)
