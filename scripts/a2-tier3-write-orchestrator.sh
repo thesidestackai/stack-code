@@ -793,6 +793,125 @@ PY
   info "package-plan: READ-ONLY. would_push=false would_open_pr=false. No git mutation performed."
 }
 
+# Shared Tier-4 readiness gate for package-plan (Stage 1) and package-commit
+# (Stage 2). READ-ONLY: it stages/commits/pushes nothing. Echoes refusals;
+# returns EXIT_GATE on any refusal, EXIT_OK otherwise. On success it sets
+# _TIER4_DECLARED (array), _TIER4_BRANCH, _TIER4_BASE for the caller. The caller
+# validates --worktree/--approved-lane presence and lane-file existence first.
+_TIER4_DECLARED=()
+_TIER4_BRANCH=""
+_TIER4_BASE=""
+_tier4_gate_package() {
+  local wt=$1 lane=$2 plan=${3:-}
+  local refusals=0
+  _t4_reject() { err "TIER-4 GATE REFUSED: $*"; refusals=$((refusals + 1)); }
+
+  # ---- PURE gates (no git IO; mirror validate-lane; refuse BEFORE any git) ----
+  local lane_wt branch base approved
+  lane_wt=$(json_scalar "$lane" "worktreePlan.worktreePath")
+  branch=$(json_scalar "$lane" "worktreePlan.branch")
+  base=$(json_scalar "$lane" "worktreePlan.base")
+  approved=$(json_scalar "$lane" "operatorApproved")
+
+  local problems p
+  problems=$(validate_worktree_plan "$lane_wt" "$branch" "$base")
+  while IFS= read -r p; do [[ -n "$p" ]] && _t4_reject "worktree plan: $p"; done <<<"$problems"
+
+  [[ "$(normalize_abs "$wt")" == "$(normalize_abs "$lane_wt")" ]] \
+    || _t4_reject "--worktree ($wt) does not match the approved lane worktreePath ($lane_wt)"
+  [[ "$approved" == "true" ]] || _t4_reject "operatorApproved is not true"
+
+  local declared=() d res
+  mapfile -t declared < <(json_array "$lane" "declaredPaths")
+  [[ ${#declared[@]} -gt 0 ]] || _t4_reject "no declared touched files in the approved lane"
+  for d in "${declared[@]:-}"; do
+    [[ -z "$d" ]] && continue
+    res=$(classify_write "$d" "$lane_wt" "${declared[@]}")
+    [[ "$res" == accepted:* ]] || _t4_reject "declared path $d -> $res"
+  done
+
+  if [[ -n "$plan" ]]; then
+    if [[ ! -f "$plan" ]]; then
+      _t4_reject "plan file not found: $plan"
+    else
+      local kind val abs target_count=0
+      while IFS=$'\t' read -r kind val; do
+        [[ -z "$kind" ]] && continue
+        if [[ "$kind" == "target" ]]; then
+          target_count=$((target_count + 1))
+          if [[ ${val:0:1} == "/" ]]; then _t4_reject "plan write_target.path must be workspace-relative, not absolute: $val"; continue; fi
+          abs=$(normalize_abs "$lane_wt/$val")
+          res=$(classify_write "$abs" "$lane_wt" "${declared[@]}")
+          [[ "$res" == accepted:* ]] || _t4_reject "plan write_target $val ($abs) -> $res"
+        elif [[ "$kind" == "source" ]]; then
+          [[ ${val:0:1} != "/" ]] || _t4_reject "plan after_file (source) must be workspace-relative, not absolute: $val"
+        fi
+      done < <(plan_paths "$plan")
+      [[ $target_count -gt 0 ]] || _t4_reject "plan declares no write_target.path; nothing to package"
+    fi
+  fi
+
+  # Stop BEFORE any git IO if a pure gate refused (keeps offline gate tests deterministic).
+  if [[ $refusals -gt 0 ]]; then
+    err "$refusals pure-gate refusal(s); lane is NOT package-ready."
+    return $EXIT_GATE
+  fi
+
+  # ---- LIVE read-only gates (git IO; NO mutation) ----
+  if [[ ! -d "$wt" ]] || ! git -C "$wt" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    _t4_reject "worktree is not a git work tree: $wt"
+  fi
+
+  if [[ $refusals -eq 0 ]]; then
+    local cur_branch
+    cur_branch=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+    [[ "$cur_branch" == "$branch" ]] || _t4_reject "worktree branch ($cur_branch) does not match approved lane branch ($branch)"
+
+    local ctl
+    ctl=$(git -C "$CONTROL_CHECKOUT" status --porcelain --untracked-files=all 2>/dev/null || echo "__ERR__")
+    if [[ "$ctl" == "__ERR__" ]]; then _t4_reject "cannot read control checkout: $CONTROL_CHECKOUT"
+    elif [[ -n "$ctl" ]]; then _t4_reject "control checkout is not clean — refuse to package from a dirty base"; fi
+
+    # Drift guard: every worktree change must be in the declared set (ignored .claw excepted).
+    local line pth abs2
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      pth=${line:3}
+      [[ "$pth" == *" -> "* ]] && pth=${pth##* -> }   # rename: take the new path
+      abs2=$(normalize_abs "$wt/$pth")
+      is_under "$wt/.claw" "$abs2" && continue
+      res=$(classify_write "$abs2" "$wt" "${declared[@]}")
+      [[ "$res" == accepted:* ]] || _t4_reject "drift: worktree change outside declared set: $pth ($res)"
+    done < <(git -C "$wt" status --porcelain --untracked-files=all 2>/dev/null || true)
+
+    # Per declared file: present on disk AND its sha256 matches a recorded payload after.sha256.
+    local rel sha rec
+    for d in "${declared[@]}"; do
+      rel=${d#"$wt"/}
+      if [[ ! -f "$d" ]]; then _t4_reject "declared file missing on disk (not applied?): $rel"; continue; fi
+      sha=$(sha256_of "$d")
+      rec=$(matching_after_sha "$wt" "$sha")
+      [[ -n "$rec" ]] || _t4_reject "no checkpoint payload after.sha256 matches on-disk $rel (apply evidence missing / drift)"
+    done
+
+    # Apply evidence presence: a generated apply-bundle + a checkpoint baseline.
+    [[ -n "$(find "$wt/.claw" -type f -name 'apply-bundle.json' 2>/dev/null | head -n1)" ]] \
+      || _t4_reject "no apply-bundle.json under .claw (mutation not applied via the chain)"
+    [[ -n "$(find "$wt/.claw" -type d -name 'l2b-checkpoints' 2>/dev/null | head -n1)" ]] \
+      || _t4_reject "no l2b-checkpoints under .claw (no rollback baseline / not applied)"
+  fi
+
+  if [[ $refusals -gt 0 ]]; then
+    err "$refusals package-readiness gate refusal(s); worktree is NOT package-ready."
+    return $EXIT_GATE
+  fi
+
+  _TIER4_DECLARED=("${declared[@]}")
+  _TIER4_BRANCH=$branch
+  _TIER4_BASE=$base
+  return $EXIT_OK
+}
+
 # package-plan --worktree <path> --approved-lane <lane.json> [--plan <plan.yaml>]
 cmd_package_plan() {
   local wt="" lane="" plan=""
@@ -807,111 +926,127 @@ cmd_package_plan() {
   [[ -n "$wt" && -n "$lane" ]] || { err "package-plan requires --worktree and --approved-lane"; return $EXIT_USAGE; }
   [[ -f "$lane" ]] || { err "approved-lane file not found: $lane"; return $EXIT_USAGE; }
 
-  local refusals=0
-  _pp_reject() { err "PACKAGE-PLAN GATE REFUSED: $*"; refusals=$((refusals + 1)); }
-
-  # ---- PURE gates (no git IO; mirror validate-lane; refuse BEFORE any git) ----
-  local lane_wt branch base approved
-  lane_wt=$(json_scalar "$lane" "worktreePlan.worktreePath")
-  branch=$(json_scalar "$lane" "worktreePlan.branch")
-  base=$(json_scalar "$lane" "worktreePlan.base")
-  approved=$(json_scalar "$lane" "operatorApproved")
-
-  local problems p
-  problems=$(validate_worktree_plan "$lane_wt" "$branch" "$base")
-  while IFS= read -r p; do [[ -n "$p" ]] && _pp_reject "worktree plan: $p"; done <<<"$problems"
-
-  [[ "$(normalize_abs "$wt")" == "$(normalize_abs "$lane_wt")" ]] \
-    || _pp_reject "--worktree ($wt) does not match the approved lane worktreePath ($lane_wt)"
-  [[ "$approved" == "true" ]] || _pp_reject "operatorApproved is not true"
-
-  local declared=() d res
-  mapfile -t declared < <(json_array "$lane" "declaredPaths")
-  [[ ${#declared[@]} -gt 0 ]] || _pp_reject "no declared touched files in the approved lane"
-  for d in "${declared[@]:-}"; do
-    [[ -z "$d" ]] && continue
-    res=$(classify_write "$d" "$lane_wt" "${declared[@]}")
-    [[ "$res" == accepted:* ]] || _pp_reject "declared path $d -> $res"
-  done
-
-  if [[ -n "$plan" ]]; then
-    if [[ ! -f "$plan" ]]; then
-      _pp_reject "plan file not found: $plan"
-    else
-      local kind val abs target_count=0
-      while IFS=$'\t' read -r kind val; do
-        [[ -z "$kind" ]] && continue
-        if [[ "$kind" == "target" ]]; then
-          target_count=$((target_count + 1))
-          if [[ ${val:0:1} == "/" ]]; then _pp_reject "plan write_target.path must be workspace-relative, not absolute: $val"; continue; fi
-          abs=$(normalize_abs "$lane_wt/$val")
-          res=$(classify_write "$abs" "$lane_wt" "${declared[@]}")
-          [[ "$res" == accepted:* ]] || _pp_reject "plan write_target $val ($abs) -> $res"
-        elif [[ "$kind" == "source" ]]; then
-          [[ ${val:0:1} != "/" ]] || _pp_reject "plan after_file (source) must be workspace-relative, not absolute: $val"
-        fi
-      done < <(plan_paths "$plan")
-      [[ $target_count -gt 0 ]] || _pp_reject "plan declares no write_target.path; nothing to package"
-    fi
-  fi
-
-  # Stop BEFORE any git IO if a pure gate refused (keeps offline gate tests deterministic).
-  if [[ $refusals -gt 0 ]]; then
-    err "$refusals pure-gate refusal(s); lane is NOT package-ready."
-    return $EXIT_GATE
-  fi
-
-  # ---- LIVE read-only gates (git IO; NO mutation) ----
-  if [[ ! -d "$wt" ]] || ! git -C "$wt" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    _pp_reject "worktree is not a git work tree: $wt"
-  fi
-
-  if [[ $refusals -eq 0 ]]; then
-    local cur_branch
-    cur_branch=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
-    [[ "$cur_branch" == "$branch" ]] || _pp_reject "worktree branch ($cur_branch) does not match approved lane branch ($branch)"
-
-    local ctl
-    ctl=$(git -C "$CONTROL_CHECKOUT" status --porcelain --untracked-files=all 2>/dev/null || echo "__ERR__")
-    if [[ "$ctl" == "__ERR__" ]]; then _pp_reject "cannot read control checkout: $CONTROL_CHECKOUT"
-    elif [[ -n "$ctl" ]]; then _pp_reject "control checkout is not clean — refuse to package from a dirty base"; fi
-
-    # Drift guard: every worktree change must be in the declared set (ignored .claw excepted).
-    local line pth abs2
-    while IFS= read -r line; do
-      [[ -z "$line" ]] && continue
-      pth=${line:3}
-      [[ "$pth" == *" -> "* ]] && pth=${pth##* -> }   # rename: take the new path
-      abs2=$(normalize_abs "$wt/$pth")
-      is_under "$wt/.claw" "$abs2" && continue
-      res=$(classify_write "$abs2" "$wt" "${declared[@]}")
-      [[ "$res" == accepted:* ]] || _pp_reject "drift: worktree change outside declared set: $pth ($res)"
-    done < <(git -C "$wt" status --porcelain --untracked-files=all 2>/dev/null || true)
-
-    # Per declared file: present on disk AND its sha256 matches a recorded payload after.sha256.
-    local rel sha rec
-    for d in "${declared[@]}"; do
-      rel=${d#"$wt"/}
-      if [[ ! -f "$d" ]]; then _pp_reject "declared file missing on disk (not applied?): $rel"; continue; fi
-      sha=$(sha256_of "$d")
-      rec=$(matching_after_sha "$wt" "$sha")
-      [[ -n "$rec" ]] || _pp_reject "no checkpoint payload after.sha256 matches on-disk $rel (apply evidence missing / drift)"
-    done
-
-    # Apply evidence presence: a generated apply-bundle + a checkpoint baseline.
-    [[ -n "$(find "$wt/.claw" -type f -name 'apply-bundle.json' 2>/dev/null | head -n1)" ]] \
-      || _pp_reject "no apply-bundle.json under .claw (mutation not applied via the chain)"
-    [[ -n "$(find "$wt/.claw" -type d -name 'l2b-checkpoints' 2>/dev/null | head -n1)" ]] \
-      || _pp_reject "no l2b-checkpoints under .claw (no rollback baseline / not applied)"
-  fi
-
-  if [[ $refusals -gt 0 ]]; then
-    err "$refusals package-plan gate refusal(s); worktree is NOT package-ready."
-    return $EXIT_GATE
-  fi
+  _tier4_gate_package "$wt" "$lane" "$plan" || return $?
 
   rule; info "Tier-4 package-plan (READ-ONLY) — worktree is package-ready"; rule
-  emit_package_plan "$wt" "$branch" "$base" "${declared[@]}"
+  emit_package_plan "$wt" "$_TIER4_BRANCH" "$_TIER4_BASE" "${_TIER4_DECLARED[@]}"
+  return $EXIT_OK
+}
+
+# ---- Tier-4 packaging COMMIT (package-commit) — Stage 2 ---------------------
+# Stage 2 of docs/a2-tier3-tier4-pr-packaging-design-scope.md. Reuses the SAME
+# read-only readiness gate as package-plan, then stages EXACTLY the declared set
+# and makes ONE evidence-bound commit INSIDE the disposable worktree. It NEVER
+# pushes, opens a PR, merges, mutates the control checkout, stages anything
+# outside the declared set, or uses `git add .` / `git add -A`. pushed /
+# pr_opened / merged are always false. Fail-closed: any refusal exits EXIT_GATE
+# without committing.
+
+# Emit the Stage-2 package-commit evidence JSON (AFTER the in-worktree commit).
+# Runs NO further git mutation. pushed / pr_opened / merged are emitted false.
+emit_package_commit() {
+  local wt=$1 branch=$2 base_sha=$3 commit_sha=$4; shift 4
+  local declared=("$@") payload=() d rel sha
+  for d in "${declared[@]}"; do
+    rel=${d#"$wt"/}; sha=$(sha256_of "$d")
+    payload+=("$rel" "$sha")
+  done
+  python3 - "$wt" "$branch" "$base_sha" "$commit_sha" "${payload[@]}" <<'PY'
+import json, sys
+wt, branch, base_sha, commit_sha = sys.argv[1:5]
+rest = sys.argv[5:]
+per = [{"path": rest[i], "after_sha256": rest[i + 1], "applied": True}
+       for i in range(0, len(rest), 2)]
+ev = {
+    "schema_version": "a2-tier4-package-commit.v0",
+    "stage": "tier4-stage2-package-commit",
+    "base_sha": base_sha,
+    "worktree": wt,
+    "branch": branch,
+    "declared_files": [p["path"] for p in per],
+    "staged_files": [p["path"] for p in per],
+    "perFile": per,
+    "commit_sha": commit_sha,
+    "would_push": False,
+    "would_open_pr": False,
+    "pushed": False,
+    "pr_opened": False,
+    "merged": False,
+}
+print(json.dumps(ev, indent=2, sort_keys=True))
+PY
+  rule
+  info "NEXT (Stages 3-4 — a LATER lane; require: APPROVED: Open A2 Tier 3 isolated-mutation PR):"
+  info "  #   git -C $(shq "$wt") push -u origin $(shq "$branch")"
+  info "  #   gh pr create --base main --head $(shq "$branch") --draft"
+  rule
+  info "package-commit: committed INSIDE the disposable worktree only. pushed=false pr_opened=false merged=false."
+}
+
+# package-commit --worktree <path> --approved-lane <lane.json> [--plan <plan.yaml>]
+cmd_package_commit() {
+  local wt="" lane="" plan=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --worktree) wt=${2:-}; shift 2 ;;
+      --approved-lane) lane=${2:-}; shift 2 ;;
+      --plan) plan=${2:-}; shift 2 ;;
+      *) err "unexpected argument: $1"; return $EXIT_USAGE ;;
+    esac
+  done
+  [[ -n "$wt" && -n "$lane" ]] || { err "package-commit requires --worktree and --approved-lane"; return $EXIT_USAGE; }
+  [[ -f "$lane" ]] || { err "approved-lane file not found: $lane"; return $EXIT_USAGE; }
+
+  # Same read-only readiness gate as package-plan (Stage 1). Refuses BEFORE any
+  # staging on base/branch/approval/scope/drift/hash/evidence problems.
+  _tier4_gate_package "$wt" "$lane" "$plan" || return $?
+  local branch=$_TIER4_BRANCH
+  local declared=("${_TIER4_DECLARED[@]}")
+
+  # Stage-2 precondition: the index must already be clean (the apply chain writes
+  # the working tree but stages nothing). A pre-staged index is unexpected — refuse
+  # rather than fold foreign staged content into the commit.
+  if ! git -C "$wt" diff --cached --quiet; then
+    err "TIER-4 STAGE2 REFUSED: disposable worktree index is not clean (unexpected pre-staged changes); nothing committed."
+    return $EXIT_GATE
+  fi
+
+  # base_sha = the worktree HEAD the Stage-2 commit will sit on top of (read-only).
+  local base_sha; base_sha=$(git -C "$wt" rev-parse HEAD 2>/dev/null || echo "")
+
+  # Stage EXACTLY the declared set, one exact path at a time. NEVER `git add .` / `-A`.
+  local d rel declared_rel=()
+  for d in "${declared[@]}"; do
+    rel=${d#"$wt"/}
+    declared_rel+=("$rel")
+    git -C "$wt" add -- "$rel" || { err "TIER-4 STAGE2 REFUSED: failed to stage $rel; nothing committed."; return $EXIT_GATE; }
+  done
+
+  # Verify the staged set EXACTLY equals the declared set (no more, no fewer).
+  local staged_sorted declared_sorted
+  staged_sorted=$(git -C "$wt" diff --cached --name-only | sort)
+  declared_sorted=$(printf '%s\n' "${declared_rel[@]}" | sort)
+  if [[ "$staged_sorted" != "$declared_sorted" ]]; then
+    err "TIER-4 STAGE2 REFUSED: staged set != declared set; refusing to commit."
+    err "  declared: $(printf '%s ' "${declared_rel[@]}")"
+    err "  staged:   ${staged_sorted//$'\n'/ }"
+    git -C "$wt" reset -q -- . 2>/dev/null || true   # unstage only (NOT --hard; files stay on disk)
+    return $EXIT_GATE
+  fi
+
+  # ONE evidence-bound commit INSIDE the disposable worktree (never the control checkout).
+  local msg
+  msg="a2(tier4): package isolated mutation on $branch (${#declared_rel[@]} file(s))
+
+stage: tier4-stage2-package-commit
+pushed: false  pr_opened: false  merged: false"
+  git -C "$wt" commit -q -m "$msg" \
+    || { err "TIER-4 STAGE2 REFUSED: commit failed inside the disposable worktree."; return $EXIT_GATE; }
+
+  local commit_sha; commit_sha=$(git -C "$wt" rev-parse HEAD)
+
+  rule; info "Tier-4 package-commit (Stage 2) — committed INSIDE the disposable worktree"; rule
+  emit_package_commit "$wt" "$branch" "$base_sha" "$commit_sha" "${declared[@]}"
   return $EXIT_OK
 }
 
@@ -950,6 +1085,15 @@ Subcommands:
       Fail-closed on drift, hash mismatch, dirty control checkout, or missing
       apply evidence.
 
+  package-commit --worktree <path> --approved-lane <lane.json> [--plan <plan.yaml>]
+      Tier-4 Stage 2. Runs the SAME read-only readiness gate as package-plan,
+      then stages EXACTLY the declared set (exact-path \`git add --\`; never
+      \`git add .\` / \`-A\`) and makes ONE evidence-bound commit INSIDE the
+      disposable worktree. NEVER pushes, opens a PR, merges, or touches the
+      control checkout; pushed/pr_opened/merged are always false. Refuses if the
+      index is pre-staged or the staged set != declared set. Push/PR (Stages 3-4)
+      remain a separate, token-gated lane.
+
 Environment:
   A2_CLAW   path to the built claw binary (default: the dated build artifact).
             current: $A2_CLAW
@@ -981,6 +1125,7 @@ main() {
       ;;
     apply-lane) cmd_apply_lane "$@" ;;
     package-plan) cmd_package_plan "$@" ;;
+    package-commit) cmd_package_commit "$@" ;;
     *) err "unknown subcommand: $sub"; info ""; usage; exit $EXIT_USAGE ;;
   esac
 }
