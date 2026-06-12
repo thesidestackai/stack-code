@@ -261,6 +261,153 @@ approve_rc_case "approve rc=7  -> denied/eof/non-tty" 7  denied-eof-nontty
 approve_rc_case "approve rc=12 -> output-io"          12 output-io
 approve_rc_case "approve rc=3  -> unknown"            3  unknown
 
+# ============================================================================
+# package-plan (Tier-4 Stage 1, READ-ONLY) — design:
+# docs/a2-tier3-tier4-pr-packaging-design-scope.md
+# Pure gates refuse offline (no git); live gates use hermetic git fixtures wired
+# via A2_CONTROL_CHECKOUT / A2_DISPOSABLE_WORKTREE_ROOT (test-only env overrides).
+# package-plan must NEVER mutate git (no add/commit/push/PR); would_push=false.
+# ============================================================================
+
+# ---- pure-gate refusals (offline; refuse BEFORE any git IO) -----------------
+# Use default-root paths so these are independent of the live fixtures/env.
+PWT="/mnt/vast-data/git-worktrees/__a2_tier4_pp__"
+PDECL="[\"$PWT/notes.md\"]"
+
+run_case "package-plan: missing args -> usage(2)"     2 package-plan --worktree "$PWT"
+
+write_lane "$D/pp_base.json"  true  main        feat/x "$PWT" "$PDECL" '[]' '[]'
+run_case "package-plan: base not origin/main(4)"      4 package-plan --worktree "$PWT" --approved-lane "$D/pp_base.json"
+
+write_lane "$D/pp_appr.json"  false origin/main feat/x "$PWT" "$PDECL" '[]' '[]'
+run_case "package-plan: operatorApproved=false(4)"    4 package-plan --worktree "$PWT" --approved-lane "$D/pp_appr.json"
+
+write_lane "$D/pp_nodecl.json" true origin/main feat/x "$PWT" '[]' '[]' '[]'
+run_case "package-plan: empty declared set(4)"        4 package-plan --worktree "$PWT" --approved-lane "$D/pp_nodecl.json"
+
+write_lane "$D/pp_brmain.json" true origin/main main   "$PWT" "$PDECL" '[]' '[]'
+run_case "package-plan: branch is main(4)"            4 package-plan --worktree "$PWT" --approved-lane "$D/pp_brmain.json"
+
+write_lane "$D/pp_good.json"  true origin/main feat/x "$PWT" "$PDECL" '[]' '[]'
+run_case "package-plan: --worktree mismatches lane(4)" 4 package-plan --worktree "/mnt/vast-data/git-worktrees/__other__" --approved-lane "$D/pp_good.json"
+
+# ---- live read-only gates (hermetic git fixtures) --------------------------
+PKG_ROOT="$(mktemp -d -p "$WORK_DIR")"
+PKG_CTL="$PKG_ROOT/control"; PKG_WTR="$PKG_ROOT/wtroot"
+mkdir -p "$PKG_CTL"
+git -C "$PKG_CTL" init -q
+git -C "$PKG_CTL" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+
+# build_applied_wt <name> <branch> — applied disposable worktree fixture:
+# history + uncommitted declared file (notes.md) + matching .claw payload
+# after.sha256 + apply-bundle + checkpoint dir. Echoes the worktree path.
+build_applied_wt() {
+  local name=$1 branch=$2
+  local wt="$PKG_WTR/$name" sha
+  mkdir -p "$wt"
+  git -C "$wt" init -q
+  git -C "$wt" checkout -q -b "$branch"
+  git -C "$wt" -c user.email=t@t -c user.name=t commit -q --allow-empty -m base
+  printf 'hello tier4\n' > "$wt/notes.md"
+  sha=$(sha256sum "$wt/notes.md" | awk '{print $1}')
+  mkdir -p "$wt/.claw/l2b-payloads/RUN/STEP" "$wt/.claw/l2b-preview-bundles/RUN/STEP" "$wt/.claw/l2b-checkpoints/RUN/STEP"
+  printf '%s\n' "$sha" > "$wt/.claw/l2b-payloads/RUN/STEP/after.sha256"
+  printf '{}' > "$wt/.claw/l2b-preview-bundles/RUN/STEP/apply-bundle.json"
+  printf '%s' "$wt"
+}
+
+# pkg_lane <file> <wt> <branch> — minimal approved lane for the fixture.
+pkg_lane() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import json,sys
+f,wt,branch=sys.argv[1:4]
+json.dump({"objective":"t","worktreePlan":{"worktreePath":wt,"branch":branch,"base":"origin/main"},
+           "declaredPaths":[wt+"/notes.md"],"operatorApproved":True}, open(f,"w"))
+PY
+}
+
+# run_pkg <name> <expect> <args...> — package-plan with the hermetic env.
+run_pkg() {
+  local name=$1 expect=$2; shift 2
+  local rc=0
+  A2_CONTROL_CHECKOUT="$PKG_CTL" A2_DISPOSABLE_WORKTREE_ROOT="$PKG_WTR" \
+    "${ORCH}" "$@" >/dev/null 2>&1 || rc=$?
+  if [[ "$rc" -eq "$expect" ]]; then
+    PASS_COUNT=$((PASS_COUNT+1)); printf 'PASS  %-52s (exit %s)\n' "$name" "$rc"
+  else
+    FAIL_COUNT=$((FAIL_COUNT+1)); printf 'FAIL  %-52s (got %s, want %s)\n' "$name" "$rc" "$expect"
+  fi
+}
+
+WT_OK="$(build_applied_wt ok feat/x)"
+pkg_lane "$PKG_ROOT/lane_ok.json" "$WT_OK" feat/x
+run_pkg "package-plan: happy path package-ready(0)"   0 package-plan --worktree "$WT_OK" --approved-lane "$PKG_ROOT/lane_ok.json"
+
+# proof of NO git mutation after the happy-path plan: nothing staged/committed,
+# HEAD unchanged, no new commit, notes.md still untracked.
+HEAD_BEFORE="$(git -C "$WT_OK" rev-parse HEAD)"
+A2_CONTROL_CHECKOUT="$PKG_CTL" A2_DISPOSABLE_WORKTREE_ROOT="$PKG_WTR" \
+  "${ORCH}" package-plan --worktree "$WT_OK" --approved-lane "$PKG_ROOT/lane_ok.json" >/dev/null 2>&1 || true
+HEAD_AFTER="$(git -C "$WT_OK" rev-parse HEAD)"
+STAGED="$(git -C "$WT_OK" diff --cached --name-only)"
+UNTRACKED_NOTES="$(git -C "$WT_OK" status --porcelain -- notes.md)"
+if [[ "$HEAD_BEFORE" == "$HEAD_AFTER" && -z "$STAGED" && "$UNTRACKED_NOTES" == '?? notes.md' ]]; then
+  PASS_COUNT=$((PASS_COUNT+1)); printf 'PASS  %-52s (no git mutation)\n' "package-plan: performed zero git mutation"
+else
+  FAIL_COUNT=$((FAIL_COUNT+1)); printf 'FAIL  %-52s (HEAD/%s staged/%s notes/%s)\n' "package-plan: performed zero git mutation" "$HEAD_AFTER" "$STAGED" "$UNTRACKED_NOTES"
+fi
+
+# drift: an out-of-declared-set untracked file -> refuse(4).
+WT_DRIFT="$(build_applied_wt drift feat/x)"; printf 'x' > "$WT_DRIFT/EXTRA.txt"
+pkg_lane "$PKG_ROOT/lane_drift.json" "$WT_DRIFT" feat/x
+run_pkg "package-plan: drift outside declared set(4)" 4 package-plan --worktree "$WT_DRIFT" --approved-lane "$PKG_ROOT/lane_drift.json"
+
+# hash mismatch: on-disk bytes differ from recorded after.sha256 -> refuse(4).
+WT_HASH="$(build_applied_wt hash feat/x)"; printf 'tampered\n' > "$WT_HASH/notes.md"
+pkg_lane "$PKG_ROOT/lane_hash.json" "$WT_HASH" feat/x
+run_pkg "package-plan: on-disk hash mismatch(4)"      4 package-plan --worktree "$WT_HASH" --approved-lane "$PKG_ROOT/lane_hash.json"
+
+# missing declared file on disk (not applied) -> refuse(4).
+WT_MISS="$(build_applied_wt miss feat/x)"; rm -f "$WT_MISS/notes.md"
+pkg_lane "$PKG_ROOT/lane_miss.json" "$WT_MISS" feat/x
+run_pkg "package-plan: declared file missing(4)"      4 package-plan --worktree "$WT_MISS" --approved-lane "$PKG_ROOT/lane_miss.json"
+
+# wrong branch: worktree on a different branch than the lane -> refuse(4).
+WT_BR="$(build_applied_wt br feat/y)"
+pkg_lane "$PKG_ROOT/lane_br.json" "$WT_BR" feat/x   # lane says feat/x, worktree on feat/y
+run_pkg "package-plan: worktree branch mismatch(4)"   4 package-plan --worktree "$WT_BR" --approved-lane "$PKG_ROOT/lane_br.json"
+
+# missing apply evidence: remove apply-bundle.json -> refuse(4).
+WT_NOEV="$(build_applied_wt noev feat/x)"; find "$WT_NOEV/.claw" -name 'apply-bundle.json' -delete
+pkg_lane "$PKG_ROOT/lane_noev.json" "$WT_NOEV" feat/x
+run_pkg "package-plan: missing apply-bundle evidence(4)" 4 package-plan --worktree "$WT_NOEV" --approved-lane "$PKG_ROOT/lane_noev.json"
+
+# dirty control checkout -> refuse(4) (uses its own dirty control dir).
+PKG_CTL_DIRTY="$PKG_ROOT/control_dirty"
+mkdir -p "$PKG_CTL_DIRTY"; git -C "$PKG_CTL_DIRTY" init -q
+git -C "$PKG_CTL_DIRTY" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+printf 'dirty' > "$PKG_CTL_DIRTY/dirty.txt"
+WT_DC="$(build_applied_wt dc feat/x)"
+pkg_lane "$PKG_ROOT/lane_dc.json" "$WT_DC" feat/x
+rc_dc=0
+A2_CONTROL_CHECKOUT="$PKG_CTL_DIRTY" A2_DISPOSABLE_WORKTREE_ROOT="$PKG_WTR" \
+  "${ORCH}" package-plan --worktree "$WT_DC" --approved-lane "$PKG_ROOT/lane_dc.json" >/dev/null 2>&1 || rc_dc=$?
+if [[ "$rc_dc" -eq 4 ]]; then
+  PASS_COUNT=$((PASS_COUNT+1)); printf 'PASS  %-52s (exit %s)\n' "package-plan: dirty control checkout(4)" "$rc_dc"
+else
+  FAIL_COUNT=$((FAIL_COUNT+1)); printf 'FAIL  %-52s (got %s, want 4)\n' "package-plan: dirty control checkout(4)" "$rc_dc"
+fi
+
+# ---- package-plan static invariants (read-only / no-mutation by construction) ---
+static_assert "package-plan subcommand present"          'cmd_package_plan\(\)'                         present
+static_assert "package-plan read-only would_push=false"  '"would_push": False'                          present
+static_assert "package-plan read-only would_open_pr=false" '"would_open_pr": False'                     present
+static_assert "package-plan prints, never runs, push/PR" 'package-plan runs NONE of them'               present
+static_assert "package-plan executes NO git add"         '^[[:space:]]*git[[:space:]]+-C[[:space:]]+"\$wt"[[:space:]]+add' absent
+static_assert "package-plan executes NO git commit"      '^[[:space:]]*git[[:space:]]+-C[[:space:]]+"\$wt"[[:space:]]+commit' absent
+static_assert "package-plan executes NO git push"        '^[[:space:]]*git[[:space:]]+-C[[:space:]]+"\$wt"[[:space:]]+push' absent
+static_assert "package-plan executes NO gh"              '^[[:space:]]*gh[[:space:]]+pr'                 absent
+
 # ---- summary ---------------------------------------------------------------
 printf -- '----\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]
