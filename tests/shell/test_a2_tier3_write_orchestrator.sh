@@ -313,8 +313,10 @@ build_applied_wt() {
   local wt="$PKG_WTR/$name" sha
   mkdir -p "$wt"
   git -C "$wt" init -q
+  git -C "$wt" config user.email t@t   # persistent identity so an in-worktree commit (Stage 2) works
+  git -C "$wt" config user.name t
   git -C "$wt" checkout -q -b "$branch"
-  git -C "$wt" -c user.email=t@t -c user.name=t commit -q --allow-empty -m base
+  git -C "$wt" commit -q --allow-empty -m base
   printf 'hello tier4\n' > "$wt/notes.md"
   sha=$(sha256sum "$wt/notes.md" | awk '{print $1}')
   mkdir -p "$wt/.claw/l2b-payloads/RUN/STEP" "$wt/.claw/l2b-preview-bundles/RUN/STEP" "$wt/.claw/l2b-checkpoints/RUN/STEP"
@@ -410,10 +412,112 @@ static_assert "package-plan subcommand present"          'cmd_package_plan\(\)' 
 static_assert "package-plan read-only would_push=false"  '"would_push": False'                          present
 static_assert "package-plan read-only would_open_pr=false" '"would_open_pr": False'                     present
 static_assert "package-plan prints, never runs, push/PR" 'package-plan runs NONE of them'               present
-static_assert "package-plan executes NO git add"         '^[[:space:]]*git[[:space:]]+-C[[:space:]]+"\$wt"[[:space:]]+add' absent
-static_assert "package-plan executes NO git commit"      '^[[:space:]]*git[[:space:]]+-C[[:space:]]+"\$wt"[[:space:]]+commit' absent
-static_assert "package-plan executes NO git push"        '^[[:space:]]*git[[:space:]]+-C[[:space:]]+"\$wt"[[:space:]]+push' absent
-static_assert "package-plan executes NO gh"              '^[[:space:]]*gh[[:space:]]+pr'                 absent
+# Stage 2 legitimately stages+commits INSIDE the disposable worktree, so the file
+# now CONTAINS exact-path `git add --` / `git commit`. The invariants worth pinning
+# are: only exact-path staging (never `git add .`/`-A`/`commit -a`), and NEVER an
+# executed push/PR/merge anywhere in the orchestrator.
+static_assert "orchestrator never uses git add . / -A"   'git[[:space:]]+add[[:space:]]+(\.|-A)([[:space:]]|$)' absent
+static_assert "orchestrator never uses git commit -a"    'git[[:space:]].*commit[[:space:]].*[[:space:]]-a([[:space:]]|$)' absent
+static_assert "orchestrator executes NO git push"        '^[[:space:]]*git[[:space:]]+-C[[:space:]]+"\$(wt|WT_PATH)"[[:space:]]+push' absent
+static_assert "orchestrator executes NO gh"              '^[[:space:]]*gh[[:space:]]+pr'                 absent
+
+# ============================================================================
+# package-commit (Tier-4 Stage 2) — stages EXACTLY the declared set + ONE commit
+# INSIDE the disposable worktree; never push/PR/merge; never touches the control
+# checkout. Reuses the Stage-1 gate, so pure-gate refusals are covered above.
+# ============================================================================
+
+# happy path: commits exactly the declared set inside the disposable worktree.
+WT_C_OK="$(build_applied_wt cok feat/x)"
+pkg_lane "$PKG_ROOT/lane_cok.json" "$WT_C_OK" feat/x
+C_HEAD_BEFORE="$(git -C "$WT_C_OK" rev-parse HEAD)"
+C_NCOMMITS_BEFORE="$(git -C "$WT_C_OK" rev-list --count HEAD)"
+run_pkg "package-commit: happy path commits(0)"       0 package-commit --worktree "$WT_C_OK" --approved-lane "$PKG_ROOT/lane_cok.json"
+
+# verify EXACTLY one new commit, containing exactly the declared set, working tree
+# now clean except the ignored .claw tree, and the control checkout untouched.
+C_HEAD_AFTER="$(git -C "$WT_C_OK" rev-parse HEAD)"
+C_NCOMMITS_AFTER="$(git -C "$WT_C_OK" rev-list --count HEAD)"
+C_COMMIT_FILES="$(git -C "$WT_C_OK" show --name-only --pretty=format: HEAD | sed '/^$/d' | sort | tr '\n' ' ')"
+C_WT_LEFT="$(git -C "$WT_C_OK" status --porcelain | sort | tr '\n' '|')"
+C_CTL_DIRTY="$(git -C "$PKG_CTL" status --porcelain)"
+if [[ "$C_HEAD_AFTER" != "$C_HEAD_BEFORE" \
+      && "$C_NCOMMITS_AFTER" -eq "$((C_NCOMMITS_BEFORE + 1))" \
+      && "$C_COMMIT_FILES" == "notes.md " \
+      && "$C_WT_LEFT" == '?? .claw/|' \
+      && -z "$C_CTL_DIRTY" ]]; then
+  PASS_COUNT=$((PASS_COUNT+1)); printf 'PASS  %-52s (1 commit, declared only, ctl clean)\n' "package-commit: exactly one in-worktree commit"
+else
+  FAIL_COUNT=$((FAIL_COUNT+1)); printf 'FAIL  %-52s (head=%s n=%s files=[%s] left=[%s] ctl=[%s])\n' "package-commit: exactly one in-worktree commit" "$C_HEAD_AFTER" "$C_NCOMMITS_AFTER" "$C_COMMIT_FILES" "$C_WT_LEFT" "$C_CTL_DIRTY"
+fi
+
+# emitted evidence carries the read-only-for-stages-3-4 flags.
+WT_C_EV="$(build_applied_wt cev feat/x)"
+pkg_lane "$PKG_ROOT/lane_cev.json" "$WT_C_EV" feat/x
+C_JSON="$(A2_CONTROL_CHECKOUT="$PKG_CTL" A2_DISPOSABLE_WORKTREE_ROOT="$PKG_WTR" \
+  "${ORCH}" package-commit --worktree "$WT_C_EV" --approved-lane "$PKG_ROOT/lane_cev.json" 2>/dev/null || true)"
+if printf '%s' "$C_JSON" | grep -q '"pushed": false' \
+   && printf '%s' "$C_JSON" | grep -q '"pr_opened": false' \
+   && printf '%s' "$C_JSON" | grep -q '"merged": false' \
+   && printf '%s' "$C_JSON" | grep -q '"commit_sha"'; then
+  PASS_COUNT=$((PASS_COUNT+1)); printf 'PASS  %-52s (pushed/pr_opened/merged=false + commit_sha)\n' "package-commit: evidence contract"
+else
+  FAIL_COUNT=$((FAIL_COUNT+1)); printf 'FAIL  %-52s (evidence JSON missing flags)\n' "package-commit: evidence contract"
+fi
+
+# refusal: pre-staged index (apply chain never stages) -> refuse(4), no commit.
+WT_C_IDX="$(build_applied_wt cidx feat/x)"
+git -C "$WT_C_IDX" add -- notes.md   # foreign pre-staging
+pkg_lane "$PKG_ROOT/lane_cidx.json" "$WT_C_IDX" feat/x
+IDX_NB="$(git -C "$WT_C_IDX" rev-list --count HEAD)"
+run_pkg "package-commit: pre-staged index refused(4)" 4 package-commit --worktree "$WT_C_IDX" --approved-lane "$PKG_ROOT/lane_cidx.json"
+if [[ "$(git -C "$WT_C_IDX" rev-list --count HEAD)" -eq "$IDX_NB" ]]; then
+  PASS_COUNT=$((PASS_COUNT+1)); printf 'PASS  %-52s (no commit on refusal)\n' "package-commit: pre-staged refusal makes no commit"
+else
+  FAIL_COUNT=$((FAIL_COUNT+1)); printf 'FAIL  %-52s (commit happened!)\n' "package-commit: pre-staged refusal makes no commit"
+fi
+
+# refusal: drift -> refuse(4); refusal: hash mismatch -> refuse(4).
+WT_C_DRIFT="$(build_applied_wt cdrift feat/x)"; printf 'x' > "$WT_C_DRIFT/EXTRA.txt"
+pkg_lane "$PKG_ROOT/lane_cdrift.json" "$WT_C_DRIFT" feat/x
+run_pkg "package-commit: drift refused(4)"            4 package-commit --worktree "$WT_C_DRIFT" --approved-lane "$PKG_ROOT/lane_cdrift.json"
+
+WT_C_HASH="$(build_applied_wt chash feat/x)"; printf 'tampered\n' > "$WT_C_HASH/notes.md"
+pkg_lane "$PKG_ROOT/lane_chash.json" "$WT_C_HASH" feat/x
+run_pkg "package-commit: hash mismatch refused(4)"    4 package-commit --worktree "$WT_C_HASH" --approved-lane "$PKG_ROOT/lane_chash.json"
+
+# refusal: missing declared file -> refuse(4); refusal: branch main -> refuse(4).
+WT_C_MISS="$(build_applied_wt cmiss feat/x)"; rm -f "$WT_C_MISS/notes.md"
+pkg_lane "$PKG_ROOT/lane_cmiss.json" "$WT_C_MISS" feat/x
+run_pkg "package-commit: declared file missing(4)"    4 package-commit --worktree "$WT_C_MISS" --approved-lane "$PKG_ROOT/lane_cmiss.json"
+
+WT_C_BR="$(build_applied_wt cbr main)"
+pkg_lane "$PKG_ROOT/lane_cbr.json" "$WT_C_BR" main
+run_pkg "package-commit: branch main refused(4)"      4 package-commit --worktree "$WT_C_BR" --approved-lane "$PKG_ROOT/lane_cbr.json"
+
+# refusal: dirty control checkout -> refuse(4), commits nothing.
+WT_C_DC="$(build_applied_wt cdc feat/x)"
+pkg_lane "$PKG_ROOT/lane_cdc.json" "$WT_C_DC" feat/x
+C_DC_NB="$(git -C "$WT_C_DC" rev-list --count HEAD)"
+rc_cdc=0
+A2_CONTROL_CHECKOUT="$PKG_CTL_DIRTY" A2_DISPOSABLE_WORKTREE_ROOT="$PKG_WTR" \
+  "${ORCH}" package-commit --worktree "$WT_C_DC" --approved-lane "$PKG_ROOT/lane_cdc.json" >/dev/null 2>&1 || rc_cdc=$?
+if [[ "$rc_cdc" -eq 4 && "$(git -C "$WT_C_DC" rev-list --count HEAD)" -eq "$C_DC_NB" ]]; then
+  PASS_COUNT=$((PASS_COUNT+1)); printf 'PASS  %-52s (refused, no commit)\n' "package-commit: dirty control checkout(4)"
+else
+  FAIL_COUNT=$((FAIL_COUNT+1)); printf 'FAIL  %-52s (rc=%s)\n' "package-commit: dirty control checkout(4)" "$rc_cdc"
+fi
+
+# usage refusals.
+run_case "package-commit: missing args -> usage(2)"   2 package-commit --worktree "$PWT"
+
+# ---- package-commit static invariants --------------------------------------
+static_assert "package-commit subcommand present"        'cmd_package_commit\(\)'                       present
+static_assert "package-commit stages exact-path only"    'git -C "\$wt" add -- "\$rel"'                  present
+static_assert "package-commit commits in-worktree"       'git -C "\$wt" commit -q -m'                    present
+static_assert "package-commit evidence pushed=false"     '"pushed": False'                              present
+static_assert "package-commit evidence merged=false"     '"merged": False'                              present
+static_assert "package-commit verifies staged==declared" 'staged set != declared set'                   present
 
 # ---- summary ---------------------------------------------------------------
 printf -- '----\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
