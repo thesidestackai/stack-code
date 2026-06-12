@@ -52,6 +52,7 @@ describe("helperRunner — subcommand allowlist", () => {
       "print-apply-bundle",
       "print-approval",
       "print-preview",
+      "print-tier3-evidence",
       "validate-input",
       "verify-final",
     ]);
@@ -80,6 +81,72 @@ describe("helperRunner — subcommand allowlist", () => {
         }),
       HelperRunnerRefusal,
     );
+  });
+});
+
+describe("helperRunner — print-tier3-evidence (Option B refresh)", () => {
+  it("builds `<helper> print-tier3-evidence --workspace <ws>` exactly", () => {
+    const req = buildHelperRequest({
+      helperPath: HELPER,
+      subcommand: "print-tier3-evidence",
+      options: { workspace: "/disposable/wks" },
+    });
+    assert.strictEqual(req.binary, HELPER);
+    assert.deepStrictEqual(req.args, ["print-tier3-evidence", "--workspace", "/disposable/wks"]);
+  });
+
+  it("is a read-only/print subcommand (print- prefix, no executor verb)", () => {
+    assert.ok((ALLOWED_SUBCOMMANDS as readonly string[]).includes("print-tier3-evidence"));
+    assert.ok(!/^run$|^approve$|^apply$|^apply-bundle$/.test("print-tier3-evidence"));
+  });
+
+  it("allows ONLY the --workspace flag", () => {
+    assert.deepStrictEqual(ALLOWED_FLAGS["print-tier3-evidence"], ["workspace"]);
+  });
+
+  it("refuses any flag other than --workspace", () => {
+    assert.throws(
+      () =>
+        buildHelperRequest({
+          helperPath: HELPER,
+          subcommand: "print-tier3-evidence",
+          options: { plan: "/x/plan.yaml" },
+        }),
+      HelperRunnerRefusal,
+    );
+  });
+
+  it("refuses a flag-shaped or chain-write-shaped workspace value", () => {
+    assert.throws(
+      () =>
+        buildHelperRequest({
+          helperPath: HELPER,
+          subcommand: "print-tier3-evidence",
+          options: { workspace: "--apply" },
+        }),
+      HelperRunnerRefusal,
+    );
+    assert.throws(
+      () =>
+        buildHelperRequest({
+          helperPath: HELPER,
+          subcommand: "print-tier3-evidence",
+          options: { workspace: "/x; claw plan apply y" },
+        }),
+      HelperRunnerRefusal,
+    );
+  });
+
+  it("never produces a bare `claw` or chain-write argv element", () => {
+    const req = buildHelperRequest({
+      helperPath: HELPER,
+      subcommand: "print-tier3-evidence",
+      options: { workspace: "/disposable/wks" },
+    });
+    for (const a of [req.binary, ...req.args]) {
+      assert.ok(a !== "claw", "argv must not contain a bare `claw`");
+      assert.ok(!/claw\s+plan\s+(run|approve|apply-bundle|apply)\b/.test(a), `chain-write phrase: ${a}`);
+    }
   });
 });
 

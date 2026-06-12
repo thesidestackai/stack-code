@@ -17,6 +17,7 @@ import {
   EvidenceSnapshotView,
   parseEvidenceSnapshot,
 } from "./tier3EvidenceSnapshot";
+import { refreshOutcomeFromResult } from "./tier3EvidenceRefresh";
 import {
   computeTier3Readiness,
   dirtyControlCheckoutBlock,
@@ -472,6 +473,50 @@ async function pasteEvidenceSnapshot(): Promise<void> {
   }
 }
 
+// Option B acquisition: read-only in-panel refresh of the Tier 3 evidence
+// snapshot. Runs the print-only `print-tier3-evidence` helper subcommand through
+// the SAME single spawn boundary (helperRunner) the rest of the panel uses; that
+// subcommand runs the read-only, writes-nothing, non-claw collector and prints
+// its a2-tier3-evidence-snapshot.v0 to stdout. We store that stdout as the
+// session snapshot text (fed to the existing pure parser/renderer) — exactly the
+// Option A path, only the acquisition source changes from paste to the helper.
+// It creates no worktree, writes no file, and runs no claw/model/broker/runtime.
+// Fail-closed: a non-zero exit or empty output clears the snapshot and shows a
+// notice instead of fabricating readiness.
+async function refreshTier3EvidenceSnapshot(): Promise<void> {
+  const helperPath = resolveHelperPath();
+  const ws = session.inputs.workspace ?? defaultWorkspace();
+  if (!helperPath || !ws) {
+    session.notice =
+      "Set a workspace first (or configure an absolute a2HarnessPanel.helperPath) to refresh Tier 3 evidence.";
+    rerender();
+    return;
+  }
+  const inv: HelperInvocation = {
+    helperPath,
+    subcommand: "print-tier3-evidence",
+    options: { workspace: ws },
+  };
+  try {
+    const result = await runHelper(inv, defaultSpawnImpl());
+    const outcome = refreshOutcomeFromResult(result);
+    session.evidenceSnapshotText = outcome.snapshotText;
+    session.notice = outcome.notice;
+    record(
+      timelineEvent(
+        "helper",
+        "print-tier3-evidence — Tier 3 evidence refreshed read-only",
+        result.exitCode,
+      ),
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    session.notice = `Tier 3 evidence refresh refused/failed: ${msg}`;
+    record(timelineEvent("note", "print-tier3-evidence refused/failed"));
+  }
+  rerender();
+}
+
 // Recompute the read-only workspace-first views (setup status, next-step,
 // discovery) from the current session signals. Pure aggregation: it spawns
 // nothing and reads no file — it only assembles already-gathered data.
@@ -819,6 +864,11 @@ export function activate(context: vscode.ExtensionContext): void {
     pasteEvidenceSnapshot,
   );
   context.subscriptions.push(pasteSnapshot);
+  const refreshSnapshot = vscode.commands.registerCommand(
+    "a2HarnessPanel.refreshTier3EvidenceSnapshot",
+    refreshTier3EvidenceSnapshot,
+  );
+  context.subscriptions.push(refreshSnapshot);
 }
 
 export function deactivate(): void {

@@ -8,10 +8,13 @@
 #   - locates .claw artifacts read-only
 #   - shows hashes read-only
 #   - PRINTS the exact command the operator must run manually
+#   - (print-tier3-evidence) runs the READ-ONLY, writes-nothing, non-claw
+#     a2-evidence-collector to print the existing Tier 3 evidence snapshot
 #
 # Source of truth (merged on main):
 #   docs/a2-l4-ide-harness-workflow-scope.md
 #   handoffs/a2_ide_harness_workflow_implementation_prompt_DRAFT_2026-06-07.md
+#   docs/a2-tier3-panel-integration-option-b-design-scope.md   (print-tier3-evidence)
 #
 # SAFETY (hard invariants this script preserves):
 #   - Preview does NOT write target.
@@ -21,7 +24,11 @@
 #   - No auto-approval, no hidden apply, no batch/--yes/fake-TTY.
 #   - This script calls NO model / NO broker / NO runtime; it never executes `claw`.
 #
-# This v0 is print/validate only by design. It has no exec mode on purpose.
+# This v0 is print/validate only, with ONE bounded read-only exec exception:
+# print-tier3-evidence invokes the a2-evidence-collector binary, which is itself
+# read-only (writes nothing; runs no claw/orchestrator; makes no model/broker/
+# runtime/network/Vault call). It is invoked by exact basename, array-argv, no
+# shell. There is no target-writing exec mode, by design.
 
 set -euo pipefail
 
@@ -31,6 +38,15 @@ set -euo pipefail
 # contain spaces; always quote it when printing the command for the operator.
 DEFAULT_CLAW="/media/suki/18TB 2/build-artifacts/stack-code/rust/target/debug/claw"
 A2_CLAW="${A2_CLAW:-$DEFAULT_CLAW}"
+
+# Default built read-only evidence collector (override with
+# A2_EVIDENCE_COLLECTOR=/path/to/a2-evidence-collector). Used ONLY by
+# print-tier3-evidence. The collector is read-only: it writes nothing and runs
+# no claw/orchestrator/model/broker/runtime. Its basename must be exactly
+# a2-evidence-collector or print-tier3-evidence refuses to invoke it.
+DEFAULT_EVIDENCE_COLLECTOR="/media/suki/18TB 2/build-artifacts/stack-code/rust/target/debug/a2-evidence-collector"
+A2_EVIDENCE_COLLECTOR="${A2_EVIDENCE_COLLECTOR:-$DEFAULT_EVIDENCE_COLLECTOR}"
+EVIDENCE_COLLECTOR_BASENAME="a2-evidence-collector"
 
 # Approval grammar is fixed by the CLI source (a2-plan-runner/src/approval.rs).
 APPROVAL_GRAMMAR='apply <step-id> <preview_sha256>'
@@ -160,6 +176,10 @@ Subcommands (all read-only / print-only):
   verify-final      --workspace <path> --target <path> --after-sha <sha>
   audit-workspace   --workspace <path> [--target <path> --after-sha <sha>]
                     (read-only chain-state audit from .claw ARTIFACTS + optional target hash check)
+  print-tier3-evidence --workspace <path>
+                    (Option B refresh: prints the existing a2-tier3-evidence-snapshot.v0 by
+                     running the READ-ONLY, writes-nothing, non-claw a2-evidence-collector;
+                     stdout is JSON only. Override the binary with A2_EVIDENCE_COLLECTOR.)
 
 Detection note: chain state and "applied" evidence come from .claw ARTIFACTS
 (apply-result.json, apply-bundle.json, approval-result.json, preview-bundle.json)
@@ -470,21 +490,59 @@ cmd_audit_workspace() {
   return $rc
 }
 
+# print-tier3-evidence — Option B read-only refresh. Prints the EXISTING Tier 3
+# evidence snapshot (a2-tier3-evidence-snapshot.v0) by running the read-only,
+# writes-nothing, non-claw a2-evidence-collector. stdout carries ONLY the
+# collector's JSON (so the panel parser can consume it); all diagnostics go to
+# stderr. This creates no worktree, writes no file, and runs no claw / model /
+# broker / runtime. Fail-closed: any guard failure prints nothing to stdout and
+# returns non-zero, so the panel renders its fail-closed notice.
+cmd_print_tier3_evidence() {
+  parse_opts "$@"
+  require_opt workspace
+  local ws=${OPT[workspace]}
+  local collector=$A2_EVIDENCE_COLLECTOR
+
+  warn_if_sensitive_path "workspace" "$ws"
+
+  # Basename guard: only the evidence collector may be invoked here (mirrors the
+  # panel-side HELPER_BASENAME bound; refuses any other binary, incl. claw).
+  if [[ "$(basename -- "$collector")" != "$EVIDENCE_COLLECTOR_BASENAME" ]]; then
+    err "refused: evidence collector basename must be exactly $EVIDENCE_COLLECTOR_BASENAME: $collector"
+    return $EXIT_VALIDATION
+  fi
+  if [[ ! -d "$ws" ]]; then
+    err "workspace is not a directory: $ws"
+    return $EXIT_VALIDATION
+  fi
+  if [[ ! -x "$collector" ]]; then
+    err "evidence collector not found or not executable: $collector"
+    err "build it (cargo build -p a2-evidence-collector) or set A2_EVIDENCE_COLLECTOR."
+    return $EXIT_VALIDATION
+  fi
+
+  # Run the collector READ-ONLY with array argv and NO shell. It emits one
+  # a2-tier3-evidence-snapshot.v0 JSON object to stdout and writes nothing. We
+  # pass it through verbatim; we never execute claw and make no runtime call.
+  "$collector" "$ws"
+}
+
 # ---- dispatch --------------------------------------------------------------
 
 main() {
   local sub=${1:-help}
   [[ $# -gt 0 ]] && shift || true
   case "$sub" in
-    help|-h|--help)      usage ;;
-    validate-input)      cmd_validate_input "$@" ;;
-    print-preview)       cmd_print_preview "$@" ;;
-    find-artifacts)      cmd_find_artifacts "$@" ;;
-    print-approval)      cmd_print_approval "$@" ;;
-    print-apply-bundle)  cmd_print_apply_bundle "$@" ;;
-    print-apply)         cmd_print_apply "$@" ;;
-    verify-final)        cmd_verify_final "$@" ;;
-    audit-workspace)     cmd_audit_workspace "$@" ;;
+    help|-h|--help)        usage ;;
+    validate-input)        cmd_validate_input "$@" ;;
+    print-preview)         cmd_print_preview "$@" ;;
+    find-artifacts)        cmd_find_artifacts "$@" ;;
+    print-approval)        cmd_print_approval "$@" ;;
+    print-apply-bundle)    cmd_print_apply_bundle "$@" ;;
+    print-apply)           cmd_print_apply "$@" ;;
+    verify-final)          cmd_verify_final "$@" ;;
+    audit-workspace)       cmd_audit_workspace "$@" ;;
+    print-tier3-evidence)  cmd_print_tier3_evidence "$@" ;;
     *)
       err "unknown subcommand: $sub"
       info ""
