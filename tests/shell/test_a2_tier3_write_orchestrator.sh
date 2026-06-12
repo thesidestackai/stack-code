@@ -13,6 +13,13 @@
 # `claw plan apply ...` (live-A2 family) and `echo hi` (non-allowlisted) so the
 # test source carries no destructive/runtime literal of its own.
 
+# shellcheck disable=SC2016
+# The static_assert calls below pass single-quoted ERE patterns that are matched
+# LITERALLY against the orchestrator's source (e.g. '\$EXIT_TTY', '"\$wt"'). The
+# `$` must stay un-expanded — it is part of the regex that matches the script
+# text — so SC2016 ("expressions don't expand in single quotes") is intentional
+# here, file-wide.
+
 set -euo pipefail
 
 TEST_FILE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

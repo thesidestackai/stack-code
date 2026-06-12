@@ -18,6 +18,7 @@ on:
       - docs/**
       - rust/**
       - schemas/**
+      - scripts/a2-tier3-write-orchestrator.sh
       - scripts/claw-sidestack-local
       - scripts/validate_planner_output_schema.py
       - tests/a2_l4/**
@@ -38,6 +39,7 @@ on:
       - docs/**
       - rust/**
       - schemas/**
+      - scripts/a2-tier3-write-orchestrator.sh
       - scripts/claw-sidestack-local
       - scripts/validate_planner_output_schema.py
       - tests/a2_l4/**
@@ -123,14 +125,20 @@ jobs:
         run: |
           bash -n scripts/claw-sidestack-local
           bash -n tests/shell/test_claw_sidestack_local.sh
+          bash -n scripts/a2-tier3-write-orchestrator.sh
+          bash -n tests/shell/test_a2_tier3_write_orchestrator.sh
       - name: Shellcheck
         run: |
           sudo apt-get update
           sudo apt-get install -y shellcheck
           shellcheck scripts/claw-sidestack-local
           shellcheck tests/shell/test_claw_sidestack_local.sh
+          shellcheck scripts/a2-tier3-write-orchestrator.sh
+          shellcheck tests/shell/test_a2_tier3_write_orchestrator.sh
       - name: Run shell tests
-        run: bash tests/shell/test_claw_sidestack_local.sh
+        run: |
+          bash tests/shell/test_claw_sidestack_local.sh
+          bash tests/shell/test_a2_tier3_write_orchestrator.sh
 
   planner-output-validator:
     name: planner-output validator
