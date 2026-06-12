@@ -17,12 +17,13 @@ function loadManifest(): Manifest {
 }
 
 describe("manifest — contributes only read-only commands", () => {
-  it("declares exactly the read-only commands: open + pasteEvidenceSnapshot", () => {
+  it("declares exactly the read-only commands: open + paste + refresh", () => {
     const m = loadManifest();
     const ids = m.contributes.commands.map((c) => c.command).sort();
     assert.deepStrictEqual(ids, [
       "a2HarnessPanel.open",
       "a2HarnessPanel.pasteEvidenceSnapshot",
+      "a2HarnessPanel.refreshTier3EvidenceSnapshot",
     ]);
   });
 
@@ -38,6 +39,7 @@ describe("manifest — contributes only read-only commands", () => {
     assert.deepStrictEqual(m.activationEvents, [
       "onCommand:a2HarnessPanel.open",
       "onCommand:a2HarnessPanel.pasteEvidenceSnapshot",
+      "onCommand:a2HarnessPanel.refreshTier3EvidenceSnapshot",
     ]);
     for (const ev of m.activationEvents) {
       assert.ok(!/onDidChange|workspaceContains|\*/.test(ev), `broad activation: ${ev}`);

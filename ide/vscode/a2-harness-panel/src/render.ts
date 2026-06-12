@@ -573,10 +573,15 @@ function evidenceSnapshotBlock(view: EvidenceSnapshotView | null | undefined): s
   if (!view) {
     return `<section class="evidence-snapshot" data-testid="evidence-snapshot">
   <h3>Tier 3 evidence snapshot (read-only)</h3>
-  <p class="muted" data-testid="evidence-snapshot-empty">No snapshot provided. Run the read-only collector yourself and paste its <code>a2-tier3-evidence-snapshot.v0</code> output (A2 Harness: Paste Tier 3 Evidence Snapshot). This section then renders it read-only. The panel obtains nothing on its own and shows no control here.</p>
+  <p class="muted" data-testid="evidence-snapshot-empty">No snapshot provided. Either run <em>A2 Harness: Refresh Tier 3 Evidence Snapshot</em> (read-only — runs the writes-nothing collector through the helper and renders its output here) or run the collector yourself and paste its <code>a2-tier3-evidence-snapshot.v0</code> output (A2 Harness: Paste Tier 3 Evidence Snapshot). This section then renders it read-only and shows no control here.</p>
 </section>`;
   }
-  return renderEvidenceSnapshotHtml(view);
+  // The pure renderer emits the read-only snapshot fragment (zero controls,
+  // fail-closed). Append a constant, descriptive refresh affordance — NOT a
+  // control — that states the refresh path is read-only: it runs only the
+  // writes-nothing collector, so it creates no worktree and writes no file.
+  return `${renderEvidenceSnapshotHtml(view)}
+<p class="muted" data-testid="evidence-snapshot-refresh-affordance">Refresh path is read-only — would-create-worktree: no, would-write-files: no.</p>`;
 }
 
 export function renderHtml(model: RenderModel): string {

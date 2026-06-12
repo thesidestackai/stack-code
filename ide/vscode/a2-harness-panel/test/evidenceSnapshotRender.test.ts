@@ -71,6 +71,26 @@ describe("evidence snapshot render — read-only integration", () => {
     assert.ok(!/postMessage/i.test(section), "no postMessage in snapshot section");
   });
 
+  it("empty placeholder mentions the read-only Refresh command (Option B)", () => {
+    const html = renderHtml(baseModel());
+    const idx = html.indexOf('data-testid="evidence-snapshot-empty"');
+    const section = html.slice(idx, idx + 800);
+    assert.ok(/Refresh Tier 3 Evidence Snapshot/i.test(section), "refresh command hint missing");
+  });
+
+  it("surfaces a read-only refresh affordance (no worktree, no write) when a view is present", () => {
+    const view = parseEvidenceSnapshot(snapshotJson());
+    const html = renderHtml({ ...baseModel(), evidenceSnapshot: view });
+    const idx = html.indexOf('id="tier3-evidence-snapshot"');
+    const section = html.slice(idx, idx + 4000);
+    assert.ok(/would-create-worktree:\s*no/i.test(section), "would-create-worktree affordance missing");
+    assert.ok(/would-write-files:\s*no/i.test(section), "would-write-files affordance missing");
+    // The affordance is descriptive text, never a control.
+    assert.ok(!/<button/i.test(section), "affordance must not add a button");
+    assert.ok(!/data-subcommand/i.test(section), "affordance must not wire a subcommand");
+    assert.ok(!/data-ui-action/i.test(section), "affordance must not wire a ui-action");
+  });
+
   it("keeps the field-setter ordering invariant with the snapshot section present", () => {
     const view = parseEvidenceSnapshot(snapshotJson());
     const html = renderHtml({ ...baseModel(), evidenceSnapshot: view });

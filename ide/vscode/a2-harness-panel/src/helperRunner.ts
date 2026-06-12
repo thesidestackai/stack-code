@@ -24,6 +24,11 @@ export const ALLOWED_SUBCOMMANDS = [
   "print-apply",
   "verify-final",
   "audit-workspace",
+  // Option B read-only refresh: prints the existing Tier 3 evidence snapshot
+  // (a2-tier3-evidence-snapshot.v0) by running the read-only, writes-nothing,
+  // non-claw a2-evidence-collector. Still print-only: no target write, no
+  // worktree, no claw/model/broker/runtime.
+  "print-tier3-evidence",
 ] as const;
 
 export type HelperSubcommand = (typeof ALLOWED_SUBCOMMANDS)[number];
@@ -41,6 +46,7 @@ export const ALLOWED_FLAGS: Record<HelperSubcommand, readonly string[]> = {
   "print-apply": ["apply-bundle"],
   "verify-final": ["workspace", "target", "after-sha"],
   "audit-workspace": ["workspace", "target", "after-sha"],
+  "print-tier3-evidence": ["workspace"],
 };
 
 // Chain-write command fragments that must never appear in any caller-supplied
