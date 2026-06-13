@@ -36,7 +36,11 @@
 #   - Exact-path scope: every write must be in the declared set, inside the
 #     worktree, not under the control checkout (deny-by-default).
 #   - Denials win over the Tier-3 allowlist for any lane-declared validation command.
-#   - It NEVER pushes, opens a PR, merges, deletes a branch, or force-removes a
+#   - The apply chain itself NEVER pushes, opens a PR, or merges. The additive
+#     Tier-4 packaging subcommands MAY push ONE exact non-force refspec
+#     (package-push) and open ONE DRAFT PR (package-pr) for the disposable
+#     branch — but NEVER force-push, NEVER merge, NEVER approve, NEVER mark a
+#     draft ready-for-review, NEVER delete a branch, and NEVER force-remove a
 #     worktree. Rollback is by ABANDONING the disposable worktree (operator action).
 #   - It makes NO model/broker/runtime/network/Vault call and no raw app inference.
 #
@@ -61,6 +65,14 @@ readonly DISPOSABLE_WORKTREE_ROOT="${A2_DISPOSABLE_WORKTREE_ROOT:-/mnt/vast-data
 # Default built claw binary (override with A2_CLAW=/path/to/claw). May contain spaces.
 readonly DEFAULT_CLAW="/media/suki/18TB 2/build-artifacts/stack-code/rust/target/debug/claw"
 A2_CLAW="${A2_CLAW:-$DEFAULT_CLAW}"
+
+# The `gh` CLI, used ONLY by the Tier-4 Stage-4 package-pr lane to open a DRAFT
+# PR. Override A2_GH only for the hermetic offline test shim; production uses
+# `gh` on PATH. Like A2_CLAW / A2_CONTROL_CHECKOUT it is test plumbing — it never
+# enables a write outside the disposable worktree (gh only opens a DRAFT PR for
+# an already-pushed disposable branch; it never merges, approves, or marks a PR
+# ready-for-review).
+A2_GH="${A2_GH:-gh}"
 
 # Fixed by the CLI source (a2-plan-runner/src/approval.rs). Human-typed at a real TTY.
 readonly APPROVAL_GRAMMAR='apply <step-id> <preview_sha256>'
@@ -1181,6 +1193,208 @@ cmd_package_push() {
   return $EXIT_OK
 }
 
+# ---- Tier-4 packaging OPEN DRAFT PR (package-pr) — Stage 4 -----------------
+# Stage 4 of docs/a2-tier3-tier4-pr-packaging-design-scope.md. Reuses the SAME
+# read-only readiness gate, REQUIRES the disposable branch to be ALREADY PUSHED
+# (Stage 3) to its `origin` remote at the EXACT package-commit sha, then opens a
+# DRAFT pull request for operator review via `gh pr create --draft`. `--draft` is
+# a FIXED element of the argv array, so a non-draft PR cannot be produced here.
+# A success is claimed ONLY when the create call returns a real PR URL (never
+# inferred). If an OPEN PR for the branch already exists it is treated as an
+# idempotent no-op ONLY when it is itself a draft; a non-draft existing PR is
+# refused (this lane never makes a PR ready). It NEVER merges, NEVER approves,
+# NEVER marks a draft ready-for-review, NEVER force-pushes, NEVER deletes a
+# branch, and NEVER touches the control checkout. Stage 5 (merge) is human-only
+# and never automated here. Fail-closed: any refusal exits EXIT_GATE with no PR.
+
+# Compose the operator-review DRAFT PR body: clear "do not auto-merge" language
+# plus the evidence a reviewer needs. Pure string build; runs nothing.
+package_pr_body() {
+  local branch=$1 base=$2 base_sha=$3 commit_sha=$4; shift 4
+  local declared=("$@") d
+  printf 'This is a DRAFT isolated-mutation PR opened by the Tier-4 packaging lane.\n\n'
+  printf -- '- Do NOT merge automatically. Stage 5 (merge) remains human-only.\n'
+  printf -- '- Review the diff, validation, and apply evidence before any human merge.\n'
+  printf -- '- This PR was opened as a DRAFT and was never marked ready-for-review.\n\n'
+  printf 'base: %s\n' "$base"
+  printf 'head (disposable branch): %s\n' "$branch"
+  printf 'base sha: %s\n' "$base_sha"
+  printf 'package-commit sha: %s\n' "$commit_sha"
+  printf 'declared files:\n'
+  for d in "${declared[@]}"; do printf -- '  - %s\n' "$d"; done
+}
+
+# Parse a `gh pr view --json url,state,isDraft` blob (passed as $1) to a single
+# "url<TAB>state<TAB>true|false" line. Read-only; tolerant of empty/malformed
+# input (emits empty fields). The blob is passed via argv (NOT stdin) because the
+# heredoc already occupies python's stdin. Used to decide idempotency safely.
+gh_pr_view_fields() {
+  python3 - "$1" <<'PY'
+import json, sys
+try:
+    o = json.loads(sys.argv[1])
+except Exception:
+    o = {}
+url = o.get("url", "") or ""
+state = o.get("state", "") or ""
+draft = bool(o.get("isDraft", False))
+print("%s\t%s\t%s" % (url, state, "true" if draft else "false"))
+PY
+}
+
+# Emit the Stage-4 package-pr evidence JSON (AFTER a real PR URL is in hand).
+emit_package_pr() {
+  local wt=$1 branch=$2 base=$3 commit_sha=$4 pr_url=$5 idempotent=$6; shift 6
+  local declared=("$@") rel_list=() d
+  for d in "${declared[@]}"; do rel_list+=("${d#"$wt"/}"); done
+  python3 - "$wt" "$branch" "$base" "$commit_sha" "$pr_url" "$idempotent" "${rel_list[@]}" <<'PY'
+import json, sys
+wt, branch, base, commit_sha, pr_url, idem = sys.argv[1:7]
+declared = sys.argv[7:]
+ev = {
+    "schema_version": "a2-tier4-package-pr.v0",
+    "stage": "tier4-stage4-open-draft-pr",
+    "worktree": wt,
+    "branch": branch,
+    "base": base,
+    "declared_files": declared,
+    "package_commit_sha": commit_sha,
+    "pr_url": pr_url,
+    "draft": True,
+    "pr_opened": True,
+    "idempotent_existing": idem == "true",
+    "merged": False,
+    "marked_ready": False,
+}
+print(json.dumps(ev, indent=2, sort_keys=True))
+PY
+  rule
+  info "NEXT (Stage 5 — human-only): a human reviews this DRAFT PR and merges it manually."
+  info "  This lane opened only a DRAFT PR. It merged nothing, approved nothing, and"
+  info "  marked nothing ready-for-review."
+  rule
+  info "package-pr: opened a DRAFT PR. merged=false marked_ready=false."
+}
+
+# package-pr --worktree <path> --approved-lane <lane.json> [--plan <plan.yaml>]
+cmd_package_pr() {
+  local wt="" lane="" plan=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --worktree) wt=${2:-}; shift 2 ;;
+      --approved-lane) lane=${2:-}; shift 2 ;;
+      --plan) plan=${2:-}; shift 2 ;;
+      *) err "unexpected argument: $1"; return $EXIT_USAGE ;;
+    esac
+  done
+  [[ -n "$wt" && -n "$lane" ]] || { err "package-pr requires --worktree and --approved-lane"; return $EXIT_USAGE; }
+  [[ -f "$lane" ]] || { err "approved-lane file not found: $lane"; return $EXIT_USAGE; }
+
+  # Same read-only readiness gate as package-plan/commit/push.
+  _tier4_gate_package "$wt" "$lane" "$plan" || return $?
+  local branch=$_TIER4_BRANCH
+  local declared=("${_TIER4_DECLARED[@]}")
+
+  # Never open a PR whose head is a default/integration branch.
+  case "$branch" in
+    main|master|HEAD) err "TIER-4 STAGE4 REFUSED: refusing to open a PR with head '$branch'; nothing opened."; return $EXIT_GATE ;;
+  esac
+
+  # The disposable worktree must be in the committed (Stage-2) state: clean of
+  # tracked changes (untracked .claw allowed) with HEAD a real commit + parent.
+  if ! git -C "$wt" diff --quiet || ! git -C "$wt" diff --cached --quiet; then
+    err "TIER-4 STAGE4 REFUSED: disposable worktree has staged/unstaged tracked changes; run package-commit first. Nothing opened."
+    return $EXIT_GATE
+  fi
+  local parent
+  parent=$(git -C "$wt" rev-parse --verify -q 'HEAD~1') \
+    || { err "TIER-4 STAGE4 REFUSED: worktree HEAD has no parent (no package-commit). Nothing opened."; return $EXIT_GATE; }
+
+  # HEAD must be the clean package-commit: it changed EXACTLY the declared set.
+  local d declared_rel=()
+  for d in "${declared[@]}"; do declared_rel+=("${d#"$wt"/}"); done
+  local head_diff declared_sorted
+  head_diff=$(git -C "$wt" diff --name-only "$parent" HEAD | sort)
+  declared_sorted=$(printf '%s\n' "${declared_rel[@]}" | sort)
+  if [[ "$head_diff" != "$declared_sorted" ]]; then
+    err "TIER-4 STAGE4 REFUSED: HEAD commit diff != declared set (not a clean package-commit). Nothing opened."
+    err "  declared:  $(printf '%s ' "${declared_rel[@]}")"
+    err "  head diff: ${head_diff//$'\n'/ }"
+    return $EXIT_GATE
+  fi
+  local commit_sha base_sha
+  commit_sha=$(git -C "$wt" rev-parse HEAD)
+  base_sha=$(git -C "$wt" rev-parse "$parent")
+
+  # The branch MUST already be pushed (Stage 3) at the EXACT package-commit sha.
+  # Fail closed if it is missing/unpushed or sitting at a different sha (no push,
+  # no force — opening a PR for a stale/absent remote head is refused).
+  local remote_name="origin" remote_sha
+  remote_sha=$(git -C "$wt" ls-remote --heads "$remote_name" "$branch" 2>/dev/null | awk 'NR==1{print $1}')
+  if [[ -z "$remote_sha" ]]; then
+    err "TIER-4 STAGE4 REFUSED: branch '$branch' is not pushed to $remote_name (run package-push first). Nothing opened."
+    return $EXIT_GATE
+  fi
+  if [[ "$remote_sha" != "$commit_sha" ]]; then
+    err "TIER-4 STAGE4 REFUSED: remote $remote_name/$branch sha ($remote_sha) != package-commit sha ($commit_sha). Nothing opened."
+    return $EXIT_GATE
+  fi
+
+  # Resolve the base branch (strip a leading origin/). Refuse an empty/unstripped
+  # (ambiguous) base, or a base equal to the head branch.
+  local base_branch=${_TIER4_BASE#origin/}
+  if [[ -z "$base_branch" || "$base_branch" == "$_TIER4_BASE" || "$base_branch" == "$branch" ]]; then
+    err "TIER-4 STAGE4 REFUSED: ambiguous base branch (lane base='$_TIER4_BASE', head='$branch'). Nothing opened."
+    return $EXIT_GATE
+  fi
+
+  # gh must be available (the only external tool this stage drives).
+  command -v "$A2_GH" >/dev/null 2>&1 \
+    || { err "TIER-4 STAGE4 REFUSED: gh CLI not found (A2_GH=$A2_GH). Nothing opened."; return $EXIT_GATE; }
+
+  # Idempotency / safety pre-check (read-only): if an OPEN PR for this head
+  # already exists it must itself be a DRAFT (this lane never makes a PR ready);
+  # a non-draft existing PR is refused. A draft existing PR is an idempotent
+  # no-op — surface its URL and open nothing new.
+  local existing_json existing_url="" existing_state="" existing_draft=""
+  existing_json=$( (cd "$wt" && "$A2_GH" pr view "$branch" --json url,state,isDraft) 2>/dev/null || true)
+  if [[ -n "$existing_json" ]]; then
+    IFS=$'\t' read -r existing_url existing_state existing_draft < <(gh_pr_view_fields "$existing_json")
+    if [[ -n "$existing_url" ]]; then
+      if [[ "$existing_draft" == "true" ]]; then
+        rule; info "Tier-4 package-pr (Stage 4) — a DRAFT PR already exists for $branch; idempotent no-op"; rule
+        emit_package_pr "$wt" "$branch" "$base_branch" "$commit_sha" "$existing_url" "true" "${declared[@]}"
+        return $EXIT_OK
+      fi
+      err "TIER-4 STAGE4 REFUSED: an existing PR for '$branch' is NOT a draft (state=$existing_state); this lane never makes a PR ready or merges. Nothing opened."
+      return $EXIT_GATE
+    fi
+  fi
+
+  # Open the DRAFT PR. `--draft` is a FIXED element of the argv array, so a
+  # non-draft PR cannot be produced here. This lane drives ONLY `pr create` and
+  # `pr view` — no other gh action.
+  local title body
+  title="a2(tier4): isolated-mutation draft PR — $branch"
+  body=$(package_pr_body "$branch" "$base_branch" "$base_sha" "$commit_sha" "${declared_rel[@]}")
+
+  local create_args=(pr create --draft --base "$base_branch" --head "$branch" --title "$title" --body "$body")
+  local pr_url
+  pr_url=$( (cd "$wt" && "$A2_GH" "${create_args[@]}") 2>/dev/null ) \
+    || { err "TIER-4 STAGE4 REFUSED: gh pr create failed; no PR opened."; return $EXIT_GATE; }
+
+  # Success ONLY on a real returned PR URL (never inferred).
+  pr_url=$(printf '%s\n' "$pr_url" | grep -Eo 'https?://[^[:space:]]+' | tail -n1)
+  if [[ -z "$pr_url" ]]; then
+    err "TIER-4 STAGE4 REFUSED: gh create returned no PR URL; not claiming success. Nothing trusted."
+    return $EXIT_GATE
+  fi
+
+  rule; info "Tier-4 package-pr (Stage 4) — opened a DRAFT PR for operator review"; rule
+  emit_package_pr "$wt" "$branch" "$base_branch" "$commit_sha" "$pr_url" "false" "${declared[@]}"
+  return $EXIT_OK
+}
+
 # ---- usage + dispatch ------------------------------------------------------
 
 usage() {
@@ -1236,14 +1450,30 @@ Subcommands:
       pr_opened=false, merged=false. Opening a PR (Stage 4) is a separate lane
       needing a NEW explicit operator approval.
 
+  package-pr     --worktree <path> --approved-lane <lane.json> [--plan <plan.yaml>]
+      Tier-4 Stage 4. Runs the SAME readiness gate, requires the disposable
+      branch to be ALREADY PUSHED (Stage 3) at the EXACT package-commit sha, then
+      opens a DRAFT pull request (\`gh pr create --draft\`; --draft is a fixed
+      argv element, so a non-draft PR is impossible) targeting the lane base
+      (origin/main -> main). NEVER merges, approves, marks a draft
+      ready-for-review, force-pushes, deletes a branch, or touches the control
+      checkout. Success is claimed ONLY on a real returned PR URL. An existing
+      OPEN draft PR for the branch is an idempotent no-op; a non-draft existing
+      PR is refused. pr_opened=true draft=true merged=false marked_ready=false.
+      Stage 5 (merge) is human-only and never automated.
+
 Environment:
   A2_CLAW   path to the built claw binary (default: the dated build artifact).
             current: $A2_CLAW
+  A2_GH     the \`gh\` CLI used by package-pr (Stage 4). default: gh
 
 Safety: writes only inside a fresh disposable worktree; dry-run-ready + operator
-approval required; denials win; no model/broker/runtime/network/Vault; no raw
-app inference; no push/PR/merge/branch-delete/force-remove. Approval is never
-composed, captured, faked, or batched — it is human-typed at a real terminal.
+approval required; denials win; no model/broker/runtime/Vault; no raw app
+inference. The apply chain never pushes/PRs/merges; the Tier-4 packaging stages
+may push ONE non-force refspec (package-push) and open ONE DRAFT PR (package-pr)
+for the disposable branch, but never force-push, merge, approve, mark a draft
+ready, delete a branch, or force-remove a worktree. Approval is never composed,
+captured, faked, or batched — it is human-typed at a real terminal.
 EOF
 }
 
@@ -1269,6 +1499,7 @@ main() {
     package-plan) cmd_package_plan "$@" ;;
     package-commit) cmd_package_commit "$@" ;;
     package-push) cmd_package_push "$@" ;;
+    package-pr) cmd_package_pr "$@" ;;
     *) err "unknown subcommand: $sub"; info ""; usage; exit $EXIT_USAGE ;;
   esac
 }
