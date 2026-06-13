@@ -1050,6 +1050,137 @@ pushed: false  pr_opened: false  merged: false"
   return $EXIT_OK
 }
 
+# ---- Tier-4 packaging PUSH (package-push) — Stage 3 -------------------------
+# Stage 3 of docs/a2-tier3-tier4-pr-packaging-design-scope.md. Reuses the SAME
+# read-only readiness gate, re-derives the Stage-2 package-commit from the
+# worktree HEAD (the HEAD commit changed EXACTLY the declared set, and the tree
+# is clean of tracked changes), then pushes ONLY that exact disposable branch at
+# that exact SHA to its `origin` remote with an exact, NON-force branch:branch
+# refspec. It NEVER force-pushes, pushes tags, deletes refs, pushes main, opens a
+# PR, merges, stages/commits, or touches the control checkout. If the remote
+# branch already exists at the SAME sha it is an idempotent no-op; a DIFFERENT
+# sha is refused (no force). Opening a PR (Stage 4) is a SEPARATE lane that needs
+# a NEW explicit operator approval. Fail-closed: any refusal exits EXIT_GATE
+# without pushing.
+
+# Emit the Stage-3 package-push evidence JSON (AFTER the verified push). pushed
+# is true; pr_opened / merged stay false.
+emit_package_push() {
+  local wt=$1 branch=$2 base_sha=$3 commit_sha=$4 remote_name=$5 remote_sha=$6; shift 6
+  local declared=("$@") rel_list=() d
+  for d in "${declared[@]}"; do rel_list+=("${d#"$wt"/}"); done
+  python3 - "$wt" "$branch" "$base_sha" "$commit_sha" "$remote_name" "$remote_sha" "${rel_list[@]}" <<'PY'
+import json, sys
+wt, branch, base_sha, commit_sha, remote_name, remote_sha = sys.argv[1:7]
+declared = sys.argv[7:]
+ev = {
+    "schema_version": "a2-tier4-package-push.v0",
+    "stage": "tier4-stage3-package-push",
+    "base_sha": base_sha,
+    "worktree": wt,
+    "branch": branch,
+    "declared_files": declared,
+    "package_commit_sha": commit_sha,
+    "remote_name": remote_name,
+    "remote_branch": branch,
+    "remote_sha": remote_sha,
+    "pushed": True,
+    "would_open_pr": False,
+    "pr_opened": False,
+    "merged": False,
+}
+print(json.dumps(ev, indent=2, sort_keys=True))
+PY
+  rule
+  info "NEXT (Stage 4 — a SEPARATE lane; opening a draft PR requires a NEW explicit operator approval)."
+  info "  package-push opened NO PR and merged nothing."
+  rule
+  info "package-push: pushed exact branch:branch (no force/tags/delete). pr_opened=false merged=false."
+}
+
+# package-push --worktree <path> --approved-lane <lane.json> [--plan <plan.yaml>]
+cmd_package_push() {
+  local wt="" lane="" plan=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --worktree) wt=${2:-}; shift 2 ;;
+      --approved-lane) lane=${2:-}; shift 2 ;;
+      --plan) plan=${2:-}; shift 2 ;;
+      *) err "unexpected argument: $1"; return $EXIT_USAGE ;;
+    esac
+  done
+  [[ -n "$wt" && -n "$lane" ]] || { err "package-push requires --worktree and --approved-lane"; return $EXIT_USAGE; }
+  [[ -f "$lane" ]] || { err "approved-lane file not found: $lane"; return $EXIT_USAGE; }
+
+  # Same read-only readiness gate as package-plan/package-commit.
+  _tier4_gate_package "$wt" "$lane" "$plan" || return $?
+  local branch=$_TIER4_BRANCH
+  local declared=("${_TIER4_DECLARED[@]}")
+
+  # Never push a default/integration branch.
+  case "$branch" in
+    main|master|HEAD) err "TIER-4 STAGE3 REFUSED: refusing to push branch '$branch'; nothing pushed."; return $EXIT_GATE ;;
+  esac
+
+  # The disposable worktree must be in the Stage-2 package-committed state:
+  # clean of tracked changes (untracked .claw allowed)...
+  if ! git -C "$wt" diff --quiet || ! git -C "$wt" diff --cached --quiet; then
+    err "TIER-4 STAGE3 REFUSED: disposable worktree has staged/unstaged tracked changes; run package-commit first. Nothing pushed."
+    return $EXIT_GATE
+  fi
+  # ...and HEAD must be a real commit with a parent.
+  local parent
+  parent=$(git -C "$wt" rev-parse --verify -q 'HEAD~1') \
+    || { err "TIER-4 STAGE3 REFUSED: worktree HEAD has no parent (no package-commit). Nothing pushed."; return $EXIT_GATE; }
+
+  # Re-derive the package-commit evidence: the HEAD commit must have changed
+  # EXACTLY the declared set (this is the Stage-2 package-commit).
+  local d declared_rel=()
+  for d in "${declared[@]}"; do declared_rel+=("${d#"$wt"/}"); done
+  local head_diff declared_sorted
+  head_diff=$(git -C "$wt" diff --name-only "$parent" HEAD | sort)
+  declared_sorted=$(printf '%s\n' "${declared_rel[@]}" | sort)
+  if [[ "$head_diff" != "$declared_sorted" ]]; then
+    err "TIER-4 STAGE3 REFUSED: HEAD commit diff != declared set (not a clean package-commit). Nothing pushed."
+    err "  declared:  $(printf '%s ' "${declared_rel[@]}")"
+    err "  head diff: ${head_diff//$'\n'/ }"
+    return $EXIT_GATE
+  fi
+  local package_commit_sha base_sha
+  package_commit_sha=$(git -C "$wt" rev-parse HEAD)
+  base_sha=$(git -C "$wt" rev-parse "$parent")
+
+  # Remote branch safety: exact branch name; refuse a pre-existing remote branch
+  # at a DIFFERENT sha (no force). A SAME-sha remote is an idempotent no-op.
+  local remote_name="origin" existing_sha idempotent=false
+  existing_sha=$(git -C "$wt" ls-remote --heads "$remote_name" "$branch" 2>/dev/null | awk 'NR==1{print $1}')
+  if [[ -n "$existing_sha" ]]; then
+    if [[ "$existing_sha" == "$package_commit_sha" ]]; then
+      idempotent=true
+      info "Stage 3: remote $remote_name/$branch already at the exact package-commit sha — idempotent no-op push."
+    else
+      err "TIER-4 STAGE3 REFUSED: remote $remote_name/$branch already exists at a DIFFERENT sha ($existing_sha); refusing (no force). Nothing pushed."
+      return $EXIT_GATE
+    fi
+  fi
+
+  # Exact, NON-force, branch:branch push (skipped when already idempotently present).
+  if [[ "$idempotent" != true ]]; then
+    git -C "$wt" push --set-upstream "$remote_name" "$branch:$branch" \
+      || { err "TIER-4 STAGE3 REFUSED: push to $remote_name failed. Nothing further done."; return $EXIT_GATE; }
+  fi
+
+  # Verify the remote now holds EXACTLY the package-commit sha.
+  local remote_sha
+  remote_sha=$(git -C "$wt" ls-remote --heads "$remote_name" "$branch" 2>/dev/null | awk 'NR==1{print $1}')
+  [[ "$remote_sha" == "$package_commit_sha" ]] \
+    || { err "TIER-4 STAGE3 REFUSED: post-push remote sha ($remote_sha) != package-commit sha ($package_commit_sha)."; return $EXIT_GATE; }
+
+  rule; info "Tier-4 package-push (Stage 3) — pushed the disposable branch to $remote_name (no PR, no merge)"; rule
+  emit_package_push "$wt" "$branch" "$base_sha" "$package_commit_sha" "$remote_name" "$remote_sha" "${declared[@]}"
+  return $EXIT_OK
+}
+
 # ---- usage + dispatch ------------------------------------------------------
 
 usage() {
@@ -1094,6 +1225,17 @@ Subcommands:
       index is pre-staged or the staged set != declared set. Push/PR (Stages 3-4)
       remain a separate, token-gated lane.
 
+  package-push   --worktree <path> --approved-lane <lane.json> [--plan <plan.yaml>]
+      Tier-4 Stage 3. Runs the SAME readiness gate, re-derives the Stage-2
+      package-commit from the worktree HEAD (HEAD changed EXACTLY the declared
+      set; tree clean), then pushes ONLY that exact disposable branch at that
+      exact sha to its \`origin\` remote with a NON-force branch:branch refspec.
+      NEVER force-pushes / pushes tags / deletes refs / pushes main / opens a PR
+      / merges / commits / touches the control checkout. A same-sha remote is an
+      idempotent no-op; a different-sha remote is refused. pushed=true,
+      pr_opened=false, merged=false. Opening a PR (Stage 4) is a separate lane
+      needing a NEW explicit operator approval.
+
 Environment:
   A2_CLAW   path to the built claw binary (default: the dated build artifact).
             current: $A2_CLAW
@@ -1126,6 +1268,7 @@ main() {
     apply-lane) cmd_apply_lane "$@" ;;
     package-plan) cmd_package_plan "$@" ;;
     package-commit) cmd_package_commit "$@" ;;
+    package-push) cmd_package_push "$@" ;;
     *) err "unknown subcommand: $sub"; info ""; usage; exit $EXIT_USAGE ;;
   esac
 }
