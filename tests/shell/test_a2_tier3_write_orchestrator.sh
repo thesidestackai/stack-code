@@ -418,7 +418,12 @@ static_assert "package-plan prints, never runs, push/PR" 'package-plan runs NONE
 # executed push/PR/merge anywhere in the orchestrator.
 static_assert "orchestrator never uses git add . / -A"   'git[[:space:]]+add[[:space:]]+(\.|-A)([[:space:]]|$)' absent
 static_assert "orchestrator never uses git commit -a"    'git[[:space:]].*commit[[:space:]].*[[:space:]]-a([[:space:]]|$)' absent
-static_assert "orchestrator executes NO git push"        '^[[:space:]]*git[[:space:]]+-C[[:space:]]+"\$(wt|WT_PATH)"[[:space:]]+push' absent
+# Stage 3 legitimately performs ONE exact, non-force branch:branch push inside the
+# disposable worktree. The invariants worth pinning: the only push is that exact
+# non-force refspec, and NEVER a force/mirror/tags push or any ref-delete refspec.
+static_assert "orchestrator's only push is exact non-force refspec" 'git -C "\$wt" push --set-upstream "\$remote_name" "\$branch:\$branch"' present
+static_assert "orchestrator never force/mirror/tags-pushes" 'push[[:space:]]+(--force|-f|--mirror|--tags)([[:space:]]|$)' absent
+static_assert "orchestrator never deletes remote refs"     'push[^"]*(--delete|--prune| :)' absent
 static_assert "orchestrator executes NO gh"              '^[[:space:]]*gh[[:space:]]+pr'                 absent
 
 # ============================================================================
@@ -518,6 +523,140 @@ static_assert "package-commit commits in-worktree"       'git -C "\$wt" commit -
 static_assert "package-commit evidence pushed=false"     '"pushed": False'                              present
 static_assert "package-commit evidence merged=false"     '"merged": False'                              present
 static_assert "package-commit verifies staged==declared" 'staged set != declared set'                   present
+
+# ============================================================================
+# package-push (Tier-4 Stage 3) — pushes ONLY the exact disposable branch at the
+# exact package-commit sha to its `origin` remote (a HERMETIC temp bare repo in
+# these tests — never GitHub); non-force; no PR/merge/tags/delete; never touches
+# the control checkout. Reuses the Stage-1 gate, so its pure-gate refusals carry.
+# ============================================================================
+
+# build_pushable_wt <name> <branch> <bare> — an applied+committed worktree (Stage-2
+# state) whose `origin` remote is the given hermetic bare repo. Echoes the path.
+build_pushable_wt() {
+  local name=$1 branch=$2 bare=$3
+  local wt="$PKG_WTR/$name" sha
+  mkdir -p "$wt"
+  git -C "$wt" init -q
+  git -C "$wt" config user.email t@t
+  git -C "$wt" config user.name t
+  git -C "$wt" remote add origin "$bare"
+  git -C "$wt" checkout -q -b "$branch"
+  git -C "$wt" commit -q --allow-empty -m base
+  printf 'hello tier4\n' > "$wt/notes.md"
+  sha=$(sha256sum "$wt/notes.md" | awk '{print $1}')
+  mkdir -p "$wt/.claw/l2b-payloads/RUN/STEP" "$wt/.claw/l2b-preview-bundles/RUN/STEP" "$wt/.claw/l2b-checkpoints/RUN/STEP"
+  printf '%s\n' "$sha" > "$wt/.claw/l2b-payloads/RUN/STEP/after.sha256"
+  printf '{}' > "$wt/.claw/l2b-preview-bundles/RUN/STEP/apply-bundle.json"
+  git -C "$wt" add -- notes.md            # simulate the Stage-2 package-commit
+  git -C "$wt" commit -q -m "a2(tier4): package isolated mutation on $branch (1 file(s))"
+  printf '%s' "$wt"
+}
+
+# new_bare <name> — create a hermetic empty bare repo; echo its path.
+new_bare() { local b="$PKG_ROOT/$1.git"; git init --bare -q "$b"; printf '%s' "$b"; }
+
+# happy path: pushes the exact branch at the package-commit sha to the bare origin.
+BARE_OK="$(new_bare origin_pok)"
+WT_P_OK="$(build_pushable_wt pok feat/x "$BARE_OK")"
+pkg_lane "$PKG_ROOT/lane_pok.json" "$WT_P_OK" feat/x
+P_LOCAL="$(git -C "$WT_P_OK" rev-parse HEAD)"
+run_pkg "package-push: happy path pushes(0)"          0 package-push --worktree "$WT_P_OK" --approved-lane "$PKG_ROOT/lane_pok.json"
+P_REMOTE="$(git -C "$WT_P_OK" ls-remote --heads "$BARE_OK" feat/x | awk 'NR==1{print $1}')"
+P_OTHER_REFS="$(git -C "$WT_P_OK" ls-remote --heads "$BARE_OK" | awk '{print $2}' | { grep -v '^refs/heads/feat/x$' || true; } | tr '\n' ',')"
+P_CTL_DIRTY="$(git -C "$PKG_CTL" status --porcelain)"
+if [[ "$P_REMOTE" == "$P_LOCAL" && -z "$P_OTHER_REFS" && -z "$P_CTL_DIRTY" ]]; then
+  PASS_COUNT=$((PASS_COUNT+1)); printf 'PASS  %-52s (remote==HEAD, only feat/x, ctl clean)\n' "package-push: pushed exact sha, only the branch"
+else
+  FAIL_COUNT=$((FAIL_COUNT+1)); printf 'FAIL  %-52s (remote=%s local=%s other=[%s] ctl=[%s])\n' "package-push: pushed exact sha, only the branch" "$P_REMOTE" "$P_LOCAL" "$P_OTHER_REFS" "$P_CTL_DIRTY"
+fi
+
+# evidence: pushed=true, pr_opened=false, merged=false, remote_sha present.
+BARE_EV="$(new_bare origin_pev)"
+WT_P_EV="$(build_pushable_wt pev feat/x "$BARE_EV")"
+pkg_lane "$PKG_ROOT/lane_pev.json" "$WT_P_EV" feat/x
+P_JSON="$(A2_CONTROL_CHECKOUT="$PKG_CTL" A2_DISPOSABLE_WORKTREE_ROOT="$PKG_WTR" \
+  "${ORCH}" package-push --worktree "$WT_P_EV" --approved-lane "$PKG_ROOT/lane_pev.json" 2>/dev/null || true)"
+if printf '%s' "$P_JSON" | grep -q '"pushed": true' \
+   && printf '%s' "$P_JSON" | grep -q '"pr_opened": false' \
+   && printf '%s' "$P_JSON" | grep -q '"merged": false' \
+   && printf '%s' "$P_JSON" | grep -q '"remote_sha"'; then
+  PASS_COUNT=$((PASS_COUNT+1)); printf 'PASS  %-52s (pushed=true pr_opened/merged=false)\n' "package-push: evidence contract"
+else
+  FAIL_COUNT=$((FAIL_COUNT+1)); printf 'FAIL  %-52s (evidence JSON missing flags)\n' "package-push: evidence contract"
+fi
+
+# idempotent: remote already at the exact sha -> no-op success(0).
+BARE_IDEM="$(new_bare origin_pidem)"
+WT_P_IDEM="$(build_pushable_wt pidem feat/x "$BARE_IDEM")"
+git -C "$WT_P_IDEM" push -q origin feat/x:feat/x       # pre-push the exact HEAD
+pkg_lane "$PKG_ROOT/lane_pidem.json" "$WT_P_IDEM" feat/x
+run_pkg "package-push: idempotent same-sha no-op(0)"  0 package-push --worktree "$WT_P_IDEM" --approved-lane "$PKG_ROOT/lane_pidem.json"
+
+# refuse: remote branch exists at a DIFFERENT sha -> refuse(4), no force.
+BARE_COLL="$(new_bare origin_pcoll)"
+WT_P_COLL="$(build_pushable_wt pcoll feat/x "$BARE_COLL")"
+git -C "$WT_P_COLL" push -q origin "HEAD~1:refs/heads/feat/x"   # remote feat/x = parent (different sha)
+P_COLL_REMOTE_BEFORE="$(git -C "$WT_P_COLL" ls-remote --heads "$BARE_COLL" feat/x | awk 'NR==1{print $1}')"
+pkg_lane "$PKG_ROOT/lane_pcoll.json" "$WT_P_COLL" feat/x
+run_pkg "package-push: remote collision diff-sha refused(4)" 4 package-push --worktree "$WT_P_COLL" --approved-lane "$PKG_ROOT/lane_pcoll.json"
+P_COLL_REMOTE_AFTER="$(git -C "$WT_P_COLL" ls-remote --heads "$BARE_COLL" feat/x | awk 'NR==1{print $1}')"
+if [[ "$P_COLL_REMOTE_AFTER" == "$P_COLL_REMOTE_BEFORE" ]]; then
+  PASS_COUNT=$((PASS_COUNT+1)); printf 'PASS  %-52s (remote unchanged, no force)\n' "package-push: collision left remote unchanged"
+else
+  FAIL_COUNT=$((FAIL_COUNT+1)); printf 'FAIL  %-52s (remote changed!)\n' "package-push: collision left remote unchanged"
+fi
+
+# refuse: dirty disposable worktree (uncommitted tracked change) -> refuse(4), no push.
+BARE_DWT="$(new_bare origin_pdwt)"
+WT_P_DWT="$(build_pushable_wt pdwt feat/x "$BARE_DWT")"
+printf 'edited\n' >> "$WT_P_DWT/notes.md"   # uncommitted tracked change
+pkg_lane "$PKG_ROOT/lane_pdwt.json" "$WT_P_DWT" feat/x
+run_pkg "package-push: dirty disposable worktree refused(4)" 4 package-push --worktree "$WT_P_DWT" --approved-lane "$PKG_ROOT/lane_pdwt.json"
+if [[ -z "$(git -C "$WT_P_DWT" ls-remote --heads "$BARE_DWT" feat/x)" ]]; then
+  PASS_COUNT=$((PASS_COUNT+1)); printf 'PASS  %-52s (nothing pushed)\n' "package-push: dirty worktree pushed nothing"
+else
+  FAIL_COUNT=$((FAIL_COUNT+1)); printf 'FAIL  %-52s (pushed anyway!)\n' "package-push: dirty worktree pushed nothing"
+fi
+
+# refuse: HEAD diff != declared set (HEAD is not a clean package-commit) -> refuse(4).
+# Build a worktree whose HEAD commit changes an EXTRA file beyond the declared set.
+BARE_NDC="$(new_bare origin_pndc)"
+WT_P_NDC="$(build_pushable_wt pndc feat/x "$BARE_NDC")"
+printf 'y\n' > "$WT_P_NDC/OTHER.md"; git -C "$WT_P_NDC" add -- OTHER.md
+git -C "$WT_P_NDC" commit -q --amend --no-edit    # HEAD now changes notes.md + OTHER.md
+pkg_lane "$PKG_ROOT/lane_pndc.json" "$WT_P_NDC" feat/x
+run_pkg "package-push: HEAD diff != declared refused(4)" 4 package-push --worktree "$WT_P_NDC" --approved-lane "$PKG_ROOT/lane_pndc.json"
+
+# refuse: dirty control checkout -> refuse(4), no push.
+BARE_PDC="$(new_bare origin_ppdc)"
+WT_P_PDC="$(build_pushable_wt ppdc feat/x "$BARE_PDC")"
+pkg_lane "$PKG_ROOT/lane_ppdc.json" "$WT_P_PDC" feat/x
+rc_ppdc=0
+A2_CONTROL_CHECKOUT="$PKG_CTL_DIRTY" A2_DISPOSABLE_WORKTREE_ROOT="$PKG_WTR" \
+  "${ORCH}" package-push --worktree "$WT_P_PDC" --approved-lane "$PKG_ROOT/lane_ppdc.json" >/dev/null 2>&1 || rc_ppdc=$?
+if [[ "$rc_ppdc" -eq 4 && -z "$(git -C "$WT_P_PDC" ls-remote --heads "$BARE_PDC" feat/x)" ]]; then
+  PASS_COUNT=$((PASS_COUNT+1)); printf 'PASS  %-52s (refused, nothing pushed)\n' "package-push: dirty control checkout(4)"
+else
+  FAIL_COUNT=$((FAIL_COUNT+1)); printf 'FAIL  %-52s (rc=%s)\n' "package-push: dirty control checkout(4)" "$rc_ppdc"
+fi
+
+# refuse: branch main -> refuse(4) (also never pushes main).
+BARE_BM="$(new_bare origin_pbm)"
+WT_P_BM="$(build_pushable_wt pbm main "$BARE_BM")"
+pkg_lane "$PKG_ROOT/lane_pbm.json" "$WT_P_BM" main
+run_pkg "package-push: branch main refused(4)"        4 package-push --worktree "$WT_P_BM" --approved-lane "$PKG_ROOT/lane_pbm.json"
+
+# usage refusal.
+run_case "package-push: missing args -> usage(2)"     2 package-push --worktree "$PWT"
+
+# ---- package-push static invariants ----------------------------------------
+static_assert "package-push subcommand present"          'cmd_package_push\(\)'                          present
+static_assert "package-push verifies HEAD diff==declared" 'HEAD commit diff != declared set'             present
+static_assert "package-push refuses diff-sha remote collision" 'already exists at a DIFFERENT sha'        present
+static_assert "package-push evidence pushed=true"        '"pushed": True'                               present
+static_assert "package-push evidence pr_opened=false"    '"pr_opened": False'                           present
+static_assert "package-push opens no PR (Stage 4 separate)" 'opening a draft PR requires a NEW explicit operator approval' present
 
 # ---- summary ---------------------------------------------------------------
 printf -- '----\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
