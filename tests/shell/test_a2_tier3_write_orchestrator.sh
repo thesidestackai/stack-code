@@ -658,6 +658,214 @@ static_assert "package-push evidence pushed=true"        '"pushed": True'       
 static_assert "package-push evidence pr_opened=false"    '"pr_opened": False'                           present
 static_assert "package-push opens no PR (Stage 4 separate)" 'opening a draft PR requires a NEW explicit operator approval' present
 
+# ============================================================================
+# package-pr (Tier-4 Stage 4) — opens a DRAFT PR for an ALREADY-PUSHED disposable
+# branch through a HERMETIC fake `gh` shim (A2_GH override). It NEVER calls real
+# GitHub, NEVER networks, and NEVER merges/approves/marks-ready. Reuses the
+# Stage-1 readiness gate (its pure-gate refusals are covered above).
+# ============================================================================
+
+# Fake gh shim: appends its argv to $FAKE_GH_LOG so the test can audit exactly
+# which gh actions ran. `pr view` reports an existing PR ONLY when FAKE_GH_EXISTING
+# is draft|nondraft (else exits 1 = no PR). `pr create` prints a fake PR URL. Any
+# other subcommand is an error. No network, no real GitHub. (This shim lives in
+# the test fixtures, not in the orchestrator under audit.)
+GH_BIN_DIR="$PKG_ROOT/ghbin"
+mkdir -p "$GH_BIN_DIR"
+cat > "$GH_BIN_DIR/gh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "${FAKE_GH_LOG:-/dev/null}"
+if [[ "${1:-}" == "pr" && "${2:-}" == "view" ]]; then
+  case "${FAKE_GH_EXISTING:-}" in
+    draft)    printf '{"url":"https://example.invalid/pull/1","state":"OPEN","isDraft":true}\n' ;;
+    nondraft) printf '{"url":"https://example.invalid/pull/2","state":"OPEN","isDraft":false}\n' ;;
+    *) exit 1 ;;
+  esac
+  exit 0
+elif [[ "${1:-}" == "pr" && "${2:-}" == "create" ]]; then
+  printf 'https://example.invalid/pull/999\n'; exit 0
+fi
+echo "fake gh: unexpected invocation: $*" >&2
+exit 99
+SH
+chmod +x "$GH_BIN_DIR/gh"
+FAKE_GH_LOG="$PKG_ROOT/gh_invocations.log"; : > "$FAKE_GH_LOG"
+
+# build_pushed_wt <name> <branch> <bare> — a Stage-2-committed worktree whose
+# branch is ALSO pushed to the hermetic bare origin (the Stage-3 state package-pr
+# requires). Echoes the worktree path.
+build_pushed_wt() {
+  local name=$1 branch=$2 bare=$3 wt
+  wt="$(build_pushable_wt "$name" "$branch" "$bare")"
+  git -C "$wt" push -q origin "$branch:$branch"
+  printf '%s' "$wt"
+}
+
+# run_pr <name> <expect> <existing draft|nondraft|none> <args...> — package-pr with
+# the hermetic env + fake gh; truncates the gh invocation log first so each call's
+# log is self-contained for auditing.
+run_pr() {
+  local name=$1 expect=$2 existing=$3; shift 3
+  local rc=0
+  : > "$FAKE_GH_LOG"
+  A2_CONTROL_CHECKOUT="$PKG_CTL" A2_DISPOSABLE_WORKTREE_ROOT="$PKG_WTR" \
+    A2_GH="$GH_BIN_DIR/gh" FAKE_GH_LOG="$FAKE_GH_LOG" FAKE_GH_EXISTING="$existing" \
+    "${ORCH}" "$@" >/dev/null 2>&1 || rc=$?
+  if [[ "$rc" -eq "$expect" ]]; then
+    PASS_COUNT=$((PASS_COUNT+1)); printf 'PASS  %-52s (exit %s)\n' "$name" "$rc"
+  else
+    FAIL_COUNT=$((FAIL_COUNT+1)); printf 'FAIL  %-52s (got %s, want %s)\n' "$name" "$rc" "$expect"
+  fi
+}
+
+# gh_log_clean — true iff the gh log never invoked merge/ready/review/--approve.
+gh_log_clean() {
+  ! grep -Eq 'pr (merge|ready|review)' "$FAKE_GH_LOG" && ! grep -q -- '--approve' "$FAKE_GH_LOG"
+}
+
+# happy path: opens a DRAFT PR; exit 0.
+BARE_PR_OK="$(new_bare origin_prok)"
+WT_PR_OK="$(build_pushed_wt prok feat/x "$BARE_PR_OK")"
+pkg_lane "$PKG_ROOT/lane_prok.json" "$WT_PR_OK" feat/x
+PR_HEAD_BEFORE="$(git -C "$WT_PR_OK" rev-parse HEAD)"
+run_pr "package-pr: happy path opens draft PR(0)"    0 none package-pr --worktree "$WT_PR_OK" --approved-lane "$PKG_ROOT/lane_prok.json"
+
+# the fake gh was asked to CREATE a DRAFT PR, and was NEVER asked to merge/ready/
+# review/approve; and the lane mutated no git state and left the control checkout clean.
+PR_HEAD_AFTER="$(git -C "$WT_PR_OK" rev-parse HEAD)"
+PR_CTL_DIRTY="$(git -C "$PKG_CTL" status --porcelain)"
+if grep -q 'pr create' "$FAKE_GH_LOG" && grep -q -- '--draft' "$FAKE_GH_LOG" \
+   && gh_log_clean && [[ "$PR_HEAD_AFTER" == "$PR_HEAD_BEFORE" && -z "$PR_CTL_DIRTY" ]]; then
+  PASS_COUNT=$((PASS_COUNT+1)); printf 'PASS  %-52s (create --draft only; HEAD/ctl unchanged)\n' "package-pr: draft-only, no merge/ready/review"
+else
+  FAIL_COUNT=$((FAIL_COUNT+1)); printf 'FAIL  %-52s (gh log or git state unexpected)\n' "package-pr: draft-only, no merge/ready/review"
+fi
+
+# evidence contract: pr_opened=true, draft=true, merged=false, marked_ready=false, pr_url present.
+BARE_PR_EV="$(new_bare origin_prev)"
+WT_PR_EV="$(build_pushed_wt prev feat/x "$BARE_PR_EV")"
+pkg_lane "$PKG_ROOT/lane_prev.json" "$WT_PR_EV" feat/x
+PR_JSON="$(A2_CONTROL_CHECKOUT="$PKG_CTL" A2_DISPOSABLE_WORKTREE_ROOT="$PKG_WTR" \
+  A2_GH="$GH_BIN_DIR/gh" FAKE_GH_LOG="$FAKE_GH_LOG" FAKE_GH_EXISTING=none \
+  "${ORCH}" package-pr --worktree "$WT_PR_EV" --approved-lane "$PKG_ROOT/lane_prev.json" 2>/dev/null || true)"
+if printf '%s' "$PR_JSON" | grep -q '"pr_opened": true' \
+   && printf '%s' "$PR_JSON" | grep -q '"draft": true' \
+   && printf '%s' "$PR_JSON" | grep -q '"merged": false' \
+   && printf '%s' "$PR_JSON" | grep -q '"marked_ready": false' \
+   && printf '%s' "$PR_JSON" | grep -q '"pr_url"'; then
+  PASS_COUNT=$((PASS_COUNT+1)); printf 'PASS  %-52s (pr_opened/draft=true; merged/marked_ready=false)\n' "package-pr: evidence contract"
+else
+  FAIL_COUNT=$((FAIL_COUNT+1)); printf 'FAIL  %-52s (evidence JSON missing flags)\n' "package-pr: evidence contract"
+fi
+
+# idempotent: an existing OPEN DRAFT PR -> no-op success(0); opens NO second PR.
+BARE_PR_IDEM="$(new_bare origin_pridem)"
+WT_PR_IDEM="$(build_pushed_wt pridem feat/x "$BARE_PR_IDEM")"
+pkg_lane "$PKG_ROOT/lane_pridem.json" "$WT_PR_IDEM" feat/x
+run_pr "package-pr: existing draft PR idempotent(0)" 0 draft package-pr --worktree "$WT_PR_IDEM" --approved-lane "$PKG_ROOT/lane_pridem.json"
+if ! grep -q 'pr create' "$FAKE_GH_LOG" && gh_log_clean; then
+  PASS_COUNT=$((PASS_COUNT+1)); printf 'PASS  %-52s (no second PR created)\n' "package-pr: idempotent opens no second PR"
+else
+  FAIL_COUNT=$((FAIL_COUNT+1)); printf 'FAIL  %-52s (created a second PR!)\n' "package-pr: idempotent opens no second PR"
+fi
+
+# existing NON-draft PR -> refuse(4); opens NO PR and never marks ready/merges.
+BARE_PR_ND="$(new_bare origin_prnd)"
+WT_PR_ND="$(build_pushed_wt prnd feat/x "$BARE_PR_ND")"
+pkg_lane "$PKG_ROOT/lane_prnd.json" "$WT_PR_ND" feat/x
+run_pr "package-pr: existing non-draft PR refused(4)" 4 nondraft package-pr --worktree "$WT_PR_ND" --approved-lane "$PKG_ROOT/lane_prnd.json"
+if ! grep -q 'pr create' "$FAKE_GH_LOG" && gh_log_clean; then
+  PASS_COUNT=$((PASS_COUNT+1)); printf 'PASS  %-52s (no PR opened; never marked ready)\n' "package-pr: non-draft existing refused safely"
+else
+  FAIL_COUNT=$((FAIL_COUNT+1)); printf 'FAIL  %-52s (unexpected gh action)\n' "package-pr: non-draft existing refused safely"
+fi
+
+# branch not pushed (committed but unpushed) -> refuse(4); opens NO PR.
+BARE_PR_NP="$(new_bare origin_prnp)"
+WT_PR_NP="$(build_pushable_wt prnp feat/x "$BARE_PR_NP")"   # committed, NOT pushed
+pkg_lane "$PKG_ROOT/lane_prnp.json" "$WT_PR_NP" feat/x
+run_pr "package-pr: branch not pushed refused(4)"    4 none package-pr --worktree "$WT_PR_NP" --approved-lane "$PKG_ROOT/lane_prnp.json"
+if ! grep -q 'pr create' "$FAKE_GH_LOG"; then
+  PASS_COUNT=$((PASS_COUNT+1)); printf 'PASS  %-52s (no PR for an unpushed branch)\n' "package-pr: unpushed branch opens nothing"
+else
+  FAIL_COUNT=$((FAIL_COUNT+1)); printf 'FAIL  %-52s (opened a PR anyway!)\n' "package-pr: unpushed branch opens nothing"
+fi
+
+# remote at a DIFFERENT sha than the package-commit HEAD -> refuse(4).
+BARE_PR_DS="$(new_bare origin_prds)"
+WT_PR_DS="$(build_pushable_wt prds feat/x "$BARE_PR_DS")"
+git -C "$WT_PR_DS" push -q origin "HEAD~1:refs/heads/feat/x"   # remote feat/x = parent (stale)
+pkg_lane "$PKG_ROOT/lane_prds.json" "$WT_PR_DS" feat/x
+run_pr "package-pr: remote sha != commit refused(4)" 4 none package-pr --worktree "$WT_PR_DS" --approved-lane "$PKG_ROOT/lane_prds.json"
+
+# dirty disposable worktree (uncommitted tracked change) -> refuse(4).
+BARE_PR_DW="$(new_bare origin_prdw)"
+WT_PR_DW="$(build_pushed_wt prdw feat/x "$BARE_PR_DW")"
+printf 'edited\n' >> "$WT_PR_DW/notes.md"
+pkg_lane "$PKG_ROOT/lane_prdw.json" "$WT_PR_DW" feat/x
+run_pr "package-pr: dirty disposable worktree refused(4)" 4 none package-pr --worktree "$WT_PR_DW" --approved-lane "$PKG_ROOT/lane_prdw.json"
+
+# HEAD diff != declared set (HEAD changes an extra file) -> refuse(4).
+BARE_PR_HD="$(new_bare origin_prhd)"
+WT_PR_HD="$(build_pushable_wt prhd feat/x "$BARE_PR_HD")"
+printf 'y\n' > "$WT_PR_HD/OTHER.md"; git -C "$WT_PR_HD" add -- OTHER.md
+git -C "$WT_PR_HD" commit -q --amend --no-edit       # HEAD now changes notes.md + OTHER.md
+git -C "$WT_PR_HD" push -q origin feat/x:feat/x
+pkg_lane "$PKG_ROOT/lane_prhd.json" "$WT_PR_HD" feat/x
+run_pr "package-pr: HEAD diff != declared refused(4)" 4 none package-pr --worktree "$WT_PR_HD" --approved-lane "$PKG_ROOT/lane_prhd.json"
+
+# branch main -> refuse(4) (readiness gate refuses main before any push check).
+BARE_PR_BM="$(new_bare origin_prbm)"
+WT_PR_BM="$(build_pushable_wt prbm main "$BARE_PR_BM")"
+pkg_lane "$PKG_ROOT/lane_prbm.json" "$WT_PR_BM" main
+run_pr "package-pr: branch main refused(4)"          4 none package-pr --worktree "$WT_PR_BM" --approved-lane "$PKG_ROOT/lane_prbm.json"
+
+# gh CLI missing -> refuse(4) (A2_GH points at a nonexistent path).
+BARE_PR_NOGH="$(new_bare origin_prnogh)"
+WT_PR_NOGH="$(build_pushed_wt prnogh feat/x "$BARE_PR_NOGH")"
+pkg_lane "$PKG_ROOT/lane_prnogh.json" "$WT_PR_NOGH" feat/x
+rc_nogh=0
+A2_CONTROL_CHECKOUT="$PKG_CTL" A2_DISPOSABLE_WORKTREE_ROOT="$PKG_WTR" \
+  A2_GH="$PKG_ROOT/__no_such_gh_binary__" \
+  "${ORCH}" package-pr --worktree "$WT_PR_NOGH" --approved-lane "$PKG_ROOT/lane_prnogh.json" >/dev/null 2>&1 || rc_nogh=$?
+if [[ "$rc_nogh" -eq 4 ]]; then
+  PASS_COUNT=$((PASS_COUNT+1)); printf 'PASS  %-52s (exit %s)\n' "package-pr: gh CLI missing refused(4)" "$rc_nogh"
+else
+  FAIL_COUNT=$((FAIL_COUNT+1)); printf 'FAIL  %-52s (got %s, want 4)\n' "package-pr: gh CLI missing refused(4)" "$rc_nogh"
+fi
+
+# dirty control checkout -> refuse(4).
+BARE_PR_PDC="$(new_bare origin_prpdc)"
+WT_PR_PDC="$(build_pushed_wt prpdc feat/x "$BARE_PR_PDC")"
+pkg_lane "$PKG_ROOT/lane_prpdc.json" "$WT_PR_PDC" feat/x
+rc_prpdc=0
+A2_CONTROL_CHECKOUT="$PKG_CTL_DIRTY" A2_DISPOSABLE_WORKTREE_ROOT="$PKG_WTR" \
+  A2_GH="$GH_BIN_DIR/gh" FAKE_GH_LOG="$FAKE_GH_LOG" FAKE_GH_EXISTING=none \
+  "${ORCH}" package-pr --worktree "$WT_PR_PDC" --approved-lane "$PKG_ROOT/lane_prpdc.json" >/dev/null 2>&1 || rc_prpdc=$?
+if [[ "$rc_prpdc" -eq 4 ]]; then
+  PASS_COUNT=$((PASS_COUNT+1)); printf 'PASS  %-52s (exit %s)\n' "package-pr: dirty control checkout(4)" "$rc_prpdc"
+else
+  FAIL_COUNT=$((FAIL_COUNT+1)); printf 'FAIL  %-52s (got %s, want 4)\n' "package-pr: dirty control checkout(4)" "$rc_prpdc"
+fi
+
+# usage refusal.
+run_case "package-pr: missing args -> usage(2)"      2 package-pr --worktree "$PWT"
+
+# ---- package-pr static invariants ------------------------------------------
+static_assert "package-pr subcommand present"            'cmd_package_pr\(\)'                            present
+static_assert "package-pr opens DRAFT via fixed --draft" 'pr create --draft'                             present
+static_assert "package-pr requires branch already pushed" 'is not pushed to'                             present
+static_assert "package-pr success needs a real PR URL"   'returned no PR URL'                            present
+static_assert "package-pr evidence marked_ready=false"   '"marked_ready": False'                         present
+static_assert "package-pr drives gh only via \$A2_GH"    '"\$A2_GH"'                                      present
+# the ONLY gh write is a draft create + a read-only pr view; no gh invocation line
+# may carry merge/ready/review/--approve (these match the gh-invocation lines, not prose).
+static_assert "no gh invocation line merges"             '"\$A2_GH".*merge'                              absent
+static_assert "no gh invocation line marks ready"        '"\$A2_GH".*ready'                              absent
+static_assert "no gh invocation line reviews"            '"\$A2_GH".*review'                             absent
+static_assert "no gh invocation line approves"           '"\$A2_GH".*--approve'                          absent
+
 # ---- summary ---------------------------------------------------------------
 printf -- '----\n%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]
