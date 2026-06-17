@@ -48,6 +48,28 @@ export interface NavView {
   stepButtonId: string | null;
 }
 
+// Northstar Phase N2 — read-only WORKSPACE STATUS CARD view. Pre-formatted by
+// the extension from the pure workspaceStatus module. Read-only display only.
+export interface WorkspaceStatusView {
+  lines: string[];
+  // Honest reason git facts may be unknown (null when fully probed).
+  gitProbeNote: string | null;
+}
+
+// Northstar Phase N2 — read-only state-model (ladder) view. Pre-formatted by the
+// extension from the pure northstarState module. The render layer only displays
+// the current state + the single recommended next safe step; it runs nothing.
+export interface NorthstarLadderView {
+  state: string;
+  stateClass: string;
+  stepLabel: string;
+  stepKind: string;
+  // True only for read-only steps; never for an apply/package/push/pr/merge.
+  automatable: boolean;
+  // True when the next gate is a REAL terminal (human-typed apply approval).
+  requiresRealTty: boolean;
+}
+
 // Read-only discovery summary lines (e.g. "plan.yaml: auto-selected /a/plan.yaml",
 // "preview-bundle.json: /d/.claw/preview-bundle.json"). Already formatted by the
 // extension; every discovered path is shown here before it is used.
@@ -130,6 +152,12 @@ export interface RenderModel {
   setup?: SetupStatus | null;
   nav?: NavView | null;
   discovery?: DiscoveryView | null;
+  // Northstar Phase N2 read-only views (optional; absent => muted hint). The
+  // workspace status card auto-renders on open; the ladder view shows the
+  // current Northstar state + the single recommended next safe step. Both are
+  // read-only: they add no control and run no apply/package/PR/merge.
+  workspaceCard?: WorkspaceStatusView | null;
+  northstar?: NorthstarLadderView | null;
   // Pre-formatted evidence-timeline lines.
   timeline?: string[] | null;
   // A2 Local Coding Agent Foundation v0 control-plane view (optional; degrades
@@ -286,6 +314,49 @@ function navBlock(nav: NavView | null | undefined): string {
   <p data-testid="next-step-label">${escapeHtml(nav.stepLabel)}</p>
 ${btn}
   <p class="muted">This is a read-only recommendation. Print/validate steps print or copy a command; you run preview/approval/apply yourself at a real terminal.</p>
+</section>`;
+}
+
+// Northstar Phase N2 — WORKSPACE STATUS CARD section. Auto-rendered on open
+// (workspace root is detected from the vscode folder). Read-only; git facts may
+// render "unknown" with an honest probe note — never green-by-default.
+function workspaceCardBlock(card: WorkspaceStatusView | null | undefined): string {
+  if (!card) {
+    return `<section class="workspace-card" data-testid="workspace-card">
+  <h3>Workspace (Northstar)</h3>
+  <p class="muted" data-testid="workspace-card-empty">No workspace detected yet. Open a folder; the card auto-detects the workspace root on open.</p>
+</section>`;
+  }
+  const items = card.lines.map((l) => `    <li>${escapeHtml(l)}</li>`).join("\n");
+  const note = card.gitProbeNote
+    ? `  <p class="muted" data-testid="workspace-card-git-note">Git facts: not-checked — ${escapeHtml(card.gitProbeNote)}</p>`
+    : "";
+  return `<section class="workspace-card" data-testid="workspace-card">
+  <h3>Workspace (Northstar)</h3>
+  <ul>
+${items}
+  </ul>
+${note}
+  <p class="muted">Read-only, auto-detected on open. The card reads no file and spawns nothing; it never modifies the workspace.</p>
+</section>`;
+}
+
+// Northstar Phase N2 — STATE-MODEL (ladder) section. Shows the current Northstar
+// state and the single recommended next safe step. Read-only guidance only: it
+// runs no apply/package/push/pr/merge and auto-advances past no human gate.
+function northstarBlock(view: NorthstarLadderView | null | undefined): string {
+  if (!view) {
+    return "";
+  }
+  const gate = view.requiresRealTty
+    ? `  <p data-testid="northstar-gate">Next gate is a REAL terminal (human-typed); the panel never crosses it for you.</p>`
+    : "";
+  return `<section class="northstar" data-testid="northstar-state">
+  <h3>Northstar state (read-only)</h3>
+  <p data-testid="northstar-state-value">state: <code>${escapeHtml(view.state)}</code> <span class="muted">(${escapeHtml(view.stateClass)})</span></p>
+  <p data-testid="northstar-next-step">next safe step: ${escapeHtml(view.stepLabel)} <span class="muted">[${escapeHtml(view.stepKind)}; automatable=${view.automatable ? "yes" : "no"}]</span></p>
+${gate}
+  <p class="muted">Read-only state model. It reflects observed state and recommends one safe step; it never applies, packages, pushes, opens, or merges. Merge is human-only.</p>
 </section>`;
 }
 
@@ -632,6 +703,8 @@ export function renderHtml(model: RenderModel): string {
 <h2>A2 Harness Panel</h2>
 <p class="muted">Visual driver for the print/validate-only A2 IDE harness v0. Each button runs one read-only/print helper subcommand or copies its printed command — nothing executes the A2 chain.</p>
 ${safetyBlock()}
+${workspaceCardBlock(model.workspaceCard)}
+${northstarBlock(model.northstar)}
 ${setupBlock(model.setup)}
 ${navBlock(model.nav)}
 ${discoveryBlock(model.discovery)}

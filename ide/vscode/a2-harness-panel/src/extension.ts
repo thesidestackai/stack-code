@@ -7,6 +7,8 @@ import {
   HelperOutput,
   NavView,
   DiscoveryView,
+  WorkspaceStatusView,
+  NorthstarLadderView,
   FoundationView,
   Tier3View,
   ExecutorDryRunView,
@@ -76,6 +78,16 @@ import {
   assertSafe,
 } from "./stateMachine";
 import {
+  WorkspaceProbe,
+  computeWorkspaceStatusCard,
+  renderWorkspaceStatusLines,
+} from "./workspaceStatus";
+import {
+  NorthstarSignals,
+  emptyNorthstarSignals,
+  buildNorthstarView,
+} from "./northstarState";
+import {
   TimelineEvent,
   event as timelineEvent,
   append as appendEvent,
@@ -104,6 +116,9 @@ interface SessionState {
   setup: SetupStatus | null;
   nav: NavView | null;
   discovery: DiscoveryView | null;
+  // Northstar Phase N2 read-only views (workspace status card + state model).
+  workspaceCard: WorkspaceStatusView | null;
+  northstar: NorthstarLadderView | null;
   timeline: TimelineEvent[];
   // True once a validate-input run exited 0 in this session.
   validated: boolean;
@@ -133,6 +148,8 @@ const session: SessionState = {
   setup: null,
   nav: null,
   discovery: null,
+  workspaceCard: null,
+  northstar: null,
   timeline: [],
   validated: false,
   audit: null,
@@ -315,6 +332,8 @@ function model(): RenderModel {
     setup: session.setup,
     nav: session.nav,
     discovery: session.discovery,
+    workspaceCard: session.workspaceCard,
+    northstar: session.northstar,
     timeline: session.timeline.length > 0 ? formatTimeline(session.timeline) : null,
     foundation: buildFoundationView(),
     tier3: buildTier3View(),
@@ -551,6 +570,47 @@ function recomputeViews(): void {
   });
   const step = assertSafe(nextSafeStep(state));
   session.nav = { state, stepLabel: stepLabel(step), stepButtonId: stepButtonId(step) };
+
+  // Northstar Phase N2 — read-only workspace status card. The root is auto-
+  // detected from the vscode workspace folder (available on open). Branch /
+  // clean-dirty / origin-main freshness need a read-only git probe the print/
+  // validate-only helper does not yet emit, so they stay honest unknowns until a
+  // later phase wires it. No fs, no spawn here.
+  const workspaceProbe: WorkspaceProbe = {
+    workspaceRoot: ws,
+    branch: null,
+    worktreeClean: null,
+    originMainFreshness: null,
+  };
+  const card = computeWorkspaceStatusCard(workspaceProbe);
+  session.workspaceCard = {
+    lines: renderWorkspaceStatusLines(card),
+    gitProbeNote: card.gitProbeNote,
+  };
+
+  // Northstar Phase N2 — read-only state-model view, derived from the same
+  // read-only signals (workspace + validate-input + the audit chain state).
+  // Forward signals (task/plan-draft/package/PR/disposition) are not observed in
+  // N2 and stay false; the model then rests at the most-advanced OBSERVED state
+  // and never auto-advances past the apply gate (buildNorthstarView asserts it).
+  const chain = session.audit ? session.audit.chainState : null;
+  const nsSignals: NorthstarSignals = {
+    ...emptyNorthstarSignals(),
+    workspaceReady: typeof ws === "string" && ws.trim().length > 0,
+    planValidated: session.validated,
+    previewReady: chain === "preview-ready",
+    awaitingApplyApproval: chain === "approval-ready" || chain === "apply-bundle-ready",
+    appliedObserved: chain === "applied",
+  };
+  const nsView = buildNorthstarView(nsSignals);
+  session.northstar = {
+    state: nsView.state,
+    stateClass: nsView.stateClass,
+    stepLabel: nsView.stepLabel,
+    stepKind: nsView.stepKind,
+    automatable: nsView.automatable,
+    requiresRealTty: nsView.requiresRealTty,
+  };
 
   session.discovery = buildDiscoveryView();
 }
@@ -849,6 +909,12 @@ function openPanel(): void {
       }),
     );
   }
+  // Northstar Phase N2: auto-detect the workspace on open and populate the
+  // read-only workspace status card + state-model view before the first render.
+  // recomputeViews is pure (computeSetupStatus / computeWorkspaceStatusCard /
+  // buildNorthstarView) — it spawns nothing and reads no file; the workspace
+  // root comes from the vscode folder via defaultWorkspace().
+  recomputeViews();
   session.panel.show(model());
   // Workspace-first: kick off a single read-only status refresh on open so the
   // panel shows setup status + next safe step without the operator typing
