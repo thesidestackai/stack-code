@@ -9,6 +9,7 @@ import {
   DiscoveryView,
   WorkspaceStatusView,
   NorthstarLadderView,
+  N3PanelView,
   FoundationView,
   Tier3View,
   ExecutorDryRunView,
@@ -88,6 +89,16 @@ import {
   buildNorthstarView,
 } from "./northstarState";
 import {
+  TaskDraft,
+  TaskIntakeEvent,
+  emptyTaskDraft,
+  reduceTaskIntake,
+  renderTaskIntakeLines,
+} from "./n3TaskIntake";
+import { riskDisposition } from "./n3RiskClassifier";
+import { renderPlanDraftLines } from "./n3PlanDraft";
+import { buildN3View, n3ToLadderSignals } from "./n3State";
+import {
   TimelineEvent,
   event as timelineEvent,
   append as appendEvent,
@@ -119,6 +130,9 @@ interface SessionState {
   // Northstar Phase N2 read-only views (workspace status card + state model).
   workspaceCard: WorkspaceStatusView | null;
   northstar: NorthstarLadderView | null;
+  // Northstar Phase N3 local task intake draft + its read-only view.
+  taskDraft: TaskDraft;
+  n3: N3PanelView | null;
   timeline: TimelineEvent[];
   // True once a validate-input run exited 0 in this session.
   validated: boolean;
@@ -150,6 +164,8 @@ const session: SessionState = {
   discovery: null,
   workspaceCard: null,
   northstar: null,
+  taskDraft: emptyTaskDraft("task-1"),
+  n3: null,
   timeline: [],
   validated: false,
   audit: null,
@@ -334,6 +350,7 @@ function model(): RenderModel {
     discovery: session.discovery,
     workspaceCard: session.workspaceCard,
     northstar: session.northstar,
+    n3: session.n3,
     timeline: session.timeline.length > 0 ? formatTimeline(session.timeline) : null,
     foundation: buildFoundationView(),
     tier3: buildTier3View(),
@@ -473,6 +490,79 @@ async function pickPath(prompt: string, key: keyof PanelInputs): Promise<void> {
   }
 }
 
+// Northstar Phase N3 — dispatch a task-intake reducer event over the local
+// session draft, then recompute views + re-render. The reducer is pure; this
+// boundary supplies the timestamp and re-renders. It spawns nothing, reads no
+// file, calls no model, and never runs apply/package/PR.
+function dispatchN3(event: TaskIntakeEvent): void {
+  session.taskDraft = reduceTaskIntake(session.taskDraft, event);
+  record(timelineEvent("field-set", `n3 ${event.type} -> ${session.taskDraft.draft_status}`));
+  recomputeViews();
+  rerender();
+}
+
+function n3Stamp(): { now: string } {
+  return { now: new Date().toISOString() };
+}
+
+// Capture the task summary + intent (free text). Empty input is a no-op.
+async function n3DescribeTask(): Promise<void> {
+  const summary = await vscode.window.showInputBox({
+    prompt: "Task summary (one line). The plan draft is non-executing; nothing runs.",
+    ignoreFocusOut: true,
+  });
+  if (summary === undefined) {
+    return;
+  }
+  const intent = await vscode.window.showInputBox({
+    prompt: "Operator intent (free text describing the desired change).",
+    ignoreFocusOut: true,
+  });
+  if (intent === undefined) {
+    return;
+  }
+  const ws = session.inputs.workspace ?? defaultWorkspace();
+  dispatchN3({ type: "DescribeTask", summary, intent, workspaceRoot: ws, stamp: n3Stamp() });
+}
+
+// Add one exact declared target path (no globs; deny-list always wins).
+async function n3AddDeclaredPath(): Promise<void> {
+  const value = await vscode.window.showInputBox({
+    prompt: "Declare ONE exact, workspace-relative target path (no globs, no absolute paths).",
+    ignoreFocusOut: true,
+  });
+  if (value !== undefined && value.trim().length > 0) {
+    dispatchN3({ type: "DeclareTarget", path: value.trim(), stamp: n3Stamp() });
+  }
+}
+
+// Add one explicit forbidden path (in addition to the always-denied families).
+async function n3AddForbiddenPath(): Promise<void> {
+  const value = await vscode.window.showInputBox({
+    prompt: "Add ONE forbidden path (deny-list). Runtime/services/HQ/Vault/secrets are always denied.",
+    ignoreFocusOut: true,
+  });
+  if (value !== undefined && value.trim().length > 0) {
+    dispatchN3({ type: "DeclareForbidden", path: value.trim(), stamp: n3Stamp() });
+  }
+}
+
+// Produce the non-executing plan draft and validate it (classify -> draft ->
+// validate). This runs no command and opens nothing; the result is a review
+// artifact that is structurally non-runnable.
+function n3DraftPlan(): void {
+  const stamp = n3Stamp();
+  session.taskDraft = reduceTaskIntake(session.taskDraft, { type: "DraftPlan", stamp });
+  session.taskDraft = reduceTaskIntake(session.taskDraft, { type: "ValidateDraft", stamp });
+  record(timelineEvent("field-set", `n3 DraftPlan+Validate -> ${session.taskDraft.draft_status}`));
+  recomputeViews();
+  rerender();
+}
+
+function n3Reset(): void {
+  dispatchN3({ type: "Reset", taskId: "task-1", stamp: n3Stamp() });
+}
+
 // Option A acquisition: capture the operator-provided evidence-snapshot text.
 // The operator runs the read-only collector themselves and pastes its output;
 // this only stores the text on the session and re-renders. It spawns nothing,
@@ -594,15 +684,37 @@ function recomputeViews(): void {
   // N2 and stay false; the model then rests at the most-advanced OBSERVED state
   // and never auto-advances past the apply gate (buildNorthstarView asserts it).
   const chain = session.audit ? session.audit.chainState : null;
+  // Northstar Phase N3: the local task-draft produces the early-ladder signals
+  // (taskDescribed / planDrafted / planValidated) the N2 model already consumes.
+  // It never sets a signal at or beyond the apply gate.
+  const ladder = n3ToLadderSignals(session.taskDraft);
   const nsSignals: NorthstarSignals = {
     ...emptyNorthstarSignals(),
     workspaceReady: typeof ws === "string" && ws.trim().length > 0,
-    planValidated: session.validated,
+    taskDescribed: ladder.taskDescribed,
+    planDrafted: ladder.planDrafted,
+    planValidated: ladder.planValidated || session.validated,
     previewReady: chain === "preview-ready",
     awaitingApplyApproval: chain === "approval-ready" || chain === "apply-bundle-ready",
     appliedObserved: chain === "applied",
   };
   const nsView = buildNorthstarView(nsSignals);
+
+  // Northstar Phase N3 read-only view from the local task draft.
+  const n3v = buildN3View(session.taskDraft);
+  const draft = session.taskDraft;
+  session.n3 = {
+    state: n3v.state,
+    stepLabel: n3v.stepLabel,
+    isBlocked: n3v.isBlocked,
+    isTerminal: n3v.isTerminal,
+    riskLevel: draft.risk_level ?? "(unclassified)",
+    riskDisposition: draft.risk_level ? riskDisposition(draft.risk_level) : "(n/a)",
+    intakeLines: renderTaskIntakeLines(draft),
+    planDraftLines: draft.plan_draft ? renderPlanDraftLines(draft.plan_draft) : null,
+    lintStatus: draft.plan_validation ? draft.plan_validation.status : null,
+    lintReasons: draft.plan_validation ? draft.plan_validation.reasons : [],
+  };
   session.northstar = {
     state: nsView.state,
     stateClass: nsView.stateClass,
@@ -780,6 +892,21 @@ async function handleUiAction(action: string): Promise<void> {
       return;
     case "refreshStatus":
       await refreshWorkspaceStatus();
+      return;
+    case "n3DescribeTask":
+      await n3DescribeTask();
+      return;
+    case "n3AddDeclaredPath":
+      await n3AddDeclaredPath();
+      return;
+    case "n3AddForbiddenPath":
+      await n3AddForbiddenPath();
+      return;
+    case "n3DraftPlan":
+      n3DraftPlan();
+      return;
+    case "n3Reset":
+      n3Reset();
       return;
     case "openRunbook":
       await openRunbook();

@@ -77,6 +77,24 @@ export interface DiscoveryView {
   lines: string[];
 }
 
+// Northstar Phase N3 — read-only TASK INTAKE + NON-EXECUTING PLAN DRAFT view.
+// Pre-formatted by the extension from the pure n3 modules. The render layer only
+// displays it and offers capture/draft/reset controls that dispatch the pure
+// reducer; it runs no apply/package/PR, calls no model, and the plan draft it
+// shows is a non-runnable review artifact.
+export interface N3PanelView {
+  state: string;
+  stepLabel: string;
+  isBlocked: boolean;
+  isTerminal: boolean;
+  riskLevel: string;
+  riskDisposition: string;
+  intakeLines: string[];
+  planDraftLines: string[] | null;
+  lintStatus: string | null;
+  lintReasons: string[];
+}
+
 // A2 Local Coding Agent Foundation v0 — read-only control-plane view. All data
 // is pre-computed by the extension from the pure foundation modules
 // (permissionTiers / deniedCommands / agentSession / agentEvidence /
@@ -158,6 +176,9 @@ export interface RenderModel {
   // read-only: they add no control and run no apply/package/PR/merge.
   workspaceCard?: WorkspaceStatusView | null;
   northstar?: NorthstarLadderView | null;
+  // Northstar Phase N3 read-only task intake + non-executing plan draft view
+  // (optional; absent => muted hint).
+  n3?: N3PanelView | null;
   // Pre-formatted evidence-timeline lines.
   timeline?: string[] | null;
   // A2 Local Coding Agent Foundation v0 control-plane view (optional; degrades
@@ -357,6 +378,63 @@ function northstarBlock(view: NorthstarLadderView | null | undefined): string {
   <p data-testid="northstar-next-step">next safe step: ${escapeHtml(view.stepLabel)} <span class="muted">[${escapeHtml(view.stepKind)}; automatable=${view.automatable ? "yes" : "no"}]</span></p>
 ${gate}
   <p class="muted">Read-only state model. It reflects observed state and recommends one safe step; it never applies, packages, pushes, opens, or merges. Merge is human-only.</p>
+</section>`;
+}
+
+// Northstar Phase N3 — TASK INTAKE + NON-EXECUTING PLAN DRAFT section. Shows the
+// captured task intent, declared/forbidden boundaries, risk badge, the non-
+// runnable plan draft, and the offline lint result. The capture/draft/reset
+// controls dispatch the pure reducer; NONE runs apply/package/PR or calls a
+// model. There is no execution button here.
+function n3UiButton(action: string, label: string): string {
+  return `    <button class="btn ui" data-ui-action="${escapeHtml(action)}" data-button-id="${escapeHtml(action)}">${escapeHtml(label)}</button>`;
+}
+
+function n3Block(view: N3PanelView | null | undefined): string {
+  const controls = [
+    n3UiButton("n3DescribeTask", "Describe Task"),
+    n3UiButton("n3AddDeclaredPath", "Add Declared Path"),
+    n3UiButton("n3AddForbiddenPath", "Add Forbidden Path"),
+    n3UiButton("n3DraftPlan", "Draft + Validate (non-executing)"),
+    n3UiButton("n3Reset", "Reset Task"),
+  ].join("\n");
+
+  if (!view) {
+    return `<section class="n3" data-testid="n3-task-intake">
+  <h3>Task intake + plan draft (Northstar N3)</h3>
+  <p class="muted" data-testid="n3-empty">No task described yet. Describe a task to begin a non-executing plan draft. This never runs apply / package / PR and calls no model.</p>
+  <div class="n3-controls" data-testid="n3-controls">
+${controls}
+  </div>
+</section>`;
+  }
+
+  const intake = view.intakeLines.map((l) => `    <li>${escapeHtml(l)}</li>`).join("\n");
+  const draft =
+    view.planDraftLines && view.planDraftLines.length > 0
+      ? `  <h4>Plan draft (non-executing review artifact)</h4>
+  <ul data-testid="n3-plan-draft">
+${view.planDraftLines.map((l) => `    <li>${escapeHtml(l)}</li>`).join("\n")}
+  </ul>`
+      : "";
+  const lint = view.lintStatus
+    ? `  <p data-testid="n3-lint-status">lint: <code>${escapeHtml(view.lintStatus)}</code></p>
+${view.lintReasons.length > 0 ? `  <ul data-testid="n3-lint-reasons">${view.lintReasons.map((r) => `<li>${escapeHtml(r)}</li>`).join("")}</ul>` : ""}`
+    : "";
+
+  return `<section class="n3" data-testid="n3-task-intake">
+  <h3>Task intake + plan draft (Northstar N3)</h3>
+  <p data-testid="n3-state">state: <code>${escapeHtml(view.state)}</code> <span class="muted">risk: ${escapeHtml(view.riskLevel)} (${escapeHtml(view.riskDisposition)})</span></p>
+  <p data-testid="n3-next-step">${escapeHtml(view.stepLabel)}</p>
+  <ul data-testid="n3-intake">
+${intake}
+  </ul>
+${draft}
+${lint}
+  <div class="n3-controls" data-testid="n3-controls">
+${controls}
+  </div>
+  <p class="muted">Read-only / local. The plan draft is a non-runnable review artifact (no command, no plan body, no claw invocation). N3 stops before any preview / apply / package / PR; merge is human-only.</p>
 </section>`;
 }
 
@@ -705,6 +783,7 @@ export function renderHtml(model: RenderModel): string {
 ${safetyBlock()}
 ${workspaceCardBlock(model.workspaceCard)}
 ${northstarBlock(model.northstar)}
+${n3Block(model.n3)}
 ${setupBlock(model.setup)}
 ${navBlock(model.nav)}
 ${discoveryBlock(model.discovery)}
