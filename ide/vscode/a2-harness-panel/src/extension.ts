@@ -10,6 +10,7 @@ import {
   WorkspaceStatusView,
   NorthstarLadderView,
   N3PanelView,
+  N4PanelView,
   FoundationView,
   Tier3View,
   ExecutorDryRunView,
@@ -98,6 +99,7 @@ import {
 import { riskDisposition } from "./n3RiskClassifier";
 import { renderPlanDraftLines } from "./n3PlanDraft";
 import { buildN3View, n3ToLadderSignals } from "./n3State";
+import { buildN4View } from "./n4View";
 import {
   TimelineEvent,
   event as timelineEvent,
@@ -133,6 +135,8 @@ interface SessionState {
   // Northstar Phase N3 local task intake draft + its read-only view.
   taskDraft: TaskDraft;
   n3: N3PanelView | null;
+  // Northstar Phase N4 read-only preview/diff/evidence viewer over the N3 draft.
+  n4: N4PanelView | null;
   timeline: TimelineEvent[];
   // True once a validate-input run exited 0 in this session.
   validated: boolean;
@@ -166,6 +170,7 @@ const session: SessionState = {
   northstar: null,
   taskDraft: emptyTaskDraft("task-1"),
   n3: null,
+  n4: null,
   timeline: [],
   validated: false,
   audit: null,
@@ -351,6 +356,7 @@ function model(): RenderModel {
     workspaceCard: session.workspaceCard,
     northstar: session.northstar,
     n3: session.n3,
+    n4: session.n4,
     timeline: session.timeline.length > 0 ? formatTimeline(session.timeline) : null,
     foundation: buildFoundationView(),
     tier3: buildTier3View(),
@@ -714,6 +720,20 @@ function recomputeViews(): void {
     planDraftLines: draft.plan_draft ? renderPlanDraftLines(draft.plan_draft) : null,
     lintStatus: draft.plan_validation ? draft.plan_validation.status : null,
     lintReasons: draft.plan_validation ? draft.plan_validation.reasons : [],
+  };
+
+  // Northstar Phase N4 — read-only preview/diff/evidence viewer over the same
+  // local N3 draft. Display-only: it renders present data labelled by trust
+  // level and fails closed; it runs no preview/apply/package/PR and writes
+  // nothing. buildN4View asserts no N4 state routes to the apply gate.
+  const n4v = buildN4View(session.taskDraft);
+  session.n4 = {
+    state: n4v.state,
+    stepLabel: n4v.stepLabel,
+    isBlocked: n4v.isBlocked,
+    preview: { trust: n4v.preview.trust, lines: n4v.preview.lines },
+    diff: { trust: n4v.diff.trust, lines: n4v.diff.lines },
+    evidence: { trust: n4v.evidence.trust, lines: n4v.evidence.lines },
   };
   session.northstar = {
     state: nsView.state,
