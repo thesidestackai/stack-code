@@ -95,6 +95,25 @@ export interface N3PanelView {
   lintReasons: string[];
 }
 
+// Northstar Phase N4 — read-only PREVIEW / DIFF / EVIDENCE viewer view. Pre-
+// formatted by the extension from the pure n4 modules. DISPLAY-ONLY: it renders
+// the N3 plan draft + present read-only data, each facet labelled by trust
+// level; it runs no preview/apply/package/PR, has no controls, and fails closed
+// (blocked facets render no content).
+export interface N4FacetView {
+  trust: string;
+  lines: string[];
+}
+
+export interface N4PanelView {
+  state: string;
+  stepLabel: string;
+  isBlocked: boolean;
+  preview: N4FacetView;
+  diff: N4FacetView;
+  evidence: N4FacetView;
+}
+
 // A2 Local Coding Agent Foundation v0 — read-only control-plane view. All data
 // is pre-computed by the extension from the pure foundation modules
 // (permissionTiers / deniedCommands / agentSession / agentEvidence /
@@ -179,6 +198,9 @@ export interface RenderModel {
   // Northstar Phase N3 read-only task intake + non-executing plan draft view
   // (optional; absent => muted hint).
   n3?: N3PanelView | null;
+  // Northstar Phase N4 read-only preview/diff/evidence viewer (optional; absent
+  // => muted hint). Display-only; no controls; fails closed.
+  n4?: N4PanelView | null;
   // Pre-formatted evidence-timeline lines.
   timeline?: string[] | null;
   // A2 Local Coding Agent Foundation v0 control-plane view (optional; degrades
@@ -435,6 +457,40 @@ ${lint}
 ${controls}
   </div>
   <p class="muted">Read-only / local. The plan draft is a non-runnable review artifact (no command, no plan body, no claw invocation). N3 stops before any preview / apply / package / PR; merge is human-only.</p>
+</section>`;
+}
+
+// Northstar Phase N4 — read-only PREVIEW / DIFF / EVIDENCE viewer section.
+// DISPLAY-ONLY: it renders the N3 plan draft + present read-only data, each
+// facet labelled by trust level (VERIFIED / INFERRED / MISSING / BLOCKED). It
+// has NO controls and runs nothing; blocked facets render no content (fail
+// closed). N4 never routes to apply/package/PR.
+function n4FacetHtml(name: string, facet: N4FacetView): string {
+  const body =
+    facet.lines.length > 0
+      ? `    <ul data-testid="n4-${escapeHtml(name)}-lines">${facet.lines.map((l) => `<li>${escapeHtml(l)}</li>`).join("")}</ul>`
+      : `    <p class="muted" data-testid="n4-${escapeHtml(name)}-empty">no ${escapeHtml(name)} content (trust ${escapeHtml(facet.trust)} — nothing rendered)</p>`;
+  return `  <div class="n4-facet" data-testid="n4-${escapeHtml(name)}">
+    <h4>${escapeHtml(name)} <span class="muted" data-testid="n4-${escapeHtml(name)}-trust">[${escapeHtml(facet.trust)}]</span></h4>
+${body}
+  </div>`;
+}
+
+function n4Block(view: N4PanelView | null | undefined): string {
+  if (!view) {
+    return `<section class="n4" data-testid="n4-review">
+  <h3>Preview / diff / evidence (Northstar N4)</h3>
+  <p class="muted" data-testid="n4-empty">No validated plan draft to review yet. Produce one in the N3 section above. N4 is a read-only viewer — it runs no preview / apply / package / PR.</p>
+</section>`;
+  }
+  return `<section class="n4" data-testid="n4-review">
+  <h3>Preview / diff / evidence (Northstar N4)</h3>
+  <p data-testid="n4-state">state: <code>${escapeHtml(view.state)}</code></p>
+  <p data-testid="n4-next-step">${escapeHtml(view.stepLabel)}</p>
+${n4FacetHtml("preview", view.preview)}
+${n4FacetHtml("diff", view.diff)}
+${n4FacetHtml("evidence", view.evidence)}
+  <p class="muted">Read-only viewer. Every datum is labelled VERIFIED / INFERRED / MISSING / BLOCKED; ambiguous data fails closed and renders no content. N4 runs no preview/apply/package/PR, writes nothing, and calls no model.</p>
 </section>`;
 }
 
@@ -784,6 +840,7 @@ ${safetyBlock()}
 ${workspaceCardBlock(model.workspaceCard)}
 ${northstarBlock(model.northstar)}
 ${n3Block(model.n3)}
+${n4Block(model.n4)}
 ${setupBlock(model.setup)}
 ${navBlock(model.nav)}
 ${discoveryBlock(model.discovery)}
