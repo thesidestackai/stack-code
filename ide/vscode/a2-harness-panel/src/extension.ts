@@ -11,6 +11,7 @@ import {
   NorthstarLadderView,
   N3PanelView,
   N4PanelView,
+  N5PanelView,
   FoundationView,
   Tier3View,
   ExecutorDryRunView,
@@ -100,6 +101,7 @@ import { riskDisposition } from "./n3RiskClassifier";
 import { renderPlanDraftLines } from "./n3PlanDraft";
 import { buildN3View, n3ToLadderSignals } from "./n3State";
 import { buildN4View } from "./n4View";
+import { buildN5View } from "./n5View";
 import {
   TimelineEvent,
   event as timelineEvent,
@@ -137,6 +139,8 @@ interface SessionState {
   n3: N3PanelView | null;
   // Northstar Phase N4 read-only preview/diff/evidence viewer over the N3 draft.
   n4: N4PanelView | null;
+  // Northstar Phase N5 read-only gated execution readiness board.
+  n5: N5PanelView | null;
   timeline: TimelineEvent[];
   // True once a validate-input run exited 0 in this session.
   validated: boolean;
@@ -171,6 +175,7 @@ const session: SessionState = {
   taskDraft: emptyTaskDraft("task-1"),
   n3: null,
   n4: null,
+  n5: null,
   timeline: [],
   validated: false,
   audit: null,
@@ -357,6 +362,7 @@ function model(): RenderModel {
     northstar: session.northstar,
     n3: session.n3,
     n4: session.n4,
+    n5: session.n5,
     timeline: session.timeline.length > 0 ? formatTimeline(session.timeline) : null,
     foundation: buildFoundationView(),
     tier3: buildTier3View(),
@@ -735,6 +741,24 @@ function recomputeViews(): void {
     diff: { trust: n4v.diff.trust, lines: n4v.diff.lines },
     evidence: { trust: n4v.evidence.trust, lines: n4v.evidence.lines },
   };
+
+  // Northstar Phase N5 — read-only gated execution readiness board over the
+  // same local N3/N4 draft. Display-only: renders per-rung package-ladder
+  // readiness labelled by trust level (incl. EXECUTION_REQUIRED); fails closed;
+  // runs no rung, opens no PR, writes nothing, calls no model/broker/runtime.
+  // buildN5View asserts no N5 state routes to any execution-capable target.
+  const n5v = buildN5View(session.taskDraft);
+  session.n5 = {
+    state: n5v.state,
+    stepLabel: n5v.stepLabel,
+    isBlocked: n5v.isBlocked,
+    n4State: n5v.n4State,
+    n4StepLabel: n5v.n4StepLabel,
+    taskSummary: n5v.taskSummary,
+    riskLevel: n5v.riskLevel,
+    ladder: n5v.ladder,
+  };
+
   session.northstar = {
     state: nsView.state,
     stateClass: nsView.stateClass,
