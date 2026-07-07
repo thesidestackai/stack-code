@@ -114,6 +114,36 @@ export interface N4PanelView {
   evidence: N4FacetView;
 }
 
+// Northstar Phase N5 — read-only GATED EXECUTION READINESS BOARD view. Pre-
+// formatted by the extension from the pure n5 modules. DISPLAY-ONLY: it renders
+// per-rung package-ladder readiness against the N4-reviewed change, each datum
+// labelled by trust level (VERIFIED/INFERRED/MISSING/BLOCKED/EXECUTION_REQUIRED).
+// It has NO controls and runs nothing; blocked/execution-required data renders
+// no actionable content (fail closed). N5 never routes to apply/package/PR.
+export interface N5RungPanelView {
+  rung: string;
+  purpose: string;
+  // "READY" | "NOT_READY" | "BLOCKED" | "EXECUTION_REQUIRED"
+  readiness: string;
+  // Per-precondition formatted lines (trust level + label + met/not-met).
+  preconditionLines: string[];
+  evidencePresent: boolean;
+  operatorConfirmationRequired: boolean;
+  note: string;
+}
+
+export interface N5PanelView {
+  state: string;
+  stepLabel: string;
+  isBlocked: boolean;
+  n4State: string;
+  n4StepLabel: string;
+  taskSummary: string;
+  riskLevel: string;
+  // Four rungs: package-plan → package-commit → package-push → package-pr.
+  ladder: N5RungPanelView[];
+}
+
 // A2 Local Coding Agent Foundation v0 — read-only control-plane view. All data
 // is pre-computed by the extension from the pure foundation modules
 // (permissionTiers / deniedCommands / agentSession / agentEvidence /
@@ -201,6 +231,10 @@ export interface RenderModel {
   // Northstar Phase N4 read-only preview/diff/evidence viewer (optional; absent
   // => muted hint). Display-only; no controls; fails closed.
   n4?: N4PanelView | null;
+  // Northstar Phase N5 read-only gated execution readiness board (optional;
+  // absent => muted hint). Display-only; no controls; no execution boundary
+  // crossed; each datum labelled by trust level; fails closed.
+  n5?: N5PanelView | null;
   // Pre-formatted evidence-timeline lines.
   timeline?: string[] | null;
   // A2 Local Coding Agent Foundation v0 control-plane view (optional; degrades
@@ -491,6 +525,44 @@ ${n4FacetHtml("preview", view.preview)}
 ${n4FacetHtml("diff", view.diff)}
 ${n4FacetHtml("evidence", view.evidence)}
   <p class="muted">Read-only viewer. Every datum is labelled VERIFIED / INFERRED / MISSING / BLOCKED; ambiguous data fails closed and renders no content. N4 runs no preview/apply/package/PR, writes nothing, and calls no model.</p>
+</section>`;
+}
+
+// Northstar Phase N5 — read-only GATED EXECUTION READINESS BOARD section.
+// DISPLAY-ONLY: shows per-rung package-ladder readiness, each datum labelled by
+// trust level. Has NO controls and runs nothing. Blocked/execution-required data
+// renders no actionable content (fail closed). N5 never routes to apply/package/PR.
+function n5RungHtml(rung: N5RungPanelView): string {
+  const readinessClass = rung.readiness.toLowerCase().replace(/_/g, "-");
+  const preconditions =
+    rung.preconditionLines.length > 0
+      ? `    <ul data-testid="n5-rung-${escapeHtml(rung.rung)}-preconditions">${rung.preconditionLines.map((l) => `<li>${escapeHtml(l)}</li>`).join("")}</ul>`
+      : `    <p class="muted">no preconditions listed</p>`;
+  return `  <div class="n5-rung n5-rung-${escapeHtml(readinessClass)}" data-testid="n5-rung-${escapeHtml(rung.rung)}">
+    <h4>${escapeHtml(rung.rung)} <span class="muted" data-testid="n5-rung-${escapeHtml(rung.rung)}-readiness">[${escapeHtml(rung.readiness)}]</span></h4>
+    <p data-testid="n5-rung-${escapeHtml(rung.rung)}-purpose">${escapeHtml(rung.purpose)}</p>
+${preconditions}
+    <p class="muted" data-testid="n5-rung-${escapeHtml(rung.rung)}-note">${escapeHtml(rung.note)}</p>
+  </div>`;
+}
+
+function n5Block(view: N5PanelView | null | undefined): string {
+  if (!view) {
+    return `<section class="n5" data-testid="n5-readiness-board">
+  <h3>Gated execution readiness board (Northstar N5)</h3>
+  <p class="muted" data-testid="n5-empty">No N4-reviewed change to assess readiness for yet. Produce a validated plan draft and N4 evidence in the sections above. N5 is a read-only readiness board — it runs no package-plan / package-commit / package-push / package-pr and opens no PR.</p>
+</section>`;
+  }
+  const rungs = view.ladder.map((r) => n5RungHtml(r)).join("\n");
+  return `<section class="n5" data-testid="n5-readiness-board">
+  <h3>Gated execution readiness board (Northstar N5)</h3>
+  <p data-testid="n5-state">state: <code>${escapeHtml(view.state)}</code></p>
+  <p data-testid="n5-next-step">${escapeHtml(view.stepLabel)}</p>
+  <p data-testid="n5-context">task: ${escapeHtml(view.taskSummary)} · risk: ${escapeHtml(view.riskLevel)}</p>
+  <p data-testid="n5-n4-state" class="muted">N4 state: <code>${escapeHtml(view.n4State)}</code> — ${escapeHtml(view.n4StepLabel)}</p>
+  <h4>Package ladder readiness (read-only — N5 runs no rung)</h4>
+${rungs}
+  <p class="muted">Read-only readiness board. Every datum is labelled VERIFIED / INFERRED / MISSING / BLOCKED / EXECUTION_REQUIRED. A READY rung is ready to be run in a separately-approved execution lane — N5 does not run it. EXECUTION_REQUIRED means the fact cannot be proven from read-only data; N5 never guesses. N5 runs no package-plan / package-commit / package-push / package-pr, opens no PR, writes nothing, and calls no model.</p>
 </section>`;
 }
 
@@ -841,6 +913,7 @@ ${workspaceCardBlock(model.workspaceCard)}
 ${northstarBlock(model.northstar)}
 ${n3Block(model.n3)}
 ${n4Block(model.n4)}
+${n5Block(model.n5)}
 ${setupBlock(model.setup)}
 ${navBlock(model.nav)}
 ${discoveryBlock(model.discovery)}
