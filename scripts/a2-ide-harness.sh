@@ -1,34 +1,44 @@
 #!/usr/bin/env bash
-# a2-ide-harness.sh — IDE-adjacent A2-L2b harness, v0 (print/validate ONLY).
+# a2-ide-harness.sh — IDE-adjacent A2-L2b harness, v1.
 #
 # Purpose: give a non-terminal-first operator a safe, visual way to drive the
 # proven A2-L2b chain from VS Code / Cursor / Claude Code / Codex-local without
-# weakening any safety gate. This script NEVER runs an A2 command. It only:
-#   - validates paths read-only
-#   - locates .claw artifacts read-only
-#   - shows hashes read-only
-#   - PRINTS the exact command the operator must run manually
-#   - (print-tier3-evidence) runs the READ-ONLY, writes-nothing, non-claw
-#     a2-evidence-collector to print the existing Tier 3 evidence snapshot
+# weakening any safety gate.
 #
 # Source of truth (merged on main):
 #   docs/a2-l4-ide-harness-workflow-scope.md
-#   handoffs/a2_ide_harness_workflow_implementation_prompt_DRAFT_2026-06-07.md
-#   docs/a2-tier3-panel-integration-option-b-design-scope.md   (print-tier3-evidence)
+#   docs/stack-code-n6a-helper-exec-allowlist-design.md   (N6A execution subcommands)
 #
 # SAFETY (hard invariants this script preserves):
 #   - Preview does NOT write target.
+#   - package-plan calls claw plan run --workspace-write-preview (preview phase ONLY).
+#     It writes the .claw/ preview bundle, NOT the target file. claw plan apply is
+#     never called by this script in any mode.
+#   - package-commit uses exact-path staging only (git add -- <declared files>).
+#     git add . and git add -A are unconditionally forbidden.
+#   - package-push is non-force only (git push <remote> <branch>).
+#     --force, --force-with-lease, --force-if-includes, and --delete are forbidden.
+#   - package-pr opens a DRAFT PR only (gh pr create --draft).
+#     --ready, --approve, --merge, --fill, and --auto-merge are forbidden.
 #   - Approval does NOT write target; it requires a REAL interactive terminal.
 #   - apply-bundle is the GENERATOR; it writes NO target.
 #   - `claw plan apply` is the EXECUTOR; it is the ONLY command that writes the target.
+#     It is NOT called by this script.
 #   - No auto-approval, no hidden apply, no batch/--yes/fake-TTY.
-#   - This script calls NO model / NO broker / NO runtime; it never executes `claw`.
+#   - This script calls NO model / NO broker / NO runtime directly.
+#     package-plan calls claw, which routes through the SideStack broker internally.
+#     This script never references :11434 or any raw Ollama endpoint.
+#   - Merge is human-only; no merge subcommand exists in this script.
 #
-# This v0 is print/validate only, with ONE bounded read-only exec exception:
-# print-tier3-evidence invokes the a2-evidence-collector binary, which is itself
-# read-only (writes nothing; runs no claw/orchestrator; makes no model/broker/
-# runtime/network/Vault call). It is invoked by exact basename, array-argv, no
-# shell. There is no target-writing exec mode, by design.
+# Bounded exec exceptions:
+#   print-tier3-evidence: invokes a2-evidence-collector (read-only, writes nothing,
+#     no claw/orchestrator/model/broker/runtime) by exact basename, array-argv, no shell.
+#   package-plan:         invokes claw plan run --workspace-write-preview by absolute
+#     path (--claw-binary flag), array-argv, no shell. Preview only; no target write.
+#   package-commit:       invokes git add -- <declared files> + git commit. Exact-path
+#     staging only; no git add . or git add -A.
+#   package-push:         invokes git push <remote> <branch>. Non-force only.
+#   package-pr:           invokes gh pr create --draft. Draft only.
 
 set -euo pipefail
 
@@ -527,6 +537,165 @@ cmd_print_tier3_evidence() {
   "$collector" "$ws"
 }
 
+# ---- N6A controlled-execution subcommands ----------------------------------
+# These subcommands execute bounded operations (claw preview, git, gh). They
+# are gated at the panel level by N6 runtime sub-tokens. See §13-17 of
+# docs/stack-code-n6a-helper-exec-allowlist-design.md for the full boundary.
+
+cmd_package_plan() {
+  parse_opts "$@"
+  require_opt workspace
+  require_opt plan
+  require_opt claw-binary
+  local ws="${OPT[workspace]}" plan="${OPT[plan]}" claw_bin="${OPT[claw-binary]}"
+
+  warn_if_sensitive_path "workspace" "$ws"
+  warn_if_sensitive_path "plan" "$plan"
+
+  [[ -d "$ws" ]]       || { err "workspace is not a directory: $ws"; exit $EXIT_VALIDATION; }
+  [[ -f "$plan" ]]     || { err "plan file not found: $plan"; exit $EXIT_VALIDATION; }
+  [[ "$claw_bin" == /* ]] || { err "claw-binary must be an absolute path: $claw_bin"; exit $EXIT_VALIDATION; }
+  [[ -f "$claw_bin" ]] || { err "claw binary not found: $claw_bin"; exit $EXIT_VALIDATION; }
+  [[ -x "$claw_bin" ]] || { err "claw binary not executable: $claw_bin"; exit $EXIT_VALIDATION; }
+
+  # Execute claw plan run (preview only; writes .claw/ preview bundle, NOT the target)
+  "$claw_bin" plan run "$plan" --workspace-root "$ws" --workspace-write-preview
+}
+
+cmd_package_commit() {
+  # --file is a repeatable flag and is incompatible with the single-value OPT[]
+  # parser. Parse manually to accumulate all --file values into FILES array.
+  local ws="" msg=""
+  local -a FILES=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --workspace)
+        [[ $# -ge 2 ]] || { err "missing value for --workspace"; exit $EXIT_USAGE; }
+        ws="$2"; shift 2 ;;
+      --file)
+        [[ $# -ge 2 ]] || { err "missing value for --file"; exit $EXIT_USAGE; }
+        FILES+=("$2"); shift 2 ;;
+      --message)
+        [[ $# -ge 2 ]] || { err "missing value for --message"; exit $EXIT_USAGE; }
+        msg="$2"; shift 2 ;;
+      --*)
+        err "unknown flag for package-commit: $1"; exit $EXIT_USAGE ;;
+      *)
+        err "unexpected argument for package-commit: $1"; exit $EXIT_USAGE ;;
+    esac
+  done
+
+  [[ -n "$ws" ]]             || { err "required option missing: --workspace"; exit $EXIT_USAGE; }
+  [[ "${#FILES[@]}" -gt 0 ]] || { err "required option missing: --file (supply at least one)"; exit $EXIT_USAGE; }
+  [[ -n "$msg" ]]            || { err "required option missing: --message"; exit $EXIT_USAGE; }
+
+  warn_if_sensitive_path "workspace" "$ws"
+
+  git -C "$ws" rev-parse --git-dir >/dev/null 2>&1 \
+    || { err "workspace is not a git repository: $ws"; exit $EXIT_VALIDATION; }
+
+  # Commit message: single-line only (guard against newline injection)
+  if [[ "$msg" == *$'\n'* ]]; then
+    err "commit message must be a single line (no embedded newlines)"; exit $EXIT_VALIDATION
+  fi
+
+  # Validate each declared file: relative path, no leading /, no .. escape
+  local f
+  for f in "${FILES[@]}"; do
+    [[ -n "$f" ]] || { err "empty --file value"; exit $EXIT_VALIDATION; }
+    [[ "$f" != /* ]] || { err "--file must be a relative path, not absolute: $f"; exit $EXIT_VALIDATION; }
+    case "$f" in ../*)
+      err "--file must not traverse above the workspace root: $f"; exit $EXIT_VALIDATION ;;
+    esac
+    warn_if_sensitive_path "file" "$f"
+  done
+
+  # Exact-path staging only: git add -- <file1> <file2> ...
+  git -C "$ws" add -- "${FILES[@]}"
+
+  # Commit with operator-supplied single-line message
+  git -C "$ws" commit -m "$msg"
+}
+
+cmd_package_push() {
+  parse_opts "$@"
+  require_opt workspace
+  require_opt remote
+  require_opt branch
+  local ws="${OPT[workspace]}" remote="${OPT[remote]}" branch="${OPT[branch]}"
+
+  warn_if_sensitive_path "workspace" "$ws"
+
+  [[ -d "$ws" ]] || { err "workspace is not a directory: $ws"; exit $EXIT_VALIDATION; }
+
+  # Safe pattern: remote name must not contain spaces or shell-special characters
+  if ! [[ "$remote" =~ ^[a-zA-Z0-9_.-]+$ ]]; then
+    err "remote name contains unsafe characters: $remote"; exit $EXIT_VALIDATION
+  fi
+
+  # Safe pattern: branch name (allows / for namespaced branches)
+  if ! [[ "$branch" =~ ^[a-zA-Z0-9/_.-]+$ ]]; then
+    err "branch name contains unsafe characters: $branch"; exit $EXIT_VALIDATION
+  fi
+
+  git -C "$ws" rev-parse --git-dir >/dev/null 2>&1 \
+    || { err "workspace is not a git repository: $ws"; exit $EXIT_VALIDATION; }
+
+  # Confirm the local branch matches the declared branch
+  local current_branch
+  current_branch="$(git -C "$ws" branch --show-current 2>/dev/null || true)"
+  if [[ "$current_branch" != "$branch" ]]; then
+    err "local branch ($current_branch) does not match declared --branch ($branch)"
+    err "refusing to push an unexpected branch."
+    exit $EXIT_VALIDATION
+  fi
+
+  # Non-force push only: git push <remote> <branch>
+  git -C "$ws" push "$remote" "$branch"
+}
+
+cmd_package_pr() {
+  parse_opts "$@"
+  require_opt workspace
+  require_opt base
+  require_opt head
+  require_opt title
+  require_opt body-file
+  local ws="${OPT[workspace]}" base="${OPT[base]}" head_branch="${OPT[head]}"
+  local title="${OPT[title]}" body_file="${OPT[body-file]}"
+
+  warn_if_sensitive_path "workspace" "$ws"
+
+  [[ -d "$ws" ]] || { err "workspace is not a directory: $ws"; exit $EXIT_VALIDATION; }
+
+  # Safe branch name patterns
+  if ! [[ "$base" =~ ^[a-zA-Z0-9/_.-]+$ ]]; then
+    err "base branch name contains unsafe characters: $base"; exit $EXIT_VALIDATION
+  fi
+  if ! [[ "$head_branch" =~ ^[a-zA-Z0-9/_.-]+$ ]]; then
+    err "head branch name contains unsafe characters: $head_branch"; exit $EXIT_VALIDATION
+  fi
+
+  # Title: non-empty, single-line, max 256 chars
+  [[ -n "$title" ]] || { err "title must not be empty"; exit $EXIT_VALIDATION; }
+  if [[ "$title" == *$'\n'* ]]; then
+    err "title must be a single line (no newlines)"; exit $EXIT_VALIDATION
+  fi
+  if [[ ${#title} -gt 256 ]]; then
+    err "title exceeds 256 characters (${#title} chars)"; exit $EXIT_VALIDATION
+  fi
+
+  [[ -f "$body_file" ]] || { err "body-file not found: $body_file"; exit $EXIT_VALIDATION; }
+
+  # Open DRAFT PR only. No --ready, no --approve, no --merge.
+  gh pr create \
+    --draft \
+    --base "$base" \
+    --head "$head_branch" \
+    --title "$title" \
+    --body-file "$body_file"
+}
+
 # ---- dispatch --------------------------------------------------------------
 
 main() {
@@ -543,6 +712,10 @@ main() {
     verify-final)          cmd_verify_final "$@" ;;
     audit-workspace)       cmd_audit_workspace "$@" ;;
     print-tier3-evidence)  cmd_print_tier3_evidence "$@" ;;
+    package-plan)          cmd_package_plan "$@" ;;
+    package-commit)        cmd_package_commit "$@" ;;
+    package-push)          cmd_package_push "$@" ;;
+    package-pr)            cmd_package_pr "$@" ;;
     *)
       err "unknown subcommand: $sub"
       info ""
