@@ -103,6 +103,18 @@ import { buildN3View, n3ToLadderSignals } from "./n3State";
 import { buildN4View } from "./n4View";
 import { buildN5View } from "./n5View";
 import {
+  N6SessionState,
+  N6PanelView,
+  emptyN6SessionState,
+  buildN6View,
+} from "./n6View";
+import {
+  N6_SUB_TOKEN_PLAN,
+  N6_SUB_TOKEN_COMMIT,
+  N6_SUB_TOKEN_PUSH,
+  N6_SUB_TOKEN_PR,
+} from "./n6State";
+import {
   TimelineEvent,
   event as timelineEvent,
   append as appendEvent,
@@ -141,6 +153,11 @@ interface SessionState {
   n4: N4PanelView | null;
   // Northstar Phase N5 read-only gated execution readiness board.
   n5: N5PanelView | null;
+  // Northstar Phase N6 execution boundary.
+  // n6State: in-memory token + exec state (D2=A; never persisted).
+  // n6: derived panel view, recomputed on every state change.
+  n6State: N6SessionState;
+  n6: N6PanelView | null;
   timeline: TimelineEvent[];
   // True once a validate-input run exited 0 in this session.
   validated: boolean;
@@ -176,6 +193,8 @@ const session: SessionState = {
   n3: null,
   n4: null,
   n5: null,
+  n6State: emptyN6SessionState(),
+  n6: null,
   timeline: [],
   validated: false,
   audit: null,
@@ -363,6 +382,7 @@ function model(): RenderModel {
     n3: session.n3,
     n4: session.n4,
     n5: session.n5,
+    n6: session.n6,
     timeline: session.timeline.length > 0 ? formatTimeline(session.timeline) : null,
     foundation: buildFoundationView(),
     tier3: buildTier3View(),
@@ -759,6 +779,11 @@ function recomputeViews(): void {
     ladder: n5v.ladder,
   };
 
+  // Northstar Phase N6 — execution boundary view. Pure: reads the current
+  // in-memory N6 session state + the N5 ladder readiness (for plan READY gate).
+  // No spawn, no file, no model/broker/Vault.
+  session.n6 = buildN6View(session.n5, session.n6State);
+
   session.northstar = {
     state: nsView.state,
     stateClass: nsView.stateClass,
@@ -958,6 +983,32 @@ async function handleUiAction(action: string): Promise<void> {
     case "exportEvidence":
       await exportEvidence();
       return;
+    // Northstar Phase N6 — sub-token activation (D1=A: VS Code input box).
+    case "n6ActivatePlanToken":
+      await n6ActivateToken("plan", N6_SUB_TOKEN_PLAN);
+      return;
+    case "n6ActivateCommitToken":
+      await n6ActivateToken("commit", N6_SUB_TOKEN_COMMIT);
+      return;
+    case "n6ActivatePushToken":
+      await n6ActivateToken("push", N6_SUB_TOKEN_PUSH);
+      return;
+    case "n6ActivatePrToken":
+      await n6ActivateToken("pr", N6_SUB_TOKEN_PR);
+      return;
+    // Northstar Phase N6 — rung execution dispatch.
+    case "n6RunPlan":
+      await n6RunRung("plan");
+      return;
+    case "n6RunCommit":
+      await n6RunRung("commit");
+      return;
+    case "n6RunPush":
+      await n6RunRung("push");
+      return;
+    case "n6RunPr":
+      await n6RunRung("pr");
+      return;
     default:
       session.notice = `unknown action: ${action}`;
       rerender();
@@ -1044,6 +1095,231 @@ async function exportEvidence(): Promise<void> {
     language: "markdown",
   });
   await vscode.window.showTextDocument(doc, { preview: false });
+}
+
+// ---- Northstar Phase N6 helpers --------------------------------------------
+//
+// Two-level token model (D2=A in-memory only):
+//   Level 1 = implementation token (activates the N6 section globally — checked
+//             by the operator before this session starts; not re-checked here).
+//   Level 2 = per-rung sub-tokens (exact string match; in-memory only; cleared
+//             on FAILED — D4=B).
+//
+// No spawn happens in token-activation paths. Execution dispatch goes through
+// helperRunner.ts (single spawn boundary). No model/broker/Vault calls.
+
+// n6ActivateToken: show input box, validate exact sub-token, set session state.
+// D1=A: operator supplies the sub-token via VS Code input box.
+async function n6ActivateToken(
+  rung: "plan" | "commit" | "push" | "pr",
+  expected: string,
+): Promise<void> {
+  const entered = await vscode.window.showInputBox({
+    prompt: `Enter N6 sub-token for rung "${rung}" (exact match required)`,
+    ignoreFocusOut: true,
+    password: false,
+  });
+  if (entered === undefined) {
+    // Cancelled — no-op.
+    return;
+  }
+  if (entered.trim() !== expected) {
+    session.notice = `N6: token mismatch for ${rung} — not activated`;
+    recomputeViews();
+    rerender();
+    return;
+  }
+  // Token validated. Set active flag and advance exec state to TOKEN_ACTIVE.
+  const s = session.n6State;
+  if (rung === "plan")   { s.planTokenActive   = true; s.planExec   = "TOKEN_ACTIVE"; }
+  if (rung === "commit") { s.commitTokenActive = true; s.commitExec = "TOKEN_ACTIVE"; }
+  if (rung === "push")   { s.pushTokenActive   = true; s.pushExec   = "TOKEN_ACTIVE"; }
+  if (rung === "pr")     { s.prTokenActive     = true; s.prExec     = "TOKEN_ACTIVE"; }
+  session.notice = null;
+  recomputeViews();
+  rerender();
+}
+
+// n6ClearToken: D4=B — clear sub-token on FAILED so the operator must supply a
+// fresh one to retry. Called by n6RunRung on any non-zero exit or spawn error.
+function n6ClearToken(rung: "plan" | "commit" | "push" | "pr"): void {
+  const s = session.n6State;
+  if (rung === "plan")   { s.planTokenActive   = false; }
+  if (rung === "commit") { s.commitTokenActive = false; }
+  if (rung === "push")   { s.pushTokenActive   = false; }
+  if (rung === "pr")     { s.prTokenActive     = false; }
+}
+
+// n6SetExec: update per-rung exec state + captured output/exit.
+function n6SetExec(
+  rung: "plan" | "commit" | "push" | "pr",
+  exec: "RUNNING" | "DONE" | "FAILED",
+  output?: string,
+  exitCode?: number,
+): void {
+  const s = session.n6State;
+  if (rung === "plan") {
+    s.planExec = exec;
+    if (output !== undefined) { s.planOutput   = output; }
+    if (exitCode !== undefined) { s.planExitCode = exitCode; }
+  } else if (rung === "commit") {
+    s.commitExec = exec;
+    if (output !== undefined) { s.commitOutput   = output; }
+    if (exitCode !== undefined) { s.commitExitCode = exitCode; }
+  } else if (rung === "push") {
+    s.pushExec = exec;
+    if (output !== undefined) { s.pushOutput   = output; }
+    if (exitCode !== undefined) { s.pushExitCode = exitCode; }
+  } else {
+    s.prExec = exec;
+    if (output !== undefined) { s.prOutput   = output; }
+    if (exitCode !== undefined) { s.prExitCode = exitCode; }
+  }
+}
+
+// n6RunRung: dispatch a package rung through helperRunner.ts.
+// Called only when the operator has supplied the exact sub-token AND the
+// run button is visible (showRunButton === true from buildN6View).
+// IMPORTANT: NO live execution in the N6 IMPLEMENTATION lane — the run
+// buttons are only visible after Level 2 sub-tokens are supplied at runtime.
+async function n6RunRung(rung: "plan" | "commit" | "push" | "pr"): Promise<void> {
+  // Guard: token must be active.
+  const s = session.n6State;
+  const tokenActive = {
+    plan:   s.planTokenActive,
+    commit: s.commitTokenActive,
+    push:   s.pushTokenActive,
+    pr:     s.prTokenActive,
+  }[rung];
+  if (!tokenActive) {
+    session.notice = `N6: ${rung} sub-token not active — activate it first`;
+    rerender();
+    return;
+  }
+
+  const helperPath = resolveHelperPath();
+  if (!helperPath) {
+    session.notice = "N6: set workspace first (or configure helperPath)";
+    rerender();
+    return;
+  }
+
+  const ws = session.inputs.workspace ?? defaultWorkspace();
+  if (!ws) {
+    session.notice = "N6: workspace required — set it first";
+    rerender();
+    return;
+  }
+
+  // Build the HelperInvocation options per rung.
+  // ALLOWED_FLAGS enforced by helperRunner.ts; values sourced from session or input box.
+  let sub: HelperSubcommand;
+  let options: Record<string, string | string[]>;
+
+  if (rung === "plan") {
+    const planPath = session.inputs.plan;
+    if (!planPath) {
+      session.notice = "N6: plan file required for package-plan — set it first";
+      rerender();
+      return;
+    }
+    sub = "package-plan";
+    options = { workspace: ws, plan: planPath };
+    if (session.clawPath) {
+      options["claw-binary"] = session.clawPath;
+    }
+  } else if (rung === "commit") {
+    const files = session.taskDraft.declared_target_paths;
+    if (!files || files.length === 0) {
+      session.notice = "N6: declared_target_paths required for package-commit — add paths in N3";
+      rerender();
+      return;
+    }
+    const message = session.taskDraft.task_summary ?? "A2 harness: package commit";
+    sub = "package-commit";
+    options = { workspace: ws, file: files, message };
+  } else if (rung === "push") {
+    // Ask operator for remote and branch (no git probe available in extension).
+    const remote = await vscode.window.showInputBox({
+      prompt: "N6 package-push: remote name (e.g. origin)",
+      value: "origin",
+      ignoreFocusOut: true,
+    });
+    if (!remote || remote.trim().length === 0) { return; }
+    const branch = await vscode.window.showInputBox({
+      prompt: "N6 package-push: branch name to push",
+      ignoreFocusOut: true,
+    });
+    if (!branch || branch.trim().length === 0) { return; }
+    sub = "package-push";
+    options = { workspace: ws, remote: remote.trim(), branch: branch.trim() };
+  } else {
+    // package-pr (D5=A): operator supplies all PR fields via input box.
+    const base = await vscode.window.showInputBox({
+      prompt: "N6 package-pr: base branch (e.g. main)",
+      value: "main",
+      ignoreFocusOut: true,
+    });
+    if (!base || base.trim().length === 0) { return; }
+    const head = await vscode.window.showInputBox({
+      prompt: "N6 package-pr: head branch",
+      ignoreFocusOut: true,
+    });
+    if (!head || head.trim().length === 0) { return; }
+    const title = await vscode.window.showInputBox({
+      prompt: "N6 package-pr: PR title (max 256 chars)",
+      value: session.taskDraft.task_summary ?? "",
+      ignoreFocusOut: true,
+    });
+    if (!title || title.trim().length === 0) { return; }
+    // D5=A: operator supplies body-file path.
+    const bodyFile = await vscode.window.showInputBox({
+      prompt: "N6 package-pr: path to PR body file (D5-A)",
+      ignoreFocusOut: true,
+    });
+    if (!bodyFile || bodyFile.trim().length === 0) {
+      session.notice = "N6: body-file path required for package-pr (D5-A)";
+      rerender();
+      return;
+    }
+    sub = "package-pr";
+    options = {
+      workspace: ws,
+      base: base.trim(),
+      head: head.trim(),
+      title: title.trim(),
+      "body-file": bodyFile.trim(),
+    };
+  }
+
+  // Dispatch through helperRunner.ts (single spawn boundary).
+  n6SetExec(rung, "RUNNING");
+  recomputeViews();
+  rerender();
+
+  const inv: HelperInvocation = { helperPath, subcommand: sub, options };
+  const subLabel = sub; // captured for catch block (TypeScript definite assignment)
+  try {
+    const result = await runHelper(inv, defaultSpawnImpl());
+    const combinedOutput = result.stdout + (result.stderr ? `\n[stderr]\n${result.stderr}` : "");
+    if (result.exitCode === 0) {
+      n6SetExec(rung, "DONE", combinedOutput, result.exitCode);
+    } else {
+      n6SetExec(rung, "FAILED", combinedOutput, result.exitCode);
+      n6ClearToken(rung); // D4=B: clear token on FAILED
+    }
+    session.output = { subcommand: sub, exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr };
+    record(timelineEvent("helper", `N6 ${subLabel}`, result.exitCode));
+    recomputeViews();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    n6SetExec(rung, "FAILED", msg, -1);
+    n6ClearToken(rung); // D4=B: clear token on error
+    session.notice = `N6 ${rung} dispatch failed: ${msg}`;
+    record(timelineEvent("note", `N6 ${subLabel} dispatch error`));
+    recomputeViews();
+  }
+  rerender();
 }
 
 async function handleMessage(msg: PanelMessage): Promise<void> {

@@ -256,6 +256,47 @@ if (commitFlagsM) {
   violations.push("src/helperRunner.ts: N6A-MISSING: ALLOWED_FLAGS[\"package-commit\"] entry not found");
 }
 
+// D7 structural assertion (N6): every N6 execution run button (identified by
+// the literal CSS class "n6-run-btn" in the render.ts source) MUST carry
+// data-n6-token-required="true" in the same source region (within 300 chars).
+//
+// Why "n6-run-btn" and not "n6Run*": render.ts builds the button HTML in a
+// template literal where the ui-action is a runtime expression (escapeHtml
+// call), so the literal "n6Run" never appears in source. The CSS class name
+// "n6-run-btn" IS a compile-time literal inside the template and is the
+// correct source-level marker. The runtime action IDs are validated at the
+// HTML level by n6Render.test.ts (the C half of D7=C).
+//
+// D7=C: this source-level check pairs with the n6Render.test.ts HTML-level check.
+const RENDER_TS = path.join(SRC, "render.ts");
+if (fs.existsSync(RENDER_TS)) {
+  const renderSource = fs.readFileSync(RENDER_TS, { encoding: "utf8" });
+  // Find all N6 run button template-literal occurrences by CSS class.
+  const n6BtnPattern = /n6-run-btn/g;
+  let n6BtnMatch;
+  let n6BtnCount = 0;
+  while ((n6BtnMatch = n6BtnPattern.exec(renderSource)) !== null) {
+    n6BtnCount++;
+    const start = Math.max(0, n6BtnMatch.index - 30);
+    const end = Math.min(renderSource.length, n6BtnMatch.index + 300);
+    const context = renderSource.slice(start, end);
+    if (!context.includes('data-n6-token-required="true"')) {
+      violations.push(
+        `src/render.ts: D7-VIOLATION: n6-run-btn occurrence at offset ${n6BtnMatch.index} missing data-n6-token-required="true" in surrounding 300 chars`,
+      );
+    }
+  }
+  // Enforcement: N6 run buttons MUST exist (guards that N6 render block is
+  // present and wired — prevents silently omitting the execution boundary).
+  if (n6BtnCount === 0) {
+    violations.push(
+      "src/render.ts: D7-MISSING: no n6-run-btn class found — N6 execution boundary render block must be present",
+    );
+  }
+} else {
+  violations.push("src/render.ts: MISSING render module");
+}
+
 if (violations.length > 0) {
   console.error("a2-harness-panel guards FAILED:");
   for (const v of violations) {

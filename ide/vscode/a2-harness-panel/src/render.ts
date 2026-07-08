@@ -19,6 +19,7 @@ import {
   EvidenceSnapshotView,
   renderEvidenceSnapshotHtml,
 } from "./tier3EvidenceSnapshot";
+import { N6PanelView, N6RungView } from "./n6View";
 
 export interface PanelInputs {
   workspace: string | null;
@@ -235,6 +236,12 @@ export interface RenderModel {
   // absent => muted hint). Display-only; no controls; no execution boundary
   // crossed; each datum labelled by trust level; fails closed.
   n5?: N5PanelView | null;
+  // Northstar Phase N6 execution boundary (optional; absent => muted hint).
+  // First execution-capable boundary: 4 package-ladder rungs behind a two-level
+  // token model (Level 1 = implementation token; Level 2 = per-rung sub-tokens).
+  // Each run button is hidden unless the operator supplies the exact sub-token.
+  // D3=B: renders BELOW the N5 readiness board in a separate section.
+  n6?: N6PanelView | null;
   // Pre-formatted evidence-timeline lines.
   timeline?: string[] | null;
   // A2 Local Coding Agent Foundation v0 control-plane view (optional; degrades
@@ -563,6 +570,60 @@ function n5Block(view: N5PanelView | null | undefined): string {
   <h4>Package ladder readiness (read-only — N5 runs no rung)</h4>
 ${rungs}
   <p class="muted">Read-only readiness board. Every datum is labelled VERIFIED / INFERRED / MISSING / BLOCKED / EXECUTION_REQUIRED. A READY rung is ready to be run in a separately-approved execution lane — N5 does not run it. EXECUTION_REQUIRED means the fact cannot be proven from read-only data; N5 never guesses. N5 runs no package-plan / package-commit / package-push / package-pr, opens no PR, writes nothing, and calls no model.</p>
+</section>`;
+}
+
+// Northstar Phase N6 — EXECUTION BOUNDARY section.
+// D3=B: renders as a SEPARATE section below N5 (not inline in N5 rung cards).
+// Each run button is ONLY visible when the operator has supplied the exact
+// per-rung sub-token AND the rung's preconditions are met (D4=B, D5=A).
+// IMPORTANT: every button that can invoke a package rung MUST carry
+// data-n6-token-required="true" — enforced by run-guards.js (D7).
+function n6RungHtml(rung: N6RungView): string {
+  const execClass = rung.execState.toLowerCase().replace(/_/g, "-");
+  const tokenBtnId = `n6-activate-${escapeHtml(rung.rung)}-token`;
+
+  // Token-entry button: shown when no token active AND not running/done/failed.
+  const showTokenEntry = !rung.tokenActive && rung.execState === "AWAITING_TOKEN";
+  const tokenEntryHtml = showTokenEntry
+    ? `    <button data-ui-action="${escapeHtml(rung.tokenAction)}" class="n6-token-entry" data-testid="${tokenBtnId}">Supply ${escapeHtml(rung.label)} sub-token</button>`
+    : "";
+
+  // Run button: ONLY shown when token active AND preconditions met AND state is TOKEN_ACTIVE.
+  // data-n6-token-required="true" is MANDATORY on every run button (D7 guard).
+  const runBtnHtml = rung.showRunButton
+    ? `    <button data-ui-action="${escapeHtml(rung.uiAction)}" class="n6-run-btn" data-n6-token-required="true" data-testid="n6-run-${escapeHtml(rung.rung)}">${escapeHtml(rung.buttonLabel)}</button>`
+    : "";
+
+  // Output block: shown only after the rung has run.
+  const outputHtml =
+    rung.output !== null
+      ? `    <pre class="n6-output" data-testid="n6-output-${escapeHtml(rung.rung)}">${escapeHtml(rung.output)}</pre>
+    <p class="muted" data-testid="n6-exit-${escapeHtml(rung.rung)}">exit: ${rung.exitCode ?? "?"}</p>`
+      : "";
+
+  return `  <div class="n6-rung n6-rung-${escapeHtml(execClass)}" data-testid="n6-rung-${escapeHtml(rung.rung)}">
+    <h4>${escapeHtml(rung.label)} <span class="muted" data-testid="n6-rung-${escapeHtml(rung.rung)}-state">[${escapeHtml(rung.execState)}]</span></h4>
+${tokenEntryHtml}
+${runBtnHtml}
+${outputHtml}
+    <p class="muted" data-testid="n6-rung-${escapeHtml(rung.rung)}-note">${escapeHtml(rung.stepNote)}</p>
+  </div>`;
+}
+
+function n6Block(view: N6PanelView | null | undefined): string {
+  if (!view) {
+    return `<section class="n6" data-testid="n6-execution-boundary">
+  <h3>Execution boundary (Northstar N6)</h3>
+  <p class="muted" data-testid="n6-empty">No N5 readiness data yet. Complete N3/N4/N5 before activating the execution boundary. Supply the Level 1 implementation token, then per-rung sub-tokens to unlock each rung. N6 runs nothing without explicit operator sub-token approval.</p>
+</section>`;
+  }
+  const rungs = view.rungs.map((r) => n6RungHtml(r)).join("\n");
+  return `<section class="n6" data-testid="n6-execution-boundary">
+  <h3>Execution boundary (Northstar N6)</h3>
+  <p class="muted">Two-level token model: Level 1 = implementation token (activates this section); Level 2 = per-rung sub-tokens (unlocks individual rungs). Each rung must be explicitly unlocked. D4-B: a FAILED rung clears its token — supply a fresh sub-token to retry. D5-A: package-pr body file path is supplied by operator via input box.</p>
+${rungs}
+  <p class="muted">N6 only dispatches through helperRunner.ts (single spawn boundary). No model, broker, or Vault calls are made by the panel. Force-push and PR-mark-ready are forbidden (N6_FORBIDDEN_TARGETS). Draft PR only.</p>
 </section>`;
 }
 
@@ -914,6 +975,7 @@ ${northstarBlock(model.northstar)}
 ${n3Block(model.n3)}
 ${n4Block(model.n4)}
 ${n5Block(model.n5)}
+${n6Block(model.n6)}
 ${setupBlock(model.setup)}
 ${navBlock(model.nav)}
 ${discoveryBlock(model.discovery)}
