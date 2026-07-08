@@ -1,19 +1,23 @@
-// Argv-bounded wrapper around the print/validate-only A2 IDE harness helper
-// (scripts/a2-ide-harness.sh). This module is the ONLY place this package
-// spawns any process. It accepts ONLY an allowlisted read-only/print
-// subcommand plus that subcommand's allowlisted flags, NEVER a chain-write
-// command, NEVER `claw`, and NEVER a shell. The spawn implementation is
-// injectable so tests audit argv without touching the real OS.
+// Argv-bounded wrapper around the A2 IDE harness helper (scripts/a2-ide-harness.sh).
+// This module is the ONLY place this package spawns any process. It accepts ONLY
+// allowlisted subcommands: print/validate subcommands (10 existing) and controlled-
+// execution subcommands (package-plan/commit/push/pr, added by N6A).
 //
-// Safety model (docs/a2-l4-ide-extension-panel-scope.md §7, §14):
-//   - the only binary spawned is the helper, and its basename must match.
-//   - the helper itself is print/validate-only; it never executes claw.
-//   - this runner never builds `claw plan run/approve/apply-bundle/apply`.
-//   - this runner never composes the approval line.
-//   - no shell, no exec/eval; spawn is array-argv only.
+// Print/validate subcommands never execute A2 commands — they print commands for the
+// operator to run manually. Controlled-execution subcommands may execute:
+//   package-plan:   claw plan run (preview only; writes .claw/ bundle, NOT the target)
+//   package-commit: git add <exact declared files> + git commit (no amend, no hooks skip)
+//   package-push:   git push <remote> <branch> (non-force only)
+//   package-pr:     gh pr create --draft (draft only; no --ready/approve/merge)
+//
+// This runner never builds `claw plan approve`, `claw plan apply-bundle`, or
+// `claw plan apply`. package-plan dispatches claw plan run (preview phase only).
+// The spawn implementation is injectable so tests audit argv without touching the OS.
+// No shell, no exec/eval; spawn is array-argv only.
 
-// Read-only / print-only helper subcommands the panel is allowed to invoke.
-// This is the complete allowlist; anything else is refused before spawn.
+// Allowed helper subcommands. Print/validate subcommands (10) never execute A2 commands.
+// Controlled-execution subcommands (4, N6A) execute bounded git/gh/claw operations gated
+// by N6 runtime sub-tokens. Anything else is refused before spawn.
 export const ALLOWED_SUBCOMMANDS = [
   "help",
   "validate-input",
@@ -29,13 +33,19 @@ export const ALLOWED_SUBCOMMANDS = [
   // non-claw a2-evidence-collector. Still print-only: no target write, no
   // worktree, no claw/model/broker/runtime.
   "print-tier3-evidence",
+  // N6A controlled-execution subcommands (require N6 runtime sub-token per rung):
+  "package-plan",    // executes claw plan run --workspace-write-preview (preview only; no target write)
+  "package-commit",  // executes git add <exact --file list> + git commit (exact-path staging only)
+  "package-push",    // executes git push <remote> <branch> (non-force; no --force variant)
+  "package-pr",      // executes gh pr create --draft (draft only; no --ready/approve/merge)
 ] as const;
 
 export type HelperSubcommand = (typeof ALLOWED_SUBCOMMANDS)[number];
 
 // Per-subcommand allowlist of flag names (without the leading `--`). The
 // runner refuses any flag not in the subcommand's set, so a button can never
-// smuggle an unexpected argument into the helper.
+// smuggle an unexpected argument into the helper. String arrays in options
+// encode repeated flags (e.g. multiple --file values for package-commit).
 export const ALLOWED_FLAGS: Record<HelperSubcommand, readonly string[]> = {
   "help": [],
   "validate-input": ["workspace", "plan"],
@@ -47,6 +57,11 @@ export const ALLOWED_FLAGS: Record<HelperSubcommand, readonly string[]> = {
   "verify-final": ["workspace", "target", "after-sha"],
   "audit-workspace": ["workspace", "target", "after-sha"],
   "print-tier3-evidence": ["workspace"],
+  // N6A execution subcommands — see docs/stack-code-n6a-helper-exec-allowlist-design.md
+  "package-plan":   ["workspace", "plan", "claw-binary"],
+  "package-commit": ["workspace", "file", "message"],
+  "package-push":   ["workspace", "remote", "branch"],
+  "package-pr":     ["workspace", "base", "head", "title", "body-file"],
 };
 
 // Chain-write command fragments that must never appear in any caller-supplied
@@ -80,8 +95,9 @@ export interface HelperInvocation {
   helperPath: string;
   subcommand: HelperSubcommand;
   // Flag values keyed by flag name (without `--`). Each must be in the
-  // subcommand's ALLOWED_FLAGS set.
-  options?: Record<string, string>;
+  // subcommand's ALLOWED_FLAGS set. A string[] value encodes repeated flags
+  // (e.g. ["src/a.ts","src/b.ts"] for --file in package-commit).
+  options?: Record<string, string | readonly string[]>;
 }
 
 export class HelperRunnerRefusal extends Error {
@@ -145,17 +161,20 @@ export function buildHelperRequest(inv: HelperInvocation): SpawnRequest {
         "refused: flag --" + key + " is not allowed for subcommand " + inv.subcommand,
       );
     }
-    const value = options[key];
-    if (typeof value !== "string") {
-      throw new HelperRunnerRefusal("refused: non-string value for --" + key);
+    const rawValue = options[key];
+    const values: readonly string[] = typeof rawValue === "string" ? [rawValue] : rawValue;
+    for (const value of values) {
+      if (typeof value !== "string") {
+        throw new HelperRunnerRefusal("refused: non-string value for --" + key);
+      }
+      if (value.startsWith("-")) {
+        throw new HelperRunnerRefusal(
+          "refused: value for --" + key + " must not begin with '-' (flag shape)",
+        );
+      }
+      refuseIfChainWrite(value, "--" + key);
+      args.push("--" + key, value);
     }
-    if (value.startsWith("-")) {
-      throw new HelperRunnerRefusal(
-        "refused: value for --" + key + " must not begin with '-' (flag shape)",
-      );
-    }
-    refuseIfChainWrite(value, "--" + key);
-    args.push("--" + key, value);
   }
 
   return { binary: inv.helperPath, args };

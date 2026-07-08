@@ -43,11 +43,15 @@ describe("helperRunner — argv shape", () => {
 });
 
 describe("helperRunner — subcommand allowlist", () => {
-  it("the allowlist is exactly the read-only/print subcommands", () => {
+  it("the allowlist contains all read-only/print subcommands and the 4 N6A execution subcommands", () => {
     assert.deepStrictEqual([...ALLOWED_SUBCOMMANDS].sort(), [
       "audit-workspace",
       "find-artifacts",
       "help",
+      "package-commit",
+      "package-plan",
+      "package-pr",
+      "package-push",
       "print-apply",
       "print-apply-bundle",
       "print-approval",

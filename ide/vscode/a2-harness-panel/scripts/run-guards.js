@@ -224,6 +224,38 @@ if (!fs.existsSync(HELPER_RUNNER)) {
   violations.push("src/helperRunner.ts: MISSING single-spawn-boundary module");
 }
 
+// N6A structural assertions: ALLOWED_FLAGS for execution subcommands must not
+// contain force-family flags, PR mark-ready/merge flags, or commit-amend flags.
+// Read the raw source (not stripped) and pattern-match the specific array literals.
+const helperSource = fs.readFileSync(HELPER_RUNNER, { encoding: "utf8" });
+
+const pushFlagsM = helperSource.match(/"package-push"\s*:\s*\[([^\]]*)\]/);
+if (pushFlagsM) {
+  if (/['"]force['"]/i.test(pushFlagsM[1])) {
+    violations.push("src/helperRunner.ts: FORBIDDEN-FORCE-PUSH-IN-HELPER: force-family flag in ALLOWED_FLAGS[\"package-push\"]");
+  }
+} else {
+  violations.push("src/helperRunner.ts: N6A-MISSING: ALLOWED_FLAGS[\"package-push\"] entry not found");
+}
+
+const prFlagsM = helperSource.match(/"package-pr"\s*:\s*\[([^\]]*)\]/);
+if (prFlagsM) {
+  if (/['"](?:ready|approve|merge)['"]/i.test(prFlagsM[1])) {
+    violations.push("src/helperRunner.ts: FORBIDDEN-PR-MARK-READY-IN-HELPER: ready/approve/merge flag in ALLOWED_FLAGS[\"package-pr\"]");
+  }
+} else {
+  violations.push("src/helperRunner.ts: N6A-MISSING: ALLOWED_FLAGS[\"package-pr\"] entry not found");
+}
+
+const commitFlagsM = helperSource.match(/"package-commit"\s*:\s*\[([^\]]*)\]/);
+if (commitFlagsM) {
+  if (/['"](?:amend|all)['"]/i.test(commitFlagsM[1])) {
+    violations.push("src/helperRunner.ts: FORBIDDEN-COMMIT-AMEND-IN-HELPER: amend/all flag in ALLOWED_FLAGS[\"package-commit\"]");
+  }
+} else {
+  violations.push("src/helperRunner.ts: N6A-MISSING: ALLOWED_FLAGS[\"package-commit\"] entry not found");
+}
+
 if (violations.length > 0) {
   console.error("a2-harness-panel guards FAILED:");
   for (const v of violations) {
