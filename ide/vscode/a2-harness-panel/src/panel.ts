@@ -47,7 +47,7 @@ export class A2HarnessPanel {
       vscode.postMessage({ type: 'runSubcommand', subcommand: el.getAttribute('data-subcommand') || '' });
     });
   });
-  document.querySelectorAll('.btn.ui[data-ui-action]').forEach(function (el) {
+  document.querySelectorAll('button[data-ui-action]').forEach(function (el) {
     el.addEventListener('click', function () {
       vscode.postMessage({ type: 'uiAction', action: el.getAttribute('data-ui-action') || '' });
     });
