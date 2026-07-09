@@ -20,6 +20,15 @@ export interface N5LadderForN6 {
   ladder: Array<{ readiness: string }>;
 }
 
+// N6-native workspace context: the plan rung is ready when all three are true.
+// Derived from the operator-selected workspace/plan fields and the helper-probed
+// claw binary path — not from the N3/N4 task-draft pipeline.
+export interface N6WorkspaceContext {
+  hasWorkspace: boolean;
+  hasPlan: boolean;
+  hasClawPath: boolean;
+}
+
 // In-memory N6 session state (held by extension.ts; never persisted — D2=A).
 export interface N6SessionState {
   // Sub-token presence flags (D2=A: in-memory only; cleared on deactivate).
@@ -99,20 +108,28 @@ export interface N6PanelView {
 }
 
 // Build the N6 panel view from the current session and N5 ladder readiness.
-// Pure: reads only the two inputs; no side effects.
+// Pure: reads only the inputs; no side effects.
+//
+// ctx (optional): N6-native workspace/plan/claw-path readiness used to gate the
+// plan rung. When omitted the plan rung is NOT ready (fail closed). The N5
+// ladder (n5) is retained for callers that still pass it but is no longer used
+// to determine plan rung readiness — N6 has its own validated workspace/plan fields.
 export function buildN6View(
   n5: N5LadderForN6 | null,
   session: N6SessionState,
+  ctx?: N6WorkspaceContext,
 ): N6PanelView {
-  // Derive N5 ladder readiness for each rung (fail closed: null n5 → NOT_READY).
-  const ladder = n5 ? n5.ladder : [];
-  const n5PlanReady  = ladder[0]?.readiness === "READY";
+  // Plan rung: ready when N6-native workspace/plan/claw-path context is all present.
+  // Fail closed: no ctx → not ready.
+  const planContextReady = ctx
+    ? ctx.hasWorkspace && ctx.hasPlan && ctx.hasClawPath
+    : false;
   // Downstream rungs: N6 requires prior rung DONE in this session (scope doc §11b-d).
   const commitReady  = session.planExec === "DONE";
   const pushReady    = session.commitExec === "DONE";
   const prReady      = session.pushExec === "DONE";
 
-  const planRung    = buildRungView("plan",   "package-plan",   "Run package-plan",   "n6RunPlan",    "n6ActivatePlanToken",   N6_SUB_TOKEN_PLAN,   session.planExec,   session.planTokenActive,   n5PlanReady,  session.planOutput,   session.planExitCode);
+  const planRung    = buildRungView("plan",   "package-plan",   "Run package-plan",   "n6RunPlan",    "n6ActivatePlanToken",   N6_SUB_TOKEN_PLAN,   session.planExec,   session.planTokenActive,   planContextReady,  session.planOutput,   session.planExitCode);
   const commitRung  = buildRungView("commit", "package-commit", "Run package-commit", "n6RunCommit",  "n6ActivateCommitToken", N6_SUB_TOKEN_COMMIT, session.commitExec, session.commitTokenActive, commitReady,  session.commitOutput, session.commitExitCode);
   const pushRung    = buildRungView("push",   "package-push",   "Run package-push",   "n6RunPush",    "n6ActivatePushToken",   N6_SUB_TOKEN_PUSH,   session.pushExec,   session.pushTokenActive,   pushReady,    session.pushOutput,   session.pushExitCode);
   const prRung      = buildRungView("pr",     "package-pr",     "Open Draft PR",      "n6RunPr",      "n6ActivatePrToken",     N6_SUB_TOKEN_PR,     session.prExec,     session.prTokenActive,     prReady,      session.prOutput,     session.prExitCode);

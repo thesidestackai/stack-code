@@ -2,7 +2,7 @@ import * as assert from "assert";
 import * as fs from "fs";
 import * as path from "path";
 import { renderHtml, emptyInputs } from "../src/render";
-import { emptyN6SessionState, buildN6View } from "../src/n6View";
+import { emptyN6SessionState, buildN6View, N6WorkspaceContext } from "../src/n6View";
 import { N6SessionState } from "../src/n6View";
 
 // tsconfig.test.json rootDir="."; compiled to out-test/test/ → walk up two dirs to reach src/.
@@ -11,33 +11,17 @@ const PANEL_SRC = fs.readFileSync(
   "utf8",
 );
 
-// Minimal N5 ladder with package-plan READY (matches n6Render.test.ts helper).
-function readyN5() {
-  return {
-    state: "N5_READY_FOR_PACKAGE_PLAN" as const,
-    stepLabel: "Ready for package-plan",
-    isBlocked: false,
-    n4State: "N4_DRAFT_REVIEWED" as const,
-    n4StepLabel: "Draft reviewed",
-    taskSummary: "test task",
-    riskLevel: "low",
-    ladder: [
-      { rung: "package-plan",   purpose: "p", readiness: "READY",     preconditionLines: [], evidencePresent: true,  operatorConfirmationRequired: false, note: "" },
-      { rung: "package-commit", purpose: "p", readiness: "NOT_READY", preconditionLines: [], evidencePresent: false, operatorConfirmationRequired: false, note: "" },
-      { rung: "package-push",   purpose: "p", readiness: "NOT_READY", preconditionLines: [], evidencePresent: false, operatorConfirmationRequired: false, note: "" },
-      { rung: "package-pr",     purpose: "p", readiness: "NOT_READY", preconditionLines: [], evidencePresent: false, operatorConfirmationRequired: false, note: "" },
-    ],
-  };
-}
-
-function htmlWithN6(session: N6SessionState, n5Ready = false) {
-  const n5 = n5Ready ? readyN5() : null;
+// planCtxReady=true simulates workspace + plan + claw-path all configured (N6-native gate).
+function htmlWithN6(session: N6SessionState, planCtxReady = false) {
+  const ctx: N6WorkspaceContext | undefined = planCtxReady
+    ? { hasWorkspace: true, hasPlan: true, hasClawPath: true }
+    : undefined;
   return renderHtml({
     inputs: emptyInputs(),
     output: null,
     notice: null,
-    n5,
-    n6: buildN6View(n5, session),
+    n5: null,
+    n6: buildN6View(null, session, ctx),
   });
 }
 
@@ -89,7 +73,7 @@ describe("Panel click handler — N6 button coverage (regression guard)", () => 
     };
     const html = htmlWithN6(session, true);
     const match = html.match(/<button[^>]*data-ui-action="n6RunPlan"[^>]*>/);
-    assert.ok(match, "plan run button must be present when TOKEN_ACTIVE + N5 ready");
+    assert.ok(match, "plan run button must be present when TOKEN_ACTIVE + workspace/plan/claw all configured");
     assert.ok(
       match![0].startsWith("<button"),
       "n6RunPlan must be a <button> element so button[data-ui-action] selector hits it",
