@@ -1,35 +1,22 @@
 import * as assert from "assert";
 import { renderHtml } from "../src/render";
-import { emptyN6SessionState, buildN6View } from "../src/n6View";
+import { emptyN6SessionState, buildN6View, N6WorkspaceContext } from "../src/n6View";
 import { N6SessionState } from "../src/n6View";
 import { emptyInputs } from "../src/render";
 
 // Helper: build a minimal RenderModel with only the n6 field populated.
-function modelWithN6(n6State: N6SessionState, n5Ready = false) {
-  const n5 = n5Ready
-    ? {
-        state: "N5_READY_FOR_PACKAGE_PLAN" as const,
-        stepLabel: "Ready for package-plan",
-        isBlocked: false,
-        n4State: "N4_DRAFT_REVIEWED" as const,
-        n4StepLabel: "Draft reviewed",
-        taskSummary: "test task",
-        riskLevel: "low",
-        ladder: [
-          { rung: "package-plan",   purpose: "p", readiness: "READY",     preconditionLines: [], evidencePresent: true,  operatorConfirmationRequired: false, note: "" },
-          { rung: "package-commit", purpose: "p", readiness: "NOT_READY", preconditionLines: [], evidencePresent: false, operatorConfirmationRequired: false, note: "" },
-          { rung: "package-push",   purpose: "p", readiness: "NOT_READY", preconditionLines: [], evidencePresent: false, operatorConfirmationRequired: false, note: "" },
-          { rung: "package-pr",     purpose: "p", readiness: "NOT_READY", preconditionLines: [], evidencePresent: false, operatorConfirmationRequired: false, note: "" },
-        ],
-      }
-    : null;
+// planCtxReady=true simulates workspace + plan + claw-path all configured (N6-native gate).
+function modelWithN6(n6State: N6SessionState, planCtxReady = false) {
+  const ctx: N6WorkspaceContext | undefined = planCtxReady
+    ? { hasWorkspace: true, hasPlan: true, hasClawPath: true }
+    : undefined;
 
   return {
     inputs: emptyInputs(),
     output: null,
     notice: null,
-    n5,
-    n6: buildN6View(n5, n6State),
+    n5: null,
+    n6: buildN6View(null, n6State, ctx),
   };
 }
 
@@ -168,14 +155,14 @@ describe("N6Render — HTML output (D7 HTML-level check)", () => {
       assert.ok(!html.includes('data-ui-action="n6RunPlan"'), "run button must be hidden without token");
     });
 
-    it("plan run button absent when N5 plan NOT_READY (even if token active)", () => {
+    it("plan run button absent when workspace/plan/claw ctx missing (even if token active)", () => {
       const s: N6SessionState = {
         ...emptyN6SessionState(),
         planTokenActive: true,
         planExec: "TOKEN_ACTIVE",
       };
-      const html = renderHtml(modelWithN6(s, false)); // n5 plan not ready
-      assert.ok(!html.includes('data-ui-action="n6RunPlan"'), "run button must be hidden without N5 READY");
+      const html = renderHtml(modelWithN6(s, false)); // no ctx → planContextReady = false
+      assert.ok(!html.includes('data-ui-action="n6RunPlan"'), "run button must be hidden without workspace/plan/claw");
     });
 
     it("commit run button absent when plan not DONE", () => {

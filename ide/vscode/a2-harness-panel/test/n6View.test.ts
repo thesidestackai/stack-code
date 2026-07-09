@@ -4,6 +4,7 @@ import {
   N6PanelView,
   N6RungView,
   N5LadderForN6,
+  N6WorkspaceContext,
   emptyN6SessionState,
   buildN6View,
 } from "../src/n6View";
@@ -78,13 +79,14 @@ describe("N6View — buildN6View (pure)", () => {
       }
     });
 
-    it("no run button shown even if n5 plan is READY (token required)", () => {
-      const v2 = buildN6View(n5WithPlanReady(), emptyN6SessionState());
+    it("no run button shown even if ctx is fully ready (token required)", () => {
+      const ctx: N6WorkspaceContext = { hasWorkspace: true, hasPlan: true, hasClawPath: true };
+      const v2 = buildN6View(null, emptyN6SessionState(), ctx);
       assert.strictEqual(rungForKey(v2, "plan").showRunButton, false);
     });
 
     it("each rung has the correct expectedToken", () => {
-      const v = buildN6View(n5WithPlanReady(), emptyN6SessionState());
+      const v = buildN6View(null, emptyN6SessionState());
       assert.strictEqual(rungForKey(v, "plan").expectedToken,   N6_SUB_TOKEN_PLAN);
       assert.strictEqual(rungForKey(v, "commit").expectedToken, N6_SUB_TOKEN_COMMIT);
       assert.strictEqual(rungForKey(v, "push").expectedToken,   N6_SUB_TOKEN_PUSH);
@@ -108,26 +110,59 @@ describe("N6View — buildN6View (pure)", () => {
     });
   });
 
-  describe("precondition: package-plan requires N5 ladder[0] READY", () => {
-    it("plan isReady = false when n5 is null", () => {
-      const s: N6SessionState = { ...emptyN6SessionState(), planTokenActive: true, planExec: "TOKEN_ACTIVE" };
-      const v = buildN6View(null, s);
+  describe("precondition: package-plan requires workspace/plan/claw-path context (N6-native)", () => {
+    const allCtx: N6WorkspaceContext = { hasWorkspace: true, hasPlan: true, hasClawPath: true };
+    const tokenActiveState: N6SessionState = {
+      ...emptyN6SessionState(),
+      planTokenActive: true,
+      planExec: "TOKEN_ACTIVE",
+    };
+
+    it("plan isReady = false when ctx is omitted (fail closed)", () => {
+      const v = buildN6View(null, tokenActiveState);
       assert.strictEqual(rungForKey(v, "plan").isReady, false);
-      assert.strictEqual(rungForKey(v, "plan").showRunButton, false, "no button without precondition");
+      assert.strictEqual(rungForKey(v, "plan").showRunButton, false, "no button without ctx");
     });
 
-    it("plan isReady = false when N5 ladder[0].readiness != READY", () => {
-      const s: N6SessionState = { ...emptyN6SessionState(), planTokenActive: true, planExec: "TOKEN_ACTIVE" };
-      const v = buildN6View(n5WithPlanNotReady(), s);
+    it("plan isReady = false when workspace missing", () => {
+      const v = buildN6View(null, tokenActiveState, { hasWorkspace: false, hasPlan: true, hasClawPath: true });
       assert.strictEqual(rungForKey(v, "plan").isReady, false);
       assert.strictEqual(rungForKey(v, "plan").showRunButton, false);
     });
 
-    it("plan showRunButton = true when token active AND N5 plan READY", () => {
-      const s: N6SessionState = { ...emptyN6SessionState(), planTokenActive: true, planExec: "TOKEN_ACTIVE" };
-      const v = buildN6View(n5WithPlanReady(), s);
+    it("plan isReady = false when plan missing", () => {
+      const v = buildN6View(null, tokenActiveState, { hasWorkspace: true, hasPlan: false, hasClawPath: true });
+      assert.strictEqual(rungForKey(v, "plan").isReady, false);
+      assert.strictEqual(rungForKey(v, "plan").showRunButton, false);
+    });
+
+    it("plan isReady = false when claw path missing", () => {
+      const v = buildN6View(null, tokenActiveState, { hasWorkspace: true, hasPlan: true, hasClawPath: false });
+      assert.strictEqual(rungForKey(v, "plan").isReady, false);
+      assert.strictEqual(rungForKey(v, "plan").showRunButton, false);
+    });
+
+    it("plan showRunButton = true when token active AND workspace + plan + claw all present", () => {
+      const v = buildN6View(null, tokenActiveState, allCtx);
       assert.strictEqual(rungForKey(v, "plan").isReady, true);
       assert.strictEqual(rungForKey(v, "plan").showRunButton, true);
+    });
+
+    it("plan showRunButton = false when token AWAITING (ctx does not bypass token requirement)", () => {
+      const awaiting: N6SessionState = { ...emptyN6SessionState() };
+      const v = buildN6View(null, awaiting, allCtx);
+      assert.strictEqual(rungForKey(v, "plan").showRunButton, false);
+    });
+
+    it("commit/push/pr tokens do NOT make plan button visible (tokens are per-rung)", () => {
+      const s: N6SessionState = {
+        ...emptyN6SessionState(),
+        commitTokenActive: true,
+        pushTokenActive: true,
+        prTokenActive: true,
+      };
+      const v = buildN6View(null, s, allCtx);
+      assert.strictEqual(rungForKey(v, "plan").showRunButton, false, "plan unaffected by other tokens");
     });
   });
 
@@ -139,7 +174,7 @@ describe("N6View — buildN6View (pure)", () => {
         commitTokenActive: true,
         commitExec: "TOKEN_ACTIVE",
       };
-      const v = buildN6View(n5WithPlanReady(), s);
+      const v = buildN6View(null, s);
       assert.strictEqual(rungForKey(v, "commit").isReady, false);
       assert.strictEqual(rungForKey(v, "commit").showRunButton, false);
     });
@@ -151,7 +186,7 @@ describe("N6View — buildN6View (pure)", () => {
         commitTokenActive: true,
         commitExec: "TOKEN_ACTIVE",
       };
-      const v = buildN6View(n5WithPlanReady(), s);
+      const v = buildN6View(null, s);
       assert.strictEqual(rungForKey(v, "commit").isReady, true);
       assert.strictEqual(rungForKey(v, "commit").showRunButton, true);
     });
@@ -201,6 +236,7 @@ describe("N6View — buildN6View (pure)", () => {
 
   describe("D4=B: RUNNING/DONE/FAILED suppress the run button", () => {
     const suppressStates = ["RUNNING", "DONE", "FAILED"] as const;
+    const allCtx: N6WorkspaceContext = { hasWorkspace: true, hasPlan: true, hasClawPath: true };
     for (const execState of suppressStates) {
       it(`plan showRunButton = false when planExec = ${execState}`, () => {
         const s: N6SessionState = {
@@ -208,7 +244,7 @@ describe("N6View — buildN6View (pure)", () => {
           planTokenActive: true,
           planExec: execState,
         };
-        const v = buildN6View(n5WithPlanReady(), s);
+        const v = buildN6View(null, s, allCtx);
         assert.strictEqual(rungForKey(v, "plan").showRunButton, false);
       });
     }

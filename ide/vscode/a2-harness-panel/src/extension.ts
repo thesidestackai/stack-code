@@ -105,6 +105,7 @@ import { buildN5View } from "./n5View";
 import {
   N6SessionState,
   N6PanelView,
+  N6WorkspaceContext,
   emptyN6SessionState,
   buildN6View,
 } from "./n6View";
@@ -780,9 +781,14 @@ function recomputeViews(): void {
   };
 
   // Northstar Phase N6 — execution boundary view. Pure: reads the current
-  // in-memory N6 session state + the N5 ladder readiness (for plan READY gate).
+  // in-memory N6 session state + the N6-native workspace/plan/claw context.
   // No spawn, no file, no model/broker/Vault.
-  session.n6 = buildN6View(session.n5, session.n6State);
+  const n6Ctx: N6WorkspaceContext = {
+    hasWorkspace: typeof ws === "string" && ws.trim().length > 0,
+    hasPlan: session.setup.plan === "found",
+    hasClawPath: !!session.clawPath,
+  };
+  session.n6 = buildN6View(session.n5, session.n6State, n6Ctx);
 
   session.northstar = {
     state: nsView.state,
