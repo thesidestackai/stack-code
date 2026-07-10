@@ -48,6 +48,18 @@ check "NO-GIT-ADD-ALL"   'git\s+(-C\s+\S+\s+)?add\s+(\.(\s|$)|-A\b|-a\b|--all\b)
 # No commit --amend.
 check "NO-COMMIT-AMEND"  'git\s+.*commit\s+.*--amend\b'
 
+# Positive check: package-plan must pass --wrapper to claw plan run so the step
+# executor does not fall back to a CWD-relative wrapper path.
+require() {
+  local label="$1" pattern="$2"
+  if ! grep -v '^\s*#' "$SCRIPT" | grep -qE "$pattern" 2>/dev/null; then
+    echo "FAIL [$label]: required pattern not found in $SCRIPT" >&2
+    VIOLATIONS=$((VIOLATIONS + 1))
+  fi
+}
+
+require "WRAPPER-ABSOLUTE"  '\-\-wrapper\s+"\$wrapper"'
+
 if [[ "$VIOLATIONS" -gt 0 ]]; then
   echo "check-harness-exec-safety: $VIOLATIONS violation(s) found in $SCRIPT" >&2
   exit 1

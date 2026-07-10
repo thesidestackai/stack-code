@@ -33,8 +33,10 @@
 # Bounded exec exceptions:
 #   print-tier3-evidence: invokes a2-evidence-collector (read-only, writes nothing,
 #     no claw/orchestrator/model/broker/runtime) by exact basename, array-argv, no shell.
-#   package-plan:         invokes claw plan run --workspace-write-preview by absolute
-#     path (--claw-binary flag), array-argv, no shell. Preview only; no target write.
+#   package-plan:         invokes claw plan run --workspace-write-preview --wrapper by
+#     absolute paths (--claw-binary + derived workspace wrapper), array-argv, no shell.
+#     --wrapper is derived from the workspace root so the process CWD is irrelevant.
+#     Preview only; no target write.
 #   package-commit:       invokes git add -- <declared files> + git commit. Exact-path
 #     staging only; no git add . or git add -A.
 #   package-push:         invokes git push <remote> <branch>. Non-force only.
@@ -558,8 +560,18 @@ cmd_package_plan() {
   [[ -f "$claw_bin" ]] || { err "claw binary not found: $claw_bin"; exit $EXIT_VALIDATION; }
   [[ -x "$claw_bin" ]] || { err "claw binary not executable: $claw_bin"; exit $EXIT_VALIDATION; }
 
+  # Derive the step-executor wrapper from the workspace so claw plan run does not
+  # depend on process CWD to locate scripts/claw-sidestack-local. When the panel
+  # spawns this script, its CWD is whatever VS Code inherited from the terminal —
+  # not necessarily the workspace root. Passing --wrapper with an absolute path
+  # makes the step executor find the broker profile regardless of CWD.
+  local wrapper="$ws/scripts/claw-sidestack-local"
+  [[ -f "$wrapper" ]] || { err "workspace wrapper not found: $wrapper"; exit $EXIT_VALIDATION; }
+  [[ -x "$wrapper" ]] || { err "workspace wrapper not executable: $wrapper"; exit $EXIT_VALIDATION; }
+
   # Execute claw plan run (preview only; writes .claw/ preview bundle, NOT the target)
-  "$claw_bin" plan run "$plan" --workspace-root "$ws" --workspace-write-preview
+  "$claw_bin" plan run "$plan" --workspace-root "$ws" --workspace-write-preview \
+    --wrapper "$wrapper"
 }
 
 cmd_package_commit() {
