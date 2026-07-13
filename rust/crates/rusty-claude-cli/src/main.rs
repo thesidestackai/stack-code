@@ -737,6 +737,19 @@ fn run_plan_subcommand(
             substrate_url.unwrap_or(DEFAULT_SUBSTRATE_URL),
             fast_model.unwrap_or(DEFAULT_FAST_MODEL),
         ));
+        // Resolve workspace root for step executor CWD. Operator may pass
+        // --workspace-root; otherwise fall back to CWD. Mirrors the
+        // resolution in the --workspace-write-preview branch above.
+        let workspace_root_live: PathBuf = match workspace_root {
+            Some(p) => p.to_path_buf(),
+            None => match std::env::current_dir() {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("claw plan run: cannot read CWD as workspace root: {e}");
+                    return EXIT_PARSE_ERROR;
+                }
+            },
+        };
         // Pre-check wrapper existence so we emit a clean
         // substrate-unavailable instead of letting Command::new spawn fail
         // with an obscure errno message.
@@ -747,7 +760,13 @@ fn run_plan_subcommand(
             );
             substrate_unavailable_report(&plan.name)
         } else {
-            a2_plan_runner::run_plan(&plan, wrapper_path, substrate, effective_step_timeout)
+            a2_plan_runner::run_plan(
+                &plan,
+                wrapper_path,
+                substrate,
+                effective_step_timeout,
+                &workspace_root_live,
+            )
         }
     };
 
@@ -18275,7 +18294,11 @@ mod plan_run_cli_tests {
             expected_post_write: None,
             after_file: None,
         };
-        let cmd = build_claw_command(std::path::Path::new("/tmp/wrapper"), &step);
+        let cmd = build_claw_command(
+            std::path::Path::new("/tmp/wrapper"),
+            &step,
+            std::path::Path::new("/tmp/workspace"),
+        );
         assert!(
             cmd.args
                 .windows(2)
