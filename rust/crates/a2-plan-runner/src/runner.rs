@@ -77,15 +77,24 @@ use crate::write_preview::{produce_write_preview, WritePreviewArtifacts, WritePr
 // Claw argument construction — the load-bearing safety boundary
 // -----------------------------------------------------------------------------
 
-/// A resolved claw invocation: wrapper executable + argument vector.
+/// A resolved claw invocation: wrapper executable + argument vector + working
+/// directory for the subprocess.
 ///
 /// Constructed exclusively via [`build_claw_command`]. Holding a
-/// `ClawCommand` is a proof-by-construction that read-only enforcement and
-/// allowlist intersection have already been applied.
+/// `ClawCommand` is a proof-by-construction that read-only enforcement,
+/// allowlist intersection, and workspace-root CWD have already been applied.
+///
+/// The `cwd` field is applied via `Command::current_dir` at spawn time so
+/// that claw's sandbox is rooted in the plan's workspace, not in the
+/// process CWD inherited from the VS Code extension host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClawCommand {
     pub program: PathBuf,
     pub args: Vec<String>,
+    /// Working directory for the step subprocess. Set to the plan
+    /// `workspace_root` so claw's `workspace-only` sandbox covers the
+    /// right tree instead of the VS Code extension host CWD.
+    pub cwd: PathBuf,
 }
 
 /// Build a claw invocation for a single read-only plan step.
@@ -108,12 +117,21 @@ pub struct ClawCommand {
 /// 7. `args` never contains `--dangerously-skip-permissions`,
 ///    `--danger-full-access`, `--print`, or any other elevation/text-mode
 ///    flag.
+/// 8. `cwd` is set to `workspace_root` so the spawned subprocess has its
+///    working directory aligned with the plan workspace. Claw's
+///    `workspace-only` sandbox is rooted in the process CWD; without this,
+///    a step executor spawned from the VS Code extension host inherits the
+///    editor's CWD and its sandbox cannot reach the actual plan workspace.
 ///
 /// The function is pure: no I/O, no subprocess spawn. Callers turn the
 /// resulting `ClawCommand` into a [`std::process::Command`] at the actual
 /// boundary.
 #[must_use]
-pub fn build_claw_command(wrapper_path: &Path, step: &PlanStep) -> ClawCommand {
+pub fn build_claw_command(
+    wrapper_path: &Path,
+    step: &PlanStep,
+    workspace_root: &Path,
+) -> ClawCommand {
     let allowed_tools_csv = step
         .tools
         .iter()
@@ -138,6 +156,7 @@ pub fn build_claw_command(wrapper_path: &Path, step: &PlanStep) -> ClawCommand {
     ClawCommand {
         program: wrapper_path.to_path_buf(),
         args,
+        cwd: workspace_root.to_path_buf(),
     }
 }
 
@@ -413,6 +432,7 @@ fn execute_with_timeout(
 ) -> Result<ProcessResult, StepFailure> {
     let mut child = Command::new(&cmd.program)
         .args(&cmd.args)
+        .current_dir(&cmd.cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -786,7 +806,7 @@ pub fn run_plan_with_write_preview(
     //    with the L1b contract. Embed its PlanReport's markers + step
     //    reports verbatim.
     if write_step_count == 0 {
-        let underlying = run_plan(plan, wrapper_path, substrate, step_timeout);
+        let underlying = run_plan(plan, wrapper_path, substrate, step_timeout, workspace_root);
         let exit = exit_code_from_plan_report(&underlying);
         let status = match underlying.outcome {
             PlanOutcome::Pass => WritePreviewPlanStatus::ReadOnlyComplete,
@@ -876,7 +896,7 @@ pub fn run_plan_with_write_preview(
             step_outcomes.push((step.id.clone(), StepOutcomeForReport::Skipped));
             continue;
         }
-        let cmd = build_claw_command(wrapper_path, step);
+        let cmd = build_claw_command(wrapper_path, step, workspace_root);
         match run_step(&cmd, step, step_timeout) {
             Ok(()) => step_outcomes.push((step.id.clone(), StepOutcomeForReport::Passed)),
             Err(f) => {
@@ -981,6 +1001,10 @@ fn exit_code_from_plan_report(report: &PlanReport) -> i32 {
 /// `substrate` is `Some((url, fast_model_id))` for live runs; `None` skips
 /// the probe (useful for dry-run / introspection paths).
 ///
+/// `workspace_root` is set as the working directory for every step
+/// subprocess so claw's `workspace-only` sandbox is rooted in the plan
+/// workspace rather than the process CWD.
+///
 /// First live exercise: Phase 5 smoke (gated by operator STOP).
 #[must_use]
 pub fn run_plan(
@@ -988,6 +1012,7 @@ pub fn run_plan(
     wrapper_path: &Path,
     substrate: Option<(&str, &str)>,
     step_timeout: Duration,
+    workspace_root: &Path,
 ) -> PlanReport {
     let validator_report = validate_plan(plan);
     if let Err(refusal) = precheck(plan, &validator_report) {
@@ -1006,7 +1031,7 @@ pub fn run_plan(
             step_outcomes.push((step.id.clone(), StepOutcomeForReport::Skipped));
             continue;
         }
-        let cmd = build_claw_command(wrapper_path, step);
+        let cmd = build_claw_command(wrapper_path, step, workspace_root);
         match run_step(&cmd, step, step_timeout) {
             Ok(()) => step_outcomes.push((step.id.clone(), StepOutcomeForReport::Passed)),
             Err(f) => {
@@ -1028,6 +1053,7 @@ mod tests {
     use a2_plan_schema::{ExpectedOutputContract, ModelTier, PlanMode};
 
     const WRAPPER_FIXTURE: &str = "/tmp/fake-wrapper/scripts/claw-sidestack-local";
+    const WORKSPACE_FIXTURE: &str = "/tmp/fake-workspace/preview-20260710";
 
     fn step(tools: &[&str]) -> PlanStep {
         PlanStep {
@@ -1055,7 +1081,11 @@ mod tests {
     /// regressions in the central arg builder.
     #[test]
     fn build_claw_command_always_includes_permission_mode_read_only() {
-        let cmd = build_claw_command(Path::new(WRAPPER_FIXTURE), &step(&["Read"]));
+        let cmd = build_claw_command(
+            Path::new(WRAPPER_FIXTURE),
+            &step(&["Read"]),
+            Path::new(WORKSPACE_FIXTURE),
+        );
         let mut found = false;
         let mut iter = cmd.args.iter();
         while let Some(a) = iter.next() {
@@ -1081,7 +1111,11 @@ mod tests {
         // Exhaustive: prove the read-only flag is present regardless of
         // which allowlist tool the step declares.
         for tool in READ_ONLY_TOOLS {
-            let cmd = build_claw_command(Path::new(WRAPPER_FIXTURE), &step(&[tool]));
+            let cmd = build_claw_command(
+                Path::new(WRAPPER_FIXTURE),
+                &step(&[tool]),
+                Path::new(WORKSPACE_FIXTURE),
+            );
             assert!(
                 cmd.args
                     .windows(2)
@@ -1101,6 +1135,7 @@ mod tests {
         let cmd = build_claw_command(
             Path::new(WRAPPER_FIXTURE),
             &step(&["Read", "Edit", "Grep", "Bash"]),
+            Path::new(WORKSPACE_FIXTURE),
         );
         let mut iter = cmd.args.iter();
         let allowed = loop {
@@ -1126,6 +1161,7 @@ mod tests {
         let cmd = build_claw_command(
             Path::new(WRAPPER_FIXTURE),
             &step(&["Edit", "Write", "Bash"]),
+            Path::new(WORKSPACE_FIXTURE),
         );
         assert!(cmd
             .args
@@ -1137,7 +1173,11 @@ mod tests {
 
     #[test]
     fn build_claw_command_pins_output_format_json() {
-        let cmd = build_claw_command(Path::new(WRAPPER_FIXTURE), &step(&["Read"]));
+        let cmd = build_claw_command(
+            Path::new(WRAPPER_FIXTURE),
+            &step(&["Read"]),
+            Path::new(WORKSPACE_FIXTURE),
+        );
         assert!(cmd
             .args
             .windows(2)
@@ -1152,7 +1192,11 @@ mod tests {
         // which would defeat `--output-format json`. Phase 5 (2026-05-20)
         // live smoke uncovered this — see runner.rs doc on
         // `build_claw_command`.
-        let cmd = build_claw_command(Path::new(WRAPPER_FIXTURE), &step(&["Read"]));
+        let cmd = build_claw_command(
+            Path::new(WRAPPER_FIXTURE),
+            &step(&["Read"]),
+            Path::new(WORKSPACE_FIXTURE),
+        );
         assert!(
             cmd.args.iter().any(|a| a == "prompt"),
             "args must use the prompt subcommand for non-interactive single-shot: {:?}",
@@ -1165,7 +1209,11 @@ mod tests {
     /// `--output-format json` to text and break every live plan run.
     #[test]
     fn build_claw_command_never_includes_print_flag() {
-        let cmd = build_claw_command(Path::new(WRAPPER_FIXTURE), &step(&["Read"]));
+        let cmd = build_claw_command(
+            Path::new(WRAPPER_FIXTURE),
+            &step(&["Read"]),
+            Path::new(WORKSPACE_FIXTURE),
+        );
         assert!(
             !cmd.args.iter().any(|a| a == "--print"),
             "--print must not be present; it would force claw to text mode \
@@ -1180,7 +1228,11 @@ mod tests {
     /// `message` and `iterations` fields).
     #[test]
     fn build_claw_command_emits_proven_good_arg_layout() {
-        let cmd = build_claw_command(Path::new(WRAPPER_FIXTURE), &step(&["Read", "Grep"]));
+        let cmd = build_claw_command(
+            Path::new(WRAPPER_FIXTURE),
+            &step(&["Read", "Grep"]),
+            Path::new(WORKSPACE_FIXTURE),
+        );
         // Empirically validated arg layout (in order):
         let expected: &[&str] = &[
             "--model",
@@ -1202,7 +1254,11 @@ mod tests {
 
     #[test]
     fn build_claw_command_pins_model_to_fast() {
-        let cmd = build_claw_command(Path::new(WRAPPER_FIXTURE), &step(&["Read"]));
+        let cmd = build_claw_command(
+            Path::new(WRAPPER_FIXTURE),
+            &step(&["Read"]),
+            Path::new(WORKSPACE_FIXTURE),
+        );
         assert!(cmd
             .args
             .windows(2)
@@ -1213,7 +1269,11 @@ mod tests {
 
     #[test]
     fn build_claw_command_never_includes_elevation_flags() {
-        let cmd = build_claw_command(Path::new(WRAPPER_FIXTURE), &step(&["Read", "Grep"]));
+        let cmd = build_claw_command(
+            Path::new(WRAPPER_FIXTURE),
+            &step(&["Read", "Grep"]),
+            Path::new(WORKSPACE_FIXTURE),
+        );
         let joined = join_args(&cmd);
         let forbidden = [
             "--dangerously-skip-permissions",
@@ -1236,7 +1296,11 @@ mod tests {
     #[test]
     fn build_claw_command_never_routes_around_wrapper() {
         // The program field MUST be the wrapper path, never raw `claw`.
-        let cmd = build_claw_command(Path::new(WRAPPER_FIXTURE), &step(&["Read"]));
+        let cmd = build_claw_command(
+            Path::new(WRAPPER_FIXTURE),
+            &step(&["Read"]),
+            Path::new(WORKSPACE_FIXTURE),
+        );
         assert_eq!(cmd.program, Path::new(WRAPPER_FIXTURE));
         assert!(
             cmd.program
@@ -1252,8 +1316,8 @@ mod tests {
     #[test]
     fn build_claw_command_is_deterministic() {
         let s = step(&["Read", "Grep"]);
-        let a = build_claw_command(Path::new(WRAPPER_FIXTURE), &s);
-        let b = build_claw_command(Path::new(WRAPPER_FIXTURE), &s);
+        let a = build_claw_command(Path::new(WRAPPER_FIXTURE), &s, Path::new(WORKSPACE_FIXTURE));
+        let b = build_claw_command(Path::new(WRAPPER_FIXTURE), &s, Path::new(WORKSPACE_FIXTURE));
         assert_eq!(a, b);
     }
 
@@ -1261,7 +1325,7 @@ mod tests {
     fn build_claw_command_preserves_step_description_as_prompt_argument() {
         let mut s = step(&["Read"]);
         s.description = "find the project config".to_string();
-        let cmd = build_claw_command(Path::new(WRAPPER_FIXTURE), &s);
+        let cmd = build_claw_command(Path::new(WRAPPER_FIXTURE), &s, Path::new(WORKSPACE_FIXTURE));
         // Description appears immediately after the `prompt` token.
         let pos = cmd
             .args
@@ -1279,7 +1343,7 @@ mod tests {
         s.expected_output = Some(ExpectedOutputContract {
             must_contain: vec!["sentinel".to_string()],
         });
-        let cmd = build_claw_command(Path::new(WRAPPER_FIXTURE), &s);
+        let cmd = build_claw_command(Path::new(WRAPPER_FIXTURE), &s, Path::new(WORKSPACE_FIXTURE));
         assert!(!join_args(&cmd).contains("sentinel"));
         assert!(!join_args(&cmd).contains("must_contain"));
     }
@@ -1670,6 +1734,7 @@ mod tests {
             Path::new("/does/not/exist/wrapper"), // would fail to spawn if reached
             None,                                 // no substrate probe
             Duration::from_secs(1),
+            Path::new(WORKSPACE_FIXTURE),
         );
         assert_eq!(report.outcome, PlanOutcome::RefusedPrecheck);
         assert!(report
@@ -1695,11 +1760,68 @@ mod tests {
         assert_eq!(f_ptr, r_ptr);
         // And the only public constructor of ClawCommand is via the
         // wrapper-pinning builder:
-        let cmd = build_claw_command(Path::new(WRAPPER_FIXTURE), &step(&["Read"]));
+        let cmd = build_claw_command(
+            Path::new(WRAPPER_FIXTURE),
+            &step(&["Read"]),
+            Path::new(WORKSPACE_FIXTURE),
+        );
         assert!(cmd
             .program
             .to_string_lossy()
             .ends_with("claw-sidestack-local"));
+    }
+
+    // --- CWD / workspace-root threading (N6 step executor sandbox fix) -------
+
+    /// Regression guard: `build_claw_command` must store the supplied
+    /// `workspace_root` in `ClawCommand.cwd`. The spawn path applies
+    /// `Command::current_dir(&cmd.cwd)` so the step executor's sandbox is
+    /// rooted in the plan workspace, not the VS Code extension host CWD.
+    ///
+    /// Root-cause context: without this field the inherited CWD was
+    /// `/home/suki/sidestackai`; claw's `workspace-only` sandbox then
+    /// blocked every `Read`/`Grep` call to the preview workspace, causing
+    /// `locate-config` to exit 1 before reaching the broker.
+    #[test]
+    fn build_claw_command_carries_workspace_root_in_cwd_field() {
+        let workspace = Path::new("/mnt/vast-data/git-worktrees/stack-code-n6-preview");
+        let cmd = build_claw_command(Path::new(WRAPPER_FIXTURE), &step(&["Read"]), workspace);
+        assert_eq!(
+            cmd.cwd, workspace,
+            "ClawCommand.cwd must equal the supplied workspace_root; \
+             execute_with_timeout applies this as Command::current_dir"
+        );
+    }
+
+    /// Different workspace roots must produce different `cwd` values — the
+    /// field is not hardcoded or defaulted.
+    #[test]
+    fn build_claw_command_cwd_reflects_supplied_workspace_not_a_constant() {
+        let ws_a = Path::new("/mnt/vast-data/preview-a");
+        let ws_b = Path::new("/mnt/vast-data/preview-b");
+        let cmd_a = build_claw_command(Path::new(WRAPPER_FIXTURE), &step(&["Read"]), ws_a);
+        let cmd_b = build_claw_command(Path::new(WRAPPER_FIXTURE), &step(&["Read"]), ws_b);
+        assert_ne!(
+            cmd_a.cwd, cmd_b.cwd,
+            "two different workspace_root values must produce two different cwd fields"
+        );
+        assert_eq!(cmd_a.cwd, ws_a);
+        assert_eq!(cmd_b.cwd, ws_b);
+    }
+
+    /// `ClawCommand.cwd` must not be the wrapper directory, the repo root,
+    /// or any inference from the wrapper path — it must be exactly the
+    /// caller-supplied workspace_root.
+    #[test]
+    fn build_claw_command_cwd_is_not_inferred_from_wrapper_path() {
+        let wrapper = Path::new("/home/suki/stack-code/scripts/claw-sidestack-local");
+        let workspace = Path::new("/mnt/vast-data/git-worktrees/preview-20260710");
+        let cmd = build_claw_command(wrapper, &step(&["Read"]), workspace);
+        // cwd must NOT be the wrapper's parent or grandparent
+        assert_ne!(cmd.cwd, Path::new("/home/suki/stack-code/scripts"));
+        assert_ne!(cmd.cwd, Path::new("/home/suki/stack-code"));
+        // cwd must be the explicit workspace_root
+        assert_eq!(cmd.cwd, workspace);
     }
 
     // --- --step-timeout parser (Phase 5 Fix A) -------------------------------
