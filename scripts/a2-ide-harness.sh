@@ -96,6 +96,19 @@ warn_if_sensitive_path() {
   esac
 }
 
+# Resolve a --plan value against --workspace: an absolute plan is returned
+# unchanged; a relative plan is anchored to the workspace root rather than the
+# process CWD (the panel's extension host CWD is not guaranteed to be the
+# workspace — the same problem the wrapper derivation below already solves).
+resolve_plan_for_workspace() {
+  local workspace=$1 supplied_plan=$2
+  if [[ "$supplied_plan" == /* ]]; then
+    printf '%s' "$supplied_plan"
+  else
+    printf '%s' "$workspace/$supplied_plan"
+  fi
+}
+
 # Read-only sha256 of a file, or a placeholder if absent/unreadable.
 sha_or_note() {
   local p=$1
@@ -242,12 +255,15 @@ cmd_validate_input() {
   parse_opts "$@"
   require_opt workspace
   require_opt plan
-  local ws=${OPT[workspace]} plan=${OPT[plan]}
+  local ws="${OPT[workspace]}" supplied_plan="${OPT[plan]}"
+  local plan
+  plan=$(resolve_plan_for_workspace "$ws" "$supplied_plan")
   local rc=$EXIT_OK
 
   rule; info "A2 validate-input (read-only)"; rule
-  info "workspace : $ws"
-  info "plan      : $plan"
+  info "workspace     : $ws"
+  info "plan (supplied): $supplied_plan"
+  info "plan (resolved): $plan"
 
   if [[ ! -d "$ws" ]]; then err "workspace is not a directory: $ws"; rc=$EXIT_VALIDATION; fi
   if [[ ! -f "$plan" ]]; then err "plan.yaml not found: $plan"; rc=$EXIT_VALIDATION; fi
@@ -549,7 +565,9 @@ cmd_package_plan() {
   require_opt workspace
   require_opt plan
   require_opt claw-binary
-  local ws="${OPT[workspace]}" plan="${OPT[plan]}" claw_bin="${OPT[claw-binary]}"
+  local ws="${OPT[workspace]}" supplied_plan="${OPT[plan]}" claw_bin="${OPT[claw-binary]}"
+  local plan
+  plan=$(resolve_plan_for_workspace "$ws" "$supplied_plan")
 
   warn_if_sensitive_path "workspace" "$ws"
   warn_if_sensitive_path "plan" "$plan"

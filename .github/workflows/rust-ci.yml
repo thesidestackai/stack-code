@@ -127,6 +127,7 @@ jobs:
           bash -n tests/shell/test_claw_sidestack_local.sh
           bash -n scripts/a2-tier3-write-orchestrator.sh
           bash -n tests/shell/test_a2_tier3_write_orchestrator.sh
+          bash -n tests/shell/test_a2_ide_harness_plan_path.sh
       - name: Shellcheck
         run: |
           sudo apt-get update
@@ -135,10 +136,12 @@ jobs:
           shellcheck tests/shell/test_claw_sidestack_local.sh
           shellcheck scripts/a2-tier3-write-orchestrator.sh
           shellcheck tests/shell/test_a2_tier3_write_orchestrator.sh
+          shellcheck tests/shell/test_a2_ide_harness_plan_path.sh
       - name: Run shell tests
         run: |
           bash tests/shell/test_claw_sidestack_local.sh
           bash tests/shell/test_a2_tier3_write_orchestrator.sh
+          bash tests/shell/test_a2_ide_harness_plan_path.sh
 
   planner-output-validator:
     name: planner-output validator
