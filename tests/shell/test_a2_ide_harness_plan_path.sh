@@ -349,6 +349,51 @@ if assert_eq "${name}" "exit code" 3 "${rc}" "${out}" "${errf}" \
   pass_case "${name}"
 fi
 
+# =============================================================================
+# canonical default entrypoint
+# =============================================================================
+
+# case: with A2_CLAW unset, the default resolves to $HOME/.local/bin/claw
+# (never a target/debug/claw artifact). `help` never invokes claw, so this is
+# read-only by construction.
+name="help_default_claw_uses_home_local_bin"
+case_dir="${WORK_DIR}/${name}"
+fixture_home="${case_dir}/home with spaces"
+mkdir -p "${fixture_home}"
+out="${case_dir}/stdout"; errf="${case_dir}/stderr"
+set +e
+env -u A2_CLAW HOME="${fixture_home}" bash "${HARNESS}" help >"${out}" 2>"${errf}"
+rc=$?
+set -e
+if assert_eq "${name}" "exit code" 0 "${rc}" "${out}" "${errf}" \
+   && assert_contains "${name}" "stdout" "${out}" "current: ${fixture_home}/.local/bin/claw" "${out}" "${errf}"; then
+  if grep -Fq '/target/debug/claw' "${out}"; then
+    fail_case "${name}" "help output still references a target/debug/claw artifact" "${out}" "${errf}"
+  else
+    pass_case "${name}"
+  fi
+fi
+
+# case: an explicit A2_CLAW override remains authoritative over the default
+name="help_explicit_A2_CLAW_override_wins"
+case_dir="${WORK_DIR}/${name}"
+fixture_home="${case_dir}/home"
+mkdir -p "${fixture_home}"
+override_claw="${case_dir}/approved-claw"
+out="${case_dir}/stdout"; errf="${case_dir}/stderr"
+set +e
+env A2_CLAW="${override_claw}" HOME="${fixture_home}" bash "${HARNESS}" help >"${out}" 2>"${errf}"
+rc=$?
+set -e
+if assert_eq "${name}" "exit code" 0 "${rc}" "${out}" "${errf}" \
+   && assert_contains "${name}" "stdout" "${out}" "current: ${override_claw}" "${out}" "${errf}"; then
+  if grep -Fq "${fixture_home}/.local/bin/claw" "${out}"; then
+    fail_case "${name}" "default was substituted despite an explicit A2_CLAW override" "${out}" "${errf}"
+  else
+    pass_case "${name}"
+  fi
+fi
+
 # ---------- summary ----------
 if [[ "${FAIL_COUNT}" -gt 0 ]]; then
   printf '\nFAIL: %d cases failed, %d passed\n' "${FAIL_COUNT}" "${PASS_COUNT}" >&2
