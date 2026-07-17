@@ -46,9 +46,13 @@ set -euo pipefail
 
 # ---- constants -------------------------------------------------------------
 
-# Default built claw binary (override with A2_CLAW=/path/to/claw). The path may
-# contain spaces; always quote it when printing the command for the operator.
-DEFAULT_CLAW="/media/suki/18TB 2/build-artifacts/stack-code/rust/target/debug/claw"
+# Canonical local Claw entrypoint. This symlink is maintained by the controlled
+# Stack-Code build/deployment lane and avoids silently selecting stale debug
+# artifacts. Override explicitly with A2_CLAW=/absolute/path/to/claw. The path
+# may contain spaces; always quote it when printing the command for the
+# operator. Fails closed (via `set -u`) rather than falling back to a debug
+# artifact if $HOME is unset.
+DEFAULT_CLAW="${HOME}/.local/bin/claw"
 A2_CLAW="${A2_CLAW:-$DEFAULT_CLAW}"
 
 # Default built read-only evidence collector (override with
