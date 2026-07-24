@@ -20,14 +20,91 @@ import {
 // Every temp root is unique and ends in .claw/n7, per the lane's explicit
 // requirement; the repository's real .claw/n7 is never touched.
 //
-// N7C_TEST_BASE replaces os.tmpdir() for every N7-C test store root, per
-// this repair lane's test-root confinement requirement — os.tmpdir() may
-// not be assumed to resolve to a safe location, and every store root (and
-// every "outside" fixture path used to test symlink rejection) must live
-// beneath this explicit, approved boundary instead.
+// Test-base selection (CI-portable, allowlisted): every N7-C store root
+// (and every "outside" fixture path used to test symlink rejection) lives
+// beneath ONE validated, selected base — never the OS-default temp-dir
+// helper (which may resolve to an unsafe or unanticipated mount, per the
+// prior lane's finding) and never an arbitrary environment-provided path.
+//
+//   1. /mnt/vast-data/tmp — preferred on the SideStackAI host.
+//   2. /tmp               — explicit Linux/GitHub-hosted-runner fallback.
+//
+// selectN7CTestBase() tries the preferred base first, falls back to the
+// explicit fallback only if the preferred base doesn't exist, and validates
+// whichever base it selects (absolute, exactly one of the two literals
+// above, a real non-symlinked directory, outside this repository worktree,
+// outside /mnt/ollama-models, writable and searchable) before any temp
+// directory or store path is ever created. A test-only override
+// (STACK_CODE_N7C_TEST_BASE) may force either approved base for validation
+// purposes; anything else throws immediately, before any fs mutation.
 // ---------------------------------------------------------------------------
 
-const N7C_TEST_BASE = "/mnt/vast-data/tmp";
+const APPROVED_N7C_TEST_BASES = ["/mnt/vast-data/tmp", "/tmp"] as const;
+type N7CTestBase = (typeof APPROVED_N7C_TEST_BASES)[number];
+
+function findRepositoryRoot(startDir: string): string | null {
+  let dir = startDir;
+  for (;;) {
+    if (fs.existsSync(path.join(dir, ".git"))) return dir;
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+}
+
+// Throws a plain Error (never returns) when `candidate` fails any approved-
+// base safety property. Never creates `candidate` — only ever validates an
+// already-existing directory.
+function assertApprovedN7CTestBase(candidate: string): asserts candidate is N7CTestBase {
+  if (!path.isAbsolute(candidate)) {
+    throw new Error(`N7C test base must be an absolute path, got: ${candidate}`);
+  }
+  if (!(APPROVED_N7C_TEST_BASES as readonly string[]).includes(candidate)) {
+    throw new Error(`N7C test base must be exactly one of ${APPROVED_N7C_TEST_BASES.join(", ")}, got: ${candidate}`);
+  }
+  if (candidate.startsWith("/mnt/ollama-models")) {
+    throw new Error(`N7C test base must not be beneath /mnt/ollama-models: ${candidate}`);
+  }
+  const repoRoot = findRepositoryRoot(__dirname);
+  if (repoRoot && (candidate === repoRoot || candidate.startsWith(repoRoot + path.sep))) {
+    throw new Error(`N7C test base must not be inside the repository worktree: ${candidate}`);
+  }
+  let st: fs.Stats;
+  try {
+    st = fs.lstatSync(candidate);
+  } catch {
+    throw new Error(`N7C test base does not exist: ${candidate}`);
+  }
+  if (st.isSymbolicLink()) {
+    throw new Error(`N7C test base must not be a symlink: ${candidate}`);
+  }
+  if (!st.isDirectory()) {
+    throw new Error(`N7C test base must be a real directory: ${candidate}`);
+  }
+  try {
+    fs.accessSync(candidate, fs.constants.W_OK | fs.constants.X_OK);
+  } catch {
+    throw new Error(`N7C test base must be writable and searchable: ${candidate}`);
+  }
+}
+
+function selectN7CTestBase(override: string | undefined): N7CTestBase {
+  if (override !== undefined) {
+    assertApprovedN7CTestBase(override);
+    return override;
+  }
+  for (const candidate of APPROVED_N7C_TEST_BASES) {
+    if (!fs.existsSync(candidate)) continue;
+    assertApprovedN7CTestBase(candidate);
+    return candidate;
+  }
+  throw new Error(
+    `No approved N7C test base is available (tried: ${APPROVED_N7C_TEST_BASES.join(", ")}). ` +
+      "Refusing to fall back to an OS-default temp directory or any other unvalidated location.",
+  );
+}
+
+const N7C_TEST_BASE: N7CTestBase = selectN7CTestBase(process.env.STACK_CODE_N7C_TEST_BASE);
 
 function makeTempRoot(): string {
   const base = fs.mkdtempSync(path.join(N7C_TEST_BASE, "n7c-evidence-test-"));
@@ -35,12 +112,13 @@ function makeTempRoot(): string {
 }
 
 // N7-C integrity-repair adversarial tests (finalization, lock-race,
-// canonical-storage, directory-sync) use a root under /mnt/vast-data/tmp
-// rather than the OS temp dir, per this repair lane's explicit test
-// filesystem safety requirement. Never cleaned up (no recursive deletion is
-// permitted in this file); evidence roots are preserved after the run.
-function makeVastTempRoot(): string {
-  const base = fs.mkdtempSync(path.join("/mnt/vast-data/tmp", "n7c-repair-test-"));
+// canonical-storage, directory-sync) use a root under the same selected,
+// validated N7C_TEST_BASE rather than the OS temp dir, per this repair
+// lane's explicit test filesystem safety requirement. Never cleaned up (no
+// recursive deletion is permitted in this file); evidence roots are
+// preserved after the run.
+function makeRepairTempRoot(): string {
+  const base = fs.mkdtempSync(path.join(N7C_TEST_BASE, "n7c-repair-test-"));
   return path.join(base, ".claw", "n7");
 }
 
@@ -841,7 +919,7 @@ describe("n7EvidenceStore — no arbitrary-path or repair API surface", () => {
 
 describe("n7EvidenceStore — atomic no-replace finalization", () => {
   it("event_preexisting_final_is_not_overwritten", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const store = await N7EvidenceStore.open(root);
     const eventsDir = path.join(root, "events");
     fs.mkdirSync(eventsDir, { recursive: true, mode: 0o700 });
@@ -857,7 +935,7 @@ describe("n7EvidenceStore — atomic no-replace finalization", () => {
     // artifact can only be exercised via the same named hook seam used by
     // the "created after precheck" test below — there is no way for a
     // caller to know the final filename in advance to create it first.
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     let injectedPath: string | null = null;
     const hooks: N7StoreHooks = {
       afterTempWrite: async (finalPath: string) => {
@@ -873,7 +951,7 @@ describe("n7EvidenceStore — atomic no-replace finalization", () => {
   });
 
   it("event_final_created_after_precheck_is_not_overwritten", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const hooks: N7StoreHooks = {
       afterTempWrite: async (finalPath: string) => {
         // appendEvent() also finalizes its claim (and later, release) record
@@ -893,7 +971,7 @@ describe("n7EvidenceStore — atomic no-replace finalization", () => {
   });
 
   it("artifact_final_created_after_precheck_is_not_overwritten", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     let injectedPath: string | null = null;
     const hooks: N7StoreHooks = {
       afterTempWrite: async (finalPath: string) => {
@@ -909,7 +987,7 @@ describe("n7EvidenceStore — atomic no-replace finalization", () => {
   });
 
   it("final_collision_does_not_report_acceptance", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const hooks: N7StoreHooks = {
       afterTempWrite: async (finalPath: string) => {
         if (isLockLedgerPath(finalPath)) return;
@@ -924,7 +1002,7 @@ describe("n7EvidenceStore — atomic no-replace finalization", () => {
   });
 
   it("final_collision_preserves_existing_bytes", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const hooks: N7StoreHooks = {
       afterTempWrite: async (finalPath: string) => {
         if (isLockLedgerPath(finalPath)) return;
@@ -942,7 +1020,7 @@ describe("n7EvidenceStore — atomic no-replace finalization", () => {
     // Double-fault: the final link collides AND the subsequent cleanup
     // unlink of this writer's own temp name also fails. The temp file must
     // be left in place as recovery evidence, never silently swept away.
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     let capturedTempPath: string | null = null;
     const wrapped: N7StoreFsAdapter = {
@@ -989,7 +1067,7 @@ describe("n7EvidenceStore — race-safe lock release", () => {
     // removes anything. Several sequential appends produce several
     // claim/release pairs; every one of them must remain present and
     // byte-identical to what it was immediately after creation.
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const store = await N7EvidenceStore.open(root);
     const lockDir = path.join(root, "chain.lock.d");
     const snapshots: Record<string, string> = {};
@@ -1015,7 +1093,7 @@ describe("n7EvidenceStore — race-safe lock release", () => {
     // "a pre-existing unreleased claim is not broken or replaced" test
     // already assumes) must never falsely free the lock for a concurrent
     // writer, since it cannot know the real claim's random ownerToken.
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const store = await N7EvidenceStore.open(root);
     writeForeignClaim(root, 1);
     // Forged release: matching claim_id, but a token that does not hash to
@@ -1048,7 +1126,7 @@ describe("n7EvidenceStore — race-safe lock release", () => {
     // during the event write, before release runs) means that proof can no
     // longer be made: release must safely decline (no release record
     // written, no throw) rather than write one anyway.
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const claimPath = path.join(root, "chain.lock.d", "claim-1.json");
     const hooks: N7StoreHooks = {
       afterFinalLink: async (finalPath: string) => {
@@ -1078,7 +1156,7 @@ describe("n7EvidenceStore — race-safe lock release", () => {
   });
 
   it("lock_write_failure_does_not_report_success", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     const wrapped: N7StoreFsAdapter = {
       ...real,
@@ -1101,7 +1179,7 @@ describe("n7EvidenceStore — race-safe lock release", () => {
   });
 
   it("lock_flush_failure_does_not_report_success", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     const wrapped: N7StoreFsAdapter = {
       ...real,
@@ -1121,7 +1199,7 @@ describe("n7EvidenceStore — race-safe lock release", () => {
   });
 
   it("lock_release_failure_does_not_report_success", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     const wrapped: N7StoreFsAdapter = {
       ...real,
@@ -1153,7 +1231,7 @@ describe("n7EvidenceStore — race-safe lock release", () => {
   });
 
   it("crashed_writer_leaves_future_append_blocked", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     const wrapped: N7StoreFsAdapter = {
       ...real,
@@ -1175,7 +1253,7 @@ describe("n7EvidenceStore — race-safe lock release", () => {
     // The blocked state is durable filesystem state, not in-process memory:
     // a BRAND NEW store instance pointed at the same root (simulating a
     // fresh process after a crash) must observe the identical contention.
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     const crashy: N7StoreFsAdapter = {
       ...real,
@@ -1196,7 +1274,7 @@ describe("n7EvidenceStore — race-safe lock release", () => {
   });
 
   it("corrupted_claim_record_fails_closed_not_throws", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const store = await N7EvidenceStore.open(root);
     fs.mkdirSync(path.join(root, "chain.lock.d"), { recursive: true, mode: 0o700 });
     fs.writeFileSync(path.join(root, "chain.lock.d", "claim-1.json"), "{ this is not valid json", { encoding: "utf8", mode: 0o600 });
@@ -1209,7 +1287,7 @@ describe("n7EvidenceStore — race-safe lock release", () => {
   });
 
   it("corrupted_release_record_is_not_treated_as_a_valid_release", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const store = await N7EvidenceStore.open(root);
     writeForeignClaim(root, 1);
     fs.writeFileSync(path.join(root, "chain.lock.d", "release-1.json"), "{ this is not valid json", { encoding: "utf8", mode: 0o600 });
@@ -1218,10 +1296,10 @@ describe("n7EvidenceStore — race-safe lock release", () => {
   });
 
   it("symlinked_lock_record_fails_closed", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const store = await N7EvidenceStore.open(root);
     const lockDir = path.join(root, "chain.lock.d");
-    const outsideFile = path.join("/mnt/vast-data/tmp", `n7c-lockproto-outside-${Date.now()}.json`);
+    const outsideFile = path.join(N7C_TEST_BASE, `n7c-lockproto-outside-${Date.now()}.json`);
     fs.writeFileSync(outsideFile, JSON.stringify({ ownerToken: "x", pid: 1, generation: 1 }), "utf8");
     fs.symlinkSync(outsideFile, path.join(lockDir, "claim-1.json"));
     const res = await store.appendEvent(makeEventInput());
@@ -1235,7 +1313,7 @@ describe("n7EvidenceStore — race-safe lock release", () => {
 
 describe("n7EvidenceStore — canonical stored event bytes", () => {
   it("stored_event_bytes_equal_n7a_canonical_serialization", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const store = await N7EvidenceStore.open(root);
     const res = await store.appendEvent(makeEventInput());
     assert.strictEqual(res.status, "ACCEPTED");
@@ -1245,7 +1323,7 @@ describe("n7EvidenceStore — canonical stored event bytes", () => {
   });
 
   it("stored_event_bytes_have_defined_newline_behavior", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const store = await N7EvidenceStore.open(root);
     await store.appendEvent(makeEventInput());
     const raw = fs.readFileSync(path.join(root, "events", "000001.json"), "utf8");
@@ -1254,7 +1332,7 @@ describe("n7EvidenceStore — canonical stored event bytes", () => {
   });
 
   it("noncanonical_equivalent_json_fails_chain_verification", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const store = await N7EvidenceStore.open(root);
     const res = await store.appendEvent(makeEventInput());
     assert.strictEqual(res.status, "ACCEPTED");
@@ -1300,7 +1378,7 @@ describe("n7EvidenceStore — canonical stored event bytes", () => {
   });
 
   it("canonical_event_hash_still_matches", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const store = await N7EvidenceStore.open(root);
     const res = await store.appendEvent(makeEventInput());
     assert.strictEqual(res.status, "ACCEPTED");
@@ -1310,7 +1388,7 @@ describe("n7EvidenceStore — canonical stored event bytes", () => {
   });
 
   it("event_hash_omits_only_event_sha256", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const store = await N7EvidenceStore.open(root);
     const res = await store.appendEvent(makeEventInput());
     assert.strictEqual(res.status, "ACCEPTED");
@@ -1324,7 +1402,7 @@ describe("n7EvidenceStore — canonical stored event bytes", () => {
   });
 
   it("prior_canonical_event_bytes_remain_unchanged_after_append", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const store = await N7EvidenceStore.open(root);
     await store.appendEvent(makeEventInput());
     const filePath = path.join(root, "events", "000001.json");
@@ -1342,7 +1420,7 @@ describe("n7EvidenceStore — canonical stored event bytes", () => {
 
 describe("n7EvidenceStore — directory-sync error classification", () => {
   it("supported directory sync reports no warning and no failure", async () => {
-    const store = await N7EvidenceStore.open(makeVastTempRoot());
+    const store = await N7EvidenceStore.open(makeRepairTempRoot());
     const res = await store.appendEvent(makeEventInput());
     assert.strictEqual(res.status, "ACCEPTED");
     if (res.status === "ACCEPTED") {
@@ -1351,7 +1429,7 @@ describe("n7EvidenceStore — directory-sync error classification", () => {
   });
 
   it("recognized unsupported directory sync is reported as a warning, not a failure", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const faulty = wrapAdapterWithFaults(createNodeFsAdapter(), { fsyncDirUnsupported: true });
     const store = await N7EvidenceStore.open(root, faulty);
     const res = await store.appendEvent(makeEventInput());
@@ -1362,7 +1440,7 @@ describe("n7EvidenceStore — directory-sync error classification", () => {
   });
 
   it("injected ordinary directory-sync I/O failure on an event write is never claimed accepted", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const faulty = wrapAdapterWithFaults(createNodeFsAdapter(), { fsyncDirIoError: true });
     const store = await N7EvidenceStore.open(root, faulty);
     const res = await store.appendEvent(makeEventInput());
@@ -1373,7 +1451,7 @@ describe("n7EvidenceStore — directory-sync error classification", () => {
   });
 
   it("injected ordinary directory-sync I/O failure on an artifact write is never claimed written", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const faulty = wrapAdapterWithFaults(createNodeFsAdapter(), { fsyncDirIoError: true });
     const store = await N7EvidenceStore.open(root, faulty);
     const res = await store.writeArtifact({ kind: "x", content: "hello", redaction: "no-secrets", confirmedNoSecrets: true });
@@ -1382,14 +1460,14 @@ describe("n7EvidenceStore — directory-sync error classification", () => {
 
   it("a real ENOENT directory-sync failure is classified as an I/O error, not unsupported", async () => {
     const adapter = createNodeFsAdapter();
-    const missingDir = path.join("/mnt/vast-data/tmp", `n7c-repair-missing-dir-${Date.now()}`);
+    const missingDir = path.join(N7C_TEST_BASE, `n7c-repair-missing-dir-${Date.now()}`);
     const outcome = await adapter.fsyncDir(missingDir);
     assert.strictEqual(outcome.kind, "IO_ERROR");
   });
 
   it("a real permission-denied directory-sync failure is classified as an I/O error, not unsupported", async () => {
     const adapter = createNodeFsAdapter();
-    const base = fs.mkdtempSync(path.join("/mnt/vast-data/tmp", "n7c-repair-perm-"));
+    const base = fs.mkdtempSync(path.join(N7C_TEST_BASE, "n7c-repair-perm-"));
     fs.chmodSync(base, 0o000);
     try {
       const outcome = await adapter.fsyncDir(base);
@@ -1406,7 +1484,7 @@ describe("n7EvidenceStore — directory-sync error classification", () => {
 
 describe("n7EvidenceStore — ownership proof (hashed active token)", () => {
   it("active_claim_does_not_store_raw_owner_token", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const store = await N7EvidenceStore.open(root);
     await store.appendEvent(makeEventInput());
     const claim = JSON.parse(fs.readFileSync(path.join(root, "chain.lock.d", "claim-1.json"), "utf8"));
@@ -1415,7 +1493,7 @@ describe("n7EvidenceStore — ownership proof (hashed active token)", () => {
   });
 
   it("active_claim_stores_owner_token_sha256", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const store = await N7EvidenceStore.open(root);
     await store.appendEvent(makeEventInput());
     const claim = JSON.parse(fs.readFileSync(path.join(root, "chain.lock.d", "claim-1.json"), "utf8"));
@@ -1430,7 +1508,7 @@ describe("n7EvidenceStore — ownership proof (hashed active token)", () => {
     // construct a valid release, since the hash itself does not satisfy
     // sha256(release.owner_token) === claim.owner_token_sha256 unless the
     // attacker already knows the raw token that produced it.
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     let attackerRes: Awaited<ReturnType<N7EvidenceStore["appendEvent"]>> | null = null;
     const hooks: N7StoreHooks = {
@@ -1452,7 +1530,7 @@ describe("n7EvidenceStore — ownership proof (hashed active token)", () => {
   });
 
   it("wrong_release_token_fails_closed", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const knownToken = "a-real-known-token-for-this-test";
     writeForeignClaim(root, 1, { owner_token_sha256: sha256Hex(knownToken) });
     writeForeignRelease(root, 1, { owner_token: "a-completely-different-wrong-token" });
@@ -1462,7 +1540,7 @@ describe("n7EvidenceStore — ownership proof (hashed active token)", () => {
   });
 
   it("missing_release_token_fails_closed", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     writeForeignClaim(root, 1);
     const lockDir = path.join(root, "chain.lock.d");
     // Missing owner_token field entirely.
@@ -1477,7 +1555,7 @@ describe("n7EvidenceStore — ownership proof (hashed active token)", () => {
   });
 
   it("release_token_hash_must_match_claim", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const knownToken = "yet-another-known-token";
     writeForeignClaim(root, 1, { owner_token_sha256: sha256Hex(knownToken) });
     writeForeignRelease(root, 1, { owner_token: knownToken });
@@ -1491,7 +1569,7 @@ describe("n7EvidenceStore — ownership proof (hashed active token)", () => {
   });
 
   it("raw_owner_token_not_returned_or_logged", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const store = await N7EvidenceStore.open(root);
     const res = await store.appendEvent(makeEventInput());
     assert.strictEqual(res.status, "ACCEPTED");
@@ -1510,7 +1588,7 @@ describe("n7EvidenceStore — ownership proof (hashed active token)", () => {
 
 describe("n7EvidenceStore — complete ledger validation", () => {
   it("claim_records_are_canonical", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const store = await N7EvidenceStore.open(root);
     await store.appendEvent(makeEventInput());
     const raw = fs.readFileSync(path.join(root, "chain.lock.d", "claim-1.json"), "utf8");
@@ -1518,7 +1596,7 @@ describe("n7EvidenceStore — complete ledger validation", () => {
   });
 
   it("release_records_are_canonical", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const store = await N7EvidenceStore.open(root);
     await store.appendEvent(makeEventInput());
     const raw = fs.readFileSync(path.join(root, "chain.lock.d", "release-1.json"), "utf8");
@@ -1526,7 +1604,7 @@ describe("n7EvidenceStore — complete ledger validation", () => {
   });
 
   it("noncanonical_claim_blocks", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const lockDir = path.join(root, "chain.lock.d");
     fs.mkdirSync(lockDir, { recursive: true, mode: 0o700 });
     const record = { schema_version: N7_LOCK_SCHEMA_VERSION, generation: 1, claim_id: "foreign-claim-id", owner_token_sha256: "0".repeat(64), pid: 1 };
@@ -1541,7 +1619,7 @@ describe("n7EvidenceStore — complete ledger validation", () => {
   });
 
   it("noncanonical_release_blocks", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     writeForeignClaim(root, 1);
     const record = { schema_version: N7_LOCK_SCHEMA_VERSION, generation: 1, claim_id: "foreign-claim-id", owner_token: "foreign-owner-token" };
     const noncanonical = JSON.stringify(record);
@@ -1553,7 +1631,7 @@ describe("n7EvidenceStore — complete ledger validation", () => {
   });
 
   it("malformed_lower_generation_blocks", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const lockDir = path.join(root, "chain.lock.d");
     fs.mkdirSync(lockDir, { recursive: true, mode: 0o700 });
     fs.writeFileSync(path.join(lockDir, "claim-1.json"), "{ not valid json at all", { encoding: "utf8", mode: 0o600 });
@@ -1574,7 +1652,7 @@ describe("n7EvidenceStore — complete ledger validation", () => {
   });
 
   it("unknown_lock_record_blocks", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const lockDir = path.join(root, "chain.lock.d");
     fs.mkdirSync(lockDir, { recursive: true, mode: 0o700 });
     fs.writeFileSync(path.join(lockDir, "not-a-real-record.json"), "{}", { encoding: "utf8", mode: 0o600 });
@@ -1584,7 +1662,7 @@ describe("n7EvidenceStore — complete ledger validation", () => {
   });
 
   it("claim_generation_gap_blocks", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     writeForeignClaim(root, 2);
     const store = await N7EvidenceStore.open(root);
     const res = await store.appendEvent(makeEventInput());
@@ -1592,7 +1670,7 @@ describe("n7EvidenceStore — complete ledger validation", () => {
   });
 
   it("duplicate_claim_generation_blocks", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     writeForeignClaim(root, 1);
     fs.writeFileSync(
       path.join(root, "chain.lock.d", "claim-01.json"),
@@ -1605,7 +1683,7 @@ describe("n7EvidenceStore — complete ledger validation", () => {
   });
 
   it("release_without_claim_blocks", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     writeForeignRelease(root, 1);
     const store = await N7EvidenceStore.open(root);
     const res = await store.appendEvent(makeEventInput());
@@ -1613,7 +1691,7 @@ describe("n7EvidenceStore — complete ledger validation", () => {
   });
 
   it("duplicate_release_blocks", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     writeForeignClaim(root, 1);
     writeForeignRelease(root, 1);
     fs.writeFileSync(
@@ -1627,7 +1705,7 @@ describe("n7EvidenceStore — complete ledger validation", () => {
   });
 
   it("release_claim_id_mismatch_blocks", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const knownToken = "matching-token-different-claim-id";
     writeForeignClaim(root, 1, { claim_id: "claim-A", owner_token_sha256: sha256Hex(knownToken) });
     writeForeignRelease(root, 1, { claim_id: "claim-B", owner_token: knownToken });
@@ -1637,7 +1715,7 @@ describe("n7EvidenceStore — complete ledger validation", () => {
   });
 
   it("invalid_release_token_proof_blocks", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     writeForeignClaim(root, 1);
     writeForeignRelease(root, 1);
     const store = await N7EvidenceStore.open(root);
@@ -1646,7 +1724,7 @@ describe("n7EvidenceStore — complete ledger validation", () => {
   });
 
   it("later_claim_after_unreleased_claim_blocks", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     writeForeignClaim(root, 1); // unreleased
     const knownToken = "generation-2-known-token";
     writeForeignClaim(root, 2, { claim_id: "claim-2-id", owner_token_sha256: sha256Hex(knownToken) });
@@ -1657,7 +1735,7 @@ describe("n7EvidenceStore — complete ledger validation", () => {
   });
 
   it("multiple_active_claims_block", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     writeForeignClaim(root, 1);
     writeForeignClaim(root, 2, { claim_id: "claim-2-id" });
     const store = await N7EvidenceStore.open(root);
@@ -1666,7 +1744,7 @@ describe("n7EvidenceStore — complete ledger validation", () => {
   });
 
   it("partial_claim_final_blocks", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const lockDir = path.join(root, "chain.lock.d");
     fs.mkdirSync(lockDir, { recursive: true, mode: 0o700 });
     fs.writeFileSync(path.join(lockDir, "claim-1.json"), '{"schema_version":"n7.lock-record.v1","generation":1,', { encoding: "utf8", mode: 0o600 });
@@ -1676,7 +1754,7 @@ describe("n7EvidenceStore — complete ledger validation", () => {
   });
 
   it("partial_release_final_blocks", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     writeForeignClaim(root, 1);
     fs.writeFileSync(path.join(root, "chain.lock.d", "release-1.json"), '{"schema_version":"n7.lock-record.v1","claim_id":', { encoding: "utf8", mode: 0o600 });
     const store = await N7EvidenceStore.open(root);
@@ -1685,7 +1763,7 @@ describe("n7EvidenceStore — complete ledger validation", () => {
   });
 
   it("symlinked_claim_blocks", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const store = await N7EvidenceStore.open(root);
     const lockDir = path.join(root, "chain.lock.d");
     const outsideFile = path.join(N7C_TEST_BASE, `n7c-ledger-outside-claim-${Date.now()}.json`);
@@ -1696,7 +1774,7 @@ describe("n7EvidenceStore — complete ledger validation", () => {
   });
 
   it("symlinked_release_blocks", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     writeForeignClaim(root, 1);
     const store = await N7EvidenceStore.open(root);
     const lockDir = path.join(root, "chain.lock.d");
@@ -1714,7 +1792,7 @@ describe("n7EvidenceStore — complete ledger validation", () => {
 
 describe("n7EvidenceStore — post-claim and post-release full rescans", () => {
   it("post_claim_conflicting_record_blocks_before_chain_tip_selection", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     const hooks: N7StoreHooks = {
       afterFinalLink: async (finalPath: string) => {
@@ -1732,7 +1810,7 @@ describe("n7EvidenceStore — post-claim and post-release full rescans", () => {
   });
 
   it("post_claim_higher_generation_blocks", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     const hooks: N7StoreHooks = {
       afterFinalLink: async (finalPath: string) => {
@@ -1746,7 +1824,7 @@ describe("n7EvidenceStore — post-claim and post-release full rescans", () => {
   });
 
   it("post_claim_malformed_record_blocks", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     const hooks: N7StoreHooks = {
       afterFinalLink: async (finalPath: string) => {
@@ -1763,7 +1841,7 @@ describe("n7EvidenceStore — post-claim and post-release full rescans", () => {
   });
 
   it("post_claim_verification_is_required", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     const lockDir = path.join(root, "chain.lock.d");
     let listDirCalls = 0;
@@ -1783,7 +1861,7 @@ describe("n7EvidenceStore — post-claim and post-release full rescans", () => {
   });
 
   it("post_release_conflicting_record_blocks_success", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     const hooks: N7StoreHooks = {
       afterFinalLink: async (finalPath: string) => {
@@ -1807,7 +1885,7 @@ describe("n7EvidenceStore — post-claim and post-release full rescans", () => {
   });
 
   it("post_release_malformed_record_blocks_success", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     const hooks: N7StoreHooks = {
       afterFinalLink: async (finalPath: string) => {
@@ -1829,7 +1907,7 @@ describe("n7EvidenceStore — post-claim and post-release full rescans", () => {
   });
 
   it("post_release_verification_is_required", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     const lockDir = path.join(root, "chain.lock.d");
     let listDirCallsAfterReleaseLink = 0;
@@ -1853,7 +1931,7 @@ describe("n7EvidenceStore — post-claim and post-release full rescans", () => {
   });
 
   it("losing_claim_contender_does_not_retry", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const storeA = await N7EvidenceStore.open(root);
     const storeB = await N7EvidenceStore.open(root);
     const [resA, resB] = await Promise.all([storeA.appendEvent(makeEventInput()), storeB.appendEvent(makeEventInput())]);
@@ -1872,7 +1950,7 @@ describe("n7EvidenceStore — post-claim and post-release full rescans", () => {
 
 describe("n7EvidenceStore — durability-uncertain recovery", () => {
   it("event_sync_failure_remains_durability_uncertain", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const faulty = wrapAdapterWithFaults(createNodeFsAdapter(), { fsyncDirIoError: true });
     const store = await N7EvidenceStore.open(root, faulty);
     const res = await store.appendEvent(makeEventInput());
@@ -1883,7 +1961,7 @@ describe("n7EvidenceStore — durability-uncertain recovery", () => {
   });
 
   it("artifact_sync_failure_remains_durability_uncertain", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     const artifactsDir = path.join(root, "artifacts");
     const faulty: N7StoreFsAdapter = {
@@ -1902,7 +1980,7 @@ describe("n7EvidenceStore — durability-uncertain recovery", () => {
   });
 
   it("claim_sync_failure_remains_durability_uncertain", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     const lockDir = path.join(root, "chain.lock.d");
     const faulty: N7StoreFsAdapter = {
@@ -1921,7 +1999,7 @@ describe("n7EvidenceStore — durability-uncertain recovery", () => {
   });
 
   it("release_sync_failure_remains_durability_uncertain", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     const lockDir = path.join(root, "chain.lock.d");
     let lockDirSyncCalls = 0;
@@ -1955,7 +2033,7 @@ describe("n7EvidenceStore — durability-uncertain recovery", () => {
   });
 
   it("fresh_store_does_not_accept_sync_failed_event", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const faulty = wrapAdapterWithFaults(createNodeFsAdapter(), { fsyncDirIoError: true });
     const store = await N7EvidenceStore.open(root, faulty);
     await store.appendEvent(makeEventInput());
@@ -1965,7 +2043,7 @@ describe("n7EvidenceStore — durability-uncertain recovery", () => {
   });
 
   it("fresh_store_does_not_accept_sync_failed_artifact", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     const artifactsDir = path.join(root, "artifacts");
     const faulty: N7StoreFsAdapter = {
@@ -2000,7 +2078,7 @@ describe("n7EvidenceStore — durability-uncertain recovery", () => {
   });
 
   it("fresh_store_does_not_accept_sync_failed_claim", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     const lockDir = path.join(root, "chain.lock.d");
     const faulty: N7StoreFsAdapter = {
@@ -2018,7 +2096,7 @@ describe("n7EvidenceStore — durability-uncertain recovery", () => {
   });
 
   it("fresh_store_does_not_accept_sync_failed_release", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     const lockDir = path.join(root, "chain.lock.d");
     let lockDirSyncCalls = 0;
@@ -2040,7 +2118,7 @@ describe("n7EvidenceStore — durability-uncertain recovery", () => {
   });
 
   it("durability_uncertain_temp_is_preserved", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const faulty = wrapAdapterWithFaults(createNodeFsAdapter(), { fsyncDirIoError: true });
     const store = await N7EvidenceStore.open(root, faulty);
     await store.appendEvent(makeEventInput());
@@ -2053,7 +2131,7 @@ describe("n7EvidenceStore — durability-uncertain recovery", () => {
   });
 
   it("durability_uncertain_record_blocks_append", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const faulty = wrapAdapterWithFaults(createNodeFsAdapter(), { fsyncDirIoError: true });
     const store = await N7EvidenceStore.open(root, faulty);
     await store.appendEvent(makeEventInput());
@@ -2065,7 +2143,7 @@ describe("n7EvidenceStore — durability-uncertain recovery", () => {
   });
 
   it("durability_uncertain_ledger_blocks_acquisition", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     const lockDir = path.join(root, "chain.lock.d");
     const faulty: N7StoreFsAdapter = {
@@ -2089,7 +2167,7 @@ describe("n7EvidenceStore — durability-uncertain recovery", () => {
 
 describe("n7EvidenceStore — release observability", () => {
   it("post_release_conflicting_record_is_observable_to_append_caller", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     const hooks: N7StoreHooks = {
       afterFinalLink: async (finalPath: string) => {
@@ -2109,7 +2187,7 @@ describe("n7EvidenceStore — release observability", () => {
   });
 
   it("post_release_malformed_record_is_observable_to_append_caller", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     const hooks: N7StoreHooks = {
       afterFinalLink: async (finalPath: string) => {
@@ -2129,7 +2207,7 @@ describe("n7EvidenceStore — release observability", () => {
   });
 
   it("post_release_verification_failure_is_not_released", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     const hooks: N7StoreHooks = {
       afterFinalLink: async (finalPath: string) => {
@@ -2146,7 +2224,7 @@ describe("n7EvidenceStore — release observability", () => {
   });
 
   it("release_write_failure_is_observable", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     const lockDir = path.join(root, "chain.lock.d");
     let tempWritesInLockDir = 0;
@@ -2173,7 +2251,7 @@ describe("n7EvidenceStore — release observability", () => {
   });
 
   it("release_file_flush_failure_is_observable", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     let tempWritesInLockDir = 0;
     const wrapped: N7StoreFsAdapter = {
@@ -2198,7 +2276,7 @@ describe("n7EvidenceStore — release observability", () => {
   });
 
   it("release_finalization_failure_is_observable", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     const wrapped: N7StoreFsAdapter = {
       ...real,
@@ -2218,7 +2296,7 @@ describe("n7EvidenceStore — release observability", () => {
   });
 
   it("release_directory_sync_failure_is_observable", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     const lockDir = path.join(root, "chain.lock.d");
     let lockDirSyncCalls = 0;
@@ -2241,7 +2319,7 @@ describe("n7EvidenceStore — release observability", () => {
   });
 
   it("release_durability_uncertain_is_observable", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     const lockDir = path.join(root, "chain.lock.d");
     let lockDirSyncCalls = 0;
@@ -2264,7 +2342,7 @@ describe("n7EvidenceStore — release observability", () => {
   });
 
   it("release_readback_failure_is_observable", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     const wrapped: N7StoreFsAdapter = {
       ...real,
@@ -2284,7 +2362,7 @@ describe("n7EvidenceStore — release observability", () => {
   });
 
   it("release_ownership_failure_is_observable", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const claimPath = path.join(root, "chain.lock.d", "claim-1.json");
     const hooks: N7StoreHooks = {
       afterFinalLink: async (finalPath: string) => {
@@ -2307,7 +2385,7 @@ describe("n7EvidenceStore — release observability", () => {
   });
 
   it("accepted_event_identity_is_preserved_when_release_fails", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     const wrapped: N7StoreFsAdapter = {
       ...real,
@@ -2326,7 +2404,7 @@ describe("n7EvidenceStore — release observability", () => {
   });
 
   it("accepted_event_hash_is_preserved_when_release_fails", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     const wrapped: N7StoreFsAdapter = {
       ...real,
@@ -2344,7 +2422,7 @@ describe("n7EvidenceStore — release observability", () => {
   });
 
   it("event_accepted_release_failed_is_not_unqualified_accepted", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     const wrapped: N7StoreFsAdapter = {
       ...real,
@@ -2361,7 +2439,7 @@ describe("n7EvidenceStore — release observability", () => {
   });
 
   it("event_failure_and_release_failure_are_both_preserved", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     // Pre-seed a corrupted existing event so the CHAIN itself is invalid
     // (the event write fails), while ALSO faulting release.
@@ -2389,7 +2467,7 @@ describe("n7EvidenceStore — release observability", () => {
   });
 
   it("successful_event_and_release_returns_fully_successful_outcome", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const store = await N7EvidenceStore.open(root);
     const res = await store.appendEvent(makeEventInput());
     assert.strictEqual(res.status, "ACCEPTED");
@@ -2403,7 +2481,7 @@ describe("n7EvidenceStore — release observability", () => {
   });
 
   it("unsupported_directory_sync_warning_is_observable", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     const lockDir = path.join(root, "chain.lock.d");
     let lockDirSyncCalls = 0;
@@ -2431,7 +2509,7 @@ describe("n7EvidenceStore — release observability", () => {
   });
 
   it("release_claim_result_contains_no_raw_owner_token", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     const wrapped: N7StoreFsAdapter = {
       ...real,
@@ -2449,7 +2527,7 @@ describe("n7EvidenceStore — release observability", () => {
   });
 
   it("release_attempted_exactly_once_on_success", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     let releaseLinkAttempts = 0;
     const wrapped: N7StoreFsAdapter = {
@@ -2466,7 +2544,7 @@ describe("n7EvidenceStore — release observability", () => {
   });
 
   it("release_not_retried_automatically", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     let releaseLinkAttempts = 0;
     const wrapped: N7StoreFsAdapter = {
@@ -2485,7 +2563,7 @@ describe("n7EvidenceStore — release observability", () => {
   });
 
   it("post_release_verification_not_rerun_in_retry_loop", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const real = createNodeFsAdapter();
     const lockDir = path.join(root, "chain.lock.d");
     let listDirCalls = 0;
@@ -2509,7 +2587,7 @@ describe("n7EvidenceStore — release observability", () => {
   });
 
   it("unsuccessful_claim_acquisition_triggers_no_release_attempt", async () => {
-    const root = makeVastTempRoot();
+    const root = makeRepairTempRoot();
     const store = await N7EvidenceStore.open(root);
     writeForeignClaim(root, 1);
     const real = createNodeFsAdapter();
@@ -2525,5 +2603,93 @@ describe("n7EvidenceStore — release observability", () => {
     const res = await contendedStore.appendEvent(makeEventInput());
     assert.strictEqual(res.status, "LOCK_CONTENTION");
     assert.strictEqual(releaseLinkAttempts, 0, "an unsuccessful claim acquisition must never attempt any release");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// N7-C CI-portable test-root repair: selector tests (Phase 6)
+// ---------------------------------------------------------------------------
+
+describe("n7EvidenceStore test infrastructure — CI-portable test-base selection", () => {
+  it("explicit_tmp_override_is_accepted", () => {
+    const selected = selectN7CTestBase("/tmp");
+    assert.strictEqual(selected, "/tmp");
+  });
+
+  it("explicit_vast_data_override_is_accepted_when_present", () => {
+    if (!fs.existsSync("/mnt/vast-data/tmp")) return;
+    const selected = selectN7CTestBase("/mnt/vast-data/tmp");
+    assert.strictEqual(selected, "/mnt/vast-data/tmp");
+  });
+
+  it("unapproved_test_base_override_is_rejected", () => {
+    assert.throws(() => selectN7CTestBase("/var/tmp"));
+    assert.throws(() => selectN7CTestBase("relative/path"));
+    assert.throws(() => selectN7CTestBase("/mnt/ollama-models/tmp"));
+    assert.throws(() => selectN7CTestBase(__dirname));
+    assert.throws(() => selectN7CTestBase("/mnt/vast-data/tmp/definitely-does-not-exist-xyz"));
+  });
+
+  it("symlinked_candidate_base_is_rejected", () => {
+    const parent = fs.mkdtempSync(path.join(N7C_TEST_BASE, "n7c-selector-symlink-"));
+    const realTarget = path.join(parent, "real-dir");
+    fs.mkdirSync(realTarget, { recursive: true });
+    const symlinkPath = path.join(parent, "not-approved-anyway");
+    fs.symlinkSync(realTarget, symlinkPath);
+    // Not in the approved list at all, so this must throw regardless --
+    // included here to document that symlink rejection is checked
+    // independently of (not merely subsumed by) the allowlist check.
+    assert.throws(() => selectN7CTestBase(symlinkPath));
+  });
+
+  it("selected_test_base_is_outside_repository", () => {
+    const repoRoot = findRepositoryRoot(__dirname);
+    assert.ok(repoRoot, "test sanity: a repository root must be discoverable");
+    assert.ok(!N7C_TEST_BASE.startsWith((repoRoot as string) + path.sep));
+    assert.notStrictEqual(N7C_TEST_BASE, repoRoot);
+  });
+
+  it("selected_test_base_is_not_under_ollama_models", () => {
+    assert.ok(!N7C_TEST_BASE.startsWith("/mnt/ollama-models"));
+  });
+
+  it("all_n7c_test_roots_end_in_claw_n7", () => {
+    const suffix = path.join(".claw", "n7");
+    assert.ok(makeTempRoot().endsWith(suffix));
+    assert.ok(makeRepairTempRoot().endsWith(suffix));
+  });
+
+  it("n7c_test_file_does_not_use_os_tmpdir", () => {
+    const testSource = fs.readFileSync(path.join(__dirname, "..", "..", "test", "n7EvidenceStore.test.ts"), "utf8");
+    // Patterns built from split parts so this test's own source text never
+    // literally spells out the substrings it searches for (which would
+    // otherwise trivially self-match).
+    const osTmpdirCall = ["os", ".", "tmpdir", "()"].join("");
+    assert.ok(!testSource.includes(osTmpdirCall));
+    const runnerTempVar = ["RUNNER", "_", "TEMP"].join("");
+    assert.ok(!testSource.includes(runnerTempVar));
+  });
+
+  it("no_mkdtemp_call_hardcodes_vast_data_directly", () => {
+    const testSource = fs.readFileSync(path.join(__dirname, "..", "..", "test", "n7EvidenceStore.test.ts"), "utf8");
+    // Every mkdtempSync call must derive from the selected N7C_TEST_BASE
+    // constant, never a literal path string passed directly.
+    const mkdtempCalls = testSource.match(/mkdtempSync\([^)]*\)/g) ?? [];
+    assert.ok(mkdtempCalls.length > 0, "test sanity: mkdtempSync must actually be used");
+    for (const call of mkdtempCalls) {
+      assert.ok(!/["'](\/mnt\/vast-data\/tmp|\/tmp)["']/.test(call), `mkdtempSync call must not hardcode a literal base: ${call}`);
+      assert.ok(call.includes("N7C_TEST_BASE"), `mkdtempSync call must derive from N7C_TEST_BASE: ${call}`);
+    }
+  });
+
+  it("test_base_selection_does_not_use_a_second_independent_selector", () => {
+    const testSource = fs.readFileSync(path.join(__dirname, "..", "..", "test", "n7EvidenceStore.test.ts"), "utf8");
+    // Built from concatenated parts so this search pattern's own source text
+    // does not itself contain the literal target substring (which would
+    // otherwise inflate the count by one, matching itself).
+    const target = ["function", "selectN7CTestBase"].join(" ");
+    const pattern = new RegExp(target, "g");
+    const selectorDefinitions = testSource.match(pattern) ?? [];
+    assert.strictEqual(selectorDefinitions.length, 1, "exactly one selector implementation must exist");
   });
 });
