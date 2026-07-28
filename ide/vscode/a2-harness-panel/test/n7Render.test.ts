@@ -1,7 +1,7 @@
 import * as assert from "assert";
 import { EvidenceUnknown, FrozenReviewSnapshot, N7_PR_LIVE_SCHEMA_VERSION, N7_PR_REVIEW_FREEZE_SCHEMA_VERSION, PrLiveSnapshot } from "../src/n7Schemas";
 import { CiRequirementPolicy, N7DerivationInput, deriveN7PrimaryState } from "../src/n7State";
-import { N7PrCardInput, N7PrCardViewModel, buildN7PrCardView } from "../src/n7View";
+import { N7PrCardIdentityMismatchError, N7PrCardInput, N7PrCardViewModel, buildN7PrCardView } from "../src/n7View";
 import { RenderModel, emptyInputs, renderHtml } from "../src/render";
 
 // A minimal, valid, hand-built N7PrCardViewModel — deliberately NOT produced
@@ -16,7 +16,7 @@ function arbitraryModel(overrides: Partial<N7PrCardViewModel> = {}): N7PrCardVie
     prTitle: null,
     current: { headSha: null, baseSha: null, capturedAt: null, statusLabel: "s" },
     frozen: { headSha: null, baseSha: null, capturedAt: null, statusLabel: "s", freezeId: null },
-    comparison: { primaryState: "UNKNOWN", severity: "UNKNOWN", exactLabel: "UNKNOWN: x", detail: "d" },
+    comparison: { primaryState: "UNKNOWN", severity: "UNKNOWN", headComparison: "UNKNOWN", exactLabel: "UNKNOWN: x", detail: "d" },
     ci: { state: "NOT_REQUIRED", headSha: null, summary: "s" },
     review: { state: "UNKNOWN", summary: "s", unresolvedThreadCount: null },
     blockers: [],
@@ -150,6 +150,16 @@ function baseModel(): RenderModel {
 function renderWithN7(overrides: Partial<N7DerivationInput> = {}, cardInputOverrides: Partial<N7PrCardInput> = {}): string {
   const input = { ...makeCardInput(overrides), ...cardInputOverrides };
   return renderHtml({ ...baseModel(), n7: buildN7PrCardView(input) });
+}
+
+// Same construction as renderWithN7, but returns the built view model (or
+// lets buildN7PrCardView's thrown error propagate) instead of rendering —
+// used by identity tests that must assert on a thrown
+// N7PrCardIdentityMismatchError via the real production builder, never a
+// parallel helper.
+function buildCard(overrides: Partial<N7DerivationInput> = {}, cardInputOverrides: Partial<N7PrCardInput> = {}): N7PrCardViewModel {
+  const input = { ...makeCardInput(overrides), ...cardInputOverrides };
+  return buildN7PrCardView(input);
 }
 
 // Extracts exactly the N7 section's own HTML (from its opening <section
@@ -415,7 +425,10 @@ function assertNoInjection(html: string, payload: string): void {
 describe("n7 render — HTML escaping", () => {
   it("repository_identity_is_html_escaped", () => {
     for (const payload of ALL_PAYLOADS) {
-      const html = renderWithN7({}, { repository: { owner: payload, name: payload } });
+      // live/frozen: null so the payload-valued "requested" repository has
+      // no snapshot identity to be checked against (this test exercises
+      // repository-text escaping, not identity binding).
+      const html = renderWithN7({ live: null, frozen: null, prIdentityKnown: false }, { repository: { owner: payload, name: payload } });
       assertNoInjection(html, payload);
       assert.ok(html.includes(expectedEscapedText(payload)), "escaped form must remain visible as text");
     }
@@ -811,7 +824,7 @@ describe("n7 render — severity structural-class closure (valid severities)", (
   for (const { severity, suffix } of VALID_SEVERITIES) {
     it(`severity_${severity}_maps_to_fixed_${suffix}_class_and_label`, () => {
       const html = renderArbitrary({
-        comparison: { primaryState: "UNKNOWN", severity: severity as N7PrCardViewModel["comparison"]["severity"], exactLabel: `${severity}: test label`, detail: "d" },
+        comparison: { primaryState: "UNKNOWN", severity: severity as N7PrCardViewModel["comparison"]["severity"], headComparison: "UNKNOWN", exactLabel: `${severity}: test label`, detail: "d" },
       });
       assert.strictEqual(cardClassAttr(html), `n7-pr-card n7-severity-${suffix}`);
       assert.strictEqual(severityPrefixText(html), `${severity}:`);
@@ -842,7 +855,7 @@ describe("n7 render — severity structural-class closure (invalid severities)",
   for (const { name, value } of INVALID_SEVERITIES) {
     it(`invalid severity (${name}) collapses to the fixed unknown class and label`, () => {
       const html = renderArbitrary({
-        comparison: { primaryState: "UNKNOWN", severity: value as N7PrCardViewModel["comparison"]["severity"], exactLabel: "OK: fake success claim to prove non-authoritative", detail: "d" },
+        comparison: { primaryState: "UNKNOWN", severity: value as N7PrCardViewModel["comparison"]["severity"], headComparison: "UNKNOWN", exactLabel: "OK: fake success claim to prove non-authoritative", detail: "d" },
       });
       const classAttr = cardClassAttr(html);
       assert.strictEqual(classAttr, "n7-pr-card n7-severity-unknown", `class token count/content must be exactly fixed for: ${name}`);
@@ -860,7 +873,7 @@ describe("n7 render — severity structural-class closure (invalid severities)",
   it("no invalid severity throws during render", () => {
     for (const { value } of INVALID_SEVERITIES) {
       assert.doesNotThrow(() => {
-        renderArbitrary({ comparison: { primaryState: "UNKNOWN", severity: value as N7PrCardViewModel["comparison"]["severity"], exactLabel: "x", detail: "d" } });
+        renderArbitrary({ comparison: { primaryState: "UNKNOWN", severity: value as N7PrCardViewModel["comparison"]["severity"], headComparison: "UNKNOWN", exactLabel: "x", detail: "d" } });
       });
     }
   });
@@ -869,7 +882,7 @@ describe("n7 render — severity structural-class closure (invalid severities)",
 describe("n7 render — severity content-independence", () => {
   it("all structural attributes are identical across every invalid severity input", () => {
     const renders = INVALID_SEVERITIES.map(({ value }) =>
-      renderArbitrary({ comparison: { primaryState: "UNKNOWN", severity: value as N7PrCardViewModel["comparison"]["severity"], exactLabel: `label for ${String(value)}`, detail: "d" } }),
+      renderArbitrary({ comparison: { primaryState: "UNKNOWN", severity: value as N7PrCardViewModel["comparison"]["severity"], headComparison: "UNKNOWN", exactLabel: `label for ${String(value)}`, detail: "d" } }),
     );
     const classAttrs = renders.map(cardClassAttr);
     const prefixTexts = renders.map(severityPrefixText);
@@ -907,7 +920,7 @@ describe("n7 render — authoritative severity label closure", () => {
   for (const { testName, severity, suffix, spoofedExactLabel } of VALID_SEVERITY_MISMATCH_CASES) {
     it(testName, () => {
       const html = renderArbitrary({
-        comparison: { primaryState: "UNKNOWN", severity: severity as N7PrCardViewModel["comparison"]["severity"], exactLabel: spoofedExactLabel, detail: "d" },
+        comparison: { primaryState: "UNKNOWN", severity: severity as N7PrCardViewModel["comparison"]["severity"], headComparison: "UNKNOWN", exactLabel: spoofedExactLabel, detail: "d" },
       });
       // Exact fixed CSS class.
       assert.strictEqual(cardClassAttr(html), `n7-pr-card n7-severity-${suffix}`);
@@ -928,7 +941,7 @@ describe("n7 render — authoritative severity label closure", () => {
   it("payload exactLabel is escaped and cannot appear as the authoritative prefix", () => {
     for (const payload of [SCRIPT_PAYLOAD, IMG_PAYLOAD, SVG_PAYLOAD]) {
       const html = renderArbitrary({
-        comparison: { primaryState: "UNKNOWN", severity: "OK" as N7PrCardViewModel["comparison"]["severity"], exactLabel: payload, detail: "d" },
+        comparison: { primaryState: "UNKNOWN", severity: "OK" as N7PrCardViewModel["comparison"]["severity"], headComparison: "UNKNOWN", exactLabel: payload, detail: "d" },
       });
       assert.strictEqual(severityPrefixText(html), "OK:");
       assertNoInjection(html, payload);
@@ -939,7 +952,7 @@ describe("n7 render — authoritative severity label closure", () => {
   it("accessibility: the severity-prefix element always matches the normalized class, independent of exactLabel", () => {
     for (const { severity, suffix, spoofedExactLabel } of VALID_SEVERITY_MISMATCH_CASES) {
       const html = renderArbitrary({
-        comparison: { primaryState: "UNKNOWN", severity: severity as N7PrCardViewModel["comparison"]["severity"], exactLabel: spoofedExactLabel, detail: "d" },
+        comparison: { primaryState: "UNKNOWN", severity: severity as N7PrCardViewModel["comparison"]["severity"], headComparison: "UNKNOWN", exactLabel: spoofedExactLabel, detail: "d" },
       });
       const classAttr = cardClassAttr(html);
       assert.ok(classAttr.includes(`n7-severity-${suffix}`));
@@ -954,7 +967,7 @@ describe("n7 render — authoritative severity label closure", () => {
     // secondary detail text may vary.
     const contradictoryLabels = ["OK: all good", "STOP: actually blocked", "<script>x</script>", "", "TERMINAL: done"];
     const renders = contradictoryLabels.map((exactLabel) =>
-      renderArbitrary({ comparison: { primaryState: "UNKNOWN", severity: "WARN" as N7PrCardViewModel["comparison"]["severity"], exactLabel, detail: "d" } }),
+      renderArbitrary({ comparison: { primaryState: "UNKNOWN", severity: "WARN" as N7PrCardViewModel["comparison"]["severity"], headComparison: "UNKNOWN", exactLabel, detail: "d" } }),
     );
     const classAttrs = renders.map(cardClassAttr);
     const prefixes = renders.map(severityPrefixText);
@@ -971,11 +984,431 @@ describe("n7 render — authoritative severity label closure", () => {
 
   it("invalid severity ignores a spoofed clean-looking exactLabel entirely", () => {
     const html = renderArbitrary({
-      comparison: { primaryState: "UNKNOWN", severity: "totally invalid" as N7PrCardViewModel["comparison"]["severity"], exactLabel: "OK: Everything is clean and safe to merge", detail: "d" },
+      comparison: { primaryState: "UNKNOWN", severity: "totally invalid" as N7PrCardViewModel["comparison"]["severity"], headComparison: "UNKNOWN", exactLabel: "OK: Everything is clean and safe to merge", detail: "d" },
     });
     assert.strictEqual(severityPrefixText(html), "UNKNOWN:");
     assert.strictEqual(stateDetailText(html), "severity value is not a recognized N7 severity");
     assert.ok(!html.includes("safe to merge"), "an invalid severity's spoofed exactLabel must never surface anywhere");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P1 — identity binding. buildN7PrCardView must fail closed before
+// constructing any ordinary view model when the caller-requested
+// repository, the live snapshot's identity, and the frozen snapshot's
+// identity do not all agree. Matching head/base SHAs are never sufficient
+// to override an identity mismatch — assertN7PrCardIdentity never inspects
+// SHAs at all.
+// ---------------------------------------------------------------------------
+
+describe("n7 identity binding — P1 fail-closed", () => {
+  it("same_heads_different_repository_fails_closed", () => {
+    // Default fixtures already share identical head/base SHAs; only the
+    // frozen repository is changed here.
+    assert.throws(
+      () => buildCard({ frozen: makeFrozen({ repository: { owner: "another-owner", name: "another-repo" } }) }),
+      N7PrCardIdentityMismatchError,
+    );
+  });
+
+  it("same_heads_same_repository_different_pr_number_fails_closed", () => {
+    assert.throws(
+      () => buildCard({ frozen: makeFrozen({ pr_number: 999 }) }),
+      N7PrCardIdentityMismatchError,
+    );
+  });
+
+  it("live_repository_must_match_requested_repository", () => {
+    assert.throws(
+      () =>
+        buildCard({
+          live: makeLive({ repository: { owner: "another-owner", name: "another-repo", url: "https://example.invalid/other", provider: "github" } }),
+          frozen: null,
+        }),
+      (err: unknown) => err instanceof N7PrCardIdentityMismatchError && err.reasonCode === "LIVE_REPOSITORY_MISMATCH",
+    );
+  });
+
+  it("frozen_repository_must_match_requested_repository", () => {
+    assert.throws(
+      () =>
+        buildCard({
+          live: null,
+          frozen: makeFrozen({ repository: { owner: "another-owner", name: "another-repo" } }),
+        }),
+      (err: unknown) => err instanceof N7PrCardIdentityMismatchError && err.reasonCode === "FROZEN_REPOSITORY_MISMATCH",
+    );
+  });
+
+  it("live_and_frozen_repository_must_match_each_other", () => {
+    assert.throws(
+      () => buildCard({ frozen: makeFrozen({ repository: { owner: "another-owner", name: "another-repo" } }) }),
+      (err: unknown) => err instanceof N7PrCardIdentityMismatchError && err.reasonCode === "LIVE_FROZEN_REPOSITORY_MISMATCH",
+    );
+  });
+
+  it("live_and_frozen_pr_number_must_match_each_other", () => {
+    assert.throws(
+      () => buildCard({ frozen: makeFrozen({ pr_number: 999 }) }),
+      (err: unknown) => err instanceof N7PrCardIdentityMismatchError && err.reasonCode === "LIVE_FROZEN_PR_NUMBER_MISMATCH",
+    );
+  });
+
+  it("requested_pr_number_must_match_live_snapshot", () => {
+    assert.throws(
+      () => buildCard({ frozen: null }, { requestedPrNumber: 999 }),
+      (err: unknown) => err instanceof N7PrCardIdentityMismatchError && err.reasonCode === "LIVE_REQUESTED_PR_NUMBER_MISMATCH",
+    );
+  });
+
+  it("requested_pr_number_must_match_frozen_snapshot", () => {
+    assert.throws(
+      () => buildCard({ live: null }, { requestedPrNumber: 999 }),
+      (err: unknown) => err instanceof N7PrCardIdentityMismatchError && err.reasonCode === "FROZEN_REQUESTED_PR_NUMBER_MISMATCH",
+    );
+  });
+
+  it("matching_live_frozen_requested_identity_builds_card", () => {
+    // Fully-matching identity must build without throwing — the exact
+    // resulting primaryState depends on CI/review fixture details unrelated
+    // to identity binding, so only severity (clean) and successful
+    // construction are asserted here.
+    const view = buildCard({}, { requestedPrNumber: 168 });
+    assert.ok(view);
+    assert.strictEqual(view.comparison.severity, "OK");
+  });
+
+  it("live_only_matching_identity_builds_card", () => {
+    const view = buildCard({ frozen: null });
+    assert.ok(view);
+  });
+
+  it("frozen_only_matching_identity_builds_card", () => {
+    const view = buildCard({ live: null });
+    assert.ok(view);
+  });
+
+  it("no_snapshot_null_identity_remains_non_authoritative", () => {
+    const view = buildCard({ live: null, frozen: null, prIdentityKnown: false });
+    assert.strictEqual(view.comparison.primaryState, "NO_PR");
+  });
+
+  it("identity_mismatch_never_returns_frozen_match", () => {
+    let threw = false;
+    let view: unknown;
+    try {
+      view = buildCard({ frozen: makeFrozen({ repository: { owner: "another-owner", name: "another-repo" } }) });
+    } catch {
+      threw = true;
+    }
+    assert.strictEqual(threw, true, "identity mismatch must throw, never return a card");
+    assert.strictEqual(view, undefined);
+  });
+
+  it("identity_mismatch_never_returns_ready_clean", () => {
+    let threw = false;
+    let view: unknown;
+    try {
+      view = buildCard({
+        ciRequirementPolicy: NOT_REQUIRED_POLICY,
+        live: makeLive({ checks: [] }),
+        frozen: makeFrozen({ repository: { owner: "another-owner", name: "another-repo" } }),
+      });
+    } catch {
+      threw = true;
+    }
+    assert.strictEqual(threw, true, "identity mismatch must throw even when the underlying state would otherwise be clean");
+    assert.strictEqual(view, undefined);
+  });
+
+  it("identity_error_contains_no_snapshot_payload", () => {
+    try {
+      buildCard({ frozen: makeFrozen({ pr_number: 999 }) });
+      assert.fail("expected buildCard to throw");
+    } catch (err) {
+      assert.ok(err instanceof N7PrCardIdentityMismatchError);
+      assert.ok(!err.message.includes("head0001"), "error must not contain raw SHA content");
+      assert.ok(!err.message.includes("thesidestackai"), "error must not contain raw repository content");
+      assert.strictEqual(typeof err.reasonCode, "string");
+    }
+  });
+
+  it("identity_validation_does_not_mutate_input", () => {
+    const live = makeLive();
+    const frozen = makeFrozen({ pr_number: 999 });
+    const liveBefore = JSON.stringify(live);
+    const frozenBefore = JSON.stringify(frozen);
+    assert.throws(() => buildCard({ live, frozen }));
+    assert.strictEqual(JSON.stringify(live), liveBefore);
+    assert.strictEqual(JSON.stringify(frozen), frozenBefore);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// requestedPrNumber runtime closure. input.requestedPrNumber is compile-time
+// typed `number | null | undefined`, but it is a caller-owned field on an
+// exported interface — nothing at runtime stops a malformed value. Format
+// validation (normalizeRequestedPrNumber) must reject anything that is not
+// omitted/undefined/null/a positive safe integer, BEFORE any snapshot-
+// dependent branch, regardless of whether live/frozen are present.
+// ---------------------------------------------------------------------------
+
+const MALFORMED_REQUESTED_PR_NUMBERS: Array<{ name: string; value: unknown }> = [
+  { name: 'string "169"', value: "169" },
+  { name: "empty string", value: "" },
+  { name: "true", value: true },
+  { name: "false", value: false },
+  { name: "0", value: 0 },
+  { name: "-0", value: -0 },
+  { name: "-1", value: -1 },
+  { name: "1.5", value: 1.5 },
+  { name: "NaN", value: NaN },
+  { name: "Infinity", value: Infinity },
+  { name: "-Infinity", value: -Infinity },
+  { name: "MAX_SAFE_INTEGER + 1", value: Number.MAX_SAFE_INTEGER + 1 },
+  { name: "{}", value: {} },
+  { name: "[]", value: [] },
+  { name: "boxed Number(169)", value: new Number(169) },
+];
+
+describe("n7 identity binding — requestedPrNumber runtime closure", () => {
+  it("requested_pr_number_omitted_is_no_constraint", () => {
+    const view = buildCard({ frozen: null }, {});
+    assert.ok(view);
+  });
+
+  it("requested_pr_number_undefined_is_no_constraint", () => {
+    const view = buildCard({ frozen: null }, { requestedPrNumber: undefined });
+    assert.ok(view);
+  });
+
+  it("requested_pr_number_null_is_no_constraint", () => {
+    const view = buildCard({ frozen: null }, { requestedPrNumber: null });
+    assert.ok(view);
+    // live-vs-frozen equality checks remain active even when requested is
+    // absent: a mismatched pair must still throw.
+    assert.throws(
+      () => buildCard({ frozen: makeFrozen({ pr_number: 999 }) }, { requestedPrNumber: null }),
+      (err: unknown) => err instanceof N7PrCardIdentityMismatchError && err.reasonCode === "LIVE_FROZEN_PR_NUMBER_MISMATCH",
+    );
+  });
+
+  it("positive_safe_integer_requested_pr_number_is_accepted", () => {
+    const view = buildCard({}, { requestedPrNumber: 168 });
+    assert.ok(view);
+  });
+
+  it("requested_pr_number_one_is_accepted", () => {
+    const view = buildCard({ live: makeLive({ pr_number: 1 }), frozen: makeFrozen({ pr_number: 1 }) }, { requestedPrNumber: 1 });
+    assert.ok(view);
+  });
+
+  it("maximum_safe_integer_requested_pr_number_is_runtime_valid", () => {
+    const n = Number.MAX_SAFE_INTEGER;
+    const view = buildCard({ live: makeLive({ pr_number: n }), frozen: makeFrozen({ pr_number: n }) }, { requestedPrNumber: n });
+    assert.ok(view);
+  });
+
+  for (const { name, value } of MALFORMED_REQUESTED_PR_NUMBERS) {
+    it(`rejects malformed requestedPrNumber (${name}) with no snapshots`, () => {
+      let threw = false;
+      try {
+        buildCard({ live: null, frozen: null, prIdentityKnown: false }, { requestedPrNumber: value as number | null });
+      } catch (err) {
+        threw = true;
+        assert.ok(err instanceof N7PrCardIdentityMismatchError);
+        assert.strictEqual(err.reasonCode, "INVALID_REQUESTED_PR_NUMBER");
+        assert.strictEqual(
+          err.message,
+          "N7 PR card identity mismatch: INVALID_REQUESTED_PR_NUMBER",
+          `error must be the exact fixed message with no malformed-value content for: ${name}`,
+        );
+      }
+      assert.strictEqual(threw, true, `must throw for malformed value: ${name}`);
+    });
+
+    it(`rejects malformed requestedPrNumber (${name}) with live only`, () => {
+      assert.throws(
+        () => buildCard({ frozen: null }, { requestedPrNumber: value as number | null }),
+        (err: unknown) => err instanceof N7PrCardIdentityMismatchError && err.reasonCode === "INVALID_REQUESTED_PR_NUMBER",
+      );
+    });
+
+    it(`rejects malformed requestedPrNumber (${name}) with frozen only`, () => {
+      assert.throws(
+        () => buildCard({ live: null }, { requestedPrNumber: value as number | null }),
+        (err: unknown) => err instanceof N7PrCardIdentityMismatchError && err.reasonCode === "INVALID_REQUESTED_PR_NUMBER",
+      );
+    });
+
+    it(`rejects malformed requestedPrNumber (${name}) with live and frozen both present`, () => {
+      assert.throws(
+        () => buildCard({}, { requestedPrNumber: value as number | null }),
+        (err: unknown) => err instanceof N7PrCardIdentityMismatchError && err.reasonCode === "INVALID_REQUESTED_PR_NUMBER",
+      );
+    });
+  }
+
+  it("malformed requested number is rejected before a repository mismatch is considered", () => {
+    assert.throws(
+      () =>
+        buildCard(
+          { frozen: makeFrozen({ repository: { owner: "another-owner", name: "another-repo" } }) },
+          { requestedPrNumber: "169" as unknown as number },
+        ),
+      (err: unknown) => err instanceof N7PrCardIdentityMismatchError && err.reasonCode === "INVALID_REQUESTED_PR_NUMBER",
+    );
+  });
+
+  it("malformed requested number is rejected before a PR-number mismatch is considered", () => {
+    assert.throws(
+      () => buildCard({ frozen: makeFrozen({ pr_number: 999 }) }, { requestedPrNumber: NaN }),
+      (err: unknown) => err instanceof N7PrCardIdentityMismatchError && err.reasonCode === "INVALID_REQUESTED_PR_NUMBER",
+    );
+  });
+
+  it("requested-number validation does not mutate input", () => {
+    const live = makeLive();
+    const frozen = makeFrozen();
+    const liveBefore = JSON.stringify(live);
+    const frozenBefore = JSON.stringify(frozen);
+    assert.throws(() => buildCard({ live, frozen }, { requestedPrNumber: "169" as unknown as number }));
+    assert.strictEqual(JSON.stringify(live), liveBefore);
+    assert.strictEqual(JSON.stringify(frozen), frozenBefore);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P2 — explicit head comparison. The view model must carry
+// input.derived.comparison.headComparison unchanged, and the renderer must
+// always show a dedicated, fixed-copy MATCH/DRIFT/UNKNOWN row independent
+// of primaryState — never rederived from displayed SHA text, never
+// overridable by an arbitrary prebuilt model's own label/exactLabel.
+// ---------------------------------------------------------------------------
+
+const FAILING_CHECK = {
+  provider: "github",
+  name: "test",
+  app: "github-actions",
+  status: "COMPLETED",
+  conclusion: "FAILURE",
+  head_sha: "head0001head0001head0001head0001head0001",
+  started_at: null,
+  completed_at: null,
+  details_url: null,
+  provenance: "GITHUB_LIVE",
+} as const;
+
+describe("n7 render — P2 explicit head comparison", () => {
+  it("ci_failed_primary_still_renders_head_match", () => {
+    const html = renderWithN7({ ciRequirementPolicy: REQUIRED_POLICY, live: makeLive({ checks: [FAILING_CHECK] }) });
+    const section = extractN7Section(html);
+    assert.ok(/data-testid="n7-severity-prefix">STOP:/.test(section));
+    assert.ok(section.includes("Head comparison: MATCH — current head equals frozen reviewed head"));
+  });
+
+  it("review_blocked_primary_still_renders_head_match", () => {
+    const html = renderWithN7({
+      live: makeLive({
+        reviews: { review_decision: "CHANGES_REQUESTED", requested_changes: ["alice"], unresolved_review_threads: { count: 1, complete: true, thread_refs: [] }, blocking_automated_findings: [] },
+      }),
+    });
+    const section = extractN7Section(html);
+    assert.ok(section.includes("Head comparison: MATCH — current head equals frozen reviewed head"));
+  });
+
+  it("merge_conflict_primary_still_renders_head_match", () => {
+    const html = renderWithN7({ ciRequirementPolicy: NOT_REQUIRED_POLICY, live: makeLive({ checks: [], mergeability: "CONFLICTING" }) });
+    const section = extractN7Section(html);
+    assert.ok(section.includes("Head comparison: MATCH — current head equals frozen reviewed head"));
+  });
+
+  it("head_drift_renders_explicit_drift", () => {
+    const html = renderWithN7({ live: makeLive({ head_sha: "differentHead00000000000000000000000001" }) });
+    const section = extractN7Section(html);
+    assert.ok(section.includes("Head comparison: DRIFT — current head differs from frozen reviewed head"));
+  });
+
+  it("missing_head_renders_explicit_unknown", () => {
+    const html = renderWithN7({ live: null, frozen: null, prIdentityKnown: false });
+    const section = extractN7Section(html);
+    assert.ok(section.includes("Head comparison: UNKNOWN — current or frozen head is unavailable"));
+  });
+
+  it("head_comparison_is_visible_independent_of_primary_label", () => {
+    const html = renderWithN7({ ciRequirementPolicy: REQUIRED_POLICY, live: makeLive({ checks: [FAILING_CHECK] }) });
+    const section = extractN7Section(html);
+    assert.ok(/data-testid="n7-severity-prefix">STOP:/.test(section));
+    assert.ok(section.includes('data-testid="n7-head-comparison"'));
+  });
+
+  it("head_comparison_comes_from_n7a_derived_result", () => {
+    const view = buildCard({ live: makeLive({ head_sha: "differentHead00000000000000000000000001" }) });
+    assert.strictEqual(view.comparison.headComparison, "DRIFT");
+  });
+
+  it("renderer_does_not_rederive_head_comparison_from_sha_text", () => {
+    const sha = "h".repeat(40);
+    const html = renderArbitrary({
+      current: { headSha: sha, baseSha: null, capturedAt: null, statusLabel: "s" },
+      frozen: { headSha: sha, baseSha: null, capturedAt: null, statusLabel: "s", freezeId: null },
+      comparison: { primaryState: "UNKNOWN", severity: "UNKNOWN", headComparison: "DRIFT", exactLabel: "x", detail: "d" },
+    });
+    const section = extractN7Section(html);
+    assert.ok(
+      section.includes("Head comparison: DRIFT — current head differs from frozen reviewed head"),
+      "renderer must trust the headComparison field, not recompute from equal-looking displayed SHA text",
+    );
+    assert.ok(!section.includes("Head comparison: MATCH"));
+  });
+
+  it("invalid_prebuilt_head_comparison_maps_to_unknown", () => {
+    const badValues: unknown[] = ["MATCH extra-class", "\"><script>alert(1)</script>", "match", null, undefined, 42, {}, []];
+    for (const badValue of badValues) {
+      const html = renderArbitrary({
+        comparison: { primaryState: "UNKNOWN", severity: "UNKNOWN", headComparison: badValue as N7PrCardViewModel["comparison"]["headComparison"], exactLabel: "x", detail: "d" },
+      });
+      const section = extractN7Section(html);
+      assert.ok(section.includes("Head comparison: UNKNOWN — current or frozen head is unavailable"), `bad value ${JSON.stringify(badValue)} must map to fixed UNKNOWN copy`);
+      assert.ok(!section.includes("extra-class"));
+      assert.ok(!/<script\b/i.test(section));
+      const headCompLine = section.split("\n").find((l) => l.includes('data-testid="n7-head-comparison"'));
+      assert.ok(headCompLine);
+      assert.ok(!headCompLine!.includes("class="), "no model value may introduce a class on the head-comparison row");
+    }
+  });
+
+  it("head_comparison_uses_fixed_visible_copy", () => {
+    const html = renderArbitrary({
+      comparison: { primaryState: "UNKNOWN", severity: "UNKNOWN", headComparison: "MATCH", exactLabel: "some unrelated model text that must not replace the fixed copy", detail: "d" },
+    });
+    const section = extractN7Section(html);
+    assert.ok(section.includes("Head comparison: MATCH — current head equals frozen reviewed head"));
+    assert.ok(!section.includes("some unrelated model text that must not replace the fixed copy") || section.includes("n7-state-detail"));
+  });
+
+  it("head_comparison_is_not_color_only", () => {
+    const html = renderArbitrary({
+      comparison: { primaryState: "UNKNOWN", severity: "UNKNOWN", headComparison: "DRIFT", exactLabel: "x", detail: "d" },
+    });
+    const section = extractN7Section(html);
+    const line = section.split("\n").find((l) => l.includes('data-testid="n7-head-comparison"'));
+    assert.ok(line);
+    assert.ok(!line!.includes("class="), "head comparison row must not rely on a CSS class for its meaning");
+    assert.ok(line!.includes("DRIFT — current head differs from frozen reviewed head"));
+  });
+
+  it("head_comparison_renders_before_ci_and_review", () => {
+    const html = renderWithN7();
+    const section = extractN7Section(html);
+    const frozenIdentityIdx = section.indexOf('data-testid="n7-frozen-identity"');
+    const headCompIdx = section.indexOf('data-testid="n7-head-comparison"');
+    const ciIdx = section.indexOf('data-testid="n7-ci"');
+    const reviewIdx = section.indexOf('data-testid="n7-review"');
+    assert.ok(frozenIdentityIdx >= 0 && headCompIdx >= 0 && ciIdx >= 0 && reviewIdx >= 0);
+    assert.ok(frozenIdentityIdx < headCompIdx);
+    assert.ok(headCompIdx < ciIdx);
+    assert.ok(headCompIdx < reviewIdx);
   });
 });
 

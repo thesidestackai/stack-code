@@ -970,6 +970,35 @@ function normalizeN7Severity(value: unknown): TrustedN7Severity {
   }
 }
 
+// comparison.headComparison is likewise a TypeScript-union-only field on the
+// exported N7PrCardViewModel — an arbitrary prebuilt model can set it to any
+// runtime value. This is the single place that inspects it: exact-match
+// against the three known literals only, safe default otherwise. The fixed
+// copy strings below are the ONLY text ever shown for this row — no model
+// value (label, exactLabel, or anything else) is ever substituted in.
+interface TrustedN7HeadComparison {
+  value: "MATCH" | "DRIFT" | "UNKNOWN";
+  copy: string;
+}
+
+function normalizeN7HeadComparison(value: unknown): TrustedN7HeadComparison {
+  switch (value) {
+    case "MATCH":
+      return { value: "MATCH", copy: "MATCH — current head equals frozen reviewed head" };
+    case "DRIFT":
+      return { value: "DRIFT", copy: "DRIFT — current head differs from frozen reviewed head" };
+    case "UNKNOWN":
+      return { value: "UNKNOWN", copy: "UNKNOWN — current or frozen head is unavailable" };
+    default:
+      return { value: "UNKNOWN", copy: "UNKNOWN — current or frozen head is unavailable" };
+  }
+}
+
+function n7HeadComparisonBlock(headComparison: unknown): string {
+  const trusted = normalizeN7HeadComparison(headComparison);
+  return `  <p data-testid="n7-head-comparison">Head comparison: ${escapeHtml(trusted.copy)}</p>`;
+}
+
 // Missing data always renders explicit text — never an empty string and
 // never an omitted identity.
 function n7ShaLine(testid: string, label: string, sha: string | null, missingText: string): string {
@@ -1088,6 +1117,7 @@ function n7CardBlock(view: N7PrCardViewModel | null | undefined): string {
 ${titleLine}
 ${n7CurrentIdentityBlock(view)}
 ${n7FrozenIdentityBlock(view)}
+${n7HeadComparisonBlock(view.comparison.headComparison)}
   <p data-testid="n7-comparison-detail">${escapeHtml(view.comparison.detail)}</p>
   <section data-testid="n7-ci">
     <h4>CI</h4>
