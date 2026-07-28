@@ -20,6 +20,7 @@ import {
   renderEvidenceSnapshotHtml,
 } from "./tier3EvidenceSnapshot";
 import { N6PanelView, N6RungView } from "./n6View";
+import { N7PrCardViewModel } from "./n7View";
 
 export interface PanelInputs {
   workspace: string | null;
@@ -259,6 +260,13 @@ export interface RenderModel {
   // from an operator-provided a2-tier3-evidence-snapshot.v0. The panel acquires
   // the snapshot as text and obtains it by no spawn; this view adds no control.
   evidenceSnapshot?: EvidenceSnapshotView | null;
+  // N7-D read-only Draft PR Card view (optional; degrades to a muted hint
+  // when absent). Renders already-derived N7-A state (current/live vs.
+  // frozen reviewed identity, CI/review status, blockers, next permitted
+  // action) — display-only. This section performs no GitHub read, no
+  // `.claw/n7` evidence-store access, and adds no PR/package-rung mutation
+  // control; "next permitted action" is informational text only.
+  n7?: N7PrCardViewModel | null;
 }
 
 // Tier 3 Mutation Executor v0 (dry-run) — read-only view. All data is
@@ -922,6 +930,185 @@ function evidenceSnapshotBlock(view: EvidenceSnapshotView | null | undefined): s
 <p class="muted" data-testid="evidence-snapshot-refresh-affordance">Refresh path is read-only — would-create-worktree: no, would-write-files: no.</p>`;
 }
 
+// ---- N7-D Draft PR Card section (read-only) --------------------------------
+//
+// Status-only. Renders already-derived N7-A state (current/live vs. frozen
+// reviewed identity, CI/review status, blockers, next permitted action). It
+// performs no GitHub read, no `.claw/n7` evidence-store access, and adds NO
+// PR mutation control (no create/ready/approve/merge/rerun/close/delete-
+// branch) and NO package-rung control. "Next permitted action" is
+// informational text only — never a button or message dispatch.
+// N7Severity is a compile-time-only TypeScript union — nothing at runtime
+// stops a hand-built N7PrCardViewModel from setting comparison.severity to
+// any value. This is the single, exhaustive place in the codebase that
+// inspects that field: exact-match against the five known literals only, no
+// toLowerCase()/trim()/slug/hash/concatenation of the input. Any value that
+// isn't one of the five literals — including non-string values — falls to
+// the fixed UNKNOWN result. "recognized" records which branch was taken
+// (from this same switch, not a second mapping) so the caller can decide
+// whether the model's accompanying exactLabel text is trustworthy.
+interface TrustedN7Severity {
+  label: "OK" | "WARN" | "STOP" | "UNKNOWN" | "TERMINAL";
+  className: "n7-severity-ok" | "n7-severity-warn" | "n7-severity-stop" | "n7-severity-unknown" | "n7-severity-terminal";
+  recognized: boolean;
+}
+
+function normalizeN7Severity(value: unknown): TrustedN7Severity {
+  switch (value) {
+    case "OK":
+      return { label: "OK", className: "n7-severity-ok", recognized: true };
+    case "WARN":
+      return { label: "WARN", className: "n7-severity-warn", recognized: true };
+    case "STOP":
+      return { label: "STOP", className: "n7-severity-stop", recognized: true };
+    case "UNKNOWN":
+      return { label: "UNKNOWN", className: "n7-severity-unknown", recognized: true };
+    case "TERMINAL":
+      return { label: "TERMINAL", className: "n7-severity-terminal", recognized: true };
+    default:
+      return { label: "UNKNOWN", className: "n7-severity-unknown", recognized: false };
+  }
+}
+
+// Missing data always renders explicit text — never an empty string and
+// never an omitted identity.
+function n7ShaLine(testid: string, label: string, sha: string | null, missingText: string): string {
+  const value = sha ? `<code>${escapeHtml(sha)}</code>` : escapeHtml(missingText);
+  return `    <p data-testid="${escapeHtml(testid)}">${escapeHtml(label)}: ${value}</p>`;
+}
+
+function n7TimestampLine(testid: string, label: string, iso: string | null, missingText: string): string {
+  const value = iso ? `<code>${escapeHtml(iso)}</code>` : escapeHtml(missingText);
+  return `    <p data-testid="${escapeHtml(testid)}">${escapeHtml(label)}: ${value}</p>`;
+}
+
+function n7CurrentIdentityBlock(view: N7PrCardViewModel): string {
+  return `  <section data-testid="n7-current-identity">
+    <h4>Current / Live PR State</h4>
+${n7ShaLine("n7-current-head", "Current head", view.current.headSha, "Unknown — current head was not available")}
+${n7ShaLine("n7-current-base", "Current base", view.current.baseSha, "Unknown — current base was not available")}
+${n7TimestampLine("n7-current-captured-at", "Live capture time", view.current.capturedAt, "Unknown — no live capture timestamp available")}
+    <p data-testid="n7-current-status">Status: ${escapeHtml(view.current.statusLabel)}</p>
+  </section>`;
+}
+
+function n7FrozenIdentityBlock(view: N7PrCardViewModel): string {
+  return `  <section data-testid="n7-frozen-identity">
+    <h4>Frozen Reviewed Evidence</h4>
+${n7ShaLine("n7-frozen-head", "Frozen reviewed head", view.frozen.headSha, "No frozen review snapshot exists")}
+${n7ShaLine("n7-frozen-base", "Frozen base", view.frozen.baseSha, "No frozen review snapshot exists")}
+${n7TimestampLine("n7-frozen-captured-at", "Freeze time", view.frozen.capturedAt, "No frozen review snapshot exists")}
+    <p data-testid="n7-frozen-id">Freeze id: ${view.frozen.freezeId ? `<code>${escapeHtml(view.frozen.freezeId)}</code>` : escapeHtml("No frozen review snapshot exists")}</p>
+    <p data-testid="n7-frozen-status">Status: ${escapeHtml(view.frozen.statusLabel)}</p>
+  </section>`;
+}
+
+function n7BlockersBlock(blockers: readonly N7PrCardViewModel["blockers"][number][]): string {
+  if (blockers.length === 0) {
+    return `  <section data-testid="n7-blockers">
+    <h4>Blockers</h4>
+    <p class="muted" data-testid="n7-blockers-empty">No blockers detected for the current state.</p>
+  </section>`;
+  }
+  // Selector composition never inspects b.code/b.label/b.detail — the model
+  // is an ordinary exported interface, and any caller (not only
+  // buildN7PrCardView) can construct one by hand, so model strings must
+  // never influence a structural identifier regardless of their content.
+  // Only the array's own iteration index is used.
+  const items = blockers
+    .map(
+      (b, index) =>
+        `    <li data-testid="n7-blocker-${index}"><code data-testid="n7-blocker-code-${index}">${escapeHtml(b.code)}</code> <span data-testid="n7-blocker-label-${index}">${escapeHtml(b.label)}</span>: <span data-testid="n7-blocker-detail-${index}">${escapeHtml(b.detail)}</span></li>`,
+    )
+    .join("\n");
+  return `  <section data-testid="n7-blockers">
+    <h4>Blockers</h4>
+    <ul data-testid="n7-blockers-list">
+${items}
+    </ul>
+  </section>`;
+}
+
+// Selector composition never inspects u.field/u.reason — including via
+// string-prefix checks such as field.startsWith("live."). The exported
+// N7PrCardViewModel is an ordinary interface; any caller can construct one
+// by hand, so no model string (not even a prefix of one) may choose a
+// selector or selector component. Only the array's own flat iteration index
+// is used. The visible text (e.g. "live.some_field") is unchanged.
+function n7UnknownsBlock(unknowns: readonly N7PrCardViewModel["unknowns"][number][]): string {
+  if (unknowns.length === 0) {
+    return "";
+  }
+  const items = unknowns
+    .map(
+      (u, index) =>
+        `    <li data-testid="n7-unknown-${index}"><code data-testid="n7-unknown-field-${index}">${escapeHtml(u.field)}</code>: <span data-testid="n7-unknown-reason-${index}">${escapeHtml(u.reason)}</span></li>`,
+    )
+    .join("\n");
+  return `  <section data-testid="n7-unknowns">
+    <h4>Unknown / Incomplete Data</h4>
+    <ul data-testid="n7-unknowns-list">
+${items}
+    </ul>
+  </section>`;
+}
+
+function n7CardBlock(view: N7PrCardViewModel | null | undefined): string {
+  if (!view) {
+    return `<section class="n7-pr-card" data-testid="n7-pr-card">
+  <h3>Draft PR Card (N7)</h3>
+  <p class="muted" data-testid="n7-pr-card-empty">No N7 PR-card data yet. This section renders already-derived N7-A state (current/live vs. frozen reviewed identity, CI/review status, blockers, next permitted action); it performs no GitHub read and no evidence-store access itself.</p>
+</section>`;
+  }
+
+  const trustedSeverity = normalizeN7Severity(view.comparison.severity);
+  const prNumberText = view.prNumber !== null ? ` · PR #${escapeHtml(String(view.prNumber))}` : "";
+  const titleLine = view.prTitle
+    ? `  <p data-testid="n7-pr-title">Title: ${escapeHtml(view.prTitle)}</p>`
+    : "";
+  // The authoritative severity prefix comes ONLY from the normalized result
+  // — never from the model's own comparison.exactLabel, even when severity
+  // is recognized. A prebuilt model can pair a valid severity with a
+  // contradictory exactLabel (e.g. severity STOP + exactLabel "OK: Safe to
+  // merge"); trusting exactLabel there would let model text override or
+  // contradict the trusted class/prefix pairing. exactLabel is rendered
+  // separately as escaped, explicitly non-authoritative secondary detail —
+  // it is never parsed, trimmed, or treated as a source of the prefix.
+  // When severity is not recognized, exactLabel is not shown at all (it
+  // cannot be trusted to describe anything meaningful about an unrecognized
+  // state); a fixed explanatory sentence is shown instead.
+  const stateDetailText = trustedSeverity.recognized
+    ? view.comparison.exactLabel
+    : "severity value is not a recognized N7 severity";
+
+  return `<section class="n7-pr-card ${trustedSeverity.className}" data-testid="n7-pr-card">
+  <h3>Draft PR Card (N7)</h3>
+  <p data-testid="n7-severity" class="n7-severity-text"><span data-testid="n7-severity-prefix">${escapeHtml(trustedSeverity.label)}:</span> <span data-testid="n7-state-detail">${escapeHtml(stateDetailText)}</span></p>
+  <p data-testid="n7-repository">Repository: <code>${escapeHtml(view.repository.owner)}/${escapeHtml(view.repository.name)}</code>${prNumberText}</p>
+${titleLine}
+${n7CurrentIdentityBlock(view)}
+${n7FrozenIdentityBlock(view)}
+  <p data-testid="n7-comparison-detail">${escapeHtml(view.comparison.detail)}</p>
+  <section data-testid="n7-ci">
+    <h4>CI</h4>
+    <p data-testid="n7-ci-summary">CI: ${escapeHtml(view.ci.summary)}</p>
+  </section>
+  <section data-testid="n7-review">
+    <h4>Review</h4>
+    <p data-testid="n7-review-summary">Review: ${escapeHtml(view.review.summary)}</p>
+${
+    view.review.unresolvedThreadCount !== null
+      ? `    <p data-testid="n7-review-unresolved-count">Unresolved threads: ${escapeHtml(String(view.review.unresolvedThreadCount))}</p>`
+      : `    <p data-testid="n7-review-unresolved-count" class="muted">Unresolved thread count unknown — no live PR state available.</p>`
+  }
+  </section>
+${n7BlockersBlock(view.blockers)}
+  <p data-testid="n7-next-action">Next permitted action: <strong>${escapeHtml(view.nextPermittedAction.label)}</strong> — ${escapeHtml(view.nextPermittedAction.detail)}</p>
+${n7UnknownsBlock(view.unknowns)}
+  <p class="muted">Read-only. This card renders already-derived N7-A state; it performs no GitHub read, no <code>.claw/n7</code> evidence-store access, and has no PR-mutation or package-rung control. Next permitted action is informational text only.</p>
+</section>`;
+}
+
 export function renderHtml(model: RenderModel): string {
   const i = model.inputs;
   const inputRows = [
@@ -965,6 +1152,13 @@ export function renderHtml(model: RenderModel): string {
   .setup th { text-align: left; padding-right: 1rem; font-family: monospace; }
   .setup td { font-family: monospace; }
   .nav { border-left: 3px solid var(--vscode-textLink-foreground, #3794ff); padding-left: 0.75rem; }
+  .n7-pr-card { border-left: 3px solid var(--vscode-panel-border, #444); padding-left: 0.75rem; }
+  .n7-severity-text { font-weight: 600; }
+  .n7-pr-card.n7-severity-ok .n7-severity-text { color: var(--vscode-testing-iconPassed, #3fb950); }
+  .n7-pr-card.n7-severity-warn .n7-severity-text { color: var(--vscode-editorWarning-foreground, #cca700); }
+  .n7-pr-card.n7-severity-stop .n7-severity-text { color: var(--vscode-editorError-foreground, #f48771); }
+  .n7-pr-card.n7-severity-terminal .n7-severity-text { color: var(--vscode-descriptionForeground, #999); }
+  .n7-pr-card.n7-severity-unknown .n7-severity-text { color: var(--vscode-editorWarning-foreground, #cca700); }
 </style>
 </head><body data-testid="a2-harness-panel">
 <h2>A2 Harness Panel</h2>
@@ -1000,5 +1194,6 @@ ${foundationBlock(model.foundation)}
 ${tier3Block(model.tier3)}
 ${executorDryRunBlock(model.executorDryRun)}
 ${evidenceSnapshotBlock(model.evidenceSnapshot)}
+${n7CardBlock(model.n7)}
 </body></html>`;
 }
