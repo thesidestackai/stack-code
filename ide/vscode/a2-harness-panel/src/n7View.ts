@@ -99,8 +99,11 @@ function normalizeRequestedPrNumber(value: unknown): number | null {
 
 // Runs before any N7PrCardViewModel is constructed. Deliberately never
 // inspects head/base SHAs — identity agreement and commit agreement are
-// independent facts, and this function's only job is the former.
-function assertN7PrCardIdentity(input: N7PrCardInput): void {
+// independent facts, and this function's only job is the former. Returns
+// the normalized requested PR number so the caller can use it as a display
+// fallback when no snapshot supplies one — validation here already proves
+// it agrees with every present snapshot, so reusing it is safe.
+function assertN7PrCardIdentity(input: N7PrCardInput): number | null {
   const { repository, live, frozen } = input;
 
   // The caller-provided requested-number FORMAT is validated first, before
@@ -131,6 +134,8 @@ function assertN7PrCardIdentity(input: N7PrCardInput): void {
   if (frozen && requestedPrNumber != null && frozen.pr_number !== requestedPrNumber) {
     throw new N7PrCardIdentityMismatchError("FROZEN_REQUESTED_PR_NUMBER_MISMATCH");
   }
+
+  return requestedPrNumber;
 }
 
 export interface N7PrCardIdentityView {
@@ -374,7 +379,10 @@ function buildUnknowns(input: N7PrCardInput): N7PrCardUnknown[] {
 export function buildN7PrCardView(input: N7PrCardInput): N7PrCardViewModel {
   // Fail closed before constructing anything: a mismatched identity must
   // never reach an ordinary FROZEN_MATCH/READY_CLEAN (or any other) card.
-  assertN7PrCardIdentity(input);
+  // The returned value is already proven to agree with every present
+  // snapshot (or there is no snapshot to disagree with) — safe to use as
+  // the final display fallback below.
+  const requestedPrNumber = assertN7PrCardIdentity(input);
 
   const live = input.live;
   const frozen = input.frozen;
@@ -390,7 +398,7 @@ export function buildN7PrCardView(input: N7PrCardInput): N7PrCardViewModel {
 
   return {
     repository: { owner: input.repository.owner, name: input.repository.name },
-    prNumber: live?.pr_number ?? frozen?.pr_number ?? null,
+    prNumber: live?.pr_number ?? frozen?.pr_number ?? requestedPrNumber,
     prTitle: live?.title ?? null,
     current: {
       headSha: shaOrNull(live?.head_sha),

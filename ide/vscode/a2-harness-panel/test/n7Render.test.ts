@@ -1279,6 +1279,96 @@ describe("n7 identity binding — requestedPrNumber runtime closure", () => {
 });
 
 // ---------------------------------------------------------------------------
+// PR #170 review finding: a validated requestedPrNumber was discarded by
+// assertN7PrCardIdentity (returned void) whenever both live and frozen were
+// absent, so an operator-supplied PR number never reached the card. The fix
+// returns the already-validated normalized value and uses it only as the
+// final fallback: live?.pr_number ?? frozen?.pr_number ?? requestedPrNumber.
+// ---------------------------------------------------------------------------
+
+describe("n7 identity binding — requested PR number projection (no snapshots)", () => {
+  it("valid_requested_pr_number_is_preserved_without_snapshots", () => {
+    const view = buildCard({ live: null, frozen: null }, { requestedPrNumber: 170 });
+    assert.strictEqual(view.prNumber, 170);
+  });
+
+  it("requested_pr_number_is_preserved_in_live_unchecked_model", () => {
+    const view = buildCard({ live: null, frozen: null }, { requestedPrNumber: 170 });
+    assert.strictEqual(view.comparison.primaryState, "LIVE_UNCHECKED");
+    assert.strictEqual(view.prNumber, 170);
+  });
+
+  it("requested_pr_number_is_visible_in_rendered_live_unchecked_card", () => {
+    const html = renderWithN7({ live: null, frozen: null }, { requestedPrNumber: 170 });
+    const section = extractN7Section(html);
+    assert.ok(section.includes("PR #170"), "the requested PR number must appear in the intended PR-identity element");
+  });
+
+  it("requested_pr_number_does_not_create_clean_authority", () => {
+    const view = buildCard({ live: null, frozen: null }, { requestedPrNumber: 170 });
+    assert.strictEqual(view.comparison.severity, "WARN");
+    assert.notStrictEqual(view.comparison.primaryState, "READY_CLEAN");
+    assert.notStrictEqual(view.comparison.primaryState, "FROZEN_MATCH");
+  });
+
+  it("another_valid_requested_pr_number_is_also_preserved (not hardcoded to 170)", () => {
+    const view = buildCard({ live: null, frozen: null }, { requestedPrNumber: 42 });
+    assert.strictEqual(view.prNumber, 42);
+  });
+});
+
+describe("n7 identity binding — requested PR number null/omitted semantics without snapshots", () => {
+  it("omitted_requested_pr_number_without_snapshots_returns_null", () => {
+    const view = buildCard({ live: null, frozen: null }, {});
+    assert.strictEqual(view.prNumber, null);
+  });
+
+  it("undefined_requested_pr_number_without_snapshots_returns_null", () => {
+    const view = buildCard({ live: null, frozen: null }, { requestedPrNumber: undefined });
+    assert.strictEqual(view.prNumber, null);
+  });
+
+  it("null_requested_pr_number_without_snapshots_returns_null", () => {
+    const view = buildCard({ live: null, frozen: null }, { requestedPrNumber: null });
+    assert.strictEqual(view.prNumber, null);
+  });
+});
+
+describe("n7 identity binding — snapshot fallback precedence for prNumber", () => {
+  it("live_pr_number_is_used_when_live_snapshot_exists", () => {
+    const view = buildCard({ frozen: null });
+    assert.strictEqual(view.prNumber, 168);
+  });
+
+  it("frozen_pr_number_is_used_when_only_frozen_snapshot_exists", () => {
+    const view = buildCard({ live: null });
+    assert.strictEqual(view.prNumber, 168);
+  });
+
+  it("matching_requested_and_live_pr_number_return_same_identity", () => {
+    const view = buildCard({ frozen: null }, { requestedPrNumber: 168 });
+    assert.strictEqual(view.prNumber, 168);
+  });
+
+  it("matching_requested_and_frozen_pr_number_return_same_identity", () => {
+    const view = buildCard({ live: null }, { requestedPrNumber: 168 });
+    assert.strictEqual(view.prNumber, 168);
+  });
+
+  it("matching_requested_live_frozen_pr_number_returns_same_identity", () => {
+    const view = buildCard({}, { requestedPrNumber: 168 });
+    assert.strictEqual(view.prNumber, 168);
+  });
+
+  it("a_present_mismatched_snapshot_throws_before_any_requested_value_could_override_it", () => {
+    assert.throws(
+      () => buildCard({ frozen: makeFrozen({ pr_number: 999 }) }, { requestedPrNumber: 168 }),
+      (err: unknown) => err instanceof N7PrCardIdentityMismatchError && err.reasonCode === "LIVE_FROZEN_PR_NUMBER_MISMATCH",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // P2 — explicit head comparison. The view model must carry
 // input.derived.comparison.headComparison unchanged, and the renderer must
 // always show a dedicated, fixed-copy MATCH/DRIFT/UNKNOWN row independent
