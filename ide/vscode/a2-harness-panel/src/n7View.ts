@@ -17,6 +17,7 @@
 import { FrozenReviewSnapshot, PrLiveSnapshot } from "./n7Schemas";
 import {
   CiComparisonState,
+  HeadComparison,
   N7DerivedStateResult,
   N7NextAction,
   N7PrimaryState,
@@ -33,6 +34,108 @@ export interface N7PrCardInput {
   // Already-computed by the caller via n7State.deriveN7PrimaryState — never
   // recomputed here.
   derived: N7DerivedStateResult;
+  // Optional explicit PR number the caller is requesting a card for —
+  // distinct from whatever pr_number happens to be embedded in live/frozen
+  // snapshots. When supplied, both snapshots (when present) must agree with
+  // it. Omitted (null/undefined) when the caller has no independent PR
+  // number to assert (e.g. identity is established purely by repository +
+  // live/frozen agreement).
+  requestedPrNumber?: number | null;
+}
+
+// Bounded, closed set of identity-mismatch reasons. No raw snapshot content
+// (titles, SHAs, timestamps, etc.) is ever included — only which comparison
+// failed.
+export type N7PrCardIdentityMismatchReason =
+  | "LIVE_REPOSITORY_MISMATCH"
+  | "FROZEN_REPOSITORY_MISMATCH"
+  | "LIVE_FROZEN_REPOSITORY_MISMATCH"
+  | "LIVE_FROZEN_PR_NUMBER_MISMATCH"
+  | "LIVE_REQUESTED_PR_NUMBER_MISMATCH"
+  | "FROZEN_REQUESTED_PR_NUMBER_MISMATCH"
+  | "INVALID_REQUESTED_PR_NUMBER";
+
+// Thrown by buildN7PrCardView (never caught/swallowed internally) when the
+// caller-requested identity, the live snapshot's identity, and the frozen
+// snapshot's identity do not all agree. Fail-closed: no ordinary
+// N7PrCardViewModel is ever returned in this case — matching commits (head/
+// base SHA equality) are never sufficient to paper over an identity
+// mismatch, because this check never inspects SHAs at all.
+export class N7PrCardIdentityMismatchError extends Error {
+  readonly reasonCode: N7PrCardIdentityMismatchReason;
+
+  constructor(reasonCode: N7PrCardIdentityMismatchReason) {
+    super(`N7 PR card identity mismatch: ${reasonCode}`);
+    this.name = "N7PrCardIdentityMismatchError";
+    this.reasonCode = reasonCode;
+  }
+}
+
+function sameRepository(a: { owner: string; name: string }, b: { owner: string; name: string }): boolean {
+  // Exact string equality only — no case-folding, trimming, or punctuation
+  // normalization. n7Schemas.ts already requires both fields to be
+  // non-empty strings; nothing here treats two different identities as
+  // equal.
+  return a.owner === b.owner && a.name === b.name;
+}
+
+// input.requestedPrNumber is typed number | null | undefined at compile
+// time, but the field is caller-owned on an exported interface — nothing at
+// runtime stops a caller from passing any other value. Omitted/undefined/
+// null are the explicit "no constraint" values and normalize to null; a
+// positive safe integer passes through unchanged; anything else (strings,
+// booleans, 0, negative, fractional, NaN, +/-Infinity, unsafe integers,
+// objects, boxed Number instances, etc.) is rejected outright — never
+// coerced, trimmed, parsed, rounded, or clamped into a number.
+function normalizeRequestedPrNumber(value: unknown): number | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+    throw new N7PrCardIdentityMismatchError("INVALID_REQUESTED_PR_NUMBER");
+  }
+  return value;
+}
+
+// Runs before any N7PrCardViewModel is constructed. Deliberately never
+// inspects head/base SHAs — identity agreement and commit agreement are
+// independent facts, and this function's only job is the former. Returns
+// the normalized requested PR number so the caller can use it as a display
+// fallback when no snapshot supplies one — validation here already proves
+// it agrees with every present snapshot, so reusing it is safe.
+function assertN7PrCardIdentity(input: N7PrCardInput): number | null {
+  const { repository, live, frozen } = input;
+
+  // The caller-provided requested-number FORMAT is validated first, before
+  // any snapshot-dependent branch — a malformed requested identity is
+  // itself an invalid contract, independent of whether live/frozen happen
+  // to be present or already mismatched.
+  const requestedPrNumber = normalizeRequestedPrNumber(input.requestedPrNumber);
+
+  // Cross-snapshot checks run next: whenever both live and frozen are
+  // present, disagreement between the two of them is the most direct
+  // signal of a mixed-identity card and must be caught independently of
+  // whatever the caller's requested identity happens to be.
+  if (live && frozen && !sameRepository(live.repository, frozen.repository)) {
+    throw new N7PrCardIdentityMismatchError("LIVE_FROZEN_REPOSITORY_MISMATCH");
+  }
+  if (live && !sameRepository(live.repository, repository)) {
+    throw new N7PrCardIdentityMismatchError("LIVE_REPOSITORY_MISMATCH");
+  }
+  if (frozen && !sameRepository(frozen.repository, repository)) {
+    throw new N7PrCardIdentityMismatchError("FROZEN_REPOSITORY_MISMATCH");
+  }
+  if (live && frozen && live.pr_number !== frozen.pr_number) {
+    throw new N7PrCardIdentityMismatchError("LIVE_FROZEN_PR_NUMBER_MISMATCH");
+  }
+  if (live && requestedPrNumber != null && live.pr_number !== requestedPrNumber) {
+    throw new N7PrCardIdentityMismatchError("LIVE_REQUESTED_PR_NUMBER_MISMATCH");
+  }
+  if (frozen && requestedPrNumber != null && frozen.pr_number !== requestedPrNumber) {
+    throw new N7PrCardIdentityMismatchError("FROZEN_REQUESTED_PR_NUMBER_MISMATCH");
+  }
+
+  return requestedPrNumber;
 }
 
 export interface N7PrCardIdentityView {
@@ -49,6 +152,12 @@ export interface N7PrCardFrozenIdentityView extends N7PrCardIdentityView {
 export interface N7PrCardComparisonView {
   primaryState: N7PrimaryState;
   severity: N7Severity;
+  // Copied directly from input.derived.comparison.headComparison — never
+  // rederived from the displayed current/frozen SHA strings and never
+  // inferred from primaryState. A higher-precedence primaryState (e.g.
+  // CI_FAILED, REVIEW_BLOCKED) must not hide this independent MATCH/DRIFT/
+  // UNKNOWN fact about the current vs. frozen head relationship.
+  headComparison: HeadComparison;
   // Always begins with the severity word ("OK:"/"WARN:"/"STOP:"/
   // "UNKNOWN:"/"TERMINAL:") so the state is legible without relying on
   // color, icon, CSS class, or border.
@@ -268,6 +377,13 @@ function buildUnknowns(input: N7PrCardInput): N7PrCardUnknown[] {
 }
 
 export function buildN7PrCardView(input: N7PrCardInput): N7PrCardViewModel {
+  // Fail closed before constructing anything: a mismatched identity must
+  // never reach an ordinary FROZEN_MATCH/READY_CLEAN (or any other) card.
+  // The returned value is already proven to agree with every present
+  // snapshot (or there is no snapshot to disagree with) — safe to use as
+  // the final display fallback below.
+  const requestedPrNumber = assertN7PrCardIdentity(input);
+
   const live = input.live;
   const frozen = input.frozen;
   const comparison = input.derived.comparison;
@@ -282,7 +398,7 @@ export function buildN7PrCardView(input: N7PrCardInput): N7PrCardViewModel {
 
   return {
     repository: { owner: input.repository.owner, name: input.repository.name },
-    prNumber: live?.pr_number ?? frozen?.pr_number ?? null,
+    prNumber: live?.pr_number ?? frozen?.pr_number ?? requestedPrNumber,
     prTitle: live?.title ?? null,
     current: {
       headSha: shaOrNull(live?.head_sha),
@@ -300,6 +416,7 @@ export function buildN7PrCardView(input: N7PrCardInput): N7PrCardViewModel {
     comparison: {
       primaryState: input.derived.primaryState,
       severity: input.derived.severity,
+      headComparison: comparison.headComparison,
       exactLabel: PRIMARY_STATE_LABELS[input.derived.primaryState],
       detail: input.derived.blockingReason ?? (comparison.reasons.length > 0 ? comparison.reasons.join("; ") : "no blocking condition detected"),
     },
