@@ -347,32 +347,51 @@ invalid_prebuilt_badge_value_maps_to_unknown
 comparison_values_do_not_enter_structural_attributes
 ```
 
-Status of each against the current (pre-N7-E) implementation, and what
-N7-E itself must add:
+The 15 identifiers above are normative **acceptance-behavior IDs**. They are
+not a requirement to create 15 duplicate Mocha `it()` names. Each behavior
+must be covered by the exact existing, new, or extended test mapping in the
+table below. Rows marked `EXISTING_COVERAGE` require regression execution
+only — no test-code change. Rows marked `NEW_TEST` or `EXTEND_EXISTING_TEST`
+define the exact, and only, implementation-lane test changes.
 
-| Test | Current status | N7-E action |
-|---|---|---|
-| `head_match_remains_visible_when_ci_failed` | Already covered by `ci_failed_primary_still_renders_head_match` in the existing P2 suite | none — regression-only |
-| `head_match_remains_visible_when_review_blocked` | Already covered by `review_blocked_primary_still_renders_head_match` | none — regression-only |
-| `head_drift_has_precedence_over_old_approval` | Already covered by N7-A's `head_drift_outranks_ci_success`, `current_head_change_invalidates_prior_merge_approval` | none — regression-only |
-| `base_drift_remains_independently_visible` | Partially covered (blocker-list only, no dedicated badge yet) | **new** — assert `"Base comparison: DRIFT"` renders alongside a different (higher-precedence) primary state |
-| `old_head_ci_success_is_not_current_success` | Already covered by `old_head_ci_is_not_described_as_current_success` | none — regression-only |
-| `stale_live_snapshot_is_not_clean` | Already covered by N7-A's `FROZEN_STALE` tests | none — regression-only |
-| `review_blocker_remains_visible_under_other_primary_state` | Already covered by existing blocker-independence tests | none — regression-only |
-| `partial_review_data_is_unknown` | Already covered by `partial_review_data_is_unknown_not_clear` | none — regression-only |
-| `missing_frozen_snapshot_does_not_claim_match` | Already covered by absent-model and `no_snapshot_null_identity_remains_non_authoritative` tests | none — regression-only |
-| `requested_pr_without_snapshots_remains_live_unchecked` | Already covered by `requested_pr_number_is_preserved_in_live_unchecked_model` | none — regression-only |
-| `identity_mismatch_never_returns_comparison_view` | Already covered by `identity_mismatch_never_returns_frozen_match`/`_ready_clean` | none — regression-only; add one assertion confirming `baseComparison` is likewise never reached after a thrown identity error |
-| `matching_sha_different_pr_never_matches` | Already covered by `same_heads_different_repository_fails_closed`, `same_heads_same_repository_different_pr_number_fails_closed` | none — regression-only |
-| `comparison_badges_do_not_authorize_write` | Already covered by the existing no-write boundary suite for `n7-head-comparison`; extend the same grep/structural assertions to `n7-base-comparison` | **new** (mechanical extension) |
-| `invalid_prebuilt_badge_value_maps_to_unknown` | Already covered for head comparison (`invalid_prebuilt_head_comparison_maps_to_unknown`) | **new** — mirror for base comparison with the same adversarial payload set (`"MATCH extra-class"`, `"\"><script>alert(1)</script>"`, `"match"`, `null`, `undefined`, `42`, `{}`, `[]`) |
-| `comparison_values_do_not_enter_structural_attributes` | Already covered for head comparison | **new** — mirror for base comparison (no `class=` on the `n7-base-comparison` row) |
+Every mapping below was verified by direct inspection of
+`ide/vscode/a2-harness-panel/test/n7Render.test.ts` and
+`ide/vscode/a2-harness-panel/test/n7State.test.ts` at this scope's base SHA
+— no cited test name is invented, and exact literal strings (including
+non-snake-case descriptive titles and parenthetical suffixes) are quoted
+exactly as they appear in source.
 
-Net new tests required: approximately 4-6 (base-drift-independent-visibility,
-invalid-value-mapping, no-structural-attribute, no-write-boundary extension,
-plus straightforward regression re-runs of the rest). Exact count is fixed
-at implementation time by the authoring engineer; this document freezes the
-test *names and behaviors*, not an exact count.
+| # | Behavior ID | Status | Exact mapping |
+|---|---|---|---|
+| 1 | `head_match_remains_visible_when_ci_failed` | `EXISTING_COVERAGE` | `n7Render.test.ts` — `it("ci_failed_primary_still_renders_head_match", ...)` |
+| 2 | `head_match_remains_visible_when_review_blocked` | `EXISTING_COVERAGE` | `n7Render.test.ts` — `it("review_blocked_primary_still_renders_head_match", ...)` |
+| 3 | `head_drift_has_precedence_over_old_approval` | `EXISTING_COVERAGE` | `n7State.test.ts` — `it("head_drift_outranks_ci_success", ...)` and `it("current_head_change_invalidates_prior_merge_approval (HEAD_DRIFT)", ...)` (exact literal includes the `(HEAD_DRIFT)` suffix) |
+| 4 | `base_drift_remains_independently_visible` | `NEW_TEST` | `n7Render.test.ts` — `it("base_drift_remains_independently_visible", ...)`: construct simultaneous base drift + a higher-precedence blocking condition (e.g. a failing required check); assert `view.blockers` contains a `BASE_DRIFT` entry AND the rendered `n7-base-comparison` row shows `DRIFT`, even though the primary state is `CI_FAILED` |
+| 5 | `old_head_ci_success_is_not_current_success` | `EXISTING_COVERAGE` | `n7Render.test.ts` — `it("old_head_ci_is_not_described_as_current_success", ...)` |
+| 6 | `stale_live_snapshot_is_not_clean` | `EXISTING_COVERAGE` | `n7State.test.ts` — `it("FROZEN_STALE when a live refresh exists but is older than the freshness policy", ...)` (exact literal descriptive string, not snake_case) |
+| 7 | `review_blocker_remains_visible_under_other_primary_state` | `EXTEND_EXISTING_TEST` | Extend `n7Render.test.ts`'s `it("review_blockers_are_visible", ...)` to additionally construct a simultaneous head-drift scenario and assert the `REVIEW_BLOCKED` blocker entry still appears in `view.blockers` even though `HEAD_DRIFT` is the resulting `primaryState` |
+| 8 | `partial_review_data_is_unknown` | `EXISTING_COVERAGE` | `n7Render.test.ts` — `it("partial_review_data_is_unknown_not_clear", ...)` |
+| 9 | `missing_frozen_snapshot_does_not_claim_match` | `EXTEND_EXISTING_TEST` | Extend `n7Render.test.ts`'s `it("frozen_only_matching_identity_builds_card", ...)` (currently asserts only `assert.ok(view)`) to additionally assert `assert.notStrictEqual(view.comparison.primaryState, "FROZEN_MATCH")` |
+| 10 | `requested_pr_without_snapshots_remains_live_unchecked` | `EXISTING_COVERAGE` | `n7Render.test.ts` — `it("requested_pr_number_is_preserved_in_live_unchecked_model", ...)` (already asserts `primaryState === "LIVE_UNCHECKED"` exactly) |
+| 11 | `identity_mismatch_never_returns_comparison_view` | `EXISTING_COVERAGE` | `n7Render.test.ts` — `it("identity_mismatch_never_returns_frozen_match", ...)` and `it("identity_mismatch_never_returns_ready_clean", ...)`; both already assert the returned `view` itself is `undefined` after a caught throw. Since no view object is ever constructed, no field on it — present or future, including `baseComparison` — can ever be reached. No extension is meaningful or required. |
+| 12 | `matching_sha_different_pr_never_matches` | `EXISTING_COVERAGE` | `n7Render.test.ts` — `it("same_heads_different_repository_fails_closed", ...)` and `it("same_heads_same_repository_different_pr_number_fails_closed", ...)` |
+| 13 | `comparison_badges_do_not_authorize_write` | `EXISTING_COVERAGE` | `n7Render.test.ts`'s `describe("n7 render — no-write boundary", ...)` block (`n7_card_has_no_pr_mutation_controls`, `n7_card_has_no_package_rung_controls`, `n7_card_has_no_write_message_dispatch`, `n7_card_has_no_merge_ready_approve_or_rerun_action`) already call `extractN7Section(html)` and scan the **entire** card body for forbidden patterns — this already covers any row present in that section, including the future `n7-base-comparison` row, with zero test-code change |
+| 14 | `invalid_prebuilt_badge_value_maps_to_unknown` | `NEW_TEST` | `n7Render.test.ts` — `it("invalid_prebuilt_base_comparison_maps_to_unknown", ...)`, mirroring the existing `invalid_prebuilt_head_comparison_maps_to_unknown` structure and adversarial payload set exactly (`"MATCH extra-class"`, `"\"><script>alert(1)</script>"`, `"match"`, `null`, `undefined`, `42`, `{}`, `[]`) |
+| 15 | `comparison_values_do_not_enter_structural_attributes` | `NEW_TEST` | `n7Render.test.ts` — `it("base_comparison_is_not_color_only", ...)`, mirroring the existing `head_comparison_is_not_color_only` structure exactly |
+
+Exact future test-change budget (not approximate):
+
+- **`NEW_TEST` (3)**: `base_drift_remains_independently_visible`,
+  `invalid_prebuilt_base_comparison_maps_to_unknown`,
+  `base_comparison_is_not_color_only`.
+- **`EXTEND_EXISTING_TEST` (2)**: `review_blockers_are_visible` (add a
+  head-drift-simultaneous assertion); `frozen_only_matching_identity_builds_card`
+  (add a `primaryState !== "FROZEN_MATCH"` assertion).
+- **`EXISTING_COVERAGE` (10)**: rows 1, 2, 3, 5, 6, 8, 10, 11, 12, 13 —
+  regression execution only, no test-code change, no duplicate alias tests.
+
+Total exact test-code changes: 3 new `it()` blocks + 2 extended `it()`
+blocks = 5.
 
 ## 16. Security and Accessibility
 
@@ -398,32 +417,50 @@ Frozen, inherited unchanged from the N7-D P2 pattern:
 
 ## 17. Validation Plan
 
+Repository-root commands (`scripts/check-harness-exec-safety.sh` and
+`.github/scripts/check_doc_source_of_truth.py`) and panel-package commands
+(`npm test`, `npx tsc`, `npx mocha`, `npm run lint`) resolve relative to
+different roots. Neither group's success may depend on an implicit shell
+working directory left over from the other group — each group explicitly
+sets its own working directory before running.
+
 ```bash
-cd /mnt/vast-data/git-worktrees/<n7e-implementation-worktree>/ide/vscode/a2-harness-panel
+REPO_ROOT=/mnt/vast-data/git-worktrees/<n7e-implementation-worktree>
+PANEL_ROOT="$REPO_ROOT/ide/vscode/a2-harness-panel"
 
-# focused tests
-npx mocha --reporter min --recursive ./out-test/test --grep "P2 explicit head comparison"
-npx mocha --reporter min --recursive ./out-test/test --grep "base comparison"
-npx mocha --reporter min --recursive ./out-test/test --grep "n7 identity binding"
-npx mocha --reporter min --recursive ./out-test/test --grep "n7 render"
+# --- panel-package commands: run from PANEL_ROOT ---------------------------
+(
+  cd "$PANEL_ROOT"
 
-# full panel suite
-npm test
+  # focused tests
+  npx mocha --reporter min --recursive ./out-test/test --grep "P2 explicit head comparison"
+  npx mocha --reporter min --recursive ./out-test/test --grep "base comparison"
+  npx mocha --reporter min --recursive ./out-test/test --grep "n7 identity binding"
+  npx mocha --reporter min --recursive ./out-test/test --grep "n7 render"
 
-# source typecheck
-npx tsc -p . --noEmit
+  # full panel suite
+  npm test
 
-# test typecheck
-npx tsc -p ./tsconfig.test.json --noEmit
+  # source typecheck
+  npx tsc -p . --noEmit
 
-# panel guard
-npm run lint
+  # test typecheck
+  npx tsc -p ./tsconfig.test.json --noEmit
 
-# harness safety guard
-bash scripts/check-harness-exec-safety.sh
+  # panel guard
+  npm run lint
+)
 
-# documentation source-of-truth guard
-python3 .github/scripts/check_doc_source_of_truth.py
+# --- repository-root guards: run from REPO_ROOT -----------------------------
+(
+  cd "$REPO_ROOT"
+
+  # harness execution-safety guard
+  bash scripts/check-harness-exec-safety.sh
+
+  # documentation source-of-truth guard
+  python3 .github/scripts/check_doc_source_of_truth.py
+)
 ```
 
 Required minimums for the future implementation lane: all 1114 previously
@@ -462,8 +499,13 @@ N7-E is complete when:
 2. A dedicated `data-testid="n7-base-comparison"` row renders unconditionally,
    with fixed MATCH/DRIFT/UNKNOWN copy, positioned after the existing head-
    comparison row.
-3. All 15 acceptance tests named in §15 exist and pass, with base-comparison
-   variants added alongside the already-passing head-comparison originals.
+3. All 15 acceptance behaviors in §15 are covered and passing through the
+   exact existing, new, or extended test mappings recorded in the matrix.
+   Only rows marked `NEW_TEST` or `EXTEND_EXISTING_TEST` require test-code
+   changes (exactly 3 new `it()` blocks and 2 extended `it()` blocks, per
+   §15's exact future test-change budget); duplicate alias tests for
+   `EXISTING_COVERAGE` rows are not required. No acceptance behavior is
+   satisfied only by prose.
 4. The full panel suite exceeds its current 1114-passing baseline with zero
    failures.
 5. Both repository guards (harness execution-safety, documentation
