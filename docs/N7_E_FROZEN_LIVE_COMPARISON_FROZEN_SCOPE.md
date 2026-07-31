@@ -319,10 +319,11 @@ three-file budget, with no fourth file needed:
    immediately after `${n7HeadComparisonBlock(view.comparison.headComparison)}`
    in `n7CardBlock()`'s returned template.
 3. **`ide/vscode/a2-harness-panel/test/n7Render.test.ts`** — add the
-   acceptance tests in §15, mirroring the existing "P2 explicit head
-   comparison" describe block's structure and helper reuse
+   normative acceptance tests in §15a, mirroring the existing "P2 explicit
+   head comparison" describe block's structure and helper reuse
    (`renderWithN7`, `buildCard`, `renderArbitrary`, `extractN7Section`,
-   `makeLive`, `makeFrozen`).
+   `makeLive`, `makeFrozen`); and apply the mechanical fixture-literal
+   propagation in §15b to the 14 enumerated existing sites.
 
 No package or lock change. No extension wiring in this or any authorized
 follow-on lane unless separately authorized in a dedicated prompt.
@@ -366,12 +367,12 @@ exactly as they appear in source.
 | 1 | `head_match_remains_visible_when_ci_failed` | `EXISTING_COVERAGE` | `n7Render.test.ts` — `it("ci_failed_primary_still_renders_head_match", ...)` |
 | 2 | `head_match_remains_visible_when_review_blocked` | `EXISTING_COVERAGE` | `n7Render.test.ts` — `it("review_blocked_primary_still_renders_head_match", ...)` |
 | 3 | `head_drift_has_precedence_over_old_approval` | `EXISTING_COVERAGE` | `n7State.test.ts` — `it("head_drift_outranks_ci_success", ...)` and `it("current_head_change_invalidates_prior_merge_approval (HEAD_DRIFT)", ...)` (exact literal includes the `(HEAD_DRIFT)` suffix) |
-| 4 | `base_drift_remains_independently_visible` | `NEW_TEST` | `n7Render.test.ts` — `it("base_drift_remains_independently_visible", ...)`: construct simultaneous base drift + a higher-precedence blocking condition (e.g. a failing required check); assert `view.blockers` contains a `BASE_DRIFT` entry AND the rendered `n7-base-comparison` row shows `DRIFT`, even though the primary state is `CI_FAILED` |
+| 4 | `base_drift_remains_independently_visible` | `NEW_TEST` | `n7Render.test.ts` — `it("base_drift_remains_independently_visible", ...)`: construct simultaneous **head drift AND base drift** (`headComparison = "DRIFT"`, `baseComparison = "DRIFT"`) — head drift genuinely outranks base drift (rank 7 before rank 8 in `n7State.ts`'s `deriveN7PrimaryState()`; a failing required check would not work here, since `BASE_DRIFT` (rank 8) itself already outranks `CI_FAILED` (rank 11), making "base drift + failed CI → primary `CI_FAILED`" structurally unreachable), so the resulting `primaryState` is `HEAD_DRIFT`; assert `view.blockers` still contains an independent `BASE_DRIFT` entry (per `buildBlockers()`'s unconditional, precedence-independent `if (c.baseComparison === "DRIFT")` check, mirroring the existing `HEAD_DRIFT` blocker check) AND the rendered `n7-base-comparison` row still shows `DRIFT`, even though `HEAD_DRIFT` — not `BASE_DRIFT` — is the primary state |
 | 5 | `old_head_ci_success_is_not_current_success` | `EXISTING_COVERAGE` | `n7Render.test.ts` — `it("old_head_ci_is_not_described_as_current_success", ...)` |
 | 6 | `stale_live_snapshot_is_not_clean` | `EXISTING_COVERAGE` | `n7State.test.ts` — `it("FROZEN_STALE when a live refresh exists but is older than the freshness policy", ...)` (exact literal descriptive string, not snake_case) |
 | 7 | `review_blocker_remains_visible_under_other_primary_state` | `EXTEND_EXISTING_TEST` | Extend `n7Render.test.ts`'s `it("review_blockers_are_visible", ...)` to additionally construct a simultaneous head-drift scenario and assert the `REVIEW_BLOCKED` blocker entry still appears in `view.blockers` even though `HEAD_DRIFT` is the resulting `primaryState` |
 | 8 | `partial_review_data_is_unknown` | `EXISTING_COVERAGE` | `n7Render.test.ts` — `it("partial_review_data_is_unknown_not_clear", ...)` |
-| 9 | `missing_frozen_snapshot_does_not_claim_match` | `EXTEND_EXISTING_TEST` | Extend `n7Render.test.ts`'s `it("frozen_only_matching_identity_builds_card", ...)` (currently asserts only `assert.ok(view)`) to additionally assert `assert.notStrictEqual(view.comparison.primaryState, "FROZEN_MATCH")` |
+| 9 | `missing_frozen_snapshot_does_not_claim_match` | `EXTEND_EXISTING_TEST` | Extend `n7Render.test.ts`'s `it("live_only_matching_identity_builds_card", ...)` (line 1081, `buildCard({ frozen: null })` — the frozen snapshot is genuinely absent here; `it("frozen_only_matching_identity_builds_card", ...)` at line 1086 calls `buildCard({ live: null })` instead, which retains the frozen snapshot and exercises missing-**live** behavior, not missing-frozen) — currently asserts only `assert.ok(view)` — to additionally assert `assert.strictEqual(view.comparison.baseComparison, "UNKNOWN")`, `assert.notStrictEqual(view.comparison.primaryState, "FROZEN_MATCH")`, and a rendered presentation check: the fixed `n7-base-comparison` row is asserted not to display or claim `MATCH` (for example, it includes `Base comparison: UNKNOWN — current or frozen base is unavailable` and does not include `Base comparison: MATCH`) |
 | 10 | `requested_pr_without_snapshots_remains_live_unchecked` | `EXISTING_COVERAGE` | `n7Render.test.ts` — `it("requested_pr_number_is_preserved_in_live_unchecked_model", ...)` (already asserts `primaryState === "LIVE_UNCHECKED"` exactly) |
 | 11 | `identity_mismatch_never_returns_comparison_view` | `EXISTING_COVERAGE` | `n7Render.test.ts` — `it("identity_mismatch_never_returns_frozen_match", ...)` and `it("identity_mismatch_never_returns_ready_clean", ...)`; both already assert the returned `view` itself is `undefined` after a caught throw. Since no view object is ever constructed, no field on it — present or future, including `baseComparison` — can ever be reached. No extension is meaningful or required. |
 | 12 | `matching_sha_different_pr_never_matches` | `EXISTING_COVERAGE` | `n7Render.test.ts` — `it("same_heads_different_repository_fails_closed", ...)` and `it("same_heads_same_repository_different_pr_number_fails_closed", ...)` |
@@ -379,19 +380,97 @@ exactly as they appear in source.
 | 14 | `invalid_prebuilt_badge_value_maps_to_unknown` | `NEW_TEST` | `n7Render.test.ts` — `it("invalid_prebuilt_base_comparison_maps_to_unknown", ...)`, mirroring the existing `invalid_prebuilt_head_comparison_maps_to_unknown` structure and adversarial payload set exactly (`"MATCH extra-class"`, `"\"><script>alert(1)</script>"`, `"match"`, `null`, `undefined`, `42`, `{}`, `[]`) |
 | 15 | `comparison_values_do_not_enter_structural_attributes` | `NEW_TEST` | `n7Render.test.ts` — `it("base_comparison_is_not_color_only", ...)`, mirroring the existing `head_comparison_is_not_color_only` structure exactly |
 
-Exact future test-change budget (not approximate):
+### 15a. Normative acceptance-test changes (behavioral)
+
+The counts below are **normative acceptance-test changes** — the exact
+behavioral test-code changes required to satisfy the 15 acceptance
+behaviors above. They are **not** the complete set of test-file edits
+required by this scope; §15b enumerates a separate, additional, mechanical
+category required by the new mandatory interface field:
 
 - **`NEW_TEST` (3)**: `base_drift_remains_independently_visible`,
   `invalid_prebuilt_base_comparison_maps_to_unknown`,
   `base_comparison_is_not_color_only`.
 - **`EXTEND_EXISTING_TEST` (2)**: `review_blockers_are_visible` (add a
-  head-drift-simultaneous assertion); `frozen_only_matching_identity_builds_card`
-  (add a `primaryState !== "FROZEN_MATCH"` assertion).
+  head-drift-simultaneous assertion); `live_only_matching_identity_builds_card`
+  (add `assert.strictEqual(view.comparison.baseComparison, "UNKNOWN")` and a
+  `primaryState !== "FROZEN_MATCH"` assertion, plus a rendered
+  `n7-base-comparison` row assertion that does not display or claim `MATCH` —
+  **not**
+  `frozen_only_matching_identity_builds_card`, which exercises the missing-
+  live scenario, not missing-frozen; see §15 row 9).
 - **`EXISTING_COVERAGE` (10)**: rows 1, 2, 3, 5, 6, 8, 10, 11, 12, 13 —
   regression execution only, no test-code change, no duplicate alias tests.
 
-Total exact test-code changes: 3 new `it()` blocks + 2 extended `it()`
-blocks = 5.
+Normative acceptance-test change count: 3 new `it()` blocks + 2 extended
+`it()` blocks = 5.
+
+### 15b. Mechanical model-contract propagation updates (non-behavioral)
+
+`N7PrCardComparisonView` gains a mandatory field (`baseComparison:
+BaseComparison`, §9). Every existing, explicitly typed `comparison: {
+primaryState: ..., severity: ..., headComparison: ..., exactLabel: ...,
+detail: ... }` object literal in `n7Render.test.ts` that does not already
+supply `baseComparison` will fail test-project typecheck
+(`tsc -p ./tsconfig.test.json --noEmit`) with `TS2345: Property
+'baseComparison' is missing` once that field becomes mandatory — verified
+by a standalone reproduction (non-repo scratch file, this scope's own
+evidence) using the panel's own `tsc --strict --noEmit` against a locally
+mirrored copy of the extended interface and four representative literals
+copied verbatim from the sites below; all 14 sites share the identical
+literal shape, so the same failure applies to each.
+
+Exact inventory — every explicit `comparison: { ... }` literal currently in
+`ide/vscode/a2-harness-panel/test/n7Render.test.ts` (verified by direct
+inspection at this scope's base SHA; no site is estimated):
+
+| # | Location | Current construction | Required mechanical change | Why mechanical, not behavioral |
+|---|---|---|---|---|
+| 1 | line 19, `arbitraryModel()`'s default `base` object | Full `N7PrCardViewModel` literal (the shared default merged via `{ ...base, ...overrides }`) | Add `baseComparison: "UNKNOWN"` | Sets the shared default only; every test using `arbitraryModel()`/`renderArbitrary()` without a `comparison` override inherits it unchanged — no test asserts on it |
+| 2 | line 827 | `comparison: { ... headComparison: "UNKNOWN", ... }`, severity-matrix loop body | Add `baseComparison: "UNKNOWN"` | Test asserts on `severity`/`exactLabel` rendering only |
+| 3 | line 858 | Same shape, non-authoritative-success-claim test | Add `baseComparison: "UNKNOWN"` | Test asserts on severity-label authority, not base comparison |
+| 4 | line 876 | Same shape, inline `renderArbitrary({ comparison: {...} })` call | Add `baseComparison: "UNKNOWN"` | Test asserts on severity value handling |
+| 5 | line 885 | Same shape, inline call | Add `baseComparison: "UNKNOWN"` | Test asserts on severity label text |
+| 6 | line 923 | Same shape | Add `baseComparison: "UNKNOWN"` | Test asserts on spoofed-label rejection |
+| 7 | line 944 | Same shape | Add `baseComparison: "UNKNOWN"` | Test asserts on payload escaping |
+| 8 | line 955 | Same shape | Add `baseComparison: "UNKNOWN"` | Test asserts on spoofed-label rejection |
+| 9 | line 970 | Same shape, inline call | Add `baseComparison: "UNKNOWN"` | Test asserts on severity label text |
+| 10 | line 987 | Same shape | Add `baseComparison: "UNKNOWN"` | Test asserts on invalid-severity fallback |
+| 11 | line 1445 | `comparison: { ... headComparison: "DRIFT", ... }`, P2 head-comparison block | Add `baseComparison: "UNKNOWN"` | Test asserts on head-comparison rendering, independent of base comparison |
+| 12 | line 1459 | `comparison: { ... headComparison: badValue as ..., ... }`, adversarial head-comparison payload | Add `baseComparison: "UNKNOWN"` | Test asserts on head-comparison normalization |
+| 13 | line 1473 | `comparison: { ... headComparison: "MATCH", ... }` | Add `baseComparison: "UNKNOWN"` | Test asserts head-comparison copy is not overridden by model text |
+| 14 | line 1482 | `comparison: { ... headComparison: "DRIFT", ... }` | Add `baseComparison: "UNKNOWN"` | Test asserts head-comparison rendering under drift |
+
+Mechanical propagation rule (frozen, no deviation authorized):
+
+- add `baseComparison: "UNKNOWN"` surgically to each of the 14 literals
+  above — `"UNKNOWN"` is correct in every case because none of these 14
+  tests assert anything about base comparison, so the neutral/no-signal
+  value preserves each test's existing, unrelated assertions exactly;
+- preserve every existing payload and assertion in all 14 tests unchanged;
+- do not consolidate, deduplicate, or rewrite any fixture or helper merely
+  for style;
+- the total test count (`it()` block count) must not increase from these
+  14 mechanical edits — they modify existing object literals in place;
+- every mechanical edit remains inside `n7Render.test.ts`; no other test,
+  source, package, or workflow file is touched by this category.
+
+Exact mechanical propagation count: 14 literal edits, 0 new tests, 0
+removed tests.
+
+### 15c. Total implementation test-file contract
+
+- 3 new behavioral tests (§15a);
+- 2 exact behavioral extensions (§15a);
+- 14 exact enumerated mechanical literal edits, each adding
+  `baseComparison: "UNKNOWN"` (§15b);
+- no other test-file changes are authorized or required.
+
+This replaces any prior "5 total test-code changes" framing: 5 is the
+**normative acceptance-test** change count (§15a) only, not the complete
+test-file diff. The complete test-file diff is 5 normative changes + 14
+mechanical literal edits = 19 total line-level edits across a fixed,
+enumerated set of locations, all within `n7Render.test.ts`.
 
 ## 16. Security and Accessibility
 
@@ -424,6 +503,16 @@ different roots. Neither group's success may depend on an implicit shell
 working directory left over from the other group — each group explicitly
 sets its own working directory before running.
 
+Focused Mocha invocations read compiled JavaScript from `./out-test/test`,
+which is generated by `tsc -p ./tsconfig.test.json` and is not
+version-controlled. In a fresh implementation worktree, `./out-test/` does
+not exist until that compile step runs. The panel's own `test` script
+(`"test": "tsc -p ./tsconfig.test.json && mocha ..."`) always compiles
+immediately before running Mocha — the validation sequence below follows
+the same rule: the test-project compiler runs once, first, before **every**
+focused Mocha group, so no focused command ever depends on stale or absent
+compiled output left over from an earlier, unrelated invocation.
+
 ```bash
 REPO_ROOT=/mnt/vast-data/git-worktrees/<n7e-implementation-worktree>
 PANEL_ROOT="$REPO_ROOT/ide/vscode/a2-harness-panel"
@@ -432,19 +521,24 @@ PANEL_ROOT="$REPO_ROOT/ide/vscode/a2-harness-panel"
 (
   cd "$PANEL_ROOT"
 
-  # focused tests
+  # Compile current test and source output FIRST — before any focused Mocha
+  # invocation. No focused command below may rely on pre-existing out-test.
+  npx tsc -p ./tsconfig.test.json
+
+  # focused tests — run against output compiled immediately above
   npx mocha --reporter min --recursive ./out-test/test --grep "P2 explicit head comparison"
   npx mocha --reporter min --recursive ./out-test/test --grep "base comparison"
   npx mocha --reporter min --recursive ./out-test/test --grep "n7 identity binding"
   npx mocha --reporter min --recursive ./out-test/test --grep "n7 render"
 
-  # full panel suite
+  # full panel suite; recompilation by npm test's own "tsc && mocha" is
+  # expected and is not a violation of the compile-first rule above
   npm test
 
   # source typecheck
   npx tsc -p . --noEmit
 
-  # test typecheck
+  # test typecheck (re-verifies the same project compiled above)
   npx tsc -p ./tsconfig.test.json --noEmit
 
   # panel guard
@@ -463,10 +557,16 @@ PANEL_ROOT="$REPO_ROOT/ide/vscode/a2-harness-panel"
 )
 ```
 
-Required minimums for the future implementation lane: all 1114 previously
+Required minimums for the future implementation lane: the test-project
+compiler (`npx tsc -p ./tsconfig.test.json`) runs, and exits zero, before
+every focused Mocha invocation in the same sequence; no focused Mocha
+command may be treated as valid evidence if run against `out-test` output
+that was not just produced by that same sequence; all 1114 previously
 passing tests remain passing; new base-comparison tests pass; final count
 exceeds 1114; zero failures; both guards pass; `render.ts`/`n7View.ts`
-diffs are scoped to exactly the additions described in §14.
+diffs are scoped to exactly the additions described in §14; `n7Render.test.ts`
+changes are scoped to exactly the 5 normative changes (§15a) plus the 14
+enumerated mechanical literal edits (§15b) — no other test file changes.
 
 ## 18. STOP Gates
 
@@ -501,18 +601,33 @@ N7-E is complete when:
    comparison row.
 3. All 15 acceptance behaviors in §15 are covered and passing through the
    exact existing, new, or extended test mappings recorded in the matrix.
-   Only rows marked `NEW_TEST` or `EXTEND_EXISTING_TEST` require test-code
-   changes (exactly 3 new `it()` blocks and 2 extended `it()` blocks, per
-   §15's exact future test-change budget); duplicate alias tests for
-   `EXISTING_COVERAGE` rows are not required. No acceptance behavior is
-   satisfied only by prose.
-4. The full panel suite exceeds its current 1114-passing baseline with zero
+   Only rows marked `NEW_TEST` or `EXTEND_EXISTING_TEST` require normative
+   test-code changes (exactly 3 new `it()` blocks and 2 extended `it()`
+   blocks, per §15a's exact normative acceptance-test change count);
+   duplicate alias tests for `EXISTING_COVERAGE` rows are not required. No
+   acceptance behavior is satisfied only by prose.
+4. All 14 mechanical model-contract propagation edits enumerated in §15b
+   are complete — `baseComparison: "UNKNOWN"` added to every listed literal,
+   with every existing payload and assertion in those 14 tests otherwise
+   unchanged, and no increase in `it()` block count attributable to this
+   category.
+5. Test-project typecheck (`npx tsc -p ./tsconfig.test.json --noEmit`)
+   passes with `N7PrCardComparisonView.baseComparison` mandatory — i.e. the
+   §15b propagation is complete and sufficient for a clean typecheck.
+6. Focused Mocha runs in the validation sequence are always preceded, in
+   the same sequence, by a `tsc -p ./tsconfig.test.json` compile of current
+   source (§17) — no focused run may be treated as valid evidence if it
+   used a not-freshly-compiled `out-test`.
+7. The full panel suite exceeds its current 1114-passing baseline with zero
    failures.
-5. Both repository guards (harness execution-safety, documentation
+8. Both repository guards (harness execution-safety, documentation
    source-of-truth) pass.
-6. The implementation diff is scoped to exactly the 3 files named in §14 —
+9. The implementation diff is scoped to exactly the 3 files named in §14 —
    verified via `git diff --name-only` against the base SHA recorded in §2.
-7. No STOP gate in §18 is violated.
+   Within `n7Render.test.ts`, the diff is scoped to exactly the 5 normative
+   edits (§15a) plus the 14 mechanical edits (§15b) — no other test-file
+   changes.
+10. No STOP gate in §18 is violated.
 
 ## 20. Exact Next Implementation Lane
 
