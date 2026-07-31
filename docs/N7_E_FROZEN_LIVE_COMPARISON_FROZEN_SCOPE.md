@@ -158,10 +158,13 @@ validated live snapshot (PrLiveSnapshot, from n7Schemas.ts — unchanged)
 → read-only badge row (data-testid="n7-base-comparison")
 ```
 
-No value in this flow is rederived, recomputed from SHA strings, or
-inferred from primary state. `input.derived.comparison.baseComparison` is
-read exactly once, at the same call site and in the same manner as
-`headComparison` already is.
+No value in this flow is rederived, recomputed from SHA strings, or inferred
+from primary state. The new N7-E view-model projection reads
+`input.derived.comparison.baseComparison` once for the direct
+`baseComparison` assignment. This projection/copy-path rule is deliberately
+scoped: existing semantic consumers in `buildBlockers()` and `buildUnknowns()`
+remain unchanged and are not part of this count. No consolidation, helper
+extraction, refactor, or consumer rewrite is authorized.
 
 ## 9. Interface Contracts
 
@@ -370,7 +373,7 @@ exactly as they appear in source.
 | 4 | `base_drift_remains_independently_visible` | `NEW_TEST` | `n7Render.test.ts` — `it("base_drift_remains_independently_visible", ...)`: construct simultaneous **head drift AND base drift** (`headComparison = "DRIFT"`, `baseComparison = "DRIFT"`) — head drift genuinely outranks base drift (rank 7 before rank 8 in `n7State.ts`'s `deriveN7PrimaryState()`; a failing required check would not work here, since `BASE_DRIFT` (rank 8) itself already outranks `CI_FAILED` (rank 11), making "base drift + failed CI → primary `CI_FAILED`" structurally unreachable), so the resulting `primaryState` is `HEAD_DRIFT`; assert `view.blockers` still contains an independent `BASE_DRIFT` entry (per `buildBlockers()`'s unconditional, precedence-independent `if (c.baseComparison === "DRIFT")` check, mirroring the existing `HEAD_DRIFT` blocker check) AND the rendered `n7-base-comparison` row still shows `DRIFT`, even though `HEAD_DRIFT` — not `BASE_DRIFT` — is the primary state |
 | 5 | `old_head_ci_success_is_not_current_success` | `EXISTING_COVERAGE` | `n7Render.test.ts` — `it("old_head_ci_is_not_described_as_current_success", ...)` |
 | 6 | `stale_live_snapshot_is_not_clean` | `EXISTING_COVERAGE` | `n7State.test.ts` — `it("FROZEN_STALE when a live refresh exists but is older than the freshness policy", ...)` (exact literal descriptive string, not snake_case) |
-| 7 | `review_blocker_remains_visible_under_other_primary_state` | `EXTEND_EXISTING_TEST` | Extend `n7Render.test.ts`'s `it("review_blockers_are_visible", ...)` to additionally construct a simultaneous head-drift scenario and assert the `REVIEW_BLOCKED` blocker entry still appears in `view.blockers` even though `HEAD_DRIFT` is the resulting `primaryState` |
+| 7 | `review_blocker_remains_visible_under_other_primary_state` | `EXTEND_EXISTING_TEST` | Extend `n7Render.test.ts`'s `it("review_blockers_are_visible", ...)` to additionally construct a simultaneous `HEAD_DRIFT + REVIEW_BLOCKED` scenario; assert `primaryState` remains `HEAD_DRIFT`; assert `view.blockers` still contains a `REVIEW_BLOCKED` entry; render the same simultaneous view; and assert the rendered blocker list contains an index-only blocker row whose code text is `REVIEW_BLOCKED`, even though `HEAD_DRIFT` is the primary state |
 | 8 | `partial_review_data_is_unknown` | `EXISTING_COVERAGE` | `n7Render.test.ts` — `it("partial_review_data_is_unknown_not_clear", ...)` |
 | 9 | `missing_frozen_snapshot_does_not_claim_match` | `EXTEND_EXISTING_TEST` | Extend `n7Render.test.ts`'s `it("live_only_matching_identity_builds_card", ...)` (line 1081, `buildCard({ frozen: null })` — the frozen snapshot is genuinely absent here; `it("frozen_only_matching_identity_builds_card", ...)` at line 1086 calls `buildCard({ live: null })` instead, which retains the frozen snapshot and exercises missing-**live** behavior, not missing-frozen) — currently asserts only `assert.ok(view)` — to additionally assert `assert.strictEqual(view.comparison.baseComparison, "UNKNOWN")`, `assert.notStrictEqual(view.comparison.primaryState, "FROZEN_MATCH")`, and a rendered presentation check: the fixed `n7-base-comparison` row is asserted not to display or claim `MATCH` (for example, it includes `Base comparison: UNKNOWN — current or frozen base is unavailable` and does not include `Base comparison: MATCH`) |
 | 10 | `requested_pr_without_snapshots_remains_live_unchecked` | `EXISTING_COVERAGE` | `n7Render.test.ts` — `it("requested_pr_number_is_preserved_in_live_unchecked_model", ...)` (already asserts `primaryState === "LIVE_UNCHECKED"` exactly) |
@@ -392,7 +395,10 @@ category required by the new mandatory interface field:
   `invalid_prebuilt_base_comparison_maps_to_unknown`,
   `base_comparison_is_not_color_only`.
 - **`EXTEND_EXISTING_TEST` (2)**: `review_blockers_are_visible` (add a
-  head-drift-simultaneous assertion); `live_only_matching_identity_builds_card`
+  simultaneous `HEAD_DRIFT + REVIEW_BLOCKED` assertion covering
+  `primaryState === "HEAD_DRIFT"`, `view.blockers` containing
+  `REVIEW_BLOCKED`, and a rendered index-only blocker row whose code text is
+  `REVIEW_BLOCKED`); `live_only_matching_identity_builds_card`
   (add `assert.strictEqual(view.comparison.baseComparison, "UNKNOWN")` and a
   `primaryState !== "FROZEN_MATCH"` assertion, plus a rendered
   `n7-base-comparison` row assertion that does not display or claim `MATCH` —
@@ -570,8 +576,10 @@ enumerated mechanical literal edits (§15b) — no other test file changes.
 
 ## 18. STOP Gates
 
-- no duplicate N7-A comparison logic — `baseComparison` is read from
-  `input.derived.comparison.baseComparison` exactly once, never recomputed;
+- no duplicate N7-A comparison logic — the new projection/copy path reads
+  `input.derived.comparison.baseComparison` once for the direct
+  `baseComparison` assignment, never recomputes it, and does not alter the
+  existing semantic consumers in `buildBlockers()` or `buildUnknowns()`;
 - no old approval on a new head — unaffected; N7-A's `HEAD_DRIFT` precedence
   is untouched;
 - no identity mismatch rendered as usable — unaffected;
@@ -605,7 +613,9 @@ N7-E is complete when:
    test-code changes (exactly 3 new `it()` blocks and 2 extended `it()`
    blocks, per §15a's exact normative acceptance-test change count);
    duplicate alias tests for `EXISTING_COVERAGE` rows are not required. No
-   acceptance behavior is satisfied only by prose.
+   acceptance behavior is satisfied only by prose. Row 7's extension includes
+   the rendered simultaneous `REVIEW_BLOCKED` blocker-row assertion recorded
+   in §15, not only model-level blocker construction.
 4. All 14 mechanical model-contract propagation edits enumerated in §15b
    are complete — `baseComparison: "UNKNOWN"` added to every listed literal,
    with every existing payload and assertion in those 14 tests otherwise
