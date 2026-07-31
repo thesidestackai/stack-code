@@ -355,8 +355,9 @@ The 15 identifiers above are normative **acceptance-behavior IDs**. They are
 not a requirement to create 15 duplicate Mocha `it()` names. Each behavior
 must be covered by the exact existing, new, or extended test mapping in the
 table below. Rows marked `EXISTING_COVERAGE` require regression execution
-only — no test-code change. Rows marked `NEW_TEST` or `EXTEND_EXISTING_TEST`
-define the exact, and only, implementation-lane test changes.
+only, except for the row 1 valid-MATCH badge addendum explicitly frozen in
+§15a and §15c. Rows marked `NEW_TEST` or `EXTEND_EXISTING_TEST` define the
+exact, and only, implementation-lane behavioral test changes.
 
 Every mapping below was verified by direct inspection of
 `ide/vscode/a2-harness-panel/test/n7Render.test.ts` and
@@ -367,7 +368,7 @@ exactly as they appear in source.
 
 | # | Behavior ID | Status | Exact mapping |
 |---|---|---|---|
-| 1 | `head_match_remains_visible_when_ci_failed` | `EXISTING_COVERAGE` | `n7Render.test.ts` — `it("ci_failed_primary_still_renders_head_match", ...)` |
+| 1 | `head_match_remains_visible_when_ci_failed` | `EXISTING_COVERAGE` | `n7Render.test.ts` — `it("ci_failed_primary_still_renders_head_match", ...)`. The same default live/frozen fixture has matching base SHAs (`base0001base0001base0001base0001base0001` on both snapshots), so the future view must also assert `view.comparison.baseComparison === "MATCH"` through the exact `view.comparison.baseComparison` path and assert the rendered `data-testid="n7-base-comparison"` row text is exactly `Base comparison: MATCH — current base equals frozen base`. This is the authorized valid-MATCH badge assertion host; it adds no new behavior ID and no new `it()` block. |
 | 2 | `head_match_remains_visible_when_review_blocked` | `EXISTING_COVERAGE` | `n7Render.test.ts` — `it("review_blocked_primary_still_renders_head_match", ...)` |
 | 3 | `head_drift_has_precedence_over_old_approval` | `EXISTING_COVERAGE` | `n7State.test.ts` — `it("head_drift_outranks_ci_success", ...)` and `it("current_head_change_invalidates_prior_merge_approval (HEAD_DRIFT)", ...)` (exact literal includes the `(HEAD_DRIFT)` suffix) |
 | 4 | `base_drift_remains_independently_visible` | `NEW_TEST` | `n7Render.test.ts` — `it("base_drift_remains_independently_visible", ...)`: construct simultaneous **head drift AND base drift** (`headComparison = "DRIFT"`, `baseComparison = "DRIFT"`) — head drift genuinely outranks base drift (rank 7 before rank 8 in `n7State.ts`'s `deriveN7PrimaryState()`; a failing required check would not work here, since `BASE_DRIFT` (rank 8) itself already outranks `CI_FAILED` (rank 11), making "base drift + failed CI → primary `CI_FAILED`" structurally unreachable), so the resulting `primaryState` is `HEAD_DRIFT`; assert `view.blockers` still contains an independent `BASE_DRIFT` entry (per `buildBlockers()`'s unconditional, precedence-independent `if (c.baseComparison === "DRIFT")` check, mirroring the existing `HEAD_DRIFT` blocker check) AND the rendered `n7-base-comparison` row still shows `DRIFT`, even though `HEAD_DRIFT` — not `BASE_DRIFT` — is the primary state |
@@ -406,10 +407,18 @@ category required by the new mandatory interface field:
   `frozen_only_matching_identity_builds_card`, which exercises the missing-
   live scenario, not missing-frozen; see §15 row 9).
 - **`EXISTING_COVERAGE` (10)**: rows 1, 2, 3, 5, 6, 8, 10, 11, 12, 13 —
-  regression execution only, no test-code change, no duplicate alias tests.
+  regression execution only, no duplicate alias tests. Row 1 additionally
+  carries the valid-MATCH badge addendum above: use the same matching-base
+  fixture shape to assert `view.comparison.baseComparison === "MATCH"` and
+  the rendered `data-testid="n7-base-comparison"` fixed copy
+  `Base comparison: MATCH — current base equals frozen base`.
 
 Normative acceptance-test change count: 3 new `it()` blocks + 2 extended
 `it()` blocks = 5.
+
+Valid-MATCH badge addendum count: 0 new behavior IDs, 0 new `it()` blocks,
+1 additional assertion update inside existing test
+`ci_failed_primary_still_renders_head_match`.
 
 ### 15b. Mechanical model-contract propagation updates (non-behavioral)
 
@@ -468,15 +477,18 @@ removed tests.
 
 - 3 new behavioral tests (§15a);
 - 2 exact behavioral extensions (§15a);
+- 1 valid-MATCH badge assertion addendum inside
+  `ci_failed_primary_still_renders_head_match` (§15a);
 - 14 exact enumerated mechanical literal edits, each adding
   `baseComparison: "UNKNOWN"` (§15b);
 - no other test-file changes are authorized or required.
 
 This replaces any prior "5 total test-code changes" framing: 5 is the
 **normative acceptance-test** change count (§15a) only, not the complete
-test-file diff. The complete test-file diff is 5 normative changes + 14
-mechanical literal edits = 19 total line-level edits across a fixed,
-enumerated set of locations, all within `n7Render.test.ts`.
+test-file diff. The complete test-file diff is 5 normative changes + 1
+valid-MATCH assertion addendum + 14 mechanical literal edits = 20 total
+line-level edits across a fixed, enumerated set of locations, all within
+`n7Render.test.ts`.
 
 ## 16. Security and Accessibility
 
@@ -571,8 +583,9 @@ that was not just produced by that same sequence; all 1114 previously
 passing tests remain passing; new base-comparison tests pass; final count
 exceeds 1114; zero failures; both guards pass; `render.ts`/`n7View.ts`
 diffs are scoped to exactly the additions described in §14; `n7Render.test.ts`
-changes are scoped to exactly the 5 normative changes (§15a) plus the 14
-enumerated mechanical literal edits (§15b) — no other test file changes.
+changes are scoped to exactly the 5 normative changes (§15a), the 1
+valid-MATCH badge assertion addendum (§15a/§15c), and the 14 enumerated
+mechanical literal edits (§15b) — no other test file changes.
 
 ## 18. STOP Gates
 
@@ -615,12 +628,18 @@ N7-E is complete when:
    duplicate alias tests for `EXISTING_COVERAGE` rows are not required. No
    acceptance behavior is satisfied only by prose. Row 7's extension includes
    the rendered simultaneous `REVIEW_BLOCKED` blocker-row assertion recorded
-   in §15, not only model-level blocker construction.
+   in §15, not only model-level blocker construction. Row 1 includes the
+   valid-MATCH badge addendum: `view.comparison.baseComparison === "MATCH"`
+   and rendered `Base comparison: MATCH — current base equals frozen base`
+   are both asserted in the existing
+   `ci_failed_primary_still_renders_head_match` test.
 4. All 14 mechanical model-contract propagation edits enumerated in §15b
    are complete — `baseComparison: "UNKNOWN"` added to every listed literal,
    with every existing payload and assertion in those 14 tests otherwise
    unchanged, and no increase in `it()` block count attributable to this
-   category.
+   category. The complete authorized test-file update budget is 20 line-level
+   edits: 5 normative behavioral changes + 1 valid-MATCH assertion addendum
+   + 14 mechanical propagation edits.
 5. Test-project typecheck (`npx tsc -p ./tsconfig.test.json --noEmit`)
    passes with `N7PrCardComparisonView.baseComparison` mandatory — i.e. the
    §15b propagation is complete and sufficient for a clean typecheck.
