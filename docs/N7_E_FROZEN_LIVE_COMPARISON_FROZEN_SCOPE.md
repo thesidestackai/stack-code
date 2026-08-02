@@ -382,7 +382,7 @@ exactly as they appear in source.
 | 12 | `matching_sha_different_pr_never_matches` | `EXISTING_COVERAGE` | `n7Render.test.ts` — `it("same_heads_different_repository_fails_closed", ...)` and `it("same_heads_same_repository_different_pr_number_fails_closed", ...)` |
 | 13 | `comparison_badges_do_not_authorize_write` | `EXISTING_COVERAGE` | `n7Render.test.ts`'s `describe("n7 render — no-write boundary", ...)` block (`n7_card_has_no_pr_mutation_controls`, `n7_card_has_no_package_rung_controls`, `n7_card_has_no_write_message_dispatch`, `n7_card_has_no_merge_ready_approve_or_rerun_action`) already call `extractN7Section(html)` and scan the **entire** card body for forbidden patterns — this already covers any row present in that section, including the future `n7-base-comparison` row, with zero test-code change |
 | 14 | `invalid_prebuilt_badge_value_maps_to_unknown` | `NEW_TEST` | `n7Render.test.ts` — `it("invalid_prebuilt_base_comparison_maps_to_unknown", ...)`, mirroring the existing `invalid_prebuilt_head_comparison_maps_to_unknown` structure and adversarial payload set exactly (`"MATCH extra-class"`, `"\"><script>alert(1)</script>"`, `"match"`, `null`, `undefined`, `42`, `{}`, `[]`) |
-| 15 | `comparison_values_do_not_enter_structural_attributes` | `NEW_TEST` | `n7Render.test.ts` — `it("base_comparison_is_not_color_only", ...)`, mirroring the existing `head_comparison_is_not_color_only` structure exactly |
+| 15 | `comparison_values_do_not_enter_structural_attributes` | `NEW_TEST` | `n7Render.test.ts` — `it("base_comparison_is_not_color_only", ...)`: render a valid visible `n7-base-comparison` row using `baseComparison: "DRIFT"`, isolate the opening tag that contains `data-testid="n7-base-comparison"`, assert the row still includes the exact fixed visible copy `DRIFT — current base differs from frozen base`, and assert the isolated opening tag has no actual forbidden attributes named `class`, `id`, `style`, `href`, or `src` |
 
 ### 15a. Normative acceptance-test changes (behavioral)
 
@@ -394,7 +394,16 @@ category required by the new mandatory interface field:
 
 - **`NEW_TEST` (3)**: `base_drift_remains_independently_visible`,
   `invalid_prebuilt_base_comparison_maps_to_unknown`,
-  `base_comparison_is_not_color_only`.
+  `base_comparison_is_not_color_only` (isolate the
+  `data-testid="n7-base-comparison"` opening tag for a valid
+  `baseComparison: "DRIFT"` row; assert the exact fixed visible copy
+  `DRIFT — current base differs from frozen base` remains present; assert no
+  actual `class`, `id`, `style`, `href`, or `src`
+  attribute is present on that tag using boundary-aware, case-insensitive
+  attribute checks equivalent to `(?:^|\s)class\s*=`, `(?:^|\s)id\s*=`,
+  `(?:^|\s)style\s*=`, `(?:^|\s)href\s*=`, and `(?:^|\s)src\s*=`; do
+  not use naive substring checks such as `openingTag.includes("id=")`,
+  because `data-testid=` itself contains the characters `id=`).
 - **`EXTEND_EXISTING_TEST` (2)**: `review_blockers_are_visible` (add a
   simultaneous `HEAD_DRIFT + REVIEW_BLOCKED` assertion covering
   `primaryState === "HEAD_DRIFT"`, `view.blockers` containing
@@ -487,8 +496,8 @@ This replaces any prior "5 total test-code changes" framing: 5 is the
 **normative acceptance-test** change count (§15a) only, not the complete
 test-file diff. The complete test-file diff is 5 normative changes + 1
 valid-MATCH assertion addendum + 14 mechanical literal edits = 20 total
-line-level edits across a fixed, enumerated set of locations, all within
-`n7Render.test.ts`.
+exact test-file change sites across a fixed, enumerated set of locations,
+all within `n7Render.test.ts`.
 
 ## 16. Security and Accessibility
 
@@ -583,9 +592,9 @@ that was not just produced by that same sequence; all 1114 previously
 passing tests remain passing; new base-comparison tests pass; final count
 exceeds 1114; zero failures; both guards pass; `render.ts`/`n7View.ts`
 diffs are scoped to exactly the additions described in §14; `n7Render.test.ts`
-changes are scoped to exactly the 5 normative changes (§15a), the 1
-valid-MATCH badge assertion addendum (§15a/§15c), and the 14 enumerated
-mechanical literal edits (§15b) — no other test file changes.
+changes are scoped to exactly the 5 normative change sites (§15a), the 1
+valid-MATCH badge assertion addendum site (§15a/§15c), and the 14 enumerated
+mechanical literal change sites (§15b) — no other test-file change sites.
 
 ## 18. STOP Gates
 
@@ -632,14 +641,17 @@ N7-E is complete when:
    valid-MATCH badge addendum: `view.comparison.baseComparison === "MATCH"`
    and rendered `Base comparison: MATCH — current base equals frozen base`
    are both asserted in the existing
-   `ci_failed_primary_still_renders_head_match` test.
+   `ci_failed_primary_still_renders_head_match` test. Row 15's test isolates
+   the `n7-base-comparison` opening tag and verifies the comparison state is
+   not carried by actual `class`, `id`, `style`, `href`, or `src` attributes,
+   using boundary-aware attribute checks rather than naive substring checks.
 4. All 14 mechanical model-contract propagation edits enumerated in §15b
    are complete — `baseComparison: "UNKNOWN"` added to every listed literal,
    with every existing payload and assertion in those 14 tests otherwise
    unchanged, and no increase in `it()` block count attributable to this
-   category. The complete authorized test-file update budget is 20 line-level
-   edits: 5 normative behavioral changes + 1 valid-MATCH assertion addendum
-   + 14 mechanical propagation edits.
+   category. The complete authorized test-file update budget is 20 exact
+   test-file change sites: 5 normative behavioral change sites + 1
+   valid-MATCH assertion addendum site + 14 mechanical propagation sites.
 5. Test-project typecheck (`npx tsc -p ./tsconfig.test.json --noEmit`)
    passes with `N7PrCardComparisonView.baseComparison` mandatory — i.e. the
    §15b propagation is complete and sufficient for a clean typecheck.
@@ -654,8 +666,10 @@ N7-E is complete when:
 9. The implementation diff is scoped to exactly the 3 files named in §14 —
    verified via `git diff --name-only` against the base SHA recorded in §2.
    Within `n7Render.test.ts`, the diff is scoped to exactly the 5 normative
-   edits (§15a) plus the 14 mechanical edits (§15b) — no other test-file
-   changes.
+   change sites (§15a), the 1 valid-MATCH assertion addendum site in
+   `ci_failed_primary_still_renders_head_match` (§15a/§15c), and the 14
+   mechanical fixture/type propagation sites (§15b) — 20 exact authorized
+   test-file change sites total and no other test-file change sites.
 10. No STOP gate in §18 is violated.
 
 ## 20. Exact Next Implementation Lane
