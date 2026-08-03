@@ -224,6 +224,7 @@ fn run_task(
     reject_secret_like_candidate(&candidate.planner_output_json)?;
     let planner_output_path = validator.validate(&task, &candidate.planner_output_json)?;
     verify_planner_paths(&task, &candidate.planner_output_json)?;
+    validate_docs_only_after_text(&task)?;
     write_receipt(
         &task.receipt_dir,
         "planner-validation.json",
@@ -343,6 +344,12 @@ fn run_task(
     )?;
 
     let approved_lane_path = write_approved_lane(&task)?;
+    let package_plan_gate = run_package_plan_gate(&task, &approved_lane_path)?;
+    write_receipt(
+        &task.receipt_dir,
+        "package-plan-readiness.json",
+        &package_plan_gate,
+    )?;
     let package_handoff = json!({
         "schema_version": RECEIPT_SCHEMA_V1,
         "receipt": "package_handoff_readiness",
@@ -357,6 +364,7 @@ fn run_task(
         "allowed_paths": task.allowed_paths,
         "actual_changed_paths": changed_paths,
         "approved_lane_path": approved_lane_path,
+        "package_plan_gate": package_plan_gate,
         "package_rungs": [
             "scripts/a2-tier3-write-orchestrator.sh package-plan",
             "scripts/a2-tier3-write-orchestrator.sh package-commit",
@@ -784,19 +792,7 @@ fn run_validation(task: &NormalizedTask) -> Result<(), BridgeRefusal> {
 }
 
 fn validate_docs_only_target(task: &NormalizedTask) -> Result<(), BridgeRefusal> {
-    if !Path::new(&task.target_path)
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
-    {
-        return Err(BridgeRefusal {
-            kind: "validation-failed",
-            reason: format!(
-                "docs-only validation requires a Markdown target; got {}",
-                task.target_path
-            ),
-            exit_code: EXIT_VALIDATION_FAILED,
-        });
-    }
+    validate_docs_only_path(&task.target_path)?;
     let target = task.worktree.join(&task.target_path);
     let bytes = fs::read(&target).map_err(|e| BridgeRefusal {
         kind: "validation-failed",
@@ -808,6 +804,29 @@ fn validate_docs_only_target(task: &NormalizedTask) -> Result<(), BridgeRefusal>
         reason: format!("validation target is not UTF-8: {e}"),
         exit_code: EXIT_VALIDATION_FAILED,
     })?;
+    validate_docs_only_text(task, &text)
+}
+
+fn validate_docs_only_after_text(task: &NormalizedTask) -> Result<(), BridgeRefusal> {
+    validate_docs_only_path(&task.target_path)?;
+    validate_docs_only_text(task, &task.after_text)
+}
+
+fn validate_docs_only_path(target_path: &str) -> Result<(), BridgeRefusal> {
+    if !Path::new(target_path)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+    {
+        return Err(BridgeRefusal {
+            kind: "validation-failed",
+            reason: format!("docs-only validation requires a Markdown target; got {target_path}"),
+            exit_code: EXIT_VALIDATION_FAILED,
+        });
+    }
+    Ok(())
+}
+
+fn validate_docs_only_text(task: &NormalizedTask, text: &str) -> Result<(), BridgeRefusal> {
     for (index, line) in text.lines().enumerate() {
         let line_no = index + 1;
         if line.starts_with("<<<<<<<") || line.starts_with("=======") || line.starts_with(">>>>>>>")
@@ -848,6 +867,150 @@ fn write_approved_lane(task: &NormalizedTask) -> Result<PathBuf, BridgeRefusal> 
         "taskType": task.task_type,
     });
     write_json_pretty_new(&path, &payload)?;
+    Ok(path)
+}
+
+fn run_package_plan_gate(
+    task: &NormalizedTask,
+    approved_lane_path: &Path,
+) -> Result<Value, BridgeRefusal> {
+    let script = package_plan_script(task);
+    if !script.is_file() {
+        return Err(refusal(
+            "package-plan-gate-missing",
+            format!("package-plan script not found at {}", script.display()),
+        ));
+    }
+    let mut command = Command::new("bash");
+    command
+        .current_dir(&task.worktree)
+        .arg(&script)
+        .arg("package-plan")
+        .arg("--worktree")
+        .arg(&task.worktree)
+        .arg("--approved-lane")
+        .arg(approved_lane_path);
+    #[cfg(test)]
+    command
+        .env("A2_CONTROL_CHECKOUT", test_control_checkout()?)
+        .env("A2_DISPOSABLE_WORKTREE_ROOT", disposable_worktree_root()?);
+    let output = command.output().map_err(|e| {
+        refusal(
+            "package-plan-gate-launch-failed",
+            format!("could not launch package-plan gate: {e}"),
+        )
+    })?;
+    if !output.status.success() {
+        return Err(BridgeRefusal {
+            kind: "package-plan-gate-failed",
+            reason: format!(
+                "package-plan gate exited {:?}: {}{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            exit_code: EXIT_REFUSED,
+        });
+    }
+    Ok(json!({
+        "schema_version": RECEIPT_SCHEMA_V1,
+        "receipt": "package_plan_gate",
+        "task_id": task.task_id,
+        "timestamp": timestamp(),
+        "status": "passed",
+        "worktree": task.worktree,
+        "base_sha": task.base_sha,
+        "branch": task.branch,
+        "caller_id": task.caller_id,
+        "broker_route": task.broker_url,
+        "resolved_model": task.model,
+        "approved_lane_path": approved_lane_path,
+        "command": "scripts/a2-tier3-write-orchestrator.sh package-plan",
+        "stdout_sha256": sha256_hex(&output.stdout),
+        "stderr_sha256": sha256_hex(&output.stderr),
+    }))
+}
+
+#[cfg(not(test))]
+fn package_plan_script(task: &NormalizedTask) -> PathBuf {
+    task.worktree.join("scripts/a2-tier3-write-orchestrator.sh")
+}
+
+#[cfg(test)]
+fn package_plan_script(_task: &NormalizedTask) -> PathBuf {
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    crate_dir
+        .ancestors()
+        .nth(3)
+        .expect("crate dir is under repo root")
+        .join("scripts/a2-tier3-write-orchestrator.sh")
+}
+
+#[cfg(test)]
+fn test_control_checkout() -> Result<PathBuf, BridgeRefusal> {
+    let path = std::env::temp_dir().join(format!(
+        "stack-code-task-bridge-control-{}-{}",
+        std::process::id(),
+        timestamp()
+    ));
+    fs::create_dir_all(&path).map_err(|e| {
+        refusal(
+            "test-control-checkout-create-failed",
+            format!(
+                "could not create test control checkout {}: {e}",
+                path.display()
+            ),
+        )
+    })?;
+    let init = Command::new("git")
+        .arg("-C")
+        .arg(&path)
+        .args(["init", "-b", "main"])
+        .output()
+        .map_err(|e| refusal("test-control-checkout-git-failed", format!("{e}")))?;
+    if !init.status.success() {
+        return Err(refusal(
+            "test-control-checkout-git-failed",
+            String::from_utf8_lossy(&init.stderr).to_string(),
+        ));
+    }
+    for args in [
+        ["config", "user.email", "test@example.invalid"],
+        ["config", "user.name", "Stack Code Test"],
+    ] {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&path)
+            .args(args)
+            .output()
+            .map_err(|e| refusal("test-control-checkout-git-failed", format!("{e}")))?;
+        if !output.status.success() {
+            return Err(refusal(
+                "test-control-checkout-git-failed",
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ));
+        }
+    }
+    fs::write(path.join("README.md"), "control\n").map_err(|e| {
+        refusal(
+            "test-control-checkout-write-failed",
+            format!("could not write test control README: {e}"),
+        )
+    })?;
+    for args in [&["add", "README.md"][..], &["commit", "-m", "baseline"][..]] {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&path)
+            .args(args)
+            .output()
+            .map_err(|e| refusal("test-control-checkout-git-failed", format!("{e}")))?;
+        if !output.status.success() {
+            return Err(refusal(
+                "test-control-checkout-git-failed",
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ));
+        }
+    }
     Ok(path)
 }
 
@@ -1289,11 +1452,13 @@ fn is_word_char(ch: char) -> bool {
 }
 
 fn write_context_summary(request: &PlannerRequest) -> Result<PathBuf, BridgeRefusal> {
-    let path = std::env::temp_dir().join(format!(
-        "stack-code-task-bridge-context-{}-{}.json",
+    let dir = std::env::temp_dir().join(format!(
+        "stack-code-task-bridge-context-{}-{}",
         std::process::id(),
         request.task_id
     ));
+    create_dir_0700(&dir)?;
+    let path = dir.join(format!("context-{}.json", timestamp()));
     let payload = json!({
         "schema_version": "stack-code-runnable-task-context.v1",
         "task_id": request.task_id,
@@ -1641,6 +1806,9 @@ mod tests {
             .as_str()
             .unwrap()
             .ends_with("approved-lane.json"));
+        let receipt_dir = PathBuf::from(result["receipt_dir"].as_str().unwrap());
+        assert!(receipt_dir.join("package-plan-readiness.json").is_file());
+        assert_eq!(result["package_ready"], true);
     }
 
     #[test]
@@ -2009,6 +2177,7 @@ mod tests {
         )
         .expect_err("diff check must fail");
         assert_eq!(err.kind, "validation-failed");
+        assert!(!repo.join("docs/cert.md").exists());
     }
 
     #[test]
@@ -2042,5 +2211,30 @@ mod tests {
         )
         .expect_err("cached completion must not hide unrelated drift");
         assert_eq!(err.kind, "changed-paths-mismatch");
+    }
+
+    #[test]
+    fn context_summary_uses_private_child_of_temp_dir() {
+        let repo = git_repo("context-summary");
+        let request = PlannerRequest {
+            task_id: "cert-task".to_string(),
+            objective: "Create a certification document".to_string(),
+            worktree: repo,
+            workspace_binding: "context-summary".to_string(),
+            base_sha: "base".to_string(),
+            allowed_paths: vec!["docs/cert.md".to_string()],
+            target_path: "docs/cert.md".to_string(),
+            broker_url: DEFAULT_BROKER_URL.to_string(),
+            model: DEFAULT_MODEL.to_string(),
+        };
+        let path = write_context_summary(&request).expect("context summary written");
+        let parent = path.parent().expect("context file has parent");
+        assert_ne!(parent, std::env::temp_dir());
+        assert!(parent.starts_with(std::env::temp_dir()));
+        #[cfg(unix)]
+        {
+            let mode = fs::metadata(parent).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
     }
 }
