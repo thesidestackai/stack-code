@@ -182,6 +182,9 @@ fn run_task(
     if let Some(done) = completed_task_result_if_current(&task)? {
         return Ok(done);
     }
+    if let Some(resumed) = resume_applied_task_if_current(&task)? {
+        return Ok(resumed);
+    }
     verify_clean_start(&task)?;
     create_dir_0700(&task.receipt_dir)?;
     write_receipt(
@@ -244,6 +247,13 @@ fn run_task(
             "planner_output_path": planner_output_path,
             "planner_output_sha256": sha256_hex(candidate.planner_output_json.as_bytes()),
         }),
+    )?;
+
+    let pre_apply_package_control_gate = run_package_control_checkout_gate(&task)?;
+    write_receipt(
+        &task.receipt_dir,
+        "package-control-preflight.json",
+        &pre_apply_package_control_gate,
     )?;
 
     let after_path = task.receipt_dir.join("after.bin");
@@ -327,20 +337,7 @@ fn run_task(
     write_receipt(
         &task.receipt_dir,
         "validation.json",
-        &json!({
-            "schema_version": RECEIPT_SCHEMA_V1,
-            "receipt": "validation",
-            "task_id": task.task_id,
-            "timestamp": timestamp(),
-            "status": "passed",
-            "worktree": task.worktree,
-            "base_sha": task.base_sha,
-            "caller_id": task.caller_id,
-            "broker_route": task.broker_url,
-            "resolved_model": task.model,
-            "validation_profile": task.validation_profile,
-            "command": "docs-only content guard + git diff --check",
-        }),
+        &validation_receipt(&task),
     )?;
 
     let approved_lane_path = write_approved_lane(&task)?;
@@ -350,28 +347,12 @@ fn run_task(
         "package-plan-readiness.json",
         &package_plan_gate,
     )?;
-    let package_handoff = json!({
-        "schema_version": RECEIPT_SCHEMA_V1,
-        "receipt": "package_handoff_readiness",
-        "task_id": task.task_id,
-        "timestamp": timestamp(),
-        "status": "ready",
-        "worktree": task.worktree,
-        "base_sha": task.base_sha,
-        "caller_id": task.caller_id,
-        "broker_route": task.broker_url,
-        "resolved_model": task.model,
-        "allowed_paths": task.allowed_paths,
-        "actual_changed_paths": changed_paths,
-        "approved_lane_path": approved_lane_path,
-        "package_plan_gate": package_plan_gate,
-        "package_rungs": [
-            "scripts/a2-tier3-write-orchestrator.sh package-plan",
-            "scripts/a2-tier3-write-orchestrator.sh package-commit",
-            "scripts/a2-tier3-write-orchestrator.sh package-push",
-            "scripts/a2-tier3-write-orchestrator.sh package-pr"
-        ],
-    });
+    let package_handoff = package_handoff_receipt(
+        &task,
+        &changed_paths,
+        &approved_lane_path,
+        &package_plan_gate,
+    );
     write_receipt(
         &task.receipt_dir,
         "package-handoff-readiness.json",
@@ -892,7 +873,7 @@ fn run_package_plan_gate(
         .arg(approved_lane_path);
     #[cfg(test)]
     command
-        .env("A2_CONTROL_CHECKOUT", test_control_checkout()?)
+        .env("A2_CONTROL_CHECKOUT", package_control_checkout()?)
         .env("A2_DISPOSABLE_WORKTREE_ROOT", disposable_worktree_root()?);
     let output = command.output().map_err(|e| {
         refusal(
@@ -931,9 +912,83 @@ fn run_package_plan_gate(
     }))
 }
 
+fn run_package_control_checkout_gate(task: &NormalizedTask) -> Result<Value, BridgeRefusal> {
+    let script = package_plan_script(task);
+    if !script.is_file() {
+        return Err(refusal(
+            "package-plan-gate-missing",
+            format!("package-plan script not found at {}", script.display()),
+        ));
+    }
+    let control = package_control_checkout()?;
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&control)
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .output()
+        .map_err(|e| {
+            refusal(
+                "package-control-checkout-unavailable",
+                format!(
+                    "could not inspect package control checkout {}: {e}",
+                    control.display()
+                ),
+            )
+        })?;
+    if !output.status.success() {
+        return Err(refusal(
+            "package-control-checkout-unavailable",
+            format!(
+                "cannot read package control checkout {}: {}{}",
+                control.display(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        ));
+    }
+    if !output.stdout.is_empty() {
+        return Err(refusal(
+            "package-control-checkout-dirty",
+            format!(
+                "package control checkout {} is not clean",
+                control.display()
+            ),
+        ));
+    }
+    Ok(json!({
+        "schema_version": RECEIPT_SCHEMA_V1,
+        "receipt": "package_control_preflight",
+        "task_id": task.task_id,
+        "timestamp": timestamp(),
+        "status": "passed",
+        "worktree": task.worktree,
+        "base_sha": task.base_sha,
+        "branch": task.branch,
+        "caller_id": task.caller_id,
+        "broker_route": task.broker_url,
+        "resolved_model": task.model,
+        "control_checkout": control,
+        "command": "git status --porcelain --untracked-files=all",
+        "stdout_sha256": sha256_hex(&output.stdout),
+        "stderr_sha256": sha256_hex(&output.stderr),
+    }))
+}
+
 #[cfg(not(test))]
 fn package_plan_script(task: &NormalizedTask) -> PathBuf {
     task.worktree.join("scripts/a2-tier3-write-orchestrator.sh")
+}
+
+#[cfg(not(test))]
+fn package_control_checkout() -> Result<PathBuf, BridgeRefusal> {
+    Path::new("/home/suki/stack-code")
+        .canonicalize()
+        .map_err(|e| {
+            refusal(
+                "package-control-checkout-unavailable",
+                format!("could not canonicalize package control checkout: {e}"),
+            )
+        })
 }
 
 #[cfg(test)]
@@ -944,6 +999,22 @@ fn package_plan_script(_task: &NormalizedTask) -> PathBuf {
         .nth(3)
         .expect("crate dir is under repo root")
         .join("scripts/a2-tier3-write-orchestrator.sh")
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_CONTROL_CHECKOUT_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn package_control_checkout() -> Result<PathBuf, BridgeRefusal> {
+    if let Some(path) = TEST_CONTROL_CHECKOUT_OVERRIDE
+        .with(|override_path| override_path.borrow().as_ref().cloned())
+    {
+        return Ok(path);
+    }
+    test_control_checkout()
 }
 
 #[cfg(test)]
@@ -1040,6 +1111,53 @@ fn final_success_result(
     })
 }
 
+fn validation_receipt(task: &NormalizedTask) -> Value {
+    json!({
+        "schema_version": RECEIPT_SCHEMA_V1,
+        "receipt": "validation",
+        "task_id": task.task_id,
+        "timestamp": timestamp(),
+        "status": "passed",
+        "worktree": task.worktree,
+        "base_sha": task.base_sha,
+        "caller_id": task.caller_id,
+        "broker_route": task.broker_url,
+        "resolved_model": task.model,
+        "validation_profile": task.validation_profile,
+        "command": "docs-only content guard + git diff --check",
+    })
+}
+
+fn package_handoff_receipt(
+    task: &NormalizedTask,
+    changed_paths: &[String],
+    approved_lane_path: &Path,
+    package_plan_gate: &Value,
+) -> Value {
+    json!({
+        "schema_version": RECEIPT_SCHEMA_V1,
+        "receipt": "package_handoff_readiness",
+        "task_id": task.task_id,
+        "timestamp": timestamp(),
+        "status": "ready",
+        "worktree": task.worktree,
+        "base_sha": task.base_sha,
+        "caller_id": task.caller_id,
+        "broker_route": task.broker_url,
+        "resolved_model": task.model,
+        "allowed_paths": task.allowed_paths,
+        "actual_changed_paths": changed_paths,
+        "approved_lane_path": approved_lane_path,
+        "package_plan_gate": package_plan_gate,
+        "package_rungs": [
+            "scripts/a2-tier3-write-orchestrator.sh package-plan",
+            "scripts/a2-tier3-write-orchestrator.sh package-commit",
+            "scripts/a2-tier3-write-orchestrator.sh package-push",
+            "scripts/a2-tier3-write-orchestrator.sh package-pr"
+        ],
+    })
+}
+
 fn completed_task_result_if_current(task: &NormalizedTask) -> Result<Option<Value>, BridgeRefusal> {
     let complete_path = task.receipt_dir.join("task-complete.json");
     if !complete_path.exists() {
@@ -1090,9 +1208,78 @@ fn completed_task_result_if_current(task: &NormalizedTask) -> Result<Option<Valu
         ));
     }
     let changed_paths = verify_changed_paths(task)?;
+    let approved_lane_path = approved_lane_path_from_result(&value)?;
+    let package_plan_gate = run_package_plan_gate(task, &approved_lane_path)?;
     value["actual_changed_paths"] = json!(changed_paths);
+    value["package_plan_gate"] = package_plan_gate;
+    value["package_ready"] = Value::Bool(true);
     value["status"] = Value::String("idempotent_complete".to_string());
     Ok(Some(value))
+}
+
+fn resume_applied_task_if_current(task: &NormalizedTask) -> Result<Option<Value>, BridgeRefusal> {
+    if task.receipt_dir.join("task-complete.json").exists() {
+        return Ok(None);
+    }
+    let target = task.worktree.join(&task.target_path);
+    if !target.is_file() {
+        return Ok(None);
+    }
+    let expected = sha256_hex(task.after_text.as_bytes());
+    let actual = sha256_file_hex(&target).map_err(|e| {
+        refusal(
+            "applied-task-target-hash-error",
+            format!("could not hash applied target {}: {e}", target.display()),
+        )
+    })?;
+    if expected != actual {
+        return Ok(None);
+    }
+    let approved_lane_path = task.receipt_dir.join("approved-lane.json");
+    let apply_result_path = task.receipt_dir.join("a2-apply-result.json");
+    if !approved_lane_path.is_file() || !apply_result_path.is_file() {
+        return Ok(None);
+    }
+    let changed_paths = verify_changed_paths(task)?;
+    run_validation(task)?;
+    write_receipt_if_absent(
+        &task.receipt_dir,
+        "validation.json",
+        &validation_receipt(task),
+    )?;
+    let package_plan_gate = run_package_plan_gate(task, &approved_lane_path)?;
+    write_receipt_if_absent(
+        &task.receipt_dir,
+        "package-plan-readiness.json",
+        &package_plan_gate,
+    )?;
+    let package_handoff = package_handoff_receipt(
+        task,
+        &changed_paths,
+        &approved_lane_path,
+        &package_plan_gate,
+    );
+    write_receipt_if_absent(
+        &task.receipt_dir,
+        "package-handoff-readiness.json",
+        &package_handoff,
+    )?;
+    let complete = final_success_result(task, &changed_paths, &approved_lane_path);
+    write_receipt(&task.receipt_dir, "task-complete.json", &complete)?;
+    Ok(Some(complete))
+}
+
+fn approved_lane_path_from_result(value: &Value) -> Result<PathBuf, BridgeRefusal> {
+    value
+        .get("approved_lane_path")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            refusal(
+                "completed-task-approved-lane-missing",
+                "task-complete receipt is missing approved_lane_path",
+            )
+        })
 }
 
 fn task_acceptance_receipt(task: &NormalizedTask, status: &str) -> Value {
@@ -1418,10 +1605,20 @@ fn reject_secret_like_candidate(candidate: &str) -> Result<(), BridgeRefusal> {
             "planner output contained key-block shaped text",
         ));
     }
-    if contains_prefixed_token_shape(candidate, "sk-", 16)
-        || ["ghp_", "gho_", "ghu_", "ghs_", "ghr_"]
-            .iter()
-            .any(|prefix| contains_prefixed_token_shape(candidate, prefix, 20))
+    if [
+        ("sk-proj-", 8),
+        ("sk-ant-", 8),
+        ("sk_live_", 8),
+        ("sk-", 16),
+        ("ghp_", 20),
+        ("gho_", 20),
+        ("ghu_", 20),
+        ("ghs_", 20),
+        ("ghr_", 20),
+        ("github_pat_", 20),
+    ]
+    .iter()
+    .any(|(prefix, min_tail_len)| contains_prefixed_token_shape(candidate, prefix, *min_tail_len))
     {
         return Err(refusal(
             "planner-output-secret-like-refused",
@@ -1438,17 +1635,32 @@ fn contains_prefixed_token_shape(text: &str, prefix: &str, min_tail_len: usize) 
             .next_back()
             .is_none_or(|ch| !is_word_char(ch));
         let tail = &text[idx + prefix.len()..];
-        let token_len = tail.chars().take_while(char::is_ascii_alphanumeric).count();
-        let after_ok = tail
-            .chars()
-            .nth(token_len)
-            .is_none_or(|ch| !is_word_char(ch));
+        let token_len = prefixed_token_tail_len(prefix, tail);
+        let after_ok = tail.chars().nth(token_len).is_none_or(is_token_separator);
         before_ok && after_ok && token_len >= min_tail_len
     })
 }
 
+fn prefixed_token_tail_len(prefix: &str, tail: &str) -> usize {
+    if matches!(prefix, "sk-proj-" | "sk-ant-" | "sk_live_" | "github_pat_") {
+        tail.chars()
+            .take_while(|ch| !is_token_separator(*ch))
+            .count()
+    } else {
+        tail.chars().take_while(char::is_ascii_alphanumeric).count()
+    }
+}
+
 fn is_word_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || ch == '_'
+}
+
+fn is_token_separator(ch: char) -> bool {
+    ch.is_whitespace()
+        || matches!(
+            ch,
+            '"' | '\'' | ',' | ';' | '(' | ')' | '<' | '>' | '{' | '}' | '`'
+        )
 }
 
 fn write_context_summary(request: &PlannerRequest) -> Result<PathBuf, BridgeRefusal> {
@@ -1497,6 +1709,7 @@ fn git_stdout(worktree: &Path, args: &[&str]) -> Result<String, BridgeRefusal> {
 }
 
 fn create_dir_0700(path: &Path) -> Result<(), BridgeRefusal> {
+    reject_existing_symlink_components(path)?;
     fs::create_dir_all(path).map_err(|e| {
         refusal(
             "receipt-dir-create-failed",
@@ -1530,8 +1743,69 @@ fn create_dir_0700(path: &Path) -> Result<(), BridgeRefusal> {
     Ok(())
 }
 
+fn reject_existing_symlink_components(path: &Path) -> Result<(), BridgeRefusal> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir | Component::Normal(_) => current.push(component.as_os_str()),
+            Component::CurDir => continue,
+            Component::ParentDir => {
+                return Err(refusal(
+                    "receipt-dir-invalid",
+                    format!(
+                        "{} must not contain parent-directory traversal",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(refusal(
+                    "receipt-dir-invalid",
+                    format!(
+                        "receipt directory component {} must not be a symlink",
+                        current.display()
+                    ),
+                ));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(refusal(
+                    "receipt-dir-stat-failed",
+                    format!("could not stat {}: {e}", current.display()),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn write_receipt(dir: &Path, name: &str, value: &Value) -> Result<(), BridgeRefusal> {
     write_json_pretty_new(&dir.join(name), value)
+}
+
+fn write_receipt_if_absent(dir: &Path, name: &str, value: &Value) -> Result<(), BridgeRefusal> {
+    let path = dir.join(name);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(refusal(
+                "receipt-file-invalid",
+                format!("receipt file {} must not be a symlink", path.display()),
+            ));
+        }
+        Ok(_) => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(refusal(
+                "receipt-file-stat-failed",
+                format!("could not stat {}: {e}", path.display()),
+            ));
+        }
+    }
+    write_json_pretty_new(&path, value)
 }
 
 fn write_json_pretty_new(path: &Path, value: &Value) -> Result<(), BridgeRefusal> {
@@ -1746,6 +2020,15 @@ mod tests {
         dir
     }
 
+    fn with_test_control_checkout<T>(path: &Path, f: impl FnOnce() -> T) -> T {
+        TEST_CONTROL_CHECKOUT_OVERRIDE.with(|override_path| {
+            let previous = override_path.replace(Some(path.to_path_buf()));
+            let result = f();
+            override_path.replace(previous);
+            result
+        })
+    }
+
     fn workspace_binding_for_test(worktree: &Path) -> String {
         worktree
             .file_name()
@@ -1844,6 +2127,31 @@ mod tests {
         )
         .expect_err("credential-shaped planner output must be refused");
         assert_eq!(err.kind, "planner-output-secret-like-refused");
+    }
+
+    #[test]
+    fn dashed_vendor_credential_shapes_are_refused() {
+        for (label, token) in [
+            (
+                "openai-project",
+                "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789",
+            ),
+            ("anthropic", "sk-ant-api03-deadbeefdeadbeef"),
+        ] {
+            let repo = git_repo(label);
+            let mut output: Value =
+                serde_json::from_str(&valid_planner_output(&repo, "docs/cert.md")).unwrap();
+            output["risk_notes"] = json!([token]);
+            let err = run_task(
+                spec(&repo, vec!["docs/cert.md"], None),
+                &StubPlanner {
+                    output: serde_json::to_string(&output).unwrap(),
+                },
+                &InlineValidator,
+            )
+            .expect_err("dashed vendor token-shaped planner output must be refused");
+            assert_eq!(err.kind, "planner-output-secret-like-refused");
+        }
     }
 
     #[test]
@@ -2026,6 +2334,27 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn receipt_directory_symlink_ancestor_is_rejected() {
+        let repo = git_repo("receipt-symlink");
+        let outside = unique_temp_dir("receipt-outside");
+        std::os::unix::fs::symlink(&outside, repo.join(".claw")).expect("create .claw symlink");
+        git(&repo, &["add", ".claw"]);
+        git(&repo, &["commit", "-m", "track claw symlink"]);
+        let err = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &StubPlanner {
+                output: valid_planner_output(&repo, "docs/cert.md"),
+            },
+            &InlineValidator,
+        )
+        .expect_err("receipt writes must not follow symlinked ancestors");
+        assert_eq!(err.kind, "receipt-dir-invalid");
+        assert!(!outside.join("runnable-task-bridge").exists());
+        assert!(!repo.join("docs/cert.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn bridge_receipts_are_private() {
         let repo = git_repo("private-modes");
         let planner = StubPlanner {
@@ -2193,6 +2522,63 @@ mod tests {
         let second =
             run_task(second_task, &planner, &InlineValidator).expect("second run succeeds");
         assert_eq!(second["status"], "idempotent_complete");
+    }
+
+    #[test]
+    fn cached_completion_reruns_package_gate() {
+        let repo = git_repo("idempotent-package-gate");
+        let planner = StubPlanner {
+            output: valid_planner_output(&repo, "docs/cert.md"),
+        };
+        run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("first run succeeds");
+        let dirty_control = git_repo("dirty-package-control");
+        fs::write(dirty_control.join("untracked.txt"), "dirty\n").unwrap();
+        let err = with_test_control_checkout(&dirty_control, || {
+            run_task(
+                spec(&repo, vec!["docs/cert.md"], None),
+                &planner,
+                &InlineValidator,
+            )
+        })
+        .expect_err(
+            "cached success must not claim package readiness with a dirty control checkout",
+        );
+        assert_eq!(err.kind, "package-plan-gate-failed");
+    }
+
+    #[test]
+    fn applied_task_without_completion_receipt_can_resume() {
+        let repo = git_repo("resume-applied");
+        let planner = StubPlanner {
+            output: valid_planner_output(&repo, "docs/cert.md"),
+        };
+        let first = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("first run succeeds");
+        let receipt_dir = PathBuf::from(first["receipt_dir"].as_str().unwrap());
+        fs::remove_file(receipt_dir.join("task-complete.json")).unwrap();
+        fs::remove_file(receipt_dir.join("package-plan-readiness.json")).unwrap();
+        fs::remove_file(receipt_dir.join("package-handoff-readiness.json")).unwrap();
+        let resumed = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &FailingPlanner {
+                kind: "planner-must-not-run",
+            },
+            &InlineValidator,
+        )
+        .expect("existing A2-applied task resumes without replanning");
+        assert_eq!(resumed["status"], "applied");
+        assert!(receipt_dir.join("task-complete.json").is_file());
+        assert!(receipt_dir.join("package-plan-readiness.json").is_file());
+        assert!(receipt_dir.join("package-handoff-readiness.json").is_file());
     }
 
     #[test]
