@@ -15285,7 +15285,11 @@ mod tests {
 
     #[test]
     fn multi_word_prompt_still_bypasses_subcommand_typo_guard() {
-        assert_eq!(
+        let _guard = env_lock();
+        let root = temp_dir();
+        let cwd = root.join("project");
+        std::fs::create_dir_all(&cwd).expect("project dir should exist");
+        let result = with_current_dir(&cwd, || {
             parse_args(&[
                 "hello".to_string(),
                 "world".to_string(),
@@ -15294,7 +15298,10 @@ mod tests {
                 "a".to_string(),
                 "prompt".to_string(),
             ])
-            .expect("multi-word prompt should still parse"),
+            .expect("multi-word prompt should still parse")
+        });
+        assert_eq!(
+            result,
             CliAction::Prompt {
                 prompt: "hello world this is a prompt".to_string(),
                 model: DEFAULT_MODEL.to_string(),

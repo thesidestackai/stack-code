@@ -12,6 +12,9 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
 use a2_plan_runner::{ApprovalContext, ApprovalDecision};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -23,6 +26,7 @@ const RECEIPT_SCHEMA_V1: &str = "stack-code-runnable-task-receipt.v1";
 const APPROVAL_RESULT_SCHEMA_V1: &str = "a2-l2b-approval-result.v1";
 const DEFAULT_BROKER_URL: &str = "http://127.0.0.1:11435";
 const DEFAULT_MODEL: &str = "fast";
+const DEFAULT_DISPOSABLE_WORKTREE_ROOT: &str = "/mnt/vast-data/git-worktrees";
 const VALIDATION_DOCS_ONLY: &str = "docs-only";
 const EXIT_REFUSED: i32 = 5;
 const EXIT_APPLY_REFUSED: i32 = 7;
@@ -178,7 +182,7 @@ fn run_task(
     if let Some(done) = completed_task_result_if_current(&task)? {
         return Ok(done);
     }
-    verify_clean_start(&task.worktree)?;
+    verify_clean_start(&task)?;
     create_dir_0700(&task.receipt_dir)?;
     write_receipt(
         &task.receipt_dir,
@@ -414,6 +418,7 @@ fn normalize_task(spec: RunnableTaskSpec) -> Result<NormalizedTask, BridgeRefusa
             "task worktree must be on a named branch",
         ));
     }
+    verify_disposable_worktree(&worktree, &branch)?;
     let allowed_paths = normalize_allowed_paths(&worktree, &spec.allowed_paths)?;
     let target_path = match spec.target_path {
         Some(path) => normalize_one_allowed_path(&worktree, &path)?,
@@ -932,17 +937,28 @@ fn task_acceptance_receipt(task: &NormalizedTask, status: &str) -> Value {
     })
 }
 
-fn verify_clean_start(worktree: &Path) -> Result<(), BridgeRefusal> {
+fn verify_clean_start(task: &NormalizedTask) -> Result<(), BridgeRefusal> {
     let status = git_stdout(
-        worktree,
+        &task.worktree,
         &["status", "--porcelain", "--untracked-files=all"],
     )?;
-    if status.trim().is_empty() {
+    let receipt_prefix = format!(".claw/runnable-task-bridge/{}/", task.task_id);
+    let non_bridge_status: Vec<&str> = status
+        .lines()
+        .filter(|line| {
+            let path = porcelain_path(line);
+            !path.starts_with(&receipt_prefix)
+        })
+        .collect();
+    if non_bridge_status.is_empty() {
         Ok(())
     } else {
         Err(refusal(
             "worktree-dirty",
-            format!("worktree must be clean before task run; git status: {status}"),
+            format!(
+                "worktree must be clean before task run; git status: {}",
+                non_bridge_status.join("\n")
+            ),
         ))
     }
 }
@@ -1098,6 +1114,64 @@ fn canonical_worktree(path: &Path) -> Result<PathBuf, BridgeRefusal> {
     }
 }
 
+fn verify_disposable_worktree(worktree: &Path, branch: &str) -> Result<(), BridgeRefusal> {
+    if matches!(branch, "main" | "master") {
+        return Err(refusal(
+            "worktree-branch-protected",
+            "task worktree must not be on main or master",
+        ));
+    }
+    let root = disposable_worktree_root()?;
+    if worktree == root || !worktree.starts_with(&root) {
+        return Err(refusal(
+            "worktree-not-disposable",
+            format!(
+                "task worktree must be under disposable root {}",
+                root.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn disposable_worktree_root() -> Result<PathBuf, BridgeRefusal> {
+    Path::new(DEFAULT_DISPOSABLE_WORKTREE_ROOT)
+        .canonicalize()
+        .map_err(|e| {
+            refusal(
+                "disposable-worktree-root-unavailable",
+                format!("could not canonicalize {DEFAULT_DISPOSABLE_WORKTREE_ROOT}: {e}"),
+            )
+        })
+}
+
+#[cfg(test)]
+fn disposable_worktree_root() -> Result<PathBuf, BridgeRefusal> {
+    let root = std::env::temp_dir().join(format!(
+        "stack-code-bridge-disposable-root-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&root).map_err(|e| {
+        refusal(
+            "disposable-worktree-root-unavailable",
+            format!(
+                "could not create test disposable root {}: {e}",
+                root.display()
+            ),
+        )
+    })?;
+    root.canonicalize().map_err(|e| {
+        refusal(
+            "disposable-worktree-root-unavailable",
+            format!(
+                "could not canonicalize test disposable root {}: {e}",
+                root.display()
+            ),
+        )
+    })
+}
+
 fn canonical_broker_url(input: Option<&str>) -> Result<String, BridgeRefusal> {
     let raw = input.unwrap_or(DEFAULT_BROKER_URL).trim();
     let forbidden = ["114", "34"].concat();
@@ -1226,7 +1300,32 @@ fn create_dir_0700(path: &Path) -> Result<(), BridgeRefusal> {
             "receipt-dir-create-failed",
             format!("could not create {}: {e}", path.display()),
         )
-    })
+    })?;
+    let metadata = fs::symlink_metadata(path).map_err(|e| {
+        refusal(
+            "receipt-dir-stat-failed",
+            format!("could not stat {}: {e}", path.display()),
+        )
+    })?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(refusal(
+            "receipt-dir-invalid",
+            format!("{} must be a real directory", path.display()),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|e| {
+            refusal(
+                "receipt-dir-permission-failed",
+                format!(
+                    "could not set private permissions on {}: {e}",
+                    path.display()
+                ),
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn write_receipt(dir: &Path, name: &str, value: &Value) -> Result<(), BridgeRefusal> {
@@ -1247,34 +1346,47 @@ fn write_file_new(path: &Path, bytes: &[u8]) -> Result<(), BridgeRefusal> {
     let Some(parent) = path.parent() else {
         return Err(refusal("write-path-parent-missing", "path has no parent"));
     };
-    if !parent.exists() {
-        fs::create_dir_all(parent).map_err(|e| {
-            refusal(
-                "write-path-parent-create-failed",
-                format!("could not create {}: {e}", parent.display()),
-            )
-        })?;
+    create_dir_0700(parent)?;
+    let temp = path.with_file_name(format!(
+        ".{}.tmp-{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("bridge-receipt"),
+        timestamp()
+    ));
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
     }
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(path)
-        .map_err(|e| {
-            refusal(
-                "receipt-write-failed",
-                format!("could not create {}: {e}", path.display()),
-            )
-        })?;
+    let mut file = options.open(&temp).map_err(|e| {
+        refusal(
+            "receipt-write-failed",
+            format!("could not create {}: {e}", temp.display()),
+        )
+    })?;
     file.write_all(bytes).map_err(|e| {
         refusal(
             "receipt-write-failed",
-            format!("could not write {}: {e}", path.display()),
+            format!("could not write {}: {e}", temp.display()),
         )
     })?;
     file.flush().map_err(|e| {
         refusal(
             "receipt-write-failed",
-            format!("could not flush {}: {e}", path.display()),
+            format!("could not flush {}: {e}", temp.display()),
+        )
+    })?;
+    drop(file);
+    fs::rename(&temp, path).map_err(|e| {
+        refusal(
+            "receipt-write-failed",
+            format!(
+                "could not atomically install {} as {}: {e}",
+                temp.display(),
+                path.display()
+            ),
         )
     })
 }
@@ -1323,6 +1435,11 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct FailingPlanner {
+        kind: &'static str,
+    }
+
+    #[derive(Debug)]
     struct InlineValidator;
 
     impl PlannerClient for StubPlanner {
@@ -1337,6 +1454,15 @@ mod tests {
                 resolved_model: request.model.clone(),
                 response_sha256: sha256_hex(self.output.as_bytes()),
             })
+        }
+    }
+
+    impl PlannerClient for FailingPlanner {
+        fn request_plan(
+            &self,
+            _request: &PlannerRequest,
+        ) -> Result<PlannerCandidate, BridgeRefusal> {
+            Err(refusal(self.kind, "simulated planner failure"))
         }
     }
 
@@ -1360,8 +1486,23 @@ mod tests {
             .expect("clock sane")
             .as_nanos();
         let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
+        let root = disposable_worktree_root().expect("test disposable root");
+        let dir = root.join(format!(
             "stack-code-bridge-{label}-{}-{nanos}-{seq}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir.canonicalize().expect("canonicalize temp dir")
+    }
+
+    fn non_disposable_temp_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock sane")
+            .as_nanos();
+        let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "stack-code-bridge-nondisposable-{label}-{}-{nanos}-{seq}",
             std::process::id()
         ));
         fs::create_dir_all(&dir).expect("create temp dir");
@@ -1386,6 +1527,10 @@ mod tests {
 
     fn git_repo(label: &str) -> PathBuf {
         git_repo_at(unique_temp_dir(label))
+    }
+
+    fn non_disposable_git_repo(label: &str) -> PathBuf {
+        git_repo_at(non_disposable_temp_dir(label))
     }
 
     fn git_repo_at(dir: PathBuf) -> PathBuf {
@@ -1543,6 +1688,37 @@ mod tests {
     }
 
     #[test]
+    fn non_disposable_worktree_is_rejected_before_apply() {
+        let repo = non_disposable_git_repo("outside-root");
+        let err = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &StubPlanner {
+                output: valid_planner_output(&repo, "docs/cert.md"),
+            },
+            &InlineValidator,
+        )
+        .expect_err("non-disposable worktree must fail");
+        assert_eq!(err.kind, "worktree-not-disposable");
+        assert!(!repo.join("docs/cert.md").exists());
+    }
+
+    #[test]
+    fn main_branch_worktree_is_rejected_before_apply() {
+        let repo = git_repo("main-branch");
+        git(&repo, &["checkout", "-b", "main"]);
+        let err = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &StubPlanner {
+                output: valid_planner_output(&repo, "docs/cert.md"),
+            },
+            &InlineValidator,
+        )
+        .expect_err("main branch worktree must fail");
+        assert_eq!(err.kind, "worktree-branch-protected");
+        assert!(!repo.join("docs/cert.md").exists());
+    }
+
+    #[test]
     fn stale_planner_task_id_is_rejected_before_apply() {
         let repo = git_repo("stale-plan-id");
         let mut output: Value =
@@ -1576,6 +1752,66 @@ mod tests {
         .expect_err("stale workspace identity must fail");
         assert_eq!(err.kind, "planner-output-workspace-root-mismatch");
         assert!(!repo.join("docs/cert.md").exists());
+    }
+
+    #[test]
+    fn bridge_owned_partial_receipts_do_not_block_retry() {
+        let repo = git_repo("retry");
+        let task = spec(&repo, vec!["docs/cert.md"], None);
+        let first = run_task(
+            task,
+            &FailingPlanner {
+                kind: "broker-failed",
+            },
+            &InlineValidator,
+        )
+        .expect_err("simulated planner failure leaves partial receipt");
+        assert_eq!(first.kind, "broker-failed");
+        assert!(repo
+            .join(".claw/runnable-task-bridge/cert-task/task-acceptance.json")
+            .is_file());
+
+        let planner = StubPlanner {
+            output: valid_planner_output(&repo, "docs/cert.md"),
+        };
+        let second = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("retry succeeds with only bridge-owned receipt dirt");
+        assert_eq!(second["ok"], true);
+        assert_eq!(second["actual_changed_paths"], json!(["docs/cert.md"]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bridge_receipts_are_private() {
+        let repo = git_repo("private-modes");
+        let planner = StubPlanner {
+            output: valid_planner_output(&repo, "docs/cert.md"),
+        };
+        let result = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("task succeeds");
+        let receipt_dir = PathBuf::from(result["receipt_dir"].as_str().unwrap());
+        let dir_mode = fs::metadata(&receipt_dir).unwrap().permissions().mode() & 0o777;
+        let after_mode = fs::metadata(receipt_dir.join("after.bin"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let planner_mode = fs::metadata(receipt_dir.join("planner-output.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(after_mode, 0o600);
+        assert_eq!(planner_mode, 0o600);
     }
 
     #[test]
