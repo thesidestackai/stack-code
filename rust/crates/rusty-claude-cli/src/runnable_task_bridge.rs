@@ -54,6 +54,7 @@ struct NormalizedTask {
     task_id: String,
     objective: String,
     worktree: PathBuf,
+    workspace_binding: String,
     base_sha: String,
     branch: String,
     allowed_paths: Vec<String>,
@@ -72,6 +73,7 @@ struct PlannerRequest {
     task_id: String,
     objective: String,
     worktree: PathBuf,
+    workspace_binding: String,
     base_sha: String,
     allowed_paths: Vec<String>,
     target_path: String,
@@ -188,6 +190,7 @@ fn run_task(
         task_id: task.task_id.clone(),
         objective: task.objective.clone(),
         worktree: task.worktree.clone(),
+        workspace_binding: task.workspace_binding.clone(),
         base_sha: task.base_sha.clone(),
         allowed_paths: task.allowed_paths.clone(),
         target_path: task.target_path.clone(),
@@ -205,6 +208,7 @@ fn run_task(
             "timestamp": timestamp(),
             "status": "received",
             "worktree": task.worktree,
+            "workspace_binding": task.workspace_binding,
             "base_sha": task.base_sha,
             "caller_id": task.caller_id,
             "broker_route": candidate.broker_route,
@@ -226,6 +230,7 @@ fn run_task(
             "timestamp": timestamp(),
             "status": "valid",
             "worktree": task.worktree,
+            "workspace_binding": task.workspace_binding,
             "base_sha": task.base_sha,
             "caller_id": task.caller_id,
             "broker_route": task.broker_url,
@@ -400,6 +405,7 @@ fn normalize_task(spec: RunnableTaskSpec) -> Result<NormalizedTask, BridgeRefusa
         return Err(refusal("task-type-unsupported", "task_type must be code"));
     }
     let worktree = canonical_worktree(&spec.worktree)?;
+    let workspace_binding = expected_workspace_binding(&worktree)?;
     let base_sha = git_stdout(&worktree, &["rev-parse", "HEAD"])?;
     let branch = git_stdout(&worktree, &["branch", "--show-current"])?;
     if branch.is_empty() {
@@ -438,6 +444,7 @@ fn normalize_task(spec: RunnableTaskSpec) -> Result<NormalizedTask, BridgeRefusa
         task_id: spec.task_id,
         objective: spec.objective,
         worktree,
+        workspace_binding,
         base_sha,
         branch,
         allowed_paths,
@@ -456,8 +463,10 @@ impl PlannerClient for PythonBrokerPlanner {
     fn request_plan(&self, request: &PlannerRequest) -> Result<PlannerCandidate, BridgeRefusal> {
         let context_path = write_context_summary(request)?;
         let composed_task = format!(
-            "{}\n\nAllowed paths: {}\nTarget path: {}\nReturn candidate_files containing only the allowed target path.",
+            "{}\n\nPlanner output task_id must be exactly {}.\nPlanner output workspace_root must be exactly {}.\nAllowed paths: {}\nTarget path: {}\nReturn candidate_files containing only the allowed target path.",
             request.objective.trim(),
+            request.task_id,
+            request.workspace_binding,
             request.allowed_paths.join(", "),
             request.target_path
         );
@@ -554,6 +563,39 @@ fn verify_planner_paths(task: &NormalizedTask, candidate_json: &str) -> Result<(
             format!("planner output was not valid JSON after validator pass: {e}"),
         )
     })?;
+    let task_id = doc.get("task_id").and_then(Value::as_str).ok_or_else(|| {
+        refusal(
+            "planner-output-task-id-missing",
+            "planner output task_id missing",
+        )
+    })?;
+    if task_id != task.task_id {
+        return Err(refusal(
+            "planner-output-task-id-mismatch",
+            format!(
+                "planner output task_id {task_id} did not match {}",
+                task.task_id
+            ),
+        ));
+    }
+    let workspace_root = doc
+        .get("workspace_root")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            refusal(
+                "planner-output-workspace-root-missing",
+                "planner output workspace_root missing",
+            )
+        })?;
+    if workspace_root != task.workspace_binding {
+        return Err(refusal(
+            "planner-output-workspace-root-mismatch",
+            format!(
+                "planner output workspace_root {workspace_root} did not match {}",
+                task.workspace_binding
+            ),
+        ));
+    }
     let candidates = doc
         .get("candidate_files")
         .and_then(Value::as_array)
@@ -1094,6 +1136,22 @@ fn validate_task_id(task_id: &str) -> Result<(), BridgeRefusal> {
     }
 }
 
+fn expected_workspace_binding(worktree: &Path) -> Result<String, BridgeRefusal> {
+    let Some(name) = worktree.file_name().and_then(|value| value.to_str()) else {
+        return Err(refusal(
+            "worktree-binding-invalid",
+            "task worktree must have a UTF-8 final path component",
+        ));
+    };
+    if name.is_empty() || matches!(name, "." | "..") || name.contains('/') || name.contains('\\') {
+        return Err(refusal(
+            "worktree-binding-invalid",
+            "task worktree final path component is not a safe workspace binding",
+        ));
+    }
+    Ok(name.to_string())
+}
+
 fn reject_secret_like_candidate(candidate: &str) -> Result<(), BridgeRefusal> {
     let forbidden = ["114", "34"].concat();
     if candidate.contains(&forbidden) {
@@ -1128,7 +1186,8 @@ fn write_context_summary(request: &PlannerRequest) -> Result<PathBuf, BridgeRefu
     let payload = json!({
         "schema_version": "stack-code-runnable-task-context.v1",
         "task_id": request.task_id,
-        "workspace_root": request.worktree,
+        "workspace_root": request.workspace_binding,
+        "worktree": request.worktree,
         "base_sha": request.base_sha,
         "allowed_paths": request.allowed_paths,
         "target_path": request.target_path,
@@ -1302,7 +1361,7 @@ mod tests {
             .as_nanos();
         let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "stack-code-task-bridge-{label}-{}-{nanos}-{seq}",
+            "stack-code-bridge-{label}-{}-{nanos}-{seq}",
             std::process::id()
         ));
         fs::create_dir_all(&dir).expect("create temp dir");
@@ -1340,11 +1399,19 @@ mod tests {
         dir
     }
 
-    fn valid_planner_output(path: &str) -> String {
+    fn workspace_binding_for_test(worktree: &Path) -> String {
+        worktree
+            .file_name()
+            .and_then(|value| value.to_str())
+            .expect("test worktree has utf-8 name")
+            .to_string()
+    }
+
+    fn valid_planner_output(worktree: &Path, path: &str) -> String {
         serde_json::to_string(&json!({
             "schema_version": "a2-l4-planner-output.v1",
             "task_id": "cert-task",
-            "workspace_root": ".",
+            "workspace_root": workspace_binding_for_test(worktree),
             "task_summary": "create certification document",
             "plan_steps": [{"step_id": "step-1", "description": "write the allowed file"}],
             "risk_notes": [],
@@ -1377,7 +1444,7 @@ mod tests {
     fn valid_single_file_mutation_applies_and_emits_package_handoff() {
         let repo = git_repo("valid");
         let planner = StubPlanner {
-            output: valid_planner_output("docs/cert.md"),
+            output: valid_planner_output(&repo, "docs/cert.md"),
         };
         let result = run_task(
             spec(&repo, vec!["docs/cert.md"], None),
@@ -1401,7 +1468,7 @@ mod tests {
         fs::create_dir_all(&repo_dir).expect("create disposable worktree fixture");
         let repo = git_repo_at(repo_dir.canonicalize().expect("canonicalize fixture"));
         let planner = StubPlanner {
-            output: valid_planner_output("docs/cert.md"),
+            output: valid_planner_output(&repo, "docs/cert.md"),
         };
         let result = run_task(
             spec(&repo, vec!["docs/cert.md"], None),
@@ -1444,7 +1511,7 @@ mod tests {
     fn multiple_allowed_files_are_accepted_when_target_is_explicit() {
         let repo = git_repo("multiple-allowed");
         let planner = StubPlanner {
-            output: valid_planner_output("docs/cert.md"),
+            output: valid_planner_output(&repo, "docs/cert.md"),
         };
         let result = run_task(
             spec(
@@ -1463,7 +1530,7 @@ mod tests {
     fn unauthorized_candidate_file_is_rejected_before_apply() {
         let repo = git_repo("unauthorized");
         let planner = StubPlanner {
-            output: valid_planner_output("docs/other.md"),
+            output: valid_planner_output(&repo, "docs/other.md"),
         };
         let err = run_task(
             spec(&repo, vec!["docs/cert.md"], None),
@@ -1476,12 +1543,48 @@ mod tests {
     }
 
     #[test]
+    fn stale_planner_task_id_is_rejected_before_apply() {
+        let repo = git_repo("stale-plan-id");
+        let mut output: Value =
+            serde_json::from_str(&valid_planner_output(&repo, "docs/cert.md")).unwrap();
+        output["task_id"] = json!("other-task");
+        let err = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &StubPlanner {
+                output: output.to_string(),
+            },
+            &InlineValidator,
+        )
+        .expect_err("stale task identity must fail");
+        assert_eq!(err.kind, "planner-output-task-id-mismatch");
+        assert!(!repo.join("docs/cert.md").exists());
+    }
+
+    #[test]
+    fn stale_planner_workspace_root_is_rejected_before_apply() {
+        let repo = git_repo("stale-workspace");
+        let mut output: Value =
+            serde_json::from_str(&valid_planner_output(&repo, "docs/cert.md")).unwrap();
+        output["workspace_root"] = json!("other-worktree");
+        let err = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &StubPlanner {
+                output: output.to_string(),
+            },
+            &InlineValidator,
+        )
+        .expect_err("stale workspace identity must fail");
+        assert_eq!(err.kind, "planner-output-workspace-root-mismatch");
+        assert!(!repo.join("docs/cert.md").exists());
+    }
+
+    #[test]
     fn absolute_path_is_rejected() {
         let repo = git_repo("absolute");
         let err = run_task(
             spec(&repo, vec!["/tmp/out.md"], None),
             &StubPlanner {
-                output: valid_planner_output("docs/cert.md"),
+                output: valid_planner_output(&repo, "docs/cert.md"),
             },
             &InlineValidator,
         )
@@ -1495,7 +1598,7 @@ mod tests {
         let err = run_task(
             spec(&repo, vec!["../out.md"], None),
             &StubPlanner {
-                output: valid_planner_output("docs/cert.md"),
+                output: valid_planner_output(&repo, "docs/cert.md"),
             },
             &InlineValidator,
         )
@@ -1514,7 +1617,7 @@ mod tests {
         let err = run_task(
             spec(&repo, vec!["docs/cert.md"], None),
             &StubPlanner {
-                output: valid_planner_output("docs/cert.md"),
+                output: valid_planner_output(&repo, "docs/cert.md"),
             },
             &InlineValidator,
         )
@@ -1529,7 +1632,7 @@ mod tests {
         let err = run_task(
             spec(&repo, vec!["docs/cert.md"], None),
             &StubPlanner {
-                output: valid_planner_output("docs/cert.md"),
+                output: valid_planner_output(&repo, "docs/cert.md"),
             },
             &InlineValidator,
         )
@@ -1560,7 +1663,7 @@ mod tests {
         let err = run_task(
             task,
             &StubPlanner {
-                output: valid_planner_output("docs/cert.md"),
+                output: valid_planner_output(&repo, "docs/cert.md"),
             },
             &InlineValidator,
         )
@@ -1576,7 +1679,7 @@ mod tests {
         let err = run_task(
             task,
             &StubPlanner {
-                output: valid_planner_output("docs/cert.md"),
+                output: valid_planner_output(&repo, "docs/cert.md"),
             },
             &InlineValidator,
         )
@@ -1592,7 +1695,7 @@ mod tests {
         let err = run_task(
             task,
             &StubPlanner {
-                output: valid_planner_output("docs/cert.md"),
+                output: valid_planner_output(&repo, "docs/cert.md"),
             },
             &InlineValidator,
         )
@@ -1604,7 +1707,7 @@ mod tests {
     fn completed_task_id_is_idempotent() {
         let repo = git_repo("idempotent");
         let planner = StubPlanner {
-            output: valid_planner_output("docs/cert.md"),
+            output: valid_planner_output(&repo, "docs/cert.md"),
         };
         let task = spec(&repo, vec!["docs/cert.md"], None);
         let first = run_task(task, &planner, &InlineValidator).expect("first run succeeds");
