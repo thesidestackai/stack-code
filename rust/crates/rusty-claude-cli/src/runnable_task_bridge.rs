@@ -255,6 +255,7 @@ fn run_task(
         "package-control-preflight.json",
         &pre_apply_package_control_gate,
     )?;
+    let approved_lane_path = write_approved_lane(&task)?;
 
     let after_path = task.receipt_dir.join("after.bin");
     write_file_new(&after_path, task.after_text.as_bytes())?;
@@ -340,7 +341,6 @@ fn run_task(
         &validation_receipt(&task),
     )?;
 
-    let approved_lane_path = write_approved_lane(&task)?;
     let package_plan_gate = run_package_plan_gate(&task, &approved_lane_path)?;
     write_receipt(
         &task.receipt_dir,
@@ -1235,11 +1235,11 @@ fn resume_applied_task_if_current(task: &NormalizedTask) -> Result<Option<Value>
     if expected != actual {
         return Ok(None);
     }
-    let approved_lane_path = task.receipt_dir.join("approved-lane.json");
-    let apply_result_path = task.receipt_dir.join("a2-apply-result.json");
-    if !approved_lane_path.is_file() || !apply_result_path.is_file() {
-        return Ok(None);
-    }
+    let approved_lane_path = if task.receipt_dir.join("approved-lane.json").is_file() {
+        task.receipt_dir.join("approved-lane.json")
+    } else {
+        write_approved_lane(task)?
+    };
     let changed_paths = verify_changed_paths(task)?;
     run_validation(task)?;
     write_receipt_if_absent(
@@ -1312,7 +1312,7 @@ fn verify_clean_start(task: &NormalizedTask) -> Result<(), BridgeRefusal> {
         .lines()
         .filter(|line| {
             let path = porcelain_path(line);
-            !path.starts_with(&receipt_prefix)
+            !is_bridge_owned_retry_artifact(task, path, &receipt_prefix)
         })
         .collect();
     if non_bridge_status.is_empty() {
@@ -1326,6 +1326,21 @@ fn verify_clean_start(task: &NormalizedTask) -> Result<(), BridgeRefusal> {
             ),
         ))
     }
+}
+
+fn is_bridge_owned_retry_artifact(task: &NormalizedTask, path: &str, receipt_prefix: &str) -> bool {
+    if path.starts_with(receipt_prefix) {
+        return true;
+    }
+    task.receipt_dir.exists()
+        && [
+            ".claw/l2b-checkpoints/",
+            ".claw/l2b-payloads/",
+            ".claw/l2b-preview-bundles/",
+            ".claw/l2b-runs/",
+        ]
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
 }
 
 fn verify_changed_paths(task: &NormalizedTask) -> Result<Vec<String>, BridgeRefusal> {
@@ -1592,8 +1607,7 @@ fn expected_workspace_binding(worktree: &Path) -> Result<String, BridgeRefusal> 
 }
 
 fn reject_secret_like_candidate(candidate: &str) -> Result<(), BridgeRefusal> {
-    let forbidden = ["114", "34"].concat();
-    if candidate.contains(&forbidden) {
+    if contains_raw_upstream_endpoint(candidate) {
         return Err(refusal(
             "planner-output-raw-upstream-refused",
             "planner output referenced the raw upstream port",
@@ -1626,6 +1640,21 @@ fn reject_secret_like_candidate(candidate: &str) -> Result<(), BridgeRefusal> {
         ));
     }
     Ok(())
+}
+
+fn contains_raw_upstream_endpoint(candidate: &str) -> bool {
+    let lower = candidate.to_ascii_lowercase();
+    lower.match_indices(":11434").any(|(idx, _)| {
+        let before_ok = lower[..idx]
+            .chars()
+            .next_back()
+            .is_some_and(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | ']' | '-'));
+        let after_ok = lower[idx + ":11434".len()..]
+            .chars()
+            .next()
+            .is_none_or(|ch| !ch.is_ascii_digit());
+        before_ok && after_ok
+    })
 }
 
 fn contains_prefixed_token_shape(text: &str, prefix: &str, min_tail_len: usize) -> bool {
@@ -2113,6 +2142,42 @@ mod tests {
     }
 
     #[test]
+    fn task_id_with_raw_port_digits_is_allowed() {
+        let repo = git_repo("task-port-digits");
+        let mut task = spec(&repo, vec!["docs/cert.md"], None);
+        task.task_id = "task-11434".to_string();
+        let mut output: Value =
+            serde_json::from_str(&valid_planner_output(&repo, "docs/cert.md")).unwrap();
+        output["task_id"] = json!("task-11434");
+        let result = run_task(
+            task,
+            &StubPlanner {
+                output: serde_json::to_string(&output).unwrap(),
+            },
+            &InlineValidator,
+        )
+        .expect("bare digits in task metadata must not look like an endpoint");
+        assert_eq!(result["ok"], true);
+    }
+
+    #[test]
+    fn planner_output_raw_upstream_endpoint_is_refused() {
+        let repo = git_repo("raw-endpoint");
+        let mut output: Value =
+            serde_json::from_str(&valid_planner_output(&repo, "docs/cert.md")).unwrap();
+        output["risk_notes"] = json!(["do not call http://localhost:11434/v1"]);
+        let err = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &StubPlanner {
+                output: serde_json::to_string(&output).unwrap(),
+            },
+            &InlineValidator,
+        )
+        .expect_err("raw upstream endpoint must be refused");
+        assert_eq!(err.kind, "planner-output-raw-upstream-refused");
+    }
+
+    #[test]
     fn credential_shaped_planner_json_is_refused() {
         let repo = git_repo("secret-shaped");
         let mut output: Value =
@@ -2330,6 +2395,39 @@ mod tests {
         .expect("retry succeeds with only bridge-owned receipt dirt");
         assert_eq!(second["ok"], true);
         assert_eq!(second["actual_changed_paths"], json!(["docs/cert.md"]));
+    }
+
+    #[test]
+    fn bridge_owned_a2_artifacts_do_not_block_retry() {
+        let repo = git_repo("retry-a2-artifacts");
+        let normalized =
+            normalize_task(spec(&repo, vec!["docs/cert.md"], None)).expect("task normalizes");
+        create_dir_0700(&normalized.receipt_dir).expect("receipt dir exists");
+        write_receipt(
+            &normalized.receipt_dir,
+            "task-acceptance.json",
+            &task_acceptance_receipt(&normalized, "accepted"),
+        )
+        .expect("partial receipt written");
+        for rel in [
+            ".claw/l2b-checkpoints/run/step/manifest.json",
+            ".claw/l2b-payloads/run/step/after.bin",
+            ".claw/l2b-preview-bundles/run/step/preview-bundle.json",
+            ".claw/l2b-runs/run/status.json",
+        ] {
+            let path = repo.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "{}\n").unwrap();
+        }
+        let err = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &FailingPlanner {
+                kind: "broker-failed-after-a2-artifacts",
+            },
+            &InlineValidator,
+        )
+        .expect_err("retry should reach planner despite bridge-owned A2 artifacts");
+        assert_eq!(err.kind, "broker-failed-after-a2-artifacts");
     }
 
     #[cfg(unix)]
@@ -2552,7 +2650,7 @@ mod tests {
     }
 
     #[test]
-    fn applied_task_without_completion_receipt_can_resume() {
+    fn applied_task_without_completion_receipts_can_resume() {
         let repo = git_repo("resume-applied");
         let planner = StubPlanner {
             output: valid_planner_output(&repo, "docs/cert.md"),
@@ -2567,6 +2665,8 @@ mod tests {
         fs::remove_file(receipt_dir.join("task-complete.json")).unwrap();
         fs::remove_file(receipt_dir.join("package-plan-readiness.json")).unwrap();
         fs::remove_file(receipt_dir.join("package-handoff-readiness.json")).unwrap();
+        fs::remove_file(receipt_dir.join("approved-lane.json")).unwrap();
+        fs::remove_file(receipt_dir.join("a2-apply-result.json")).unwrap();
         let resumed = run_task(
             spec(&repo, vec!["docs/cert.md"], None),
             &FailingPlanner {
@@ -2576,6 +2676,7 @@ mod tests {
         )
         .expect("existing A2-applied task resumes without replanning");
         assert_eq!(resumed["status"], "applied");
+        assert!(receipt_dir.join("approved-lane.json").is_file());
         assert!(receipt_dir.join("task-complete.json").is_file());
         assert!(receipt_dir.join("package-plan-readiness.json").is_file());
         assert!(receipt_dir.join("package-handoff-readiness.json").is_file());
