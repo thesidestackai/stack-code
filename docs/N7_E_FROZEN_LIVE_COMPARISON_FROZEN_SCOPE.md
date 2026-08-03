@@ -474,16 +474,22 @@ Base-row ordering addendum count: 0 new behavior IDs, 0 new `it()` blocks,
 card; use `extractN7Section(html)`; assert the head row, base row, CI
 section, and review section all exist using `data-testid="n7-head-comparison"`,
 `data-testid="n7-base-comparison"`, `data-testid="n7-ci"`, and
-`data-testid="n7-review"`; record those semantic positions as `headStart`,
-`baseStart`, `ciStart`, and `reviewStart`; assert each position is present,
-`headStart < baseStart`, `baseStart < ciStart`, and
-`baseStart < reviewStart`; determine `headElementEnd` from the verified
-current head-row element type (`<p>`) by locating the closing `</p>` after
-`headStart`, so the boundary is the end of the complete head row rather than
-the opening tag; use the `n7-base-comparison` occurrence after
-`headElementEnd` as the adjacent base row; and assert
-`betweenHeadAndBase = section.slice(headElementEnd, baseStart)` is
-whitespace-only. This proves semantic adjacency without depending on newline
+`data-testid="n7-review"`; record the head, CI, and review semantic positions
+as `headStart`, `ciStart`, and `reviewStart`; determine `headElementEnd` from
+the verified current head-row element type (`<p>`) by
+locating the closing `</p>` after `headStart`, so the boundary is the end of
+the complete head row rather than the opening tag; locate the
+`n7-base-comparison` attribute occurrence after `headElementEnd` as
+`baseAttrStart`; derive the adjacent base row opening boundary as
+`baseElementStart` from the complete `<p ...>` element that owns
+`baseAttrStart` (for the frozen renderer shape, a boundary-safe equivalent is
+the nearest preceding `<p` for that attribute inside the extracted N7 section);
+assert every position is present, `headStart < baseElementStart`,
+`baseElementStart < ciStart`, and `baseElementStart < reviewStart`; and assert
+`betweenHeadAndBase = section.slice(headElementEnd, baseElementStart)` is
+whitespace-only. Slicing to `baseAttrStart` is forbidden because it includes
+the base row's opening `<p ` prefix and would reject conforming adjacent
+rendering. This proves semantic adjacency without depending on newline
 placement, indentation, pretty-printing, or one-tag-per-line formatting, and
 rejects any CI, review, comparison-detail, text, or other element content
 between the head and base rows.
@@ -713,17 +719,21 @@ N7-E is complete when:
    comparison row. The existing
    `head_comparison_renders_before_ci_and_review` test carries the ordering
    addendum: `n7-head-comparison`, `n7-base-comparison`, `n7-ci`, and
-   `n7-review` must all exist; their positions are recorded as `headStart`,
-   `baseStart`, `ciStart`, and `reviewStart`; `headStart < baseStart`,
-   `baseStart < ciStart`, and `baseStart < reviewStart`; `headElementEnd` is
-   determined from the verified current head-row `<p>` element by locating the
-   closing `</p>` after `headStart`; the adjacent base row is the
-   `n7-base-comparison` occurrence after `headElementEnd`; and
-   `section.slice(headElementEnd, baseStart)` must be whitespace-only. This
-   semantic complete-element boundary check does not depend on newline
-   placement, indentation, pretty-printing, or one-tag-per-line formatting, and
-   no CI, review, comparison-detail, text, or other element content may occur
-   between the complete head row and the base row.
+   `n7-review` must all exist; `headStart`, `ciStart`, and `reviewStart`
+   record those semantic positions; `headElementEnd` is determined from the
+   verified current head-row `<p>` element by locating the closing `</p>` after
+   `headStart`; `baseAttrStart` records the `n7-base-comparison` attribute
+   occurrence after `headElementEnd`; `baseElementStart` records the opening
+   `<p` boundary for the complete base row that owns `baseAttrStart`;
+   `headStart < baseElementStart`, `baseElementStart < ciStart`, and
+   `baseElementStart < reviewStart`; and
+   `section.slice(headElementEnd, baseElementStart)` must be whitespace-only.
+   The test must not slice to `baseAttrStart`, because that slice includes the
+   base row's opening `<p ` prefix. This semantic complete-element boundary
+   check does not depend on newline placement, indentation, pretty-printing, or
+   one-tag-per-line formatting, and no CI, review, comparison-detail, text, or
+   other element content may occur between the complete head row and the base
+   row.
 3. All 15 acceptance behaviors in §15 are covered and passing through the
    exact existing, new, or extended test mappings recorded in the matrix.
    Only rows marked `NEW_TEST` or `EXTEND_EXISTING_TEST` require normative
