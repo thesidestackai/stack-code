@@ -9,6 +9,7 @@
 mod init;
 mod input;
 mod render;
+mod runnable_task_bridge;
 
 use std::collections::BTreeSet;
 use std::env;
@@ -590,6 +591,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 approval_result_path.as_deref(),
                 &mut stdout_lock,
             );
+            std::process::exit(code);
+        }
+        CliAction::TaskRun { task_spec } => {
+            let stdout = std::io::stdout();
+            let mut stdout_lock = stdout.lock();
+            let code = runnable_task_bridge::run_task_command(&task_spec, &mut stdout_lock);
             std::process::exit(code);
         }
     }
@@ -3679,6 +3686,12 @@ enum CliAction {
         workspace_root: PathBuf,
         approval_result_path: Option<PathBuf>,
     },
+    // Stack-Code runnable local task bridge. Drives broker-routed
+    // planning, validated planner output, existing A2 preview/apply
+    // evidence, and package-rung handoff readiness for one bounded task.
+    TaskRun {
+        task_spec: PathBuf,
+    },
 }
 
 /// A2-L1b CLI report-format selector. Separate enum from `CliOutputFormat`
@@ -4103,6 +4116,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         // A2-L1b: `claw plan run <file>` read-only plan runner. Purely
         // additive — no other CliAction match arm is altered.
         "plan" => parse_plan_subcommand_args(&rest[1..]),
+        "task" => parse_task_subcommand_args(&rest[1..]),
         "prompt" => {
             let prompt = rest[1..].join(" ");
             if prompt.trim().is_empty() {
@@ -4171,6 +4185,28 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             })
         }
     }
+}
+
+fn parse_task_subcommand_args(args: &[String]) -> Result<CliAction, String> {
+    match args.first().map(String::as_str) {
+        Some("run") => {}
+        Some(other) => {
+            return Err(format!(
+                "unsupported `claw task` subcommand: {other}. Use `claw task run <task.json>`."
+            ));
+        }
+        None => {
+            return Err(
+                "missing `claw task` subcommand. Use `claw task run <task.json>`.".to_string(),
+            );
+        }
+    }
+    let tail = &args[1..];
+    if tail.len() != 1 {
+        return Err("Usage: `claw task run <task.json>`.".to_string());
+    }
+    let task_spec = PathBuf::from(&tail[0]);
+    Ok(CliAction::TaskRun { task_spec })
 }
 
 fn parse_local_help_action(rest: &[String]) -> Option<Result<CliAction, String>> {
@@ -17976,6 +18012,44 @@ mod dump_manifests_tests {
 // All tests stay in dry-run mode (no wrapper subprocess) OR point `--wrapper`
 // at a non-existent path (graceful substrate-unavailable, still no live call).
 // =============================================================================
+
+#[cfg(test)]
+mod task_run_cli_tests {
+    use super::*;
+
+    fn args(tokens: &[&str]) -> Vec<String> {
+        tokens.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn task_run_parses_with_exact_task_spec_path() {
+        let action = parse_args(&args(&["task", "run", "/tmp/task.json"])).unwrap();
+        match action {
+            CliAction::TaskRun { task_spec } => {
+                assert_eq!(task_spec, PathBuf::from("/tmp/task.json"));
+            }
+            other => panic!("expected CliAction::TaskRun, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_run_requires_subcommand() {
+        let err = parse_args(&args(&["task"])).unwrap_err();
+        assert!(err.contains("missing `claw task` subcommand"));
+    }
+
+    #[test]
+    fn task_run_rejects_unknown_subcommand() {
+        let err = parse_args(&args(&["task", "apply", "/tmp/task.json"])).unwrap_err();
+        assert!(err.contains("unsupported `claw task` subcommand"));
+    }
+
+    #[test]
+    fn task_run_rejects_extra_arguments() {
+        let err = parse_args(&args(&["task", "run", "/tmp/task.json", "--extra"])).unwrap_err();
+        assert!(err.contains("Usage: `claw task run <task.json>`"));
+    }
+}
 
 #[cfg(test)]
 mod plan_run_cli_tests {
