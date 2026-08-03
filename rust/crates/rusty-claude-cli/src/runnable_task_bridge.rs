@@ -1309,22 +1309,6 @@ mod tests {
         dir.canonicalize().expect("canonicalize temp dir")
     }
 
-    fn unique_vast_worktree_dir(label: &str) -> PathBuf {
-        let root = Path::new("/mnt/vast-data/git-worktrees");
-        assert!(root.is_dir(), "canonical worktree root missing");
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock sane")
-            .as_nanos();
-        let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = root.join(format!(
-            "stack-code-task-bridge-{label}-{}-{nanos}-{seq}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&dir).expect("create vast worktree dir");
-        dir.canonicalize().expect("canonicalize vast worktree dir")
-    }
-
     fn git(worktree: &Path, args: &[&str]) {
         let output = Command::new("git")
             .arg("-C")
@@ -1343,10 +1327,6 @@ mod tests {
 
     fn git_repo(label: &str) -> PathBuf {
         git_repo_at(unique_temp_dir(label))
-    }
-
-    fn vast_git_repo(label: &str) -> PathBuf {
-        git_repo_at(unique_vast_worktree_dir(label))
     }
 
     fn git_repo_at(dir: PathBuf) -> PathBuf {
@@ -1416,7 +1396,10 @@ mod tests {
 
     #[test]
     fn approved_lane_is_accepted_by_tier4_package_plan() {
-        let repo = vast_git_repo("package-plan");
+        let disposable_root = unique_temp_dir("package-plan-root");
+        let repo_dir = disposable_root.join("package-plan-worktree");
+        fs::create_dir_all(&repo_dir).expect("create disposable worktree fixture");
+        let repo = git_repo_at(repo_dir.canonicalize().expect("canonicalize fixture"));
         let planner = StubPlanner {
             output: valid_planner_output("docs/cert.md"),
         };
@@ -1436,6 +1419,7 @@ mod tests {
         let script = repo_root.join("scripts/a2-tier3-write-orchestrator.sh");
         let output = Command::new("bash")
             .env("A2_CONTROL_CHECKOUT", &control)
+            .env("A2_DISPOSABLE_WORKTREE_ROOT", &disposable_root)
             .arg(script)
             .arg("package-plan")
             .arg("--worktree")
