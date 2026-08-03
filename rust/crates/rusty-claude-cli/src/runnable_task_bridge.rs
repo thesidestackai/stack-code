@@ -864,6 +864,7 @@ fn final_success_result(
         "timestamp": timestamp(),
         "worktree": task.worktree,
         "base_sha": task.base_sha,
+        "branch": task.branch,
         "caller_id": task.caller_id,
         "broker_route": task.broker_url,
         "resolved_model": task.model,
@@ -913,6 +914,20 @@ fn completed_task_result_if_current(task: &NormalizedTask) -> Result<Option<Valu
             format!("completed receipt was not valid JSON: {e}"),
         )
     })?;
+    if value.get("base_sha").and_then(Value::as_str) != Some(task.base_sha.as_str()) {
+        return Err(refusal(
+            "completed-task-base-mismatch",
+            "task-complete receipt base_sha does not match the current worktree HEAD",
+        ));
+    }
+    if value.get("branch").and_then(Value::as_str) != Some(task.branch.as_str()) {
+        return Err(refusal(
+            "completed-task-branch-mismatch",
+            "task-complete receipt branch does not match the current worktree branch",
+        ));
+    }
+    let changed_paths = verify_changed_paths(task)?;
+    value["actual_changed_paths"] = json!(changed_paths);
     value["status"] = Value::String("idempotent_complete".to_string());
     Ok(Some(value))
 }
@@ -1240,15 +1255,37 @@ fn reject_secret_like_candidate(candidate: &str) -> Result<(), BridgeRefusal> {
             "planner output contained key-block shaped text",
         ));
     }
-    for marker in ["sk-", "ghp_", "gho_", "ghu_", "ghs_", "ghr_"] {
-        if candidate.contains(marker) {
-            return Err(refusal(
-                "planner-output-secret-like-refused",
-                "planner output contained token-shaped text",
-            ));
-        }
+    if contains_prefixed_token_shape(candidate, "sk-", 16)
+        || ["ghp_", "gho_", "ghu_", "ghs_", "ghr_"]
+            .iter()
+            .any(|prefix| contains_prefixed_token_shape(candidate, prefix, 20))
+    {
+        return Err(refusal(
+            "planner-output-secret-like-refused",
+            "planner output contained token-shaped text",
+        ));
     }
     Ok(())
+}
+
+fn contains_prefixed_token_shape(text: &str, prefix: &str, min_tail_len: usize) -> bool {
+    text.match_indices(prefix).any(|(idx, _)| {
+        let before_ok = text[..idx]
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !is_word_char(ch));
+        let tail = &text[idx + prefix.len()..];
+        let token_len = tail.chars().take_while(char::is_ascii_alphanumeric).count();
+        let after_ok = tail
+            .chars()
+            .nth(token_len)
+            .is_none_or(|ch| !is_word_char(ch));
+        before_ok && after_ok && token_len >= min_tail_len
+    })
+}
+
+fn is_word_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
 }
 
 fn write_context_summary(request: &PlannerRequest) -> Result<PathBuf, BridgeRefusal> {
@@ -1607,6 +1644,41 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_sk_substring_in_planner_json_is_allowed() {
+        let repo = git_repo("ordinary-sk");
+        let planner = StubPlanner {
+            output: valid_planner_output(&repo, "docs/task-notes.md"),
+        };
+        let result = run_task(
+            spec(&repo, vec!["docs/task-notes.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("ordinary task-notes path must not look credential-shaped");
+        assert_eq!(
+            result["actual_changed_paths"],
+            json!(["docs/task-notes.md"])
+        );
+    }
+
+    #[test]
+    fn credential_shaped_planner_json_is_refused() {
+        let repo = git_repo("secret-shaped");
+        let mut output: Value =
+            serde_json::from_str(&valid_planner_output(&repo, "docs/cert.md")).unwrap();
+        output["risk_notes"] = json!(["sk-ABCDEFGHIJKLMNOP"]);
+        let err = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &StubPlanner {
+                output: serde_json::to_string(&output).unwrap(),
+            },
+            &InlineValidator,
+        )
+        .expect_err("credential-shaped planner output must be refused");
+        assert_eq!(err.kind, "planner-output-secret-like-refused");
+    }
+
+    #[test]
     fn approved_lane_is_accepted_by_tier4_package_plan() {
         let disposable_root = unique_temp_dir("package-plan-root");
         let repo_dir = disposable_root.join("package-plan-worktree");
@@ -1952,5 +2024,23 @@ mod tests {
         let second =
             run_task(second_task, &planner, &InlineValidator).expect("second run succeeds");
         assert_eq!(second["status"], "idempotent_complete");
+    }
+
+    #[test]
+    fn cached_completion_revalidates_current_changed_paths() {
+        let repo = git_repo("idempotent-drift");
+        let planner = StubPlanner {
+            output: valid_planner_output(&repo, "docs/cert.md"),
+        };
+        let task = spec(&repo, vec!["docs/cert.md"], None);
+        run_task(task, &planner, &InlineValidator).expect("first run succeeds");
+        fs::write(repo.join("docs/unrelated.md"), "unexpected\n").unwrap();
+        let err = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect_err("cached completion must not hide unrelated drift");
+        assert_eq!(err.kind, "changed-paths-mismatch");
     }
 }
