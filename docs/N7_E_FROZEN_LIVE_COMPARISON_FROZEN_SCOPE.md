@@ -97,8 +97,8 @@ Full matrix retained at (session-scoped evidence, not part of this commit):
 Summary (24 requirements classified; full detail and file/test citations are
 in the retained evidence file):
 
-- **IMPLEMENTED (20)**: schema validation; live-snapshot adapter (interface + parsing, not wired to a live transport); frozen-snapshot persistence (module, not wired); identity binding; requested-PR identity; head comparison (derivation and badge); base comparison (derivation only); CI exact-head correlation (derivation and badge); old-head CI handling; review comparison (derivation and badge); mergeability (derivation + blocker); freshness/staleness (derivation + blocker + `FROZEN_STALE` state); 18-state precedence; "old approval never applies to new head"; next permitted action; display badges; unknown/partial handling; arbitrary-runtime rendering safety; PR mutation controls (correctly absent).
-- **NOT_IMPLEMENTED — the genuine remaining gap (1)**: base comparison lacks the always-visible confirmation badge that head, CI, and review comparisons already have. It is currently visible only via the blockers list, i.e. only when it is `DRIFT` — never confirmed as `MATCH`.
+- **IMPLEMENTED (20)**: schema validation; live-snapshot adapter (interface + parsing, not wired to a live transport); frozen-snapshot persistence (module, not wired); identity binding; requested-PR identity; head comparison (derivation and badge); base comparison (derivation plus indirect `DRIFT`/`UNKNOWN` list surfacing); CI exact-head correlation (derivation and badge); old-head CI handling; review comparison (derivation and badge); mergeability (derivation + blocker); freshness/staleness (derivation + blocker + `FROZEN_STALE` state); 18-state precedence; "old approval never applies to new head"; next permitted action; display badges; unknown/partial handling; arbitrary-runtime rendering safety; PR mutation controls (correctly absent).
+- **NOT_IMPLEMENTED — the genuine remaining gap (1)**: base comparison lacks the dedicated always-visible confirmation badge that head, CI, and review comparisons already have. The current implementation exposes base-comparison information indirectly for non-`MATCH` cases: `DRIFT` contributes `BASE_DRIFT` to blockers, `UNKNOWN` contributes `current_base_vs_frozen_base` to unknowns, and `MATCH` has no current presentation. None of the three states has a dedicated normalized base-comparison row.
 - **OUT_OF_N7_E_SCOPE (2)**: a dedicated mergeability badge and a dedicated freshness badge distinct from existing timestamps/blockers — neither is required by the original document's "Always Visible Without Expansion" list.
 - **NOT_IMPLEMENTED — explicitly out of scope (remaining rows)**: extension wiring, `.claw/n7` reads, live refresh execution, freeze-operation execution, timeline rendering, PR mutation — all excluded by the original document's own Non-Goals and by every prior N7 lane's STOP gate.
 
@@ -223,7 +223,7 @@ function n7BaseComparisonBlock(baseComparison: unknown): string {
 | Surface | Already exists (always-visible) | N7-E adds/restructures |
 |---|---|---|
 | Head comparison | YES — `data-testid="n7-head-comparison"`, N7-D P2 repair | none |
-| Base comparison | NO — blocker-only visibility | **adds** `data-testid="n7-base-comparison"`, same pattern |
+| Base comparison | Partial — indirect list visibility only (`DRIFT` via blockers; `UNKNOWN` via unknowns; `MATCH` absent), no dedicated normalized row | **adds** `data-testid="n7-base-comparison"`, same pattern |
 | CI correlation | YES — `data-testid="n7-ci"` / `n7-ci-summary` | none |
 | Review comparison | YES — `data-testid="n7-review"` / `n7-review-summary` | none |
 | Freshness | Partial — timestamps only (`n7-current-captured-at`, `n7-frozen-captured-at`); no dedicated FRESH/STALE badge | none (out of scope, §5) |
@@ -253,10 +253,12 @@ implementation, before any N7-E change):
 - Live-probed: with `baseComparison = "DRIFT"` and a failing required check
   simultaneously, the resulting `view.blockers` array contained
   `BASE_DRIFT`, `CI_FAILED`, and `STATE_BLOCKING_REASON` entries together,
-  confirming blocker-level independence already holds today. N7-E's badge
-  addition gives base comparison the same treatment in its **positive**
-  case (`MATCH`) that it already effectively has in its negative case
-  (`DRIFT`, via the blocker list).
+  confirming blocker-level independence already holds today. The current
+  implementation also represents `UNKNOWN` base comparison indirectly through
+  the `view.unknowns` entry `current_base_vs_frozen_base`; `MATCH` has no
+  corresponding blocker, unknown, badge, row, or other visible base-comparison
+  presentation. N7-E adds the dedicated normalized row for all three states
+  without replacing the existing blocker or unknown derivation.
 
 ## 12. Identity and Evidence Binding
 
