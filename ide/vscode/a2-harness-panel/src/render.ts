@@ -999,6 +999,34 @@ function n7HeadComparisonBlock(headComparison: unknown): string {
   return `  <p data-testid="n7-head-comparison">Head comparison: ${escapeHtml(trusted.copy)}</p>`;
 }
 
+// comparison.baseComparison follows the same runtime-safety rule as
+// comparison.headComparison: arbitrary prebuilt models can pass any value, so
+// the renderer accepts only the three literal states and otherwise emits the
+// fixed UNKNOWN copy. The value chooses text only; it never contributes to
+// selectors, class names, links, or any other structural attribute.
+interface TrustedN7BaseComparison {
+  value: "MATCH" | "DRIFT" | "UNKNOWN";
+  copy: string;
+}
+
+function normalizeN7BaseComparison(value: unknown): TrustedN7BaseComparison {
+  switch (value) {
+    case "MATCH":
+      return { value: "MATCH", copy: "MATCH — current base equals frozen base" };
+    case "DRIFT":
+      return { value: "DRIFT", copy: "DRIFT — current base differs from frozen base" };
+    case "UNKNOWN":
+      return { value: "UNKNOWN", copy: "UNKNOWN — current or frozen base is unavailable" };
+    default:
+      return { value: "UNKNOWN", copy: "UNKNOWN — current or frozen base is unavailable" };
+  }
+}
+
+function n7BaseComparisonBlock(baseComparison: unknown): string {
+  const trusted = normalizeN7BaseComparison(baseComparison);
+  return `  <p data-testid="n7-base-comparison">Base comparison: ${escapeHtml(trusted.copy)}</p>`;
+}
+
 // Missing data always renders explicit text — never an empty string and
 // never an omitted identity.
 function n7ShaLine(testid: string, label: string, sha: string | null, missingText: string): string {
@@ -1118,6 +1146,7 @@ ${titleLine}
 ${n7CurrentIdentityBlock(view)}
 ${n7FrozenIdentityBlock(view)}
 ${n7HeadComparisonBlock(view.comparison.headComparison)}
+${n7BaseComparisonBlock(view.comparison.baseComparison)}
   <p data-testid="n7-comparison-detail">${escapeHtml(view.comparison.detail)}</p>
   <section data-testid="n7-ci">
     <h4>CI</h4>

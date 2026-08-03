@@ -16,6 +16,7 @@
 
 import { FrozenReviewSnapshot, PrLiveSnapshot } from "./n7Schemas";
 import {
+  BaseComparison,
   CiComparisonState,
   HeadComparison,
   N7DerivedStateResult,
@@ -158,6 +159,11 @@ export interface N7PrCardComparisonView {
   // CI_FAILED, REVIEW_BLOCKED) must not hide this independent MATCH/DRIFT/
   // UNKNOWN fact about the current vs. frozen head relationship.
   headComparison: HeadComparison;
+  // Copied directly from input.derived.comparison.baseComparison — never
+  // projected from headComparison, inferred from primaryState, or recomputed
+  // from displayed SHA text. Blocker/unknown derivation remains owned by the
+  // existing N7-A comparison result and its existing consumers below.
+  baseComparison: BaseComparison;
   // Always begins with the severity word ("OK:"/"WARN:"/"STOP:"/
   // "UNKNOWN:"/"TERMINAL:") so the state is legible without relying on
   // color, icon, CSS class, or border.
@@ -417,6 +423,7 @@ export function buildN7PrCardView(input: N7PrCardInput): N7PrCardViewModel {
       primaryState: input.derived.primaryState,
       severity: input.derived.severity,
       headComparison: comparison.headComparison,
+      baseComparison: comparison.baseComparison,
       exactLabel: PRIMARY_STATE_LABELS[input.derived.primaryState],
       detail: input.derived.blockingReason ?? (comparison.reasons.length > 0 ? comparison.reasons.join("; ") : "no blocking condition detected"),
     },
