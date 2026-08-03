@@ -16,7 +16,7 @@ function arbitraryModel(overrides: Partial<N7PrCardViewModel> = {}): N7PrCardVie
     prTitle: null,
     current: { headSha: null, baseSha: null, capturedAt: null, statusLabel: "s" },
     frozen: { headSha: null, baseSha: null, capturedAt: null, statusLabel: "s", freezeId: null },
-    comparison: { primaryState: "UNKNOWN", severity: "UNKNOWN", headComparison: "UNKNOWN", exactLabel: "UNKNOWN: x", detail: "d" },
+    comparison: { primaryState: "UNKNOWN", severity: "UNKNOWN", headComparison: "UNKNOWN", baseComparison: "UNKNOWN", exactLabel: "UNKNOWN: x", detail: "d" },
     ci: { state: "NOT_REQUIRED", headSha: null, summary: "s" },
     review: { state: "UNKNOWN", summary: "s", unresolvedThreadCount: null },
     blockers: [],
@@ -286,6 +286,23 @@ describe("n7 render — state", () => {
     const html = renderWithN7({ live: makeLive({ reviews: { review_decision: "CHANGES_REQUESTED", requested_changes: ["alice"], unresolved_review_threads: { count: 2, complete: true, thread_refs: [] }, blocking_automated_findings: [] } }) });
     assert.ok(html.includes("REVIEW_BLOCKED"));
     assert.ok(html.includes("unresolved thread"));
+
+    const simultaneousView = buildCard({
+      live: makeLive({
+        head_sha: "differentHead00000000000000000000000001",
+        reviews: { review_decision: "CHANGES_REQUESTED", requested_changes: ["alice"], unresolved_review_threads: { count: 2, complete: true, thread_refs: [] }, blocking_automated_findings: [] },
+      }),
+    });
+    assert.strictEqual(simultaneousView.comparison.primaryState, "HEAD_DRIFT");
+    assert.strictEqual(simultaneousView.comparison.headComparison, "DRIFT");
+    assert.strictEqual(simultaneousView.comparison.baseComparison, "MATCH");
+    assert.ok(simultaneousView.blockers.some((b) => b.code === "REVIEW_BLOCKED"));
+
+    const simultaneousHtml = renderHtml({ ...baseModel(), n7: simultaneousView });
+    const simultaneousSection = extractN7Section(simultaneousHtml);
+    assert.ok(simultaneousSection.includes("Base comparison: MATCH — current base equals frozen base"));
+    assert.ok(/<code data-testid="n7-blocker-code-\d+">REVIEW_BLOCKED<\/code>/.test(simultaneousSection));
+    assert.ok(!simultaneousSection.includes('data-testid="n7-blocker-REVIEW_BLOCKED"'));
   });
 
   it("partial_review_data_is_unknown_not_clear", () => {
@@ -824,7 +841,7 @@ describe("n7 render — severity structural-class closure (valid severities)", (
   for (const { severity, suffix } of VALID_SEVERITIES) {
     it(`severity_${severity}_maps_to_fixed_${suffix}_class_and_label`, () => {
       const html = renderArbitrary({
-        comparison: { primaryState: "UNKNOWN", severity: severity as N7PrCardViewModel["comparison"]["severity"], headComparison: "UNKNOWN", exactLabel: `${severity}: test label`, detail: "d" },
+        comparison: { primaryState: "UNKNOWN", severity: severity as N7PrCardViewModel["comparison"]["severity"], headComparison: "UNKNOWN", baseComparison: "UNKNOWN", exactLabel: `${severity}: test label`, detail: "d" },
       });
       assert.strictEqual(cardClassAttr(html), `n7-pr-card n7-severity-${suffix}`);
       assert.strictEqual(severityPrefixText(html), `${severity}:`);
@@ -855,7 +872,7 @@ describe("n7 render — severity structural-class closure (invalid severities)",
   for (const { name, value } of INVALID_SEVERITIES) {
     it(`invalid severity (${name}) collapses to the fixed unknown class and label`, () => {
       const html = renderArbitrary({
-        comparison: { primaryState: "UNKNOWN", severity: value as N7PrCardViewModel["comparison"]["severity"], headComparison: "UNKNOWN", exactLabel: "OK: fake success claim to prove non-authoritative", detail: "d" },
+        comparison: { primaryState: "UNKNOWN", severity: value as N7PrCardViewModel["comparison"]["severity"], headComparison: "UNKNOWN", baseComparison: "UNKNOWN", exactLabel: "OK: fake success claim to prove non-authoritative", detail: "d" },
       });
       const classAttr = cardClassAttr(html);
       assert.strictEqual(classAttr, "n7-pr-card n7-severity-unknown", `class token count/content must be exactly fixed for: ${name}`);
@@ -873,7 +890,7 @@ describe("n7 render — severity structural-class closure (invalid severities)",
   it("no invalid severity throws during render", () => {
     for (const { value } of INVALID_SEVERITIES) {
       assert.doesNotThrow(() => {
-        renderArbitrary({ comparison: { primaryState: "UNKNOWN", severity: value as N7PrCardViewModel["comparison"]["severity"], headComparison: "UNKNOWN", exactLabel: "x", detail: "d" } });
+        renderArbitrary({ comparison: { primaryState: "UNKNOWN", severity: value as N7PrCardViewModel["comparison"]["severity"], headComparison: "UNKNOWN", baseComparison: "UNKNOWN", exactLabel: "x", detail: "d" } });
       });
     }
   });
@@ -882,7 +899,7 @@ describe("n7 render — severity structural-class closure (invalid severities)",
 describe("n7 render — severity content-independence", () => {
   it("all structural attributes are identical across every invalid severity input", () => {
     const renders = INVALID_SEVERITIES.map(({ value }) =>
-      renderArbitrary({ comparison: { primaryState: "UNKNOWN", severity: value as N7PrCardViewModel["comparison"]["severity"], headComparison: "UNKNOWN", exactLabel: `label for ${String(value)}`, detail: "d" } }),
+      renderArbitrary({ comparison: { primaryState: "UNKNOWN", severity: value as N7PrCardViewModel["comparison"]["severity"], headComparison: "UNKNOWN", baseComparison: "UNKNOWN", exactLabel: `label for ${String(value)}`, detail: "d" } }),
     );
     const classAttrs = renders.map(cardClassAttr);
     const prefixTexts = renders.map(severityPrefixText);
@@ -920,7 +937,7 @@ describe("n7 render — authoritative severity label closure", () => {
   for (const { testName, severity, suffix, spoofedExactLabel } of VALID_SEVERITY_MISMATCH_CASES) {
     it(testName, () => {
       const html = renderArbitrary({
-        comparison: { primaryState: "UNKNOWN", severity: severity as N7PrCardViewModel["comparison"]["severity"], headComparison: "UNKNOWN", exactLabel: spoofedExactLabel, detail: "d" },
+        comparison: { primaryState: "UNKNOWN", severity: severity as N7PrCardViewModel["comparison"]["severity"], headComparison: "UNKNOWN", baseComparison: "UNKNOWN", exactLabel: spoofedExactLabel, detail: "d" },
       });
       // Exact fixed CSS class.
       assert.strictEqual(cardClassAttr(html), `n7-pr-card n7-severity-${suffix}`);
@@ -941,7 +958,7 @@ describe("n7 render — authoritative severity label closure", () => {
   it("payload exactLabel is escaped and cannot appear as the authoritative prefix", () => {
     for (const payload of [SCRIPT_PAYLOAD, IMG_PAYLOAD, SVG_PAYLOAD]) {
       const html = renderArbitrary({
-        comparison: { primaryState: "UNKNOWN", severity: "OK" as N7PrCardViewModel["comparison"]["severity"], headComparison: "UNKNOWN", exactLabel: payload, detail: "d" },
+        comparison: { primaryState: "UNKNOWN", severity: "OK" as N7PrCardViewModel["comparison"]["severity"], headComparison: "UNKNOWN", baseComparison: "UNKNOWN", exactLabel: payload, detail: "d" },
       });
       assert.strictEqual(severityPrefixText(html), "OK:");
       assertNoInjection(html, payload);
@@ -952,7 +969,7 @@ describe("n7 render — authoritative severity label closure", () => {
   it("accessibility: the severity-prefix element always matches the normalized class, independent of exactLabel", () => {
     for (const { severity, suffix, spoofedExactLabel } of VALID_SEVERITY_MISMATCH_CASES) {
       const html = renderArbitrary({
-        comparison: { primaryState: "UNKNOWN", severity: severity as N7PrCardViewModel["comparison"]["severity"], headComparison: "UNKNOWN", exactLabel: spoofedExactLabel, detail: "d" },
+        comparison: { primaryState: "UNKNOWN", severity: severity as N7PrCardViewModel["comparison"]["severity"], headComparison: "UNKNOWN", baseComparison: "UNKNOWN", exactLabel: spoofedExactLabel, detail: "d" },
       });
       const classAttr = cardClassAttr(html);
       assert.ok(classAttr.includes(`n7-severity-${suffix}`));
@@ -967,7 +984,7 @@ describe("n7 render — authoritative severity label closure", () => {
     // secondary detail text may vary.
     const contradictoryLabels = ["OK: all good", "STOP: actually blocked", "<script>x</script>", "", "TERMINAL: done"];
     const renders = contradictoryLabels.map((exactLabel) =>
-      renderArbitrary({ comparison: { primaryState: "UNKNOWN", severity: "WARN" as N7PrCardViewModel["comparison"]["severity"], headComparison: "UNKNOWN", exactLabel, detail: "d" } }),
+      renderArbitrary({ comparison: { primaryState: "UNKNOWN", severity: "WARN" as N7PrCardViewModel["comparison"]["severity"], headComparison: "UNKNOWN", baseComparison: "UNKNOWN", exactLabel, detail: "d" } }),
     );
     const classAttrs = renders.map(cardClassAttr);
     const prefixes = renders.map(severityPrefixText);
@@ -984,7 +1001,7 @@ describe("n7 render — authoritative severity label closure", () => {
 
   it("invalid severity ignores a spoofed clean-looking exactLabel entirely", () => {
     const html = renderArbitrary({
-      comparison: { primaryState: "UNKNOWN", severity: "totally invalid" as N7PrCardViewModel["comparison"]["severity"], headComparison: "UNKNOWN", exactLabel: "OK: Everything is clean and safe to merge", detail: "d" },
+      comparison: { primaryState: "UNKNOWN", severity: "totally invalid" as N7PrCardViewModel["comparison"]["severity"], headComparison: "UNKNOWN", baseComparison: "UNKNOWN", exactLabel: "OK: Everything is clean and safe to merge", detail: "d" },
     });
     assert.strictEqual(severityPrefixText(html), "UNKNOWN:");
     assert.strictEqual(stateDetailText(html), "severity value is not a recognized N7 severity");
@@ -1081,6 +1098,14 @@ describe("n7 identity binding — P1 fail-closed", () => {
   it("live_only_matching_identity_builds_card", () => {
     const view = buildCard({ frozen: null });
     assert.ok(view);
+    assert.strictEqual(view.comparison.baseComparison, "UNKNOWN");
+    assert.notStrictEqual(view.comparison.primaryState, "FROZEN_MATCH");
+    const html = renderWithN7({ frozen: null });
+    const section = extractN7Section(html);
+    const line = section.split("\n").find((l) => l.includes('data-testid="n7-base-comparison"'));
+    assert.ok(line);
+    assert.ok(line!.includes("Base comparison: UNKNOWN — current or frozen base is unavailable"));
+    assert.ok(!line!.includes("Base comparison: MATCH"));
   });
 
   it("frozen_only_matching_identity_builds_card", () => {
@@ -1391,10 +1416,13 @@ const FAILING_CHECK = {
 
 describe("n7 render — P2 explicit head comparison", () => {
   it("ci_failed_primary_still_renders_head_match", () => {
-    const html = renderWithN7({ ciRequirementPolicy: REQUIRED_POLICY, live: makeLive({ checks: [FAILING_CHECK] }) });
+    const view = buildCard({ ciRequirementPolicy: REQUIRED_POLICY, live: makeLive({ checks: [FAILING_CHECK] }) });
+    const html = renderHtml({ ...baseModel(), n7: view });
     const section = extractN7Section(html);
     assert.ok(/data-testid="n7-severity-prefix">STOP:/.test(section));
+    assert.strictEqual(view.comparison.baseComparison, "MATCH");
     assert.ok(section.includes("Head comparison: MATCH — current head equals frozen reviewed head"));
+    assert.ok(section.includes("Base comparison: MATCH — current base equals frozen base"));
   });
 
   it("review_blocked_primary_still_renders_head_match", () => {
@@ -1417,6 +1445,22 @@ describe("n7 render — P2 explicit head comparison", () => {
     const html = renderWithN7({ live: makeLive({ head_sha: "differentHead00000000000000000000000001" }) });
     const section = extractN7Section(html);
     assert.ok(section.includes("Head comparison: DRIFT — current head differs from frozen reviewed head"));
+  });
+
+  it("base_drift_remains_independently_visible", () => {
+    const live = makeLive({
+      head_sha: "differentHead00000000000000000000000001",
+      base_sha: "differentBase00000000000000000000000001",
+    });
+    const view = buildCard({ live });
+    assert.strictEqual(view.comparison.primaryState, "HEAD_DRIFT");
+    assert.strictEqual(view.comparison.headComparison, "DRIFT");
+    assert.strictEqual(view.comparison.baseComparison, "DRIFT");
+    assert.ok(view.blockers.some((b) => b.code === "BASE_DRIFT"));
+
+    const html = renderHtml({ ...baseModel(), n7: view });
+    const section = extractN7Section(html);
+    assert.ok(section.includes("Base comparison: DRIFT — current base differs from frozen base"));
   });
 
   it("missing_head_renders_explicit_unknown", () => {
@@ -1442,7 +1486,7 @@ describe("n7 render — P2 explicit head comparison", () => {
     const html = renderArbitrary({
       current: { headSha: sha, baseSha: null, capturedAt: null, statusLabel: "s" },
       frozen: { headSha: sha, baseSha: null, capturedAt: null, statusLabel: "s", freezeId: null },
-      comparison: { primaryState: "UNKNOWN", severity: "UNKNOWN", headComparison: "DRIFT", exactLabel: "x", detail: "d" },
+      comparison: { primaryState: "UNKNOWN", severity: "UNKNOWN", headComparison: "DRIFT", baseComparison: "UNKNOWN", exactLabel: "x", detail: "d" },
     });
     const section = extractN7Section(html);
     assert.ok(
@@ -1456,7 +1500,7 @@ describe("n7 render — P2 explicit head comparison", () => {
     const badValues: unknown[] = ["MATCH extra-class", "\"><script>alert(1)</script>", "match", null, undefined, 42, {}, []];
     for (const badValue of badValues) {
       const html = renderArbitrary({
-        comparison: { primaryState: "UNKNOWN", severity: "UNKNOWN", headComparison: badValue as N7PrCardViewModel["comparison"]["headComparison"], exactLabel: "x", detail: "d" },
+        comparison: { primaryState: "UNKNOWN", severity: "UNKNOWN", headComparison: badValue as N7PrCardViewModel["comparison"]["headComparison"], baseComparison: "UNKNOWN", exactLabel: "x", detail: "d" },
       });
       const section = extractN7Section(html);
       assert.ok(section.includes("Head comparison: UNKNOWN — current or frozen head is unavailable"), `bad value ${JSON.stringify(badValue)} must map to fixed UNKNOWN copy`);
@@ -1470,7 +1514,7 @@ describe("n7 render — P2 explicit head comparison", () => {
 
   it("head_comparison_uses_fixed_visible_copy", () => {
     const html = renderArbitrary({
-      comparison: { primaryState: "UNKNOWN", severity: "UNKNOWN", headComparison: "MATCH", exactLabel: "some unrelated model text that must not replace the fixed copy", detail: "d" },
+      comparison: { primaryState: "UNKNOWN", severity: "UNKNOWN", headComparison: "MATCH", baseComparison: "UNKNOWN", exactLabel: "some unrelated model text that must not replace the fixed copy", detail: "d" },
     });
     const section = extractN7Section(html);
     assert.ok(section.includes("Head comparison: MATCH — current head equals frozen reviewed head"));
@@ -1479,7 +1523,7 @@ describe("n7 render — P2 explicit head comparison", () => {
 
   it("head_comparison_is_not_color_only", () => {
     const html = renderArbitrary({
-      comparison: { primaryState: "UNKNOWN", severity: "UNKNOWN", headComparison: "DRIFT", exactLabel: "x", detail: "d" },
+      comparison: { primaryState: "UNKNOWN", severity: "UNKNOWN", headComparison: "DRIFT", baseComparison: "UNKNOWN", exactLabel: "x", detail: "d" },
     });
     const section = extractN7Section(html);
     const line = section.split("\n").find((l) => l.includes('data-testid="n7-head-comparison"'));
@@ -1492,13 +1536,63 @@ describe("n7 render — P2 explicit head comparison", () => {
     const html = renderWithN7();
     const section = extractN7Section(html);
     const frozenIdentityIdx = section.indexOf('data-testid="n7-frozen-identity"');
-    const headCompIdx = section.indexOf('data-testid="n7-head-comparison"');
+    const headAttrStart = section.indexOf('data-testid="n7-head-comparison"');
+    const headStart = section.lastIndexOf("<p", headAttrStart);
+    const headClosingStart = section.indexOf("</p>", headAttrStart);
+    const headElementEnd = headClosingStart >= 0 ? headClosingStart + "</p>".length : -1;
+    const baseAttrStart = section.indexOf('data-testid="n7-base-comparison"', headElementEnd);
+    const baseElementStart = section.lastIndexOf("<p", baseAttrStart);
     const ciIdx = section.indexOf('data-testid="n7-ci"');
     const reviewIdx = section.indexOf('data-testid="n7-review"');
-    assert.ok(frozenIdentityIdx >= 0 && headCompIdx >= 0 && ciIdx >= 0 && reviewIdx >= 0);
-    assert.ok(frozenIdentityIdx < headCompIdx);
-    assert.ok(headCompIdx < ciIdx);
-    assert.ok(headCompIdx < reviewIdx);
+    assert.ok(frozenIdentityIdx >= 0 && headAttrStart >= 0 && headStart >= 0 && headElementEnd >= 0 && baseAttrStart >= 0 && baseElementStart >= 0 && ciIdx >= 0 && reviewIdx >= 0);
+    assert.ok(frozenIdentityIdx < headStart);
+    assert.ok(headStart < baseElementStart);
+    assert.ok(baseElementStart < ciIdx);
+    assert.ok(baseElementStart < reviewIdx);
+    assert.ok(/^\s*$/.test(section.slice(headElementEnd, baseElementStart)), "only whitespace may appear between the complete head row and the base row opening");
+  });
+
+  it("invalid_prebuilt_base_comparison_maps_to_unknown", () => {
+    const badValues: unknown[] = ["MATCH extra-class", "\"><script>alert(1)</script>", "match", null, undefined, 42, {}, []];
+    for (const badValue of badValues) {
+      const html = renderArbitrary({
+        comparison: { primaryState: "UNKNOWN", severity: "UNKNOWN", headComparison: "UNKNOWN", baseComparison: badValue as N7PrCardViewModel["comparison"]["baseComparison"], exactLabel: "x", detail: "d" },
+      });
+      const section = extractN7Section(html);
+      const rows = section.match(/<p\b(?=[^>]*\bdata-testid="n7-base-comparison")[^>]*>[\s\S]*?<\/p>/gi) ?? [];
+      assert.strictEqual(rows.length, 1, `bad value ${JSON.stringify(badValue)} must render exactly one complete base-comparison row`);
+      const row = rows[0];
+      const openingTag = row.match(/^<p\b[^>]*>/i)?.[0];
+      assert.ok(openingTag);
+      const visibleText = row
+        .replace(/^<p\b[^>]*>/i, "")
+        .replace(/<\/p>$/i, "")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+      assert.strictEqual(visibleText, "Base comparison: UNKNOWN — current or frozen base is unavailable");
+      for (const attr of ["class", "id", "style", "href", "src"]) {
+        assert.ok(!new RegExp(`(?:^|\\s)${attr}\\s*=`, "i").test(openingTag!), `base-comparison opening tag must not contain ${attr}= for bad value ${JSON.stringify(badValue)}`);
+      }
+      assert.ok(!section.includes("extra-class"));
+      assert.ok(!/<script\b/i.test(section));
+    }
+  });
+
+  it("base_comparison_is_not_color_only", () => {
+    const html = renderArbitrary({
+      comparison: { primaryState: "UNKNOWN", severity: "UNKNOWN", headComparison: "UNKNOWN", baseComparison: "DRIFT", exactLabel: "x", detail: "d" },
+    });
+    const section = extractN7Section(html);
+    const rows = section.match(/<p\b(?=[^>]*\bdata-testid="n7-base-comparison")[^>]*>[\s\S]*?<\/p>/gi) ?? [];
+    assert.strictEqual(rows.length, 1);
+    const row = rows[0];
+    const openingTag = row.match(/^<p\b[^>]*>/i)?.[0];
+    assert.ok(openingTag);
+    assert.ok(row.includes("Base comparison: DRIFT — current base differs from frozen base"));
+    for (const attr of ["class", "id", "style", "href", "src"]) {
+      assert.ok(!new RegExp(`(?:^|\\s)${attr}\\s*=`, "i").test(openingTag!), `base-comparison opening tag must not contain ${attr}=`);
+    }
   });
 });
 
