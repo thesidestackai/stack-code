@@ -356,8 +356,9 @@ not a requirement to create 15 duplicate Mocha `it()` names. Each behavior
 must be covered by the exact existing, new, or extended test mapping in the
 table below. Rows marked `EXISTING_COVERAGE` require regression execution
 only, except for the row 1 valid-MATCH badge addendum explicitly frozen in
-§15a and §15c. Rows marked `NEW_TEST` or `EXTEND_EXISTING_TEST` define the
-exact, and only, implementation-lane behavioral test changes.
+§15a and §15c and the base-row ordering addendum explicitly frozen in §15a
+and §15c. Rows marked `NEW_TEST` or `EXTEND_EXISTING_TEST` define the exact,
+and only, implementation-lane behavioral test changes.
 
 Every mapping below was verified by direct inspection of
 `ide/vscode/a2-harness-panel/test/n7Render.test.ts` and
@@ -381,7 +382,7 @@ exactly as they appear in source.
 | 11 | `identity_mismatch_never_returns_comparison_view` | `EXISTING_COVERAGE` | `n7Render.test.ts` — `it("identity_mismatch_never_returns_frozen_match", ...)` and `it("identity_mismatch_never_returns_ready_clean", ...)`; both already assert the returned `view` itself is `undefined` after a caught throw. Since no view object is ever constructed, no field on it — present or future, including `baseComparison` — can ever be reached. No extension is meaningful or required. |
 | 12 | `matching_sha_different_pr_never_matches` | `EXISTING_COVERAGE` | `n7Render.test.ts` — `it("same_heads_different_repository_fails_closed", ...)` and `it("same_heads_same_repository_different_pr_number_fails_closed", ...)` |
 | 13 | `comparison_badges_do_not_authorize_write` | `EXISTING_COVERAGE` | `n7Render.test.ts`'s `describe("n7 render — no-write boundary", ...)` block (`n7_card_has_no_pr_mutation_controls`, `n7_card_has_no_package_rung_controls`, `n7_card_has_no_write_message_dispatch`, `n7_card_has_no_merge_ready_approve_or_rerun_action`) already call `extractN7Section(html)` and scan the **entire** card body for forbidden patterns — this already covers any row present in that section, including the future `n7-base-comparison` row, with zero test-code change |
-| 14 | `invalid_prebuilt_badge_value_maps_to_unknown` | `NEW_TEST` | `n7Render.test.ts` — `it("invalid_prebuilt_base_comparison_maps_to_unknown", ...)`, mirroring the existing `invalid_prebuilt_head_comparison_maps_to_unknown` structure and adversarial payload set exactly (`"MATCH extra-class"`, `"\"><script>alert(1)</script>"`, `"match"`, `null`, `undefined`, `42`, `{}`, `[]`) |
+| 14 | `invalid_prebuilt_badge_value_maps_to_unknown` | `NEW_TEST` | `n7Render.test.ts` — `it("invalid_prebuilt_base_comparison_maps_to_unknown", ...)`, mirroring the existing `invalid_prebuilt_head_comparison_maps_to_unknown` structure and adversarial payload set exactly (`"MATCH extra-class"`, `"\"><script>alert(1)</script>"`, `"match"`, `null`, `undefined`, `42`, `{}`, `[]`); for every invalid value, render the scenario, extract the N7 section, locate exactly one complete `<p>` element whose opening tag contains the exact `data-testid="n7-base-comparison"` attribute (section-scoped, across line boundaries, and not dependent on attribute order), derive visible text from that complete element by removing only the outer `<p ...>`/`</p>` boundaries, removing markup while retaining nested child text, trimming and collapsing whitespace, and assert strict equality with the literal fixed copy `Base comparison: UNKNOWN — current or frozen base is unavailable`; no additional helper or text-conversion step is authorized, and any appended plain, nested, escaped, or entity-form raw invalid value remains additional content that fails strict equality |
 | 15 | `comparison_values_do_not_enter_structural_attributes` | `NEW_TEST` | `n7Render.test.ts` — `it("base_comparison_is_not_color_only", ...)`: render a valid visible `n7-base-comparison` row using `baseComparison: "DRIFT"`, isolate the opening tag that contains `data-testid="n7-base-comparison"`, assert the row still includes the exact fixed visible copy `DRIFT — current base differs from frozen base`, and assert the isolated opening tag has no actual forbidden attributes named `class`, `id`, `style`, `href`, or `src` |
 
 ### 15a. Normative acceptance-test changes (behavioral)
@@ -393,7 +394,26 @@ required by this scope; §15b enumerates a separate, additional, mechanical
 category required by the new mandatory interface field:
 
 - **`NEW_TEST` (3)**: `base_drift_remains_independently_visible`,
-  `invalid_prebuilt_base_comparison_maps_to_unknown`,
+  `invalid_prebuilt_base_comparison_maps_to_unknown` (mirror the existing
+  `invalid_prebuilt_head_comparison_maps_to_unknown` adversarial payload set
+  exactly; for each invalid `baseComparison` value, render the scenario,
+  extract the N7 section, locate exactly one complete `<p>` element whose
+  opening tag contains the exact `data-testid="n7-base-comparison"` attribute
+  using a section-scoped complete-element match equivalent to
+  `<p\b(?=[^>]*\bdata-testid="n7-base-comparison")[^>]*>[\s\S]*?</p>`
+  (across line boundaries and without depending on attribute order), and do
+  not use physical-line selection or opening-tag-only extraction. Derive
+  complete visible text from that element by removing only the outer
+  `<p ...>` and `</p>` boundaries,
+  removing markup tags while retaining nested child text, trimming, and
+  collapsing whitespace; assert strict equality with the literal fixed copy
+  `Base comparison: UNKNOWN — current or frozen base is unavailable`. The
+  fixed copy is literal and no additional helper or text-conversion step is
+  authorized; any appended entity-form text remains additional content after
+  tag removal and whitespace normalization,
+  so strict equality rejects appended plain text and nested, escaped, or
+  entity-form raw suffixes including `match`, `42`, `[object Object]`,
+  `extra-class`, and script payloads),
   `base_comparison_is_not_color_only` (isolate the
   `data-testid="n7-base-comparison"` opening tag for a valid
   `baseComparison: "DRIFT"` row; assert the exact fixed visible copy
@@ -428,6 +448,26 @@ Normative acceptance-test change count: 3 new `it()` blocks + 2 extended
 Valid-MATCH badge addendum count: 0 new behavior IDs, 0 new `it()` blocks,
 1 additional assertion update inside existing test
 `ci_failed_primary_still_renders_head_match`.
+
+Base-row ordering addendum count: 0 new behavior IDs, 0 new `it()` blocks,
+1 additional assertion update inside existing test
+`head_comparison_renders_before_ci_and_review`: render the existing default
+card; use `extractN7Section(html)`; assert the head row, base row, CI
+section, and review section all exist using `data-testid="n7-head-comparison"`,
+`data-testid="n7-base-comparison"`, `data-testid="n7-ci"`, and
+`data-testid="n7-review"`; record those semantic positions as `headStart`,
+`baseStart`, `ciStart`, and `reviewStart`; assert each position is present,
+`headStart < baseStart`, `baseStart < ciStart`, and
+`baseStart < reviewStart`; determine `headElementEnd` from the verified
+current head-row element type (`<p>`) by locating the closing `</p>` after
+`headStart`, so the boundary is the end of the complete head row rather than
+the opening tag; use the `n7-base-comparison` occurrence after
+`headElementEnd` as the adjacent base row; and assert
+`betweenHeadAndBase = section.slice(headElementEnd, baseStart)` is
+whitespace-only. This proves semantic adjacency without depending on newline
+placement, indentation, pretty-printing, or one-tag-per-line formatting, and
+rejects any CI, review, comparison-detail, text, or other element content
+between the head and base rows.
 
 ### 15b. Mechanical model-contract propagation updates (non-behavioral)
 
@@ -488,6 +528,8 @@ removed tests.
 - 2 exact behavioral extensions (§15a);
 - 1 valid-MATCH badge assertion addendum inside
   `ci_failed_primary_still_renders_head_match` (§15a);
+- 1 base-row ordering assertion addendum inside
+  `head_comparison_renders_before_ci_and_review` (§15a);
 - 14 exact enumerated mechanical literal edits, each adding
   `baseComparison: "UNKNOWN"` (§15b);
 - no other test-file changes are authorized or required.
@@ -495,9 +537,9 @@ removed tests.
 This replaces any prior "5 total test-code changes" framing: 5 is the
 **normative acceptance-test** change count (§15a) only, not the complete
 test-file diff. The complete test-file diff is 5 normative changes + 1
-valid-MATCH assertion addendum + 14 mechanical literal edits = 20 total
-exact test-file change sites across a fixed, enumerated set of locations,
-all within `n7Render.test.ts`.
+valid-MATCH assertion addendum + 1 base-row ordering addendum + 14 mechanical
+literal edits = 21 total exact test-file change sites across a fixed,
+enumerated set of locations, all within `n7Render.test.ts`.
 
 ## 16. Security and Accessibility
 
@@ -593,8 +635,9 @@ passing tests remain passing; new base-comparison tests pass; final count
 exceeds 1114; zero failures; both guards pass; `render.ts`/`n7View.ts`
 diffs are scoped to exactly the additions described in §14; `n7Render.test.ts`
 changes are scoped to exactly the 5 normative change sites (§15a), the 1
-valid-MATCH badge assertion addendum site (§15a/§15c), and the 14 enumerated
-mechanical literal change sites (§15b) — no other test-file change sites.
+valid-MATCH badge assertion addendum site (§15a/§15c), the 1 base-row
+ordering addendum site (§15a/§15c), and the 14 enumerated mechanical literal
+change sites (§15b) — no other test-file change sites.
 
 ## 18. STOP Gates
 
@@ -628,7 +671,20 @@ N7-E is complete when:
    from N7-A's derived result.
 2. A dedicated `data-testid="n7-base-comparison"` row renders unconditionally,
    with fixed MATCH/DRIFT/UNKNOWN copy, positioned after the existing head-
-   comparison row.
+   comparison row. The existing
+   `head_comparison_renders_before_ci_and_review` test carries the ordering
+   addendum: `n7-head-comparison`, `n7-base-comparison`, `n7-ci`, and
+   `n7-review` must all exist; their positions are recorded as `headStart`,
+   `baseStart`, `ciStart`, and `reviewStart`; `headStart < baseStart`,
+   `baseStart < ciStart`, and `baseStart < reviewStart`; `headElementEnd` is
+   determined from the verified current head-row `<p>` element by locating the
+   closing `</p>` after `headStart`; the adjacent base row is the
+   `n7-base-comparison` occurrence after `headElementEnd`; and
+   `section.slice(headElementEnd, baseStart)` must be whitespace-only. This
+   semantic complete-element boundary check does not depend on newline
+   placement, indentation, pretty-printing, or one-tag-per-line formatting, and
+   no CI, review, comparison-detail, text, or other element content may occur
+   between the complete head row and the base row.
 3. All 15 acceptance behaviors in §15 are covered and passing through the
    exact existing, new, or extended test mappings recorded in the matrix.
    Only rows marked `NEW_TEST` or `EXTEND_EXISTING_TEST` require normative
@@ -641,7 +697,18 @@ N7-E is complete when:
    valid-MATCH badge addendum: `view.comparison.baseComparison === "MATCH"`
    and rendered `Base comparison: MATCH — current base equals frozen base`
    are both asserted in the existing
-   `ci_failed_primary_still_renders_head_match` test. Row 15's test isolates
+   `ci_failed_primary_still_renders_head_match` test. Row 14's invalid-value
+   test extracts exactly one complete `<p>` element carrying
+   `data-testid="n7-base-comparison"` from the extracted N7 section, across
+   line boundaries and never by opening-tag-only extraction or whole-page
+   comparison; derives
+   complete visible text by removing only the outer `<p ...>`/`</p>` boundary,
+   stripping markup without discarding nested text, trimming, and collapsing
+   whitespace; and asserts strict equality with the literal fixed copy
+   `Base comparison: UNKNOWN — current or frozen base is unavailable`. No
+   additional helper or text-conversion step is authorized; appended or echoed
+   plain, nested, escaped, or entity-form raw invalid input remains additional
+   content and fails strict equality. Row 15's test isolates
    the `n7-base-comparison` opening tag and verifies the comparison state is
    not carried by actual `class`, `id`, `style`, `href`, or `src` attributes,
    using boundary-aware attribute checks rather than naive substring checks.
@@ -649,9 +716,10 @@ N7-E is complete when:
    are complete — `baseComparison: "UNKNOWN"` added to every listed literal,
    with every existing payload and assertion in those 14 tests otherwise
    unchanged, and no increase in `it()` block count attributable to this
-   category. The complete authorized test-file update budget is 20 exact
+   category. The complete authorized test-file update budget is 21 exact
    test-file change sites: 5 normative behavioral change sites + 1
-   valid-MATCH assertion addendum site + 14 mechanical propagation sites.
+   valid-MATCH assertion addendum site + 1 base-row ordering addendum site +
+   14 mechanical propagation sites.
 5. Test-project typecheck (`npx tsc -p ./tsconfig.test.json --noEmit`)
    passes with `N7PrCardComparisonView.baseComparison` mandatory — i.e. the
    §15b propagation is complete and sufficient for a clean typecheck.
@@ -667,9 +735,11 @@ N7-E is complete when:
    verified via `git diff --name-only` against the base SHA recorded in §2.
    Within `n7Render.test.ts`, the diff is scoped to exactly the 5 normative
    change sites (§15a), the 1 valid-MATCH assertion addendum site in
-   `ci_failed_primary_still_renders_head_match` (§15a/§15c), and the 14
-   mechanical fixture/type propagation sites (§15b) — 20 exact authorized
-   test-file change sites total and no other test-file change sites.
+   `ci_failed_primary_still_renders_head_match` (§15a/§15c), the 1 base-row
+   ordering addendum site in `head_comparison_renders_before_ci_and_review`
+   (§15a/§15c), and the 14 mechanical fixture/type propagation sites (§15b)
+   — 21 exact authorized test-file change sites total and no other test-file
+   change sites.
 10. No STOP gate in §18 is violated.
 
 ## 20. Exact Next Implementation Lane
