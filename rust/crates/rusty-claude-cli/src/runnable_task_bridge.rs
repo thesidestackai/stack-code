@@ -1564,17 +1564,10 @@ fn task_acceptance_receipt(task: &NormalizedTask, status: &str) -> Value {
 }
 
 fn verify_clean_start(task: &NormalizedTask) -> Result<(), BridgeRefusal> {
-    let status = git_stdout(
-        &task.worktree,
-        &["status", "--porcelain", "--untracked-files=all"],
-    )?;
     let receipt_prefix = format!(".claw/runnable-task-bridge/{}/", task.task_id);
-    let non_bridge_status: Vec<&str> = status
-        .lines()
-        .filter(|line| {
-            let path = porcelain_path(line);
-            !is_bridge_owned_retry_artifact(task, path, &receipt_prefix)
-        })
+    let non_bridge_status: Vec<String> = git_status_porcelain_paths(&task.worktree)?
+        .into_iter()
+        .filter(|path| !is_bridge_owned_retry_artifact(task, path, &receipt_prefix))
         .collect();
     if non_bridge_status.is_empty() {
         Ok(())
@@ -1605,17 +1598,12 @@ fn is_bridge_owned_retry_artifact(task: &NormalizedTask, path: &str, receipt_pre
 }
 
 fn verify_changed_paths(task: &NormalizedTask) -> Result<Vec<String>, BridgeRefusal> {
-    let status = git_stdout(
-        &task.worktree,
-        &["status", "--porcelain", "--untracked-files=all"],
-    )?;
     let mut changed = Vec::new();
-    for line in status.lines().filter(|line| !line.trim().is_empty()) {
-        let path = porcelain_path(line);
+    for path in git_status_porcelain_paths(&task.worktree)? {
         if path == ".claw" || path.starts_with(".claw/") {
             continue;
         }
-        changed.push(path.to_string());
+        changed.push(path);
     }
     changed.sort();
     changed.dedup();
@@ -1632,12 +1620,66 @@ fn verify_changed_paths(task: &NormalizedTask) -> Result<Vec<String>, BridgeRefu
     }
 }
 
-fn porcelain_path(line: &str) -> &str {
-    if line.len() >= 3 {
-        &line[3..]
-    } else {
-        line
+fn git_status_porcelain_paths(worktree: &Path) -> Result<Vec<String>, BridgeRefusal> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .output()
+        .map_err(|e| refusal("git-launch-failed", format!("{e}")))?;
+    if !output.status.success() {
+        return Err(refusal(
+            "git-status-failed",
+            format!(
+                "git status failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        ));
     }
+    parse_porcelain_z_paths(&output.stdout)
+}
+
+fn parse_porcelain_z_paths(bytes: &[u8]) -> Result<Vec<String>, BridgeRefusal> {
+    let mut paths = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        let Some(offset) = bytes[index..].iter().position(|byte| *byte == 0) else {
+            return Err(refusal(
+                "git-status-parse-failed",
+                "git status -z output was missing a trailing NUL",
+            ));
+        };
+        let end = index + offset;
+        let entry = &bytes[index..end];
+        index = end + 1;
+        if entry.is_empty() {
+            continue;
+        }
+        if entry.len() < 4 || entry[2] != b' ' {
+            return Err(refusal(
+                "git-status-parse-failed",
+                "git status -z output had an unexpected record shape",
+            ));
+        }
+        let path = String::from_utf8(entry[3..].to_vec()).map_err(|e| {
+            refusal(
+                "git-status-path-utf8-failed",
+                format!("git status path was not UTF-8: {e}"),
+            )
+        })?;
+        paths.push(path);
+        if matches!(entry[0], b'R' | b'C') || matches!(entry[1], b'R' | b'C') {
+            let Some(old_offset) = bytes[index..].iter().position(|byte| *byte == 0) else {
+                return Err(refusal(
+                    "git-status-parse-failed",
+                    "git status rename/copy record was missing its source path",
+                ));
+            };
+            index += old_offset + 1;
+        }
+    }
+    Ok(paths)
 }
 
 fn normalize_allowed_paths(
@@ -1698,7 +1740,22 @@ fn normalize_one_allowed_path(worktree: &Path, path: &str) -> Result<String, Bri
             format!("path contains an unsupported component: {path}"),
         ));
     }
-    let target = worktree.join(rel);
+    let mut normalized_rel = PathBuf::new();
+    for component in rel.components() {
+        if let Component::Normal(part) = component {
+            normalized_rel.push(part);
+        }
+    }
+    if normalized_rel.as_os_str().is_empty() {
+        return Err(refusal("path-empty", "allowed path must not be empty"));
+    }
+    let normalized = normalized_rel.to_str().ok_or_else(|| {
+        refusal(
+            "path-utf8-unsupported",
+            format!("path is not valid UTF-8 after normalization: {path}"),
+        )
+    })?;
+    let target = worktree.join(&normalized_rel);
     let Some(parent) = target.parent() else {
         return Err(refusal("path-parent-missing", "target has no parent"));
     };
@@ -1722,7 +1779,7 @@ fn normalize_one_allowed_path(worktree: &Path, path: &str) -> Result<String, Bri
             ));
         }
     }
-    Ok(path.to_string())
+    Ok(normalized.to_string())
 }
 
 fn canonical_worktree(path: &Path) -> Result<PathBuf, BridgeRefusal> {
@@ -2095,7 +2152,22 @@ fn is_token_separator(ch: char) -> bool {
     ch.is_whitespace()
         || matches!(
             ch,
-            '"' | '\'' | ',' | ';' | '(' | ')' | '<' | '>' | '{' | '}' | '`'
+            '"' | '\''
+                | ','
+                | ';'
+                | ':'
+                | '.'
+                | '!'
+                | '?'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '<'
+                | '>'
+                | '{'
+                | '}'
+                | '`'
         )
 }
 
@@ -2574,6 +2646,32 @@ mod tests {
     }
 
     #[test]
+    fn redundant_path_separators_are_normalized_before_apply() {
+        let repo = git_repo("redundant-separators");
+        let planner = StubPlanner {
+            output: valid_planner_output(&repo, "docs/cert.md"),
+        };
+        let result = run_task(
+            spec(&repo, vec!["docs//cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("redundant separators normalize before changed-path verification");
+        assert_eq!(result["target_path"], json!("docs/cert.md"));
+        assert_eq!(result["actual_changed_paths"], json!(["docs/cert.md"]));
+        assert!(repo.join("docs/cert.md").is_file());
+    }
+
+    #[test]
+    fn git_quoted_porcelain_paths_are_verified_with_raw_status() {
+        let repo = git_repo("quoted-porcelain");
+        fs::write(repo.join("docs/é.md"), "accented path\n").unwrap();
+        let paths = git_status_porcelain_paths(&repo)
+            .expect("raw porcelain status preserves non-ascii task paths");
+        assert_eq!(paths, vec!["docs/é.md"]);
+    }
+
+    #[test]
     fn task_id_with_raw_port_digits_is_allowed() {
         let repo = git_repo("task-port-digits");
         let mut task = spec(&repo, vec!["docs/cert.md"], None);
@@ -2631,6 +2729,7 @@ mod tests {
         for (label, secret) in [
             ("aws-access-key", "AKIA1234567890ABCDEF"),
             ("assignment", "api_key=abcdefgh"),
+            ("punctuated-openai-token", "sk-abcdefghijklmnop."),
         ] {
             let repo = git_repo(label);
             let mut output: Value =
