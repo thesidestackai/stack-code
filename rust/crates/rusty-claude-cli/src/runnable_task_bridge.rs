@@ -262,6 +262,7 @@ fn run_task(
 
     let after_path = task.receipt_dir.join("after.bin");
     write_file_new(&after_path, task.after_text.as_bytes())?;
+    verify_clean_start(&task)?;
     let preview_result =
         crate::try_run_plan_preview_bundle(&task.worktree, &task.target_path, &after_path)
             .map_err(|e| {
@@ -1108,6 +1109,11 @@ fn final_success_result(
         "broker_route": task.broker_url,
         "resolved_model": task.model,
         "allowed_paths": task.allowed_paths,
+        "target_path": task.target_path,
+        "task_type": task.task_type,
+        "validation_profile": task.validation_profile,
+        "objective_sha256": sha256_hex(task.objective.as_bytes()),
+        "after_sha256": sha256_hex(task.after_text.as_bytes()),
         "actual_changed_paths": changed_paths,
         "receipt_dir": task.receipt_dir,
         "approved_lane_path": approved_lane,
@@ -1200,6 +1206,7 @@ fn completed_task_result_if_current(task: &NormalizedTask) -> Result<Option<Valu
             format!("completed receipt was not valid JSON: {e}"),
         )
     })?;
+    validate_cached_completion(task, &value)?;
     if value.get("base_sha").and_then(Value::as_str) != Some(task.base_sha.as_str()) {
         return Err(refusal(
             "completed-task-base-mismatch",
@@ -1220,6 +1227,29 @@ fn completed_task_result_if_current(task: &NormalizedTask) -> Result<Option<Valu
     value["package_ready"] = Value::Bool(true);
     value["status"] = Value::String("idempotent_complete".to_string());
     Ok(Some(value))
+}
+
+fn validate_cached_completion(task: &NormalizedTask, value: &Value) -> Result<(), BridgeRefusal> {
+    if value.get("task_id").and_then(Value::as_str) != Some(task.task_id.as_str())
+        || value.get("caller_id").and_then(Value::as_str) != Some(task.caller_id.as_str())
+        || value.get("broker_route").and_then(Value::as_str) != Some(task.broker_url.as_str())
+        || value.get("resolved_model").and_then(Value::as_str) != Some(task.model.as_str())
+        || value.get("target_path").and_then(Value::as_str) != Some(task.target_path.as_str())
+        || value.get("task_type").and_then(Value::as_str) != Some(task.task_type.as_str())
+        || value.get("validation_profile").and_then(Value::as_str)
+            != Some(task.validation_profile.as_str())
+        || value.get("objective_sha256").and_then(Value::as_str)
+            != Some(sha256_hex(task.objective.as_bytes()).as_str())
+        || value.get("after_sha256").and_then(Value::as_str)
+            != Some(sha256_hex(task.after_text.as_bytes()).as_str())
+        || !json_array_matches_strings(value.get("allowed_paths"), &task.allowed_paths)
+    {
+        return Err(refusal(
+            "completed-task-spec-mismatch",
+            "task-complete receipt does not bind to the current task specification",
+        ));
+    }
+    Ok(())
 }
 
 fn resume_applied_task_if_current(task: &NormalizedTask) -> Result<Option<Value>, BridgeRefusal> {
@@ -1503,6 +1533,15 @@ fn json_array_is_exact_string(value: Option<&Value>, expected: &str) -> bool {
         if items.len() == 1 && items[0].as_str() == Some(expected))
 }
 
+fn json_array_matches_strings(value: Option<&Value>, expected: &[String]) -> bool {
+    matches!(value.and_then(Value::as_array), Some(items)
+        if items.len() == expected.len()
+            && items
+                .iter()
+                .zip(expected)
+                .all(|(actual, expected)| actual.as_str() == Some(expected.as_str())))
+}
+
 fn task_acceptance_receipt(task: &NormalizedTask, status: &str) -> Value {
     json!({
         "schema_version": RECEIPT_SCHEMA_V1,
@@ -1519,6 +1558,7 @@ fn task_acceptance_receipt(task: &NormalizedTask, status: &str) -> Value {
         "allowed_paths": task.allowed_paths,
         "target_path": task.target_path,
         "validation_profile": task.validation_profile,
+        "objective_sha256": sha256_hex(task.objective.as_bytes()),
         "after_sha256": sha256_hex(task.after_text.as_bytes()),
     })
 }
@@ -1706,7 +1746,28 @@ fn canonical_worktree(path: &Path) -> Result<PathBuf, BridgeRefusal> {
         .output()
         .map_err(|e| refusal("git-launch-failed", format!("{e}")))?;
     if inside.status.success() && String::from_utf8_lossy(&inside.stdout).trim() == "true" {
-        Ok(canonical)
+        let top_level = git_stdout(&canonical, &["rev-parse", "--show-toplevel"])?;
+        let top_level = PathBuf::from(top_level).canonicalize().map_err(|e| {
+            refusal(
+                "worktree-root-canonicalize-failed",
+                format!(
+                    "could not canonicalize git toplevel for {}: {e}",
+                    canonical.display()
+                ),
+            )
+        })?;
+        if top_level == canonical {
+            Ok(canonical)
+        } else {
+            Err(refusal(
+                "worktree-not-root",
+                format!(
+                    "worktree path must be the git worktree root {}; got {}",
+                    top_level.display(),
+                    canonical.display()
+                ),
+            ))
+        }
     } else {
         Err(refusal(
             "worktree-not-git",
@@ -2291,6 +2352,13 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct MutatingPlanner {
+        output: String,
+        path: PathBuf,
+        bytes: String,
+    }
+
+    #[derive(Debug)]
     struct InlineValidator;
 
     impl PlannerClient for StubPlanner {
@@ -2314,6 +2382,22 @@ mod tests {
             _request: &PlannerRequest,
         ) -> Result<PlannerCandidate, BridgeRefusal> {
             Err(refusal(self.kind, "simulated planner failure"))
+        }
+    }
+
+    impl PlannerClient for MutatingPlanner {
+        fn request_plan(
+            &self,
+            request: &PlannerRequest,
+        ) -> Result<PlannerCandidate, BridgeRefusal> {
+            assert_eq!(request.broker_url, DEFAULT_BROKER_URL);
+            fs::write(&self.path, &self.bytes).expect("concurrent mutation succeeds");
+            Ok(PlannerCandidate {
+                planner_output_json: self.output.clone(),
+                broker_route: request.broker_url.clone(),
+                resolved_model: request.model.clone(),
+                response_sha256: sha256_hex(self.output.as_bytes()),
+            })
         }
     }
 
@@ -2689,6 +2773,22 @@ mod tests {
     }
 
     #[test]
+    fn worktree_subdirectory_is_rejected_before_apply() {
+        let repo = git_repo("subdir-worktree");
+        let subdir = repo.join("docs");
+        let err = run_task(
+            spec(&subdir, vec!["cert.md"], None),
+            &StubPlanner {
+                output: valid_planner_output(&repo, "docs/cert.md"),
+            },
+            &InlineValidator,
+        )
+        .expect_err("task worktree must be the git root, not a subdirectory");
+        assert_eq!(err.kind, "worktree-not-root");
+        assert!(!repo.join("docs/cert.md").exists());
+    }
+
+    #[test]
     fn stale_base_worktree_is_rejected_before_apply() {
         let repo = git_repo("stale-base");
         fs::write(repo.join("README.md"), "baseline\nsecond\n").unwrap();
@@ -2786,6 +2886,26 @@ mod tests {
         .expect("retry succeeds with only bridge-owned receipt dirt");
         assert_eq!(second["ok"], true);
         assert_eq!(second["actual_changed_paths"], json!(["docs/cert.md"]));
+    }
+
+    #[test]
+    fn concurrent_target_change_before_preview_is_rejected() {
+        let repo = git_repo("concurrent-before-preview");
+        let target = repo.join("docs/cert.md");
+        let concurrent = "# Purpose\n\nConcurrent edit.\n".to_string();
+        let planner = MutatingPlanner {
+            output: valid_planner_output(&repo, "docs/cert.md"),
+            path: target.clone(),
+            bytes: concurrent.clone(),
+        };
+        let err = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect_err("concurrent target dirt must be caught before preview/apply");
+        assert_eq!(err.kind, "worktree-dirty");
+        assert_eq!(fs::read_to_string(target).unwrap(), concurrent);
     }
 
     #[test]
@@ -3012,6 +3132,25 @@ mod tests {
         let second =
             run_task(second_task, &planner, &InlineValidator).expect("second run succeeds");
         assert_eq!(second["status"], "idempotent_complete");
+    }
+
+    #[test]
+    fn cached_completion_requires_same_task_specification() {
+        let repo = git_repo("idempotent-spec-binding");
+        let planner = StubPlanner {
+            output: valid_planner_output(&repo, "docs/cert.md"),
+        };
+        run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("first run succeeds");
+        let mut changed_spec = spec(&repo, vec!["docs/cert.md"], None);
+        changed_spec.caller_id = "other-caller".to_string();
+        let err = run_task(changed_spec, &planner, &InlineValidator)
+            .expect_err("cached completion must bind to the same task spec");
+        assert_eq!(err.kind, "completed-task-spec-mismatch");
     }
 
     #[test]
