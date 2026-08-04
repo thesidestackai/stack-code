@@ -814,7 +814,7 @@ _TIER4_DECLARED=()
 _TIER4_BRANCH=""
 _TIER4_BASE=""
 _tier4_gate_package() {
-  local wt=$1 lane=$2 plan=${3:-}
+  local wt=$1 lane=$2 plan=${3:-} head_mode=${4:-precommit}
   local refusals=0
   _t4_reject() { err "TIER-4 GATE REFUSED: $*"; refusals=$((refusals + 1)); }
 
@@ -879,22 +879,40 @@ _tier4_gate_package() {
     cur_branch=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
     [[ "$cur_branch" == "$branch" ]] || _t4_reject "worktree branch ($cur_branch) does not match approved lane branch ($branch)"
 
+    if [[ "$head_mode" == "precommit" ]]; then
+      local cur_head origin_head
+      cur_head=$(git -C "$wt" rev-parse HEAD 2>/dev/null || echo "")
+      origin_head=$(git -C "$wt" rev-parse origin/main 2>/dev/null || echo "")
+      [[ -n "$cur_head" && -n "$origin_head" && "$cur_head" == "$origin_head" ]] \
+        || _t4_reject "worktree HEAD ($cur_head) does not match approved base origin/main ($origin_head)"
+    fi
+
     local ctl
     ctl=$(git -C "$CONTROL_CHECKOUT" status --porcelain --untracked-files=all 2>/dev/null || echo "__ERR__")
     if [[ "$ctl" == "__ERR__" ]]; then _t4_reject "cannot read control checkout: $CONTROL_CHECKOUT"
     elif [[ -n "$ctl" ]]; then _t4_reject "control checkout is not clean — refuse to package from a dirty base"; fi
 
     # Drift guard: every worktree change must be in the declared set (ignored .claw excepted).
-    local line pth abs2
-    while IFS= read -r line; do
-      [[ -z "$line" ]] && continue
-      pth=${line:3}
-      [[ "$pth" == *" -> "* ]] && pth=${pth##* -> }   # rename: take the new path
+    local record status pth abs2 _old_pth
+    while IFS= read -r -d '' record; do
+      [[ -z "$record" ]] && continue
+      if [[ ${#record} -lt 4 || ${record:2:1} != " " ]]; then
+        _t4_reject "could not parse git status record for package drift"
+        continue
+      fi
+      status=${record:0:2}
+      pth=${record:3}
+      if [[ ${status:0:1} == R || ${status:0:1} == C || ${status:1:1} == R || ${status:1:1} == C ]]; then
+        if ! IFS= read -r -d '' _old_pth; then
+          _t4_reject "could not parse git status rename/copy source path for package drift"
+          break
+        fi
+      fi
       abs2=$(normalize_abs "$wt/$pth")
       is_under "$wt/.claw" "$abs2" && continue
       res=$(classify_write "$abs2" "$wt" "${declared[@]}")
       [[ "$res" == accepted:* ]] || _t4_reject "drift: worktree change outside declared set: $pth ($res)"
-    done < <(git -C "$wt" status --porcelain --untracked-files=all 2>/dev/null || true)
+    done < <(git -C "$wt" status --porcelain=v1 -z --untracked-files=all 2>/dev/null || true)
 
     # Per declared file: present on disk AND its sha256 matches a recorded payload after.sha256.
     local rel sha rec
@@ -924,6 +942,41 @@ _tier4_gate_package() {
   return $EXIT_OK
 }
 
+_TIER4_PACKAGE_PARENT=""
+_TIER4_APPROVED_BASE_SHA=""
+_tier4_verify_package_commit_parent() {
+  local wt=$1 stage_label=${2:-TIER-4}
+  local record
+  local parts=()
+  local parent_sha
+  local approved_base_sha
+  local expected_base_ref=${_TIER4_BASE:-origin/main}
+
+  if ! record=$(git -C "$wt" rev-list --parents -n 1 HEAD 2>/dev/null); then
+    err "$stage_label PACKAGE_COMMIT_PARENT_COUNT_INVALID: failed to inspect HEAD parents"
+    return $EXIT_GATE
+  fi
+  read -r -a parts <<<"$record"
+  if [[ ${#parts[@]} -ne 2 ]]; then
+    err "$stage_label PACKAGE_COMMIT_PARENT_COUNT_INVALID: package commit must have exactly one parent"
+    return $EXIT_GATE
+  fi
+
+  parent_sha=${parts[1]}
+  if ! approved_base_sha=$(git -C "$wt" rev-parse --verify -q "${expected_base_ref}^{commit}"); then
+    err "$stage_label PACKAGE_COMMIT_PARENT_MISMATCH: approved base $expected_base_ref is not resolvable"
+    return $EXIT_GATE
+  fi
+  if [[ "$parent_sha" != "$approved_base_sha" ]]; then
+    err "$stage_label PACKAGE_COMMIT_PARENT_MISMATCH: package parent $parent_sha does not match approved base $approved_base_sha"
+    return $EXIT_GATE
+  fi
+
+  _TIER4_PACKAGE_PARENT=$parent_sha
+  _TIER4_APPROVED_BASE_SHA=$approved_base_sha
+  return $EXIT_OK
+}
+
 # package-plan --worktree <path> --approved-lane <lane.json> [--plan <plan.yaml>]
 cmd_package_plan() {
   local wt="" lane="" plan=""
@@ -938,7 +991,7 @@ cmd_package_plan() {
   [[ -n "$wt" && -n "$lane" ]] || { err "package-plan requires --worktree and --approved-lane"; return $EXIT_USAGE; }
   [[ -f "$lane" ]] || { err "approved-lane file not found: $lane"; return $EXIT_USAGE; }
 
-  _tier4_gate_package "$wt" "$lane" "$plan" || return $?
+  _tier4_gate_package "$wt" "$lane" "$plan" precommit || return $?
 
   rule; info "Tier-4 package-plan (READ-ONLY) — worktree is package-ready"; rule
   emit_package_plan "$wt" "$_TIER4_BRANCH" "$_TIER4_BASE" "${_TIER4_DECLARED[@]}"
@@ -1011,7 +1064,7 @@ cmd_package_commit() {
 
   # Same read-only readiness gate as package-plan (Stage 1). Refuses BEFORE any
   # staging on base/branch/approval/scope/drift/hash/evidence problems.
-  _tier4_gate_package "$wt" "$lane" "$plan" || return $?
+  _tier4_gate_package "$wt" "$lane" "$plan" precommit || return $?
   local branch=$_TIER4_BRANCH
   local declared=("${_TIER4_DECLARED[@]}")
 
@@ -1125,7 +1178,7 @@ cmd_package_push() {
   [[ -f "$lane" ]] || { err "approved-lane file not found: $lane"; return $EXIT_USAGE; }
 
   # Same read-only readiness gate as package-plan/package-commit.
-  _tier4_gate_package "$wt" "$lane" "$plan" || return $?
+  _tier4_gate_package "$wt" "$lane" "$plan" postcommit || return $?
   local branch=$_TIER4_BRANCH
   local declared=("${_TIER4_DECLARED[@]}")
 
@@ -1140,10 +1193,10 @@ cmd_package_push() {
     err "TIER-4 STAGE3 REFUSED: disposable worktree has staged/unstaged tracked changes; run package-commit first. Nothing pushed."
     return $EXIT_GATE
   fi
-  # ...and HEAD must be a real commit with a parent.
+  # ...and HEAD must be exactly one package commit on the approved base.
   local parent
-  parent=$(git -C "$wt" rev-parse --verify -q 'HEAD~1') \
-    || { err "TIER-4 STAGE3 REFUSED: worktree HEAD has no parent (no package-commit). Nothing pushed."; return $EXIT_GATE; }
+  _tier4_verify_package_commit_parent "$wt" "TIER-4 STAGE3 REFUSED:" || return $?
+  parent=$_TIER4_PACKAGE_PARENT
 
   # Re-derive the package-commit evidence: the HEAD commit must have changed
   # EXACTLY the declared set (this is the Stage-2 package-commit).
@@ -1160,7 +1213,7 @@ cmd_package_push() {
   fi
   local package_commit_sha base_sha
   package_commit_sha=$(git -C "$wt" rev-parse HEAD)
-  base_sha=$(git -C "$wt" rev-parse "$parent")
+  base_sha=$_TIER4_APPROVED_BASE_SHA
 
   # Remote branch safety: exact branch name; refuse a pre-existing remote branch
   # at a DIFFERENT sha (no force). A SAME-sha remote is an idempotent no-op.
@@ -1291,7 +1344,7 @@ cmd_package_pr() {
   [[ -f "$lane" ]] || { err "approved-lane file not found: $lane"; return $EXIT_USAGE; }
 
   # Same read-only readiness gate as package-plan/commit/push.
-  _tier4_gate_package "$wt" "$lane" "$plan" || return $?
+  _tier4_gate_package "$wt" "$lane" "$plan" postcommit || return $?
   local branch=$_TIER4_BRANCH
   local declared=("${_TIER4_DECLARED[@]}")
 
@@ -1301,14 +1354,15 @@ cmd_package_pr() {
   esac
 
   # The disposable worktree must be in the committed (Stage-2) state: clean of
-  # tracked changes (untracked .claw allowed) with HEAD a real commit + parent.
+  # tracked changes (untracked .claw allowed) with exactly one package commit on
+  # the approved base.
   if ! git -C "$wt" diff --quiet || ! git -C "$wt" diff --cached --quiet; then
     err "TIER-4 STAGE4 REFUSED: disposable worktree has staged/unstaged tracked changes; run package-commit first. Nothing opened."
     return $EXIT_GATE
   fi
   local parent
-  parent=$(git -C "$wt" rev-parse --verify -q 'HEAD~1') \
-    || { err "TIER-4 STAGE4 REFUSED: worktree HEAD has no parent (no package-commit). Nothing opened."; return $EXIT_GATE; }
+  _tier4_verify_package_commit_parent "$wt" "TIER-4 STAGE4 REFUSED:" || return $?
+  parent=$_TIER4_PACKAGE_PARENT
 
   # HEAD must be the clean package-commit: it changed EXACTLY the declared set.
   local d declared_rel=()
@@ -1324,7 +1378,7 @@ cmd_package_pr() {
   fi
   local commit_sha base_sha
   commit_sha=$(git -C "$wt" rev-parse HEAD)
-  base_sha=$(git -C "$wt" rev-parse "$parent")
+  base_sha=$_TIER4_APPROVED_BASE_SHA
 
   # The branch MUST already be pushed (Stage 3) at the EXACT package-commit sha.
   # Fail closed if it is missing/unpushed or sitting at a different sha (no push,

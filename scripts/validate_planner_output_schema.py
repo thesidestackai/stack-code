@@ -68,7 +68,12 @@ SECRET_PATTERNS = [
      "secret assignment"),
 ]
 
-_PORT_11434 = "11434"
+RAW_11434_ENDPOINT_RE = re.compile(
+    r"(?i)(?:"
+    r"https?://[^\s'\"<>]+:11434(?=$|[/?#\s'\"<>,.;:)\]}])"
+    r"|(?<![A-Za-z0-9_./-])(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9][A-Za-z0-9._-]*):11434(?=$|[/?#\s'\"<>,.;:)\]}])"
+    r")"
+)
 
 
 # --------------------------------------------------------------------------
@@ -205,9 +210,9 @@ def _semantic_errors(doc: Any) -> list[str]:
                     f"$.{PATH_ARRAY_FIELD}[{i}]: path is not workspace-relative (escape refused)"
                 )
 
-    # :11434 value refusal + secret/token/key refusal across all string values.
+    # Raw upstream endpoint refusal + secret/token/key refusal across all string values.
     for field_path, text in _walk_strings(doc, "$"):
-        if _PORT_11434 in text:
+        if RAW_11434_ENDPOINT_RE.search(text):
             errors.append(f"{field_path}: forbidden :11434 endpoint reference refused")
         for pattern, label in SECRET_PATTERNS:
             if pattern.search(text):
@@ -247,8 +252,56 @@ def _self_test(schema_path: Path) -> int:
         verdict = "accept" if accepted else "refuse"
         flag = "OK " if correct else "XX "
         print(f"{flag}{fx.name}: {verdict} (expected {'accept' if expect_valid else 'refuse'})")
+    for name, doc, expect_valid in _semantic_self_test_cases():
+        failures = validate_document(doc, schema)
+        accepted = not failures
+        correct = accepted == expect_valid
+        ok = ok and correct
+        verdict = "accept" if accepted else "refuse"
+        flag = "OK " if correct else "XX "
+        print(f"{flag}{name}: {verdict} (expected {'accept' if expect_valid else 'refuse'})")
     print("self-test: PASS" if ok else "self-test: FAIL")
     return 0 if ok else 1
+
+
+def _minimal_self_test_doc() -> dict[str, Any]:
+    return {
+        "schema_version": "a2-l4-planner-output.v1",
+        "task_id": "task-0001",
+        "workspace_root": "stack-code",
+        "task_summary": "Validate semantic guard parity.",
+        "plan_steps": [
+            {"step_id": "s1", "description": "Review the bounded target."}
+        ],
+        "risk_notes": [],
+        "operator_next_steps": ["review evidence"],
+        "candidate_files": ["docs/cert.md"],
+    }
+
+
+def _semantic_self_test_cases() -> list[tuple[str, dict[str, Any], bool]]:
+    cases: list[tuple[str, dict[str, Any], bool]] = []
+
+    def case(name: str, field: str, value: Any, expect_valid: bool) -> None:
+        doc = _minimal_self_test_doc()
+        doc[field] = value
+        cases.append((name, doc, expect_valid))
+
+    case("valid-task-id-with-11434-digits", "task_id", "task-11434", True)
+    case("valid-prose-with-11434-digits", "task_summary", "Track issue 11434.", True)
+    case("valid-path-with-11434-digits", "candidate_files", ["docs/11434-notes.md"], True)
+    case("valid-broker-11435-url", "risk_notes", ["Use http://127.0.0.1:11435."], True)
+    case("invalid-localhost-11434-url", "risk_notes", ["http://localhost:11434"], False)
+    case("invalid-loopback-11434-url", "risk_notes", ["http://127.0.0.1:11434"], False)
+    case("invalid-localhost-11434-bare", "risk_notes", ["localhost:11434"], False)
+    case("invalid-loopback-11434-bare", "risk_notes", ["127.0.0.1:11434"], False)
+    case("invalid-ipv6-11434-bare", "risk_notes", ["[::1]:11434"], False)
+    case("invalid-hostname-11434-bare", "risk_notes", ["ollama:11434"], False)
+    case("invalid-wildcard-ip-11434-bare", "risk_notes", ["0.0.0.0:11434"], False)
+    case("invalid-internal-host-11434-bare", "risk_notes", ["model-host.internal:11434/v1"], False)
+    case("invalid-hostname-11434-punctuated", "risk_notes", ["Use ollama:11434."], False)
+    case("invalid-generic-url-11434", "risk_notes", ["http://example.invalid:11434/v1"], False)
+    return cases
 
 
 def main(argv: list[str] | None = None) -> int:
