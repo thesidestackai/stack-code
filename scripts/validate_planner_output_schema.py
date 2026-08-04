@@ -69,7 +69,10 @@ SECRET_PATTERNS = [
 ]
 
 RAW_11434_ENDPOINT_RE = re.compile(
-    r"(?i)(?:https?://[^\s'\"<>]+:11434\b|(?:localhost|127\.0\.0\.1|\[::1\]):11434\b)"
+    r"(?i)(?:"
+    r"https?://[^\s'\"<>]+:11434(?=$|[/?#\s'\"<>,.;:)\]}])"
+    r"|(?<![A-Za-z0-9_./-])(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9][A-Za-z0-9._-]*):11434(?=$|[/?#\s'\"<>,.;:)\]}])"
+    r")"
 )
 
 
@@ -293,6 +296,10 @@ def _semantic_self_test_cases() -> list[tuple[str, dict[str, Any], bool]]:
     case("invalid-localhost-11434-bare", "risk_notes", ["localhost:11434"], False)
     case("invalid-loopback-11434-bare", "risk_notes", ["127.0.0.1:11434"], False)
     case("invalid-ipv6-11434-bare", "risk_notes", ["[::1]:11434"], False)
+    case("invalid-hostname-11434-bare", "risk_notes", ["ollama:11434"], False)
+    case("invalid-wildcard-ip-11434-bare", "risk_notes", ["0.0.0.0:11434"], False)
+    case("invalid-internal-host-11434-bare", "risk_notes", ["model-host.internal:11434/v1"], False)
+    case("invalid-hostname-11434-punctuated", "risk_notes", ["Use ollama:11434."], False)
     case("invalid-generic-url-11434", "risk_notes", ["http://example.invalid:11434/v1"], False)
     return cases
 
