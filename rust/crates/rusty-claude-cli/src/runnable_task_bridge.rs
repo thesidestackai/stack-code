@@ -32,6 +32,9 @@ const EXIT_REFUSED: i32 = 5;
 const EXIT_APPLY_REFUSED: i32 = 7;
 const EXIT_VALIDATION_FAILED: i32 = 13;
 
+#[cfg(test)]
+static TEST_CONTROL_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RunnableTaskSpec {
@@ -400,6 +403,7 @@ fn normalize_task(spec: RunnableTaskSpec) -> Result<NormalizedTask, BridgeRefusa
     let worktree = canonical_worktree(&spec.worktree)?;
     let workspace_binding = expected_workspace_binding(&worktree)?;
     let base_sha = git_stdout(&worktree, &["rev-parse", "HEAD"])?;
+    verify_approved_base(&worktree, &base_sha)?;
     let branch = git_stdout(&worktree, &["branch", "--show-current"])?;
     if branch.is_empty() {
         return Err(refusal(
@@ -1020,9 +1024,10 @@ fn package_control_checkout() -> Result<PathBuf, BridgeRefusal> {
 #[cfg(test)]
 fn test_control_checkout() -> Result<PathBuf, BridgeRefusal> {
     let path = std::env::temp_dir().join(format!(
-        "stack-code-task-bridge-control-{}-{}",
+        "stack-code-task-bridge-control-{}-{}-{}",
         std::process::id(),
-        timestamp()
+        timestamp(),
+        TEST_CONTROL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     fs::create_dir_all(&path).map_err(|e| {
         refusal(
@@ -1235,11 +1240,8 @@ fn resume_applied_task_if_current(task: &NormalizedTask) -> Result<Option<Value>
     if expected != actual {
         return Ok(None);
     }
-    let approved_lane_path = if task.receipt_dir.join("approved-lane.json").is_file() {
-        task.receipt_dir.join("approved-lane.json")
-    } else {
-        write_approved_lane(task)?
-    };
+    let approved_lane_path = task.receipt_dir.join("approved-lane.json");
+    verify_resume_evidence(task, &approved_lane_path)?;
     let changed_paths = verify_changed_paths(task)?;
     run_validation(task)?;
     write_receipt_if_absent(
@@ -1280,6 +1282,225 @@ fn approved_lane_path_from_result(value: &Value) -> Result<PathBuf, BridgeRefusa
                 "task-complete receipt is missing approved_lane_path",
             )
         })
+}
+
+fn verify_resume_evidence(
+    task: &NormalizedTask,
+    approved_lane_path: &Path,
+) -> Result<(), BridgeRefusal> {
+    let planner_output = read_existing_receipt_string(task, "planner-output.json")?;
+    reject_secret_like_candidate(&planner_output)?;
+    verify_planner_paths(task, &planner_output)?;
+
+    let after_path = task.receipt_dir.join("after.bin");
+    require_existing_receipt_file(&after_path)?;
+    let expected_after = sha256_hex(task.after_text.as_bytes());
+    let recorded_after = sha256_file_hex(&after_path).map_err(|e| {
+        refusal(
+            "applied-task-evidence-hash-error",
+            format!(
+                "could not hash recorded after bytes {}: {e}",
+                after_path.display()
+            ),
+        )
+    })?;
+    if recorded_after != expected_after {
+        return Err(refusal(
+            "applied-task-evidence-mismatch",
+            "recorded after.bin does not match requested after_text",
+        ));
+    }
+
+    validate_approved_lane(task, approved_lane_path)?;
+    let preview_result = read_existing_receipt_json(task, "preview-generator-result.json")?;
+    let preview_bundle_path = preview_bundle_path_from_result(task, &preview_result)?;
+    let preview_bundle = read_preview_bundle(&preview_bundle_path)?;
+    let authorization = read_existing_receipt_json(task, "mutation-authorization.json")?;
+    validate_mutation_authorization(task, &authorization, &preview_bundle_path, &preview_bundle)
+}
+
+fn validate_approved_lane(task: &NormalizedTask, path: &Path) -> Result<(), BridgeRefusal> {
+    let value = read_existing_json(path)?;
+    if value.get("schema_version").and_then(Value::as_str)
+        != Some("stack-code-runnable-task-approved-lane.v1")
+        || value.get("operatorApproved").and_then(Value::as_bool) != Some(true)
+        || value.get("taskId").and_then(Value::as_str) != Some(task.task_id.as_str())
+        || value.get("callerId").and_then(Value::as_str) != Some(task.caller_id.as_str())
+        || value.get("taskType").and_then(Value::as_str) != Some(task.task_type.as_str())
+    {
+        return Err(refusal(
+            "applied-task-evidence-mismatch",
+            "approved-lane receipt does not bind to this task",
+        ));
+    }
+    let worktree = task.worktree.to_string_lossy();
+    if value
+        .pointer("/worktreePlan/worktreePath")
+        .and_then(Value::as_str)
+        != Some(worktree.as_ref())
+        || value
+            .pointer("/worktreePlan/branch")
+            .and_then(Value::as_str)
+            != Some(task.branch.as_str())
+        || value.pointer("/worktreePlan/base").and_then(Value::as_str) != Some("origin/main")
+    {
+        return Err(refusal(
+            "applied-task-evidence-mismatch",
+            "approved-lane worktree binding does not match this task",
+        ));
+    }
+    let target = task.worktree.join(&task.target_path);
+    let target = target.to_string_lossy();
+    if !json_array_is_exact_string(value.get("declaredPaths"), target.as_ref())
+        || !json_array_is_exact_string(value.get("proposedWrites"), target.as_ref())
+    {
+        return Err(refusal(
+            "applied-task-evidence-mismatch",
+            "approved-lane target path does not match this task",
+        ));
+    }
+    Ok(())
+}
+
+fn preview_bundle_path_from_result(
+    task: &NormalizedTask,
+    value: &Value,
+) -> Result<PathBuf, BridgeRefusal> {
+    let raw = value
+        .get("preview_bundle_path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            refusal(
+                "applied-task-evidence-mismatch",
+                "preview-generator-result lacks preview_bundle_path",
+            )
+        })?;
+    let path = PathBuf::from(raw);
+    require_path_inside_worktree(task, &path, "preview_bundle_path")?;
+    require_existing_receipt_file(&path)?;
+    Ok(path)
+}
+
+fn validate_mutation_authorization(
+    task: &NormalizedTask,
+    value: &Value,
+    preview_bundle_path: &Path,
+    preview_bundle: &PreviewBundleRead,
+) -> Result<(), BridgeRefusal> {
+    let preview_path = preview_bundle_path.to_string_lossy();
+    if value.get("schema_version").and_then(Value::as_str) != Some(RECEIPT_SCHEMA_V1)
+        || value.get("receipt").and_then(Value::as_str) != Some("mutation_authorization")
+        || value.get("task_id").and_then(Value::as_str) != Some(task.task_id.as_str())
+        || value.get("base_sha").and_then(Value::as_str) != Some(task.base_sha.as_str())
+        || value.get("caller_id").and_then(Value::as_str) != Some(task.caller_id.as_str())
+        || value.get("target_path").and_then(Value::as_str) != Some(task.target_path.as_str())
+        || value.get("preview_bundle_path").and_then(Value::as_str) != Some(preview_path.as_ref())
+        || value.get("preview_sha256").and_then(Value::as_str)
+            != Some(preview_bundle.preview_record.preview_sha256.as_str())
+    {
+        return Err(refusal(
+            "applied-task-evidence-mismatch",
+            "mutation authorization does not bind to this task and preview",
+        ));
+    }
+    Ok(())
+}
+
+fn read_existing_receipt_string(
+    task: &NormalizedTask,
+    name: &str,
+) -> Result<String, BridgeRefusal> {
+    let path = task.receipt_dir.join(name);
+    require_existing_receipt_file(&path)?;
+    fs::read_to_string(&path).map_err(|e| {
+        refusal(
+            "applied-task-evidence-read-error",
+            format!("could not read task-bound evidence {}: {e}", path.display()),
+        )
+    })
+}
+
+fn read_existing_receipt_json(task: &NormalizedTask, name: &str) -> Result<Value, BridgeRefusal> {
+    read_existing_json(&task.receipt_dir.join(name))
+}
+
+fn read_existing_json(path: &Path) -> Result<Value, BridgeRefusal> {
+    require_existing_receipt_file(path)?;
+    let bytes = fs::read(path).map_err(|e| {
+        refusal(
+            "applied-task-evidence-read-error",
+            format!("could not read task-bound evidence {}: {e}", path.display()),
+        )
+    })?;
+    serde_json::from_slice(&bytes).map_err(|e| {
+        refusal(
+            "applied-task-evidence-json-error",
+            format!(
+                "task-bound evidence {} was not valid JSON: {e}",
+                path.display()
+            ),
+        )
+    })
+}
+
+fn require_existing_receipt_file(path: &Path) -> Result<(), BridgeRefusal> {
+    let metadata = fs::symlink_metadata(path).map_err(|e| {
+        if e.kind() == io::ErrorKind::NotFound {
+            refusal(
+                "applied-task-evidence-missing",
+                format!(
+                    "required task-bound evidence is missing: {}",
+                    path.display()
+                ),
+            )
+        } else {
+            refusal(
+                "applied-task-evidence-stat-error",
+                format!("could not stat task-bound evidence {}: {e}", path.display()),
+            )
+        }
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(refusal(
+            "applied-task-evidence-invalid",
+            format!(
+                "task-bound evidence must be a regular file: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn require_path_inside_worktree(
+    task: &NormalizedTask,
+    path: &Path,
+    label: &str,
+) -> Result<(), BridgeRefusal> {
+    if !path.is_absolute() {
+        return Err(refusal(
+            "applied-task-evidence-mismatch",
+            format!("{label} must be an absolute A2 evidence path"),
+        ));
+    }
+    let canonical = path.canonicalize().map_err(|e| {
+        refusal(
+            "applied-task-evidence-stat-error",
+            format!("could not canonicalize {label} {}: {e}", path.display()),
+        )
+    })?;
+    if !canonical.starts_with(&task.worktree) {
+        return Err(refusal(
+            "applied-task-evidence-mismatch",
+            format!("{label} does not belong to this task worktree"),
+        ));
+    }
+    Ok(())
+}
+
+fn json_array_is_exact_string(value: Option<&Value>, expected: &str) -> bool {
+    matches!(value.and_then(Value::as_array), Some(items)
+        if items.len() == 1 && items[0].as_str() == Some(expected))
 }
 
 fn task_acceptance_receipt(task: &NormalizedTask, status: &str) -> Value {
@@ -1606,6 +1827,48 @@ fn expected_workspace_binding(worktree: &Path) -> Result<String, BridgeRefusal> 
     Ok(name.to_string())
 }
 
+fn verify_approved_base(worktree: &Path, base_sha: &str) -> Result<(), BridgeRefusal> {
+    let origin_main = git_stdout(worktree, &["rev-parse", "origin/main"])?;
+    if origin_main != base_sha {
+        return Err(refusal(
+            "worktree-base-mismatch",
+            format!(
+                "task worktree HEAD {base_sha} must equal approved base origin/main {origin_main}"
+            ),
+        ));
+    }
+    verify_repository_origin(worktree)
+}
+
+#[cfg(not(test))]
+fn verify_repository_origin(worktree: &Path) -> Result<(), BridgeRefusal> {
+    let task_origin = git_stdout(worktree, &["remote", "get-url", "origin"])?;
+    let control = package_control_checkout()?;
+    let control_origin = git_stdout(&control, &["remote", "get-url", "origin"])?;
+    if normalize_remote_url(&task_origin) == normalize_remote_url(&control_origin) {
+        Ok(())
+    } else {
+        Err(refusal(
+            "worktree-repository-mismatch",
+            "task worktree origin must match the Stack-Code control checkout origin",
+        ))
+    }
+}
+
+#[cfg(test)]
+fn verify_repository_origin(worktree: &Path) -> Result<(), BridgeRefusal> {
+    let _ = git_stdout(worktree, &["remote", "get-url", "origin"])?;
+    Ok(())
+}
+
+fn normalize_remote_url(value: &str) -> String {
+    value
+        .trim()
+        .trim_end_matches(".git")
+        .replace(':', "/")
+        .to_ascii_lowercase()
+}
+
 fn reject_secret_like_candidate(candidate: &str) -> Result<(), BridgeRefusal> {
     if contains_raw_upstream_endpoint(candidate) {
         return Err(refusal(
@@ -1639,6 +1902,12 @@ fn reject_secret_like_candidate(candidate: &str) -> Result<(), BridgeRefusal> {
             "planner output contained token-shaped text",
         ));
     }
+    if contains_aws_access_key_shape(candidate) || contains_secret_assignment_shape(candidate) {
+        return Err(refusal(
+            "planner-output-secret-like-refused",
+            "planner output contained validator-recognized secret-shaped text",
+        ));
+    }
     Ok(())
 }
 
@@ -1668,6 +1937,83 @@ fn contains_prefixed_token_shape(text: &str, prefix: &str, min_tail_len: usize) 
         let after_ok = tail.chars().nth(token_len).is_none_or(is_token_separator);
         before_ok && after_ok && token_len >= min_tail_len
     })
+}
+
+fn contains_aws_access_key_shape(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.len() < 20 {
+        return false;
+    }
+    (0..=bytes.len() - 20).any(|idx| {
+        bytes[idx..].starts_with(b"AKIA")
+            && (idx == 0 || !is_word_byte(bytes[idx - 1]))
+            && bytes[idx + 4..idx + 20]
+                .iter()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+            && (idx + 20 == bytes.len() || !is_word_byte(bytes[idx + 20]))
+    })
+}
+
+fn contains_secret_assignment_shape(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    [
+        "api_key",
+        "api-key",
+        "apikey",
+        "secret",
+        "token",
+        "password",
+        "passwd",
+        "access_token",
+        "access-token",
+        "accesstoken",
+        "bearer",
+    ]
+    .iter()
+    .any(|key| {
+        lower.match_indices(key).any(|(idx, _)| {
+            let after_key = idx + key.len();
+            if (idx > 0 && is_word_byte(bytes[idx - 1]))
+                || (after_key < bytes.len() && is_word_byte(bytes[after_key]))
+            {
+                return false;
+            }
+            let mut cursor = after_key;
+            while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                cursor += 1;
+            }
+            if !bytes
+                .get(cursor)
+                .is_some_and(|byte| matches!(byte, b':' | b'='))
+            {
+                return false;
+            }
+            cursor += 1;
+            while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                cursor += 1;
+            }
+            if bytes
+                .get(cursor)
+                .is_some_and(|byte| matches!(byte, b'\'' | b'"'))
+            {
+                cursor += 1;
+            }
+            let value_len = bytes[cursor..]
+                .iter()
+                .take_while(|byte| is_secret_assignment_value_byte(**byte))
+                .count();
+            value_len >= 8
+        })
+    })
+}
+
+fn is_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn is_secret_assignment_value_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/' | b'+')
 }
 
 fn prefixed_token_tail_len(prefix: &str, tail: &str) -> usize {
@@ -2046,6 +2392,8 @@ mod tests {
         fs::write(dir.join("README.md"), "baseline\n").unwrap();
         git(&dir, &["add", "README.md"]);
         git(&dir, &["commit", "-m", "baseline"]);
+        git(&dir, &["remote", "add", "origin", "."]);
+        git(&dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
         dir
     }
 
@@ -2195,6 +2543,31 @@ mod tests {
     }
 
     #[test]
+    fn validator_recognized_secret_shapes_are_refused_before_persistence() {
+        for (label, secret) in [
+            ("aws-access-key", "AKIA1234567890ABCDEF"),
+            ("assignment", "api_key=abcdefgh"),
+        ] {
+            let repo = git_repo(label);
+            let mut output: Value =
+                serde_json::from_str(&valid_planner_output(&repo, "docs/cert.md")).unwrap();
+            output["risk_notes"] = json!([secret]);
+            let err = run_task(
+                spec(&repo, vec!["docs/cert.md"], None),
+                &StubPlanner {
+                    output: serde_json::to_string(&output).unwrap(),
+                },
+                &InlineValidator,
+            )
+            .expect_err("validator-recognized secret-shaped output must be refused");
+            assert_eq!(err.kind, "planner-output-secret-like-refused");
+            assert!(!repo
+                .join(".claw/runnable-task-bridge/cert-task/planner-output.json")
+                .exists());
+        }
+    }
+
+    #[test]
     fn dashed_vendor_credential_shapes_are_refused() {
         for (label, token) in [
             (
@@ -2312,6 +2685,24 @@ mod tests {
         )
         .expect_err("non-disposable worktree must fail");
         assert_eq!(err.kind, "worktree-not-disposable");
+        assert!(!repo.join("docs/cert.md").exists());
+    }
+
+    #[test]
+    fn stale_base_worktree_is_rejected_before_apply() {
+        let repo = git_repo("stale-base");
+        fs::write(repo.join("README.md"), "baseline\nsecond\n").unwrap();
+        git(&repo, &["add", "README.md"]);
+        git(&repo, &["commit", "-m", "advance branch"]);
+        let err = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &StubPlanner {
+                output: valid_planner_output(&repo, "docs/cert.md"),
+            },
+            &InlineValidator,
+        )
+        .expect_err("worktree HEAD must equal the approved base before apply");
+        assert_eq!(err.kind, "worktree-base-mismatch");
         assert!(!repo.join("docs/cert.md").exists());
     }
 
@@ -2438,6 +2829,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside, repo.join(".claw")).expect("create .claw symlink");
         git(&repo, &["add", ".claw"]);
         git(&repo, &["commit", "-m", "track claw symlink"]);
+        git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
         let err = run_task(
             spec(&repo, vec!["docs/cert.md"], None),
             &StubPlanner {
@@ -2665,7 +3057,6 @@ mod tests {
         fs::remove_file(receipt_dir.join("task-complete.json")).unwrap();
         fs::remove_file(receipt_dir.join("package-plan-readiness.json")).unwrap();
         fs::remove_file(receipt_dir.join("package-handoff-readiness.json")).unwrap();
-        fs::remove_file(receipt_dir.join("approved-lane.json")).unwrap();
         fs::remove_file(receipt_dir.join("a2-apply-result.json")).unwrap();
         let resumed = run_task(
             spec(&repo, vec!["docs/cert.md"], None),
@@ -2680,6 +3071,48 @@ mod tests {
         assert!(receipt_dir.join("task-complete.json").is_file());
         assert!(receipt_dir.join("package-plan-readiness.json").is_file());
         assert!(receipt_dir.join("package-handoff-readiness.json").is_file());
+    }
+
+    #[test]
+    fn applied_target_without_task_bound_evidence_is_rejected() {
+        let repo = git_repo("resume-no-evidence");
+        let task = spec(&repo, vec!["docs/cert.md"], None);
+        fs::write(repo.join("docs/cert.md"), task.after_text.as_bytes()).unwrap();
+        let err = run_task(
+            task,
+            &FailingPlanner {
+                kind: "planner-must-not-run",
+            },
+            &InlineValidator,
+        )
+        .expect_err("matching target bytes are not enough to resume");
+        assert_eq!(err.kind, "applied-task-evidence-missing");
+    }
+
+    #[test]
+    fn applied_target_without_approved_lane_cannot_resume() {
+        let repo = git_repo("resume-no-lane");
+        let planner = StubPlanner {
+            output: valid_planner_output(&repo, "docs/cert.md"),
+        };
+        let first = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("first run succeeds");
+        let receipt_dir = PathBuf::from(first["receipt_dir"].as_str().unwrap());
+        fs::remove_file(receipt_dir.join("task-complete.json")).unwrap();
+        fs::remove_file(receipt_dir.join("approved-lane.json")).unwrap();
+        let err = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &FailingPlanner {
+                kind: "planner-must-not-run",
+            },
+            &InlineValidator,
+        )
+        .expect_err("resume must require task-bound approved-lane evidence");
+        assert_eq!(err.kind, "applied-task-evidence-missing");
     }
 
     #[test]
