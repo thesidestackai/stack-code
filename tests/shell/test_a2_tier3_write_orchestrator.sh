@@ -309,7 +309,7 @@ git -C "$PKG_CTL" -c user.email=t@t -c user.name=t commit -q --allow-empty -m in
 # history + uncommitted declared file (notes.md) + matching .claw payload
 # after.sha256 + apply-bundle + checkpoint dir. Echoes the worktree path.
 build_applied_wt() {
-  local name=$1 branch=$2
+  local name=$1 branch=$2 rel=${3:-notes.md}
   local wt="$PKG_WTR/$name" sha
   mkdir -p "$wt"
   git -C "$wt" init -q
@@ -317,21 +317,23 @@ build_applied_wt() {
   git -C "$wt" config user.name t
   git -C "$wt" checkout -q -b "$branch"
   git -C "$wt" commit -q --allow-empty -m base
-  printf 'hello tier4\n' > "$wt/notes.md"
-  sha=$(sha256sum "$wt/notes.md" | awk '{print $1}')
+  git -C "$wt" update-ref refs/remotes/origin/main HEAD
+  mkdir -p "$(dirname "$wt/$rel")"
+  printf 'hello tier4\n' > "$wt/$rel"
+  sha=$(sha256sum "$wt/$rel" | awk '{print $1}')
   mkdir -p "$wt/.claw/l2b-payloads/RUN/STEP" "$wt/.claw/l2b-preview-bundles/RUN/STEP" "$wt/.claw/l2b-checkpoints/RUN/STEP"
   printf '%s\n' "$sha" > "$wt/.claw/l2b-payloads/RUN/STEP/after.sha256"
   printf '{}' > "$wt/.claw/l2b-preview-bundles/RUN/STEP/apply-bundle.json"
   printf '%s' "$wt"
 }
 
-# pkg_lane <file> <wt> <branch> — minimal approved lane for the fixture.
+# pkg_lane <file> <wt> <branch> [rel] — minimal approved lane for the fixture.
 pkg_lane() {
-  python3 - "$1" "$2" "$3" <<'PY'
+  python3 - "$1" "$2" "$3" "${4:-notes.md}" <<'PY'
 import json,sys
-f,wt,branch=sys.argv[1:4]
+f,wt,branch,rel=sys.argv[1:5]
 json.dump({"objective":"t","worktreePlan":{"worktreePath":wt,"branch":branch,"base":"origin/main"},
-           "declaredPaths":[wt+"/notes.md"],"operatorApproved":True}, open(f,"w"))
+           "declaredPaths":[wt+"/"+rel],"operatorApproved":True}, open(f,"w"))
 PY
 }
 
@@ -371,6 +373,36 @@ WT_DRIFT="$(build_applied_wt drift feat/x)"; printf 'x' > "$WT_DRIFT/EXTRA.txt"
 pkg_lane "$PKG_ROOT/lane_drift.json" "$WT_DRIFT" feat/x
 run_pkg "package-plan: drift outside declared set(4)" 4 package-plan --worktree "$WT_DRIFT" --approved-lane "$PKG_ROOT/lane_drift.json"
 
+# Unicode, spaces, and ASCII declared paths must survive Git's NUL porcelain form.
+WT_UNICODE="$(build_applied_wt unicode feat/x 'docs/é.md')"
+pkg_lane "$PKG_ROOT/lane_unicode.json" "$WT_UNICODE" feat/x 'docs/é.md'
+run_pkg "package-plan: declared unicode path package-ready(0)" 0 package-plan --worktree "$WT_UNICODE" --approved-lane "$PKG_ROOT/lane_unicode.json"
+
+WT_SPACE="$(build_applied_wt space feat/x 'docs/space name.md')"
+pkg_lane "$PKG_ROOT/lane_space.json" "$WT_SPACE" feat/x 'docs/space name.md'
+run_pkg "package-plan: declared path with spaces package-ready(0)" 0 package-plan --worktree "$WT_SPACE" --approved-lane "$PKG_ROOT/lane_space.json"
+
+WT_ASCII="$(build_applied_wt ascii feat/x 'docs/ascii.md')"
+pkg_lane "$PKG_ROOT/lane_ascii.json" "$WT_ASCII" feat/x 'docs/ascii.md'
+run_pkg "package-plan: declared ascii path package-ready(0)" 0 package-plan --worktree "$WT_ASCII" --approved-lane "$PKG_ROOT/lane_ascii.json"
+
+WT_UNDECLARED_UNICODE="$(build_applied_wt undeclared-unicode feat/x)"
+mkdir -p "$WT_UNDECLARED_UNICODE/docs"
+printf 'x' > "$WT_UNDECLARED_UNICODE/docs/é.md"
+pkg_lane "$PKG_ROOT/lane_undeclared_unicode.json" "$WT_UNDECLARED_UNICODE" feat/x
+run_pkg "package-plan: undeclared unicode drift refused(4)" 4 package-plan --worktree "$WT_UNDECLARED_UNICODE" --approved-lane "$PKG_ROOT/lane_undeclared_unicode.json"
+
+WT_CLAW_ARTIFACT="$(build_applied_wt claw-artifact feat/x)"
+mkdir -p "$WT_CLAW_ARTIFACT/.claw/runnable-task-bridge/task"
+printf '{}' > "$WT_CLAW_ARTIFACT/.claw/runnable-task-bridge/task/extra.json"
+pkg_lane "$PKG_ROOT/lane_claw_artifact.json" "$WT_CLAW_ARTIFACT" feat/x
+run_pkg "package-plan: bridge-owned claw artifact ignored(0)" 0 package-plan --worktree "$WT_CLAW_ARTIFACT" --approved-lane "$PKG_ROOT/lane_claw_artifact.json"
+
+WT_HEAD_DRIFT="$(build_applied_wt head-drift feat/x)"
+git -C "$WT_HEAD_DRIFT" commit -q --allow-empty -m "unrelated clean commit"
+pkg_lane "$PKG_ROOT/lane_head_drift.json" "$WT_HEAD_DRIFT" feat/x
+run_pkg "package-plan: clean HEAD drift refused(4)" 4 package-plan --worktree "$WT_HEAD_DRIFT" --approved-lane "$PKG_ROOT/lane_head_drift.json"
+
 # hash mismatch: on-disk bytes differ from recorded after.sha256 -> refuse(4).
 WT_HASH="$(build_applied_wt hash feat/x)"; printf 'tampered\n' > "$WT_HASH/notes.md"
 pkg_lane "$PKG_ROOT/lane_hash.json" "$WT_HASH" feat/x
@@ -387,7 +419,8 @@ pkg_lane "$PKG_ROOT/lane_br.json" "$WT_BR" feat/x   # lane says feat/x, worktree
 run_pkg "package-plan: worktree branch mismatch(4)"   4 package-plan --worktree "$WT_BR" --approved-lane "$PKG_ROOT/lane_br.json"
 
 # missing apply evidence: remove apply-bundle.json -> refuse(4).
-WT_NOEV="$(build_applied_wt noev feat/x)"; find "$WT_NOEV/.claw" -name 'apply-bundle.json' -delete
+WT_NOEV="$(build_applied_wt noev feat/x)"
+while IFS= read -r -d '' f; do rm -f -- "$f"; done < <(find "$WT_NOEV/.claw" -name 'apply-bundle.json' -print0)
 pkg_lane "$PKG_ROOT/lane_noev.json" "$WT_NOEV" feat/x
 run_pkg "package-plan: missing apply-bundle evidence(4)" 4 package-plan --worktree "$WT_NOEV" --approved-lane "$PKG_ROOT/lane_noev.json"
 

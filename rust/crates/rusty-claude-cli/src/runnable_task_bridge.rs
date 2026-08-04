@@ -62,6 +62,7 @@ struct NormalizedTask {
     objective: String,
     worktree: PathBuf,
     workspace_binding: String,
+    repository_identity: String,
     base_sha: String,
     branch: String,
     allowed_paths: Vec<String>,
@@ -271,6 +272,7 @@ fn run_task(
 
     let after_path = task.receipt_dir.join("after.bin");
     write_file_new(&after_path, task.after_text.as_bytes())?;
+    verify_current_task_binding(&task)?;
     verify_clean_start(&task)?;
     let preview_result =
         crate::try_run_plan_preview_bundle(&task.worktree, &task.target_path, &after_path)
@@ -415,6 +417,7 @@ fn normalize_task(spec: RunnableTaskSpec) -> Result<NormalizedTask, BridgeRefusa
     }
     let worktree = canonical_worktree(&spec.worktree)?;
     let workspace_binding = expected_workspace_binding(&worktree)?;
+    let repository_identity = repository_identity(&worktree)?;
     let base_sha = git_stdout(&worktree, &["rev-parse", "HEAD"])?;
     verify_approved_base(&worktree, &base_sha)?;
     let branch = git_stdout(&worktree, &["branch", "--show-current"])?;
@@ -456,6 +459,7 @@ fn normalize_task(spec: RunnableTaskSpec) -> Result<NormalizedTask, BridgeRefusa
         objective: spec.objective,
         worktree,
         workspace_binding,
+        repository_identity,
         base_sha,
         branch,
         allowed_paths,
@@ -891,6 +895,7 @@ fn run_package_plan_gate(
     approved_lane_path: &Path,
     model_binding: &ModelBinding,
 ) -> Result<Value, BridgeRefusal> {
+    verify_current_task_binding(task)?;
     let script = package_plan_script(task);
     if !script.is_file() {
         return Err(refusal(
@@ -929,6 +934,7 @@ fn run_package_plan_gate(
             exit_code: EXIT_REFUSED,
         });
     }
+    verify_current_task_binding(task)?;
     Ok(json!({
         "schema_version": RECEIPT_SCHEMA_V1,
         "receipt": "package_plan_gate",
@@ -1260,6 +1266,7 @@ fn completed_task_result_if_current(task: &NormalizedTask) -> Result<Option<Valu
             "task-complete receipt branch does not match the current worktree branch",
         ));
     }
+    verify_current_task_binding(task)?;
     let changed_paths = verify_changed_paths(task)?;
     let approved_lane_path = approved_lane_path_from_result(&value)?;
     let package_plan_gate = run_package_plan_gate(task, &approved_lane_path, &model_binding)?;
@@ -1322,6 +1329,7 @@ fn resume_applied_task_if_current(task: &NormalizedTask) -> Result<Option<Value>
     let approved_lane_path = task.receipt_dir.join("approved-lane.json");
     let model_binding = verify_resume_evidence(task, &approved_lane_path)?;
     let changed_paths = verify_changed_paths(task)?;
+    verify_current_task_binding(task)?;
     run_validation(task)?;
     write_receipt_if_absent(
         &task.receipt_dir,
@@ -1830,6 +1838,61 @@ fn verify_changed_paths(task: &NormalizedTask) -> Result<Vec<String>, BridgeRefu
     }
 }
 
+fn verify_current_task_binding(task: &NormalizedTask) -> Result<(), BridgeRefusal> {
+    let root = git_stdout(&task.worktree, &["rev-parse", "--show-toplevel"])?;
+    let root = PathBuf::from(root).canonicalize().map_err(|e| {
+        refusal(
+            "repository-binding-changed",
+            format!("could not canonicalize current git toplevel: {e}"),
+        )
+    })?;
+    if root != task.worktree {
+        return Err(refusal(
+            "repository-binding-changed",
+            format!(
+                "current git toplevel {} no longer matches task worktree {}",
+                root.display(),
+                task.worktree.display()
+            ),
+        ));
+    }
+    let workspace_binding = expected_workspace_binding(&root)?;
+    if workspace_binding != task.workspace_binding {
+        return Err(refusal(
+            "repository-binding-changed",
+            "current worktree binding no longer matches the normalized task binding",
+        ));
+    }
+    let repository_identity = repository_identity(&task.worktree)?;
+    if repository_identity != task.repository_identity {
+        return Err(refusal(
+            "repository-binding-changed",
+            "current repository identity no longer matches the normalized task binding",
+        ));
+    }
+    let branch = git_stdout(&task.worktree, &["branch", "--show-current"])?;
+    if branch != task.branch {
+        return Err(refusal(
+            "worktree-branch-changed",
+            format!(
+                "current branch {branch} no longer matches normalized task branch {}",
+                task.branch
+            ),
+        ));
+    }
+    let head = git_stdout(&task.worktree, &["rev-parse", "HEAD"])?;
+    if head != task.base_sha {
+        return Err(refusal(
+            "worktree-head-changed",
+            format!(
+                "current HEAD {head} no longer matches normalized task base {}",
+                task.base_sha
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn git_status_porcelain_paths(worktree: &Path) -> Result<Vec<String>, BridgeRefusal> {
     let output = Command::new("git")
         .arg("-C")
@@ -1965,6 +2028,12 @@ fn normalize_one_allowed_path(worktree: &Path, path: &str) -> Result<String, Bri
             format!("path is not valid UTF-8 after normalization: {path}"),
         )
     })?;
+    if is_reserved_claw_path(normalized) {
+        return Err(refusal(
+            "reserved-target-path",
+            format!("operator tasks may not target reserved internal path: {normalized}"),
+        ));
+    }
     let target = worktree.join(&normalized_rel);
     let Some(parent) = target.parent() else {
         return Err(refusal("path-parent-missing", "target has no parent"));
@@ -1990,6 +2059,14 @@ fn normalize_one_allowed_path(worktree: &Path, path: &str) -> Result<String, Bri
         }
     }
     Ok(normalized.to_string())
+}
+
+fn is_reserved_claw_path(path: &str) -> bool {
+    let mut components = Path::new(path).components();
+    matches!(
+        components.next(),
+        Some(Component::Normal(component)) if component == ".claw"
+    )
 }
 
 fn canonical_worktree(path: &Path) -> Result<PathBuf, BridgeRefusal> {
@@ -2168,6 +2245,11 @@ fn verify_approved_base(worktree: &Path, base_sha: &str) -> Result<(), BridgeRef
     verify_repository_origin(worktree)
 }
 
+fn repository_identity(worktree: &Path) -> Result<String, BridgeRefusal> {
+    git_stdout(worktree, &["remote", "get-url", "origin"])
+        .map(|origin| normalize_remote_url(&origin))
+}
+
 #[cfg(not(test))]
 fn verify_repository_origin(worktree: &Path) -> Result<(), BridgeRefusal> {
     let task_origin = git_stdout(worktree, &["remote", "get-url", "origin"])?;
@@ -2241,17 +2323,37 @@ fn reject_secret_like_candidate(candidate: &str) -> Result<(), BridgeRefusal> {
 
 fn contains_raw_upstream_endpoint(candidate: &str) -> bool {
     let lower = candidate.to_ascii_lowercase();
-    lower.match_indices(":11434").any(|(idx, _)| {
-        let before_ok = lower[..idx]
-            .chars()
-            .next_back()
-            .is_some_and(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | ']' | '-'));
-        let after_ok = lower[idx + ":11434".len()..]
-            .chars()
-            .next()
-            .is_none_or(|ch| !ch.is_ascii_digit());
-        before_ok && after_ok
-    })
+    lower
+        .match_indices(":11434")
+        .any(|(idx, _)| raw_upstream_endpoint_at(&lower, idx))
+}
+
+fn raw_upstream_endpoint_at(lower: &str, port_idx: usize) -> bool {
+    let after_ok = lower[port_idx + ":11434".len()..]
+        .chars()
+        .next()
+        .is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_');
+    if !after_ok {
+        return false;
+    }
+
+    let before = &lower[..port_idx];
+    if before.ends_with("localhost") || before.ends_with("127.0.0.1") || before.ends_with("[::1]") {
+        return true;
+    }
+
+    if let Some(scheme_idx) = before.rfind("://") {
+        let host = &before[scheme_idx + 3..];
+        return !host.is_empty()
+            && !host.contains('/')
+            && !host.contains(char::is_whitespace)
+            && !host.contains('\'')
+            && !host.contains('"')
+            && !host.contains('<')
+            && !host.contains('>');
+    }
+
+    false
 }
 
 fn contains_prefixed_token_shape(text: &str, prefix: &str, min_tail_len: usize) -> bool {
@@ -2262,7 +2364,10 @@ fn contains_prefixed_token_shape(text: &str, prefix: &str, min_tail_len: usize) 
             .is_none_or(|ch| !is_word_char(ch));
         let tail = &text[idx + prefix.len()..];
         let token_len = prefixed_token_tail_len(prefix, tail);
-        let after_ok = tail.chars().nth(token_len).is_none_or(is_token_separator);
+        let after_ok = tail
+            .chars()
+            .nth(token_len)
+            .is_none_or(|ch| !is_word_char(ch));
         before_ok && after_ok && token_len >= min_tail_len
     })
 }
@@ -2347,7 +2452,7 @@ fn is_secret_assignment_value_byte(byte: u8) -> bool {
 fn prefixed_token_tail_len(prefix: &str, tail: &str) -> usize {
     if matches!(prefix, "sk-proj-" | "sk-ant-" | "sk_live_" | "github_pat_") {
         tail.chars()
-            .take_while(|ch| !is_token_separator(*ch))
+            .take_while(|ch| is_word_char(*ch) || matches!(*ch, '-' | '.'))
             .count()
     } else {
         tail.chars().take_while(char::is_ascii_alphanumeric).count()
@@ -2356,29 +2461,6 @@ fn prefixed_token_tail_len(prefix: &str, tail: &str) -> usize {
 
 fn is_word_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || ch == '_'
-}
-
-fn is_token_separator(ch: char) -> bool {
-    ch.is_whitespace()
-        || matches!(
-            ch,
-            '"' | '\''
-                | ','
-                | ';'
-                | ':'
-                | '.'
-                | '!'
-                | '?'
-                | '('
-                | ')'
-                | '['
-                | ']'
-                | '<'
-                | '>'
-                | '{'
-                | '}'
-                | '`'
-        )
 }
 
 fn write_context_summary(request: &PlannerRequest) -> Result<PathBuf, BridgeRefusal> {
@@ -2649,6 +2731,18 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct HeadAdvancingPlanner {
+        output: String,
+        repo: PathBuf,
+    }
+
+    #[derive(Debug)]
+    struct BranchChangingPlanner {
+        output: String,
+        repo: PathBuf,
+    }
+
+    #[derive(Debug)]
     struct InlineValidator;
 
     impl PlannerClient for StubPlanner {
@@ -2697,6 +2791,41 @@ mod tests {
         ) -> Result<PlannerCandidate, BridgeRefusal> {
             assert_eq!(request.broker_url, DEFAULT_BROKER_URL);
             fs::write(&self.path, &self.bytes).expect("concurrent mutation succeeds");
+            Ok(PlannerCandidate {
+                planner_output_json: self.output.clone(),
+                broker_route: request.broker_url.clone(),
+                resolved_model: TEST_RESOLVED_MODEL.to_string(),
+                response_sha256: sha256_hex(self.output.as_bytes()),
+            })
+        }
+    }
+
+    impl PlannerClient for HeadAdvancingPlanner {
+        fn request_plan(
+            &self,
+            request: &PlannerRequest,
+        ) -> Result<PlannerCandidate, BridgeRefusal> {
+            assert_eq!(request.broker_url, DEFAULT_BROKER_URL);
+            git(
+                &self.repo,
+                &["commit", "--allow-empty", "-m", "advance during broker"],
+            );
+            Ok(PlannerCandidate {
+                planner_output_json: self.output.clone(),
+                broker_route: request.broker_url.clone(),
+                resolved_model: TEST_RESOLVED_MODEL.to_string(),
+                response_sha256: sha256_hex(self.output.as_bytes()),
+            })
+        }
+    }
+
+    impl PlannerClient for BranchChangingPlanner {
+        fn request_plan(
+            &self,
+            request: &PlannerRequest,
+        ) -> Result<PlannerCandidate, BridgeRefusal> {
+            assert_eq!(request.broker_url, DEFAULT_BROKER_URL);
+            git(&self.repo, &["checkout", "-q", "-b", "cert-other"]);
             Ok(PlannerCandidate {
                 planner_output_json: self.output.clone(),
                 broker_route: request.broker_url.clone(),
@@ -2873,6 +3002,43 @@ mod tests {
     fn assert_requested_and_resolved(value: &Value, requested: &str, resolved: &str) {
         assert_eq!(value["requested_model"], requested);
         assert_eq!(value["resolved_model"], resolved);
+    }
+
+    fn repo_root_for_test() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .expect("crate dir is under repo root")
+            .to_path_buf()
+    }
+
+    fn minimal_validator_doc() -> Value {
+        json!({
+            "schema_version": "a2-l4-planner-output.v1",
+            "task_id": "task-0001",
+            "workspace_root": "stack-code",
+            "task_summary": "Validate semantic guard parity.",
+            "plan_steps": [
+                {"step_id": "s1", "description": "Review the bounded target."}
+            ],
+            "risk_notes": [],
+            "operator_next_steps": ["review evidence"],
+            "candidate_files": ["docs/cert.md"]
+        })
+    }
+
+    fn production_validator_accepts(doc: &Value, label: &str) -> bool {
+        let root = repo_root_for_test();
+        let dir = unique_temp_dir(label);
+        let path = dir.join("planner-output.json");
+        fs::write(&path, serde_json::to_vec_pretty(doc).unwrap()).unwrap();
+        let output = Command::new("python3")
+            .current_dir(&root)
+            .arg(root.join("scripts/validate_planner_output_schema.py"))
+            .arg(&path)
+            .output()
+            .expect("production validator launches");
+        output.status.success()
     }
 
     #[test]
@@ -3069,6 +3235,64 @@ mod tests {
     }
 
     #[test]
+    fn production_validator_allows_plain_11434_digits_but_rejects_endpoints() {
+        for (label, field, text) in [
+            ("task-id-port-digits", "task_id", "task-11434"),
+            (
+                "plain-prose-port-digits",
+                "task_summary",
+                "Track issue 11434.",
+            ),
+            (
+                "plain-colon-prose-port-digits",
+                "task_summary",
+                "Track issue:11434 without endpoint syntax.",
+            ),
+            ("path-port-digits", "candidate_files", "docs/11434-notes.md"),
+            (
+                "broker-port-valid",
+                "risk_notes",
+                "Application inference uses http://127.0.0.1:11435.",
+            ),
+        ] {
+            assert!(
+                !contains_raw_upstream_endpoint(text),
+                "Rust endpoint prefilter should accept {label}"
+            );
+            let mut doc = minimal_validator_doc();
+            match field {
+                "candidate_files" | "risk_notes" => doc[field] = json!([text]),
+                _ => doc[field] = json!(text),
+            }
+            assert!(
+                production_validator_accepts(&doc, label),
+                "production validator should accept {label}"
+            );
+        }
+
+        for (label, text) in [
+            ("raw-localhost-url", "http://localhost:11434"),
+            ("raw-loopback-url", "http://127.0.0.1:11434"),
+            ("raw-localhost-bare", "localhost:11434"),
+            ("raw-loopback-bare", "127.0.0.1:11434"),
+            ("raw-ipv6-bare", "[::1]:11434"),
+            ("raw-url-path", "http://localhost:11434/v1/chat/completions"),
+            ("raw-generic-url", "http://example.invalid:11434/v1"),
+        ] {
+            assert!(
+                contains_raw_upstream_endpoint(text),
+                "Rust endpoint prefilter should reject {label}"
+            );
+            let mut doc = minimal_validator_doc();
+            doc["risk_notes"] = json!([text]);
+            assert!(
+                !production_validator_accepts(&doc, label),
+                "production validator should reject {label}"
+            );
+        }
+    }
+
+    #[test]
     fn planner_output_raw_upstream_endpoint_is_refused() {
         let repo = git_repo("raw-endpoint");
         let mut output: Value =
@@ -3125,6 +3349,63 @@ mod tests {
             assert!(!repo
                 .join(".claw/runnable-task-bridge/cert-task/planner-output.json")
                 .exists());
+        }
+    }
+
+    #[test]
+    fn credential_prefilter_matches_validator_word_boundaries() {
+        for (label, secret) in [
+            ("token-equals", "sk-abcdefghijklmnop="),
+            ("token-period", "sk-abcdefghijklmnop."),
+            ("token-comma", "sk-abcdefghijklmnop,"),
+            ("token-bracket", "sk-abcdefghijklmnop]"),
+            ("token-brace", "sk-abcdefghijklmnop}"),
+            ("token-quote", "sk-abcdefghijklmnop\""),
+            ("token-newline", "sk-abcdefghijklmnop\n"),
+        ] {
+            assert!(
+                contains_prefixed_token_shape(secret, "sk-", 16),
+                "Rust prefilter should reject {label}"
+            );
+            let mut doc = minimal_validator_doc();
+            doc["risk_notes"] = json!([secret]);
+            assert!(
+                !production_validator_accepts(&doc, label),
+                "production validator should reject {label}"
+            );
+            let repo = git_repo(label);
+            let mut output: Value =
+                serde_json::from_str(&valid_planner_output(&repo, "docs/cert.md")).unwrap();
+            output["risk_notes"] = json!([secret]);
+            let err = run_task(
+                spec(&repo, vec!["docs/cert.md"], None),
+                &StubPlanner {
+                    output: serde_json::to_string(&output).unwrap(),
+                },
+                &InlineValidator,
+            )
+            .expect_err("word-boundary secret-shaped output must be refused before persistence");
+            assert_eq!(err.kind, "planner-output-secret-like-refused");
+            assert!(!repo
+                .join(".claw/runnable-task-bridge/cert-task/planner-output.json")
+                .exists());
+        }
+
+        for (label, benign) in [
+            ("ordinary-sk-substring", "document the sk- prefix"),
+            ("short-token", "sk-short"),
+            ("embedded-word-token", "xsk-abcdefghijklmnopx"),
+        ] {
+            assert!(
+                !contains_prefixed_token_shape(benign, "sk-", 16),
+                "Rust prefilter should allow {label}"
+            );
+            let mut doc = minimal_validator_doc();
+            doc["risk_notes"] = json!([benign]);
+            assert!(
+                production_validator_accepts(&doc, label),
+                "production validator should allow {label}"
+            );
         }
     }
 
@@ -3281,6 +3562,44 @@ mod tests {
         .expect_err("worktree HEAD must equal the approved base before apply");
         assert_eq!(err.kind, "worktree-base-mismatch");
         assert!(!repo.join("docs/cert.md").exists());
+    }
+
+    #[test]
+    fn clean_head_change_during_planning_is_rejected_before_preview() {
+        let repo = git_repo("head-change-during-planning");
+        let err = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &HeadAdvancingPlanner {
+                output: valid_planner_output(&repo, "docs/cert.md"),
+                repo: repo.clone(),
+            },
+            &InlineValidator,
+        )
+        .expect_err("clean HEAD drift during planning must fail before preview");
+        assert_eq!(err.kind, "worktree-head-changed");
+        assert!(!repo.join("docs/cert.md").exists());
+        assert!(!repo
+            .join(".claw/runnable-task-bridge/cert-task/package-plan-readiness.json")
+            .exists());
+    }
+
+    #[test]
+    fn branch_change_during_planning_is_rejected_before_preview() {
+        let repo = git_repo("branch-change-during-planning");
+        let err = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &BranchChangingPlanner {
+                output: valid_planner_output(&repo, "docs/cert.md"),
+                repo: repo.clone(),
+            },
+            &InlineValidator,
+        )
+        .expect_err("branch drift during planning must fail before preview");
+        assert_eq!(err.kind, "worktree-branch-changed");
+        assert!(!repo.join("docs/cert.md").exists());
+        assert!(!repo
+            .join(".claw/runnable-task-bridge/cert-task/package-plan-readiness.json")
+            .exists());
     }
 
     #[test]
@@ -3496,6 +3815,54 @@ mod tests {
         )
         .expect_err("traversal must fail");
         assert_eq!(err.kind, "path-traversal-refused");
+    }
+
+    #[test]
+    fn reserved_claw_target_is_rejected_before_receipts_or_planner() {
+        for (label, allowed, target) in [
+            ("reserved-claw-file", vec![".claw/notes.md"], None),
+            (
+                "reserved-claw-allowed",
+                vec!["docs/cert.md", ".claw/notes.md"],
+                Some("docs/cert.md"),
+            ),
+        ] {
+            let repo = git_repo(label);
+            let err = run_task(
+                spec(&repo, allowed, target),
+                &FailingPlanner {
+                    kind: "planner-must-not-run",
+                },
+                &InlineValidator,
+            )
+            .expect_err("reserved .claw paths must fail during normalization");
+            assert_eq!(err.kind, "reserved-target-path");
+            assert!(!repo.join(".claw").exists());
+            assert!(!repo.join("docs/cert.md").exists());
+        }
+    }
+
+    #[test]
+    fn reserved_claw_lookalikes_are_allowed() {
+        for (label, target) in [
+            ("claws-lookalike", ".claws/notes.md"),
+            ("doc-claw-notes", "docs/.claw-notes.md"),
+        ] {
+            let repo = git_repo(label);
+            if let Some(parent) = repo.join(target).parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            let result = run_task(
+                spec(&repo, vec![target], None),
+                &StubPlanner {
+                    output: valid_planner_output(&repo, target),
+                },
+                &InlineValidator,
+            )
+            .expect("lookalike paths are ordinary task targets");
+            assert_eq!(result["actual_changed_paths"], json!([target]));
+            assert!(repo.join(target).is_file());
+        }
     }
 
     #[cfg(unix)]
