@@ -2280,6 +2280,50 @@ fn normalize_remote_url(value: &str) -> String {
 }
 
 fn reject_secret_like_candidate(candidate: &str) -> Result<(), BridgeRefusal> {
+    // Serialized-text scan: catches syntax-level shapes that do not depend on
+    // JSON string-escape decoding, and is a defense-in-depth backstop should
+    // the decoded walk below ever diverge from the parser.
+    reject_secret_like_text(candidate)?;
+
+    // Fail closed: the decoded walk requires valid JSON. A candidate that
+    // fails to parse is refused here, before the validator would otherwise
+    // write it to disk on its way to discovering the same parse error.
+    let doc: Value = serde_json::from_str(candidate).map_err(|e| {
+        refusal(
+            "planner-output-json-error",
+            format!("planner output was not valid JSON before secret scan: {e}"),
+        )
+    })?;
+    reject_secret_like_value(&doc)
+}
+
+// Recursively scans every decoded JSON string in `value` — object keys,
+// string values, and array elements at any nesting depth — against the same
+// secret-pattern policy as `reject_secret_like_text`. This catches secrets
+// that are only visible after JSON string-escape decoding (e.g. a token
+// hidden behind a unicode escape sequence), which a scan of the raw
+// serialized text would miss.
+fn reject_secret_like_value(value: &Value) -> Result<(), BridgeRefusal> {
+    match value {
+        Value::String(text) => reject_secret_like_text(text),
+        Value::Array(items) => {
+            for item in items {
+                reject_secret_like_value(item)?;
+            }
+            Ok(())
+        }
+        Value::Object(map) => {
+            for (key, val) in map {
+                reject_secret_like_text(key)?;
+                reject_secret_like_value(val)?;
+            }
+            Ok(())
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => Ok(()),
+    }
+}
+
+fn reject_secret_like_text(candidate: &str) -> Result<(), BridgeRefusal> {
     if contains_raw_upstream_endpoint(candidate) {
         return Err(refusal(
             "planner-output-raw-upstream-refused",
@@ -2947,6 +2991,18 @@ mod tests {
         .unwrap()
     }
 
+    // Builds planner-output.json wire text directly (rather than through
+    // serde_json::to_string) so a test can embed literal JSON string escapes
+    // (e.g. -) that only reveal a secret shape after decoding.
+    // `extra_fields` must start with a leading comma, e.g. `,"risk_notes":[...]`.
+    fn planner_output_json_text(worktree: &Path, extra_fields: &str) -> String {
+        format!(
+            r#"{{"schema_version":"a2-l4-planner-output.v1","task_id":"cert-task","workspace_root":"{ws}","task_summary":"create certification document","plan_steps":[{{"step_id":"step-1","description":"write the allowed file"}}],"risk_notes":[],"operator_next_steps":["review A2 evidence"],"candidate_files":["docs/cert.md"],"patch_intent":{{"summary":"create file","notes":["operator after_text supplies bytes"]}}{extra_fields}}}"#,
+            ws = workspace_binding_for_test(worktree),
+            extra_fields = extra_fields,
+        )
+    }
+
     fn spec(worktree: &Path, allowed: Vec<&str>, target: Option<&str>) -> RunnableTaskSpec {
         RunnableTaskSpec {
             schema_version: TASK_SCHEMA_V1.to_string(),
@@ -3243,11 +3299,6 @@ mod tests {
                 "task_summary",
                 "Track issue 11434.",
             ),
-            (
-                "plain-colon-prose-port-digits",
-                "task_summary",
-                "Track issue:11434 without endpoint syntax.",
-            ),
             ("path-port-digits", "candidate_files", "docs/11434-notes.md"),
             (
                 "broker-port-valid",
@@ -3267,6 +3318,23 @@ mod tests {
             assert!(
                 production_validator_accepts(&doc, label),
                 "production validator should accept {label}"
+            );
+        }
+
+        // The shared validator's raw-endpoint regex (scripts/validate_planner_output_schema.py,
+        // RAW_11434_ENDPOINT_RE) is intentionally more conservative than the
+        // lighter-weight Rust prefilter above: a bare "word:11434" is treated
+        // as endpoint-shaped even when "word" isn't a known loopback
+        // hostname, since a planner cannot be trusted to only ever write
+        // real hostnames there. This is a deliberate fail-closed choice —
+        // colon-adjacent digits should be written with a space (as in
+        // "plain-prose-port-digits" above) to avoid it.
+        {
+            let mut doc = minimal_validator_doc();
+            doc["task_summary"] = json!("Track issue:11434 without endpoint syntax.");
+            assert!(
+                !production_validator_accepts(&doc, "plain-colon-prose-port-digits"),
+                "production validator conservatively rejects colon-adjacent digits, even in prose"
             );
         }
 
@@ -3432,6 +3500,162 @@ mod tests {
             .expect_err("dashed vendor token-shaped planner output must be refused");
             assert_eq!(err.kind, "planner-output-secret-like-refused");
         }
+    }
+
+    // Builds a 6-byte JSON unicode-escape sequence (backslash + 'u' + 4 hex
+    // digits) at runtime from separate fragments, so the literal escape text
+    // never appears contiguously in this source file (a contiguous
+    // \u-plus-4-hex-digits run in this file would itself get decoded away
+    // long before reaching the compiler). `"\\"` below is Rust's own escape
+    // for a single backslash character.
+    fn json_u_escape(hex4: &str) -> String {
+        format!("{}u{}", "\\", hex4)
+    }
+
+    #[test]
+    fn decoded_json_escape_secret_shapes_are_refused_before_persistence() {
+        let e_hyphen = json_u_escape("002d"); // decodes to '-'
+        let e_p = json_u_escape("0070"); // decodes to 'p'
+        let e_f = json_u_escape("0046"); // decodes to 'F'
+        let e_i = json_u_escape("0069"); // decodes to 'i'
+
+        let openai_hyphen_escaped = format!("sk{e_hyphen}abcdefghijklmnop");
+        let github_token_escaped = format!("gh{e_p}_XXXXXXXXXXXXXXXXXXXXXXXX");
+        let aws_key_escaped = format!("AKIA1234567890ABCDE{e_f}");
+        let api_key_escaped = format!("ap{e_i}_key: abcdefgh12");
+        let punctuated_escaped = format!("sk{e_hyphen}abcdefghijklmnop,");
+
+        // Each case's JSON *wire text* never contains a literal "sk-" (or
+        // similar) substring — only after serde_json decodes the \uXXXX
+        // escape does the secret shape appear. A scan of the raw serialized
+        // text alone would accept every one of these; only the decoded-value
+        // walk added in this change catches them.
+        for (label, extra_fields) in [
+            (
+                "escaped-openai-hyphen",
+                format!(r#","risk_notes":["{openai_hyphen_escaped}"]"#),
+            ),
+            (
+                "escaped-github-token",
+                format!(r#","risk_notes":["{github_token_escaped}"]"#),
+            ),
+            (
+                "escaped-aws-access-key",
+                format!(r#","risk_notes":["{aws_key_escaped}"]"#),
+            ),
+            (
+                "escaped-api-key-assignment",
+                format!(r#","risk_notes":["{api_key_escaped}"]"#),
+            ),
+            (
+                "escaped-token-followed-by-punctuation",
+                format!(r#","risk_notes":["{punctuated_escaped}"]"#),
+            ),
+            (
+                "credential-in-object-key",
+                r#","sk-ABCDEFGHIJKLMNOP":"marker""#.to_string(),
+            ),
+            (
+                "credential-in-nested-array",
+                r#","risk_notes":[["nested","sk-ABCDEFGHIJKLMNOP"]]"#.to_string(),
+            ),
+        ] {
+            let repo = git_repo(label);
+            let text = planner_output_json_text(&repo, &extra_fields);
+            let err = run_task(
+                spec(&repo, vec!["docs/cert.md"], None),
+                &StubPlanner { output: text },
+                &InlineValidator,
+            )
+            .expect_err("decoded secret-shaped planner output must be refused");
+            assert_eq!(
+                err.kind, "planner-output-secret-like-refused",
+                "{label} should be refused as secret-shaped"
+            );
+            assert!(
+                !repo
+                    .join(".claw/runnable-task-bridge/cert-task/planner-output.json")
+                    .exists(),
+                "{label} must not persist planner-output.json"
+            );
+        }
+    }
+
+    #[test]
+    fn decoded_scan_accepts_harmless_escaped_and_unicode_content() {
+        let e_hyphen = json_u_escape("002d"); // decodes to '-'
+        let e_acute = json_u_escape("00e9"); // decodes to 'é'
+        let harmless_escaped_hyphen = format!("sk{e_hyphen}short token mention");
+        let escaped_unicode_content = format!("caf{e_acute} r{e_acute}sum{e_acute}");
+
+        for (label, extra_fields) in [
+            (
+                "short-sk-token",
+                r#","risk_notes":["sk-short token mention"]"#.to_string(),
+            ),
+            (
+                "escaped-harmless-hyphen",
+                format!(r#","risk_notes":["{harmless_escaped_hyphen}"]"#),
+            ),
+            (
+                "ordinary-11434-digits",
+                r#","task_summary":"Track issue 11434 in the tracker.""#.to_string(),
+            ),
+            (
+                "valid-unicode-content",
+                r#","task_summary":"Résumé: café ☕ 中文 задача""#.to_string(),
+            ),
+            (
+                "escaped-unicode-content",
+                format!(r#","task_summary":"{escaped_unicode_content}""#),
+            ),
+        ] {
+            let repo = git_repo(label);
+            let text = planner_output_json_text(&repo, &extra_fields);
+            let result = run_task(
+                spec(&repo, vec!["docs/cert.md"], None),
+                &StubPlanner { output: text },
+                &InlineValidator,
+            )
+            .unwrap_or_else(|e| panic!("{label} must be accepted, got refusal: {}", e.reason));
+            assert_eq!(result["ok"], true, "{label} must succeed");
+        }
+    }
+
+    #[test]
+    fn ordinary_task_id_digits_are_accepted_through_decoded_scan() {
+        let repo = git_repo("ordinary-task-id-digits");
+        let mut task = spec(&repo, vec!["docs/cert.md"], None);
+        task.task_id = "task-123".to_string();
+        let mut output: Value =
+            serde_json::from_str(&valid_planner_output(&repo, "docs/cert.md")).unwrap();
+        output["task_id"] = json!("task-123");
+        let result = run_task(
+            task,
+            &StubPlanner {
+                output: serde_json::to_string(&output).unwrap(),
+            },
+            &InlineValidator,
+        )
+        .expect("ordinary task id digits must be accepted");
+        assert_eq!(result["ok"], true);
+    }
+
+    #[test]
+    fn malformed_planner_json_fails_closed_before_persistence() {
+        let repo = git_repo("decoded-scan-malformed");
+        let err = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &StubPlanner {
+                output: r#"{"task_id": "cert-task", "risk_notes": ["unterminated]"#.to_string(),
+            },
+            &InlineValidator,
+        )
+        .expect_err("malformed JSON must be refused before the decoded scan can run");
+        assert_eq!(err.kind, "planner-output-json-error");
+        assert!(!repo
+            .join(".claw/runnable-task-bridge/cert-task/planner-output.json")
+            .exists());
     }
 
     #[test]
@@ -3910,8 +4134,13 @@ mod tests {
             &InlineValidator,
         )
         .expect_err("malformed planner output must fail");
-        assert_eq!(err.kind, "planner-output-validation-refused");
+        // The decoded secret scan fails closed on invalid JSON before the
+        // validator would otherwise write the candidate to disk.
+        assert_eq!(err.kind, "planner-output-json-error");
         assert!(!repo.join("docs/cert.md").exists());
+        assert!(!repo
+            .join(".claw/runnable-task-bridge/cert-task/planner-output.json")
+            .exists());
     }
 
     #[test]

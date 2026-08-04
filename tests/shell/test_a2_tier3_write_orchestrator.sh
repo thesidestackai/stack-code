@@ -576,6 +576,7 @@ build_pushable_wt() {
   git -C "$wt" remote add origin "$bare"
   git -C "$wt" checkout -q -b "$branch"
   git -C "$wt" commit -q --allow-empty -m base
+  git -C "$wt" update-ref refs/remotes/origin/main HEAD
   printf 'hello tier4\n' > "$wt/notes.md"
   sha=$(sha256sum "$wt/notes.md" | awk '{print $1}')
   mkdir -p "$wt/.claw/l2b-payloads/RUN/STEP" "$wt/.claw/l2b-preview-bundles/RUN/STEP" "$wt/.claw/l2b-checkpoints/RUN/STEP"
@@ -583,6 +584,48 @@ build_pushable_wt() {
   printf '{}' > "$wt/.claw/l2b-preview-bundles/RUN/STEP/apply-bundle.json"
   git -C "$wt" add -- notes.md            # simulate the Stage-2 package-commit
   git -C "$wt" commit -q -m "a2(tier4): package isolated mutation on $branch (1 file(s))"
+  printf '%s' "$wt"
+}
+
+# build_parent_gate_wt <name> <branch> <bare> <mode> — package-committed
+# fixtures with invalid ancestry/topology for package-push/package-pr.
+build_parent_gate_wt() {
+  local name=$1 branch=$2 bare=$3 mode=$4
+  local wt="$PKG_WTR/$name" sha
+  mkdir -p "$wt"
+  git -C "$wt" init -q
+  git -C "$wt" config user.email t@t
+  git -C "$wt" config user.name t
+  git -C "$wt" remote add origin "$bare"
+  git -C "$wt" checkout -q -b "$branch"
+  git -C "$wt" commit -q --allow-empty -m base
+  git -C "$wt" update-ref refs/remotes/origin/main HEAD
+
+  if [[ "$mode" == unrelated-parent ]]; then
+    printf 'unrelated\n' > "$wt/unrelated.md"
+    git -C "$wt" add -- unrelated.md
+    git -C "$wt" commit -q -m unrelated
+  fi
+
+  printf 'hello tier4\n' > "$wt/notes.md"
+  sha=$(sha256sum "$wt/notes.md" | awk '{print $1}')
+  mkdir -p "$wt/.claw/l2b-payloads/RUN/STEP" "$wt/.claw/l2b-preview-bundles/RUN/STEP" "$wt/.claw/l2b-checkpoints/RUN/STEP"
+  printf '%s\n' "$sha" > "$wt/.claw/l2b-payloads/RUN/STEP/after.sha256"
+  printf '{}' > "$wt/.claw/l2b-preview-bundles/RUN/STEP/apply-bundle.json"
+  git -C "$wt" add -- notes.md
+  git -C "$wt" commit -q -m "a2(tier4): package isolated mutation on $branch (1 file(s))"
+
+  if [[ "$mode" == stale-approved-base ]]; then
+    git -C "$wt" update-ref refs/remotes/origin/main HEAD
+  elif [[ "$mode" == merge-commit ]]; then
+    git -C "$wt" checkout -q -b side HEAD~1
+    printf 'side\n' > "$wt/side.md"
+    git -C "$wt" add -- side.md
+    git -C "$wt" commit -q -m side
+    git -C "$wt" checkout -q "$branch"
+    git -C "$wt" merge -q --no-ff side -m "merge side"
+  fi
+
   printf '%s' "$wt"
 }
 
@@ -625,6 +668,29 @@ WT_P_IDEM="$(build_pushable_wt pidem feat/x "$BARE_IDEM")"
 git -C "$WT_P_IDEM" push -q origin feat/x:feat/x       # pre-push the exact HEAD
 pkg_lane "$PKG_ROOT/lane_pidem.json" "$WT_P_IDEM" feat/x
 run_pkg "package-push: idempotent same-sha no-op(0)"  0 package-push --worktree "$WT_P_IDEM" --approved-lane "$PKG_ROOT/lane_pidem.json"
+
+# refuse: an unrelated ancestor before the package commit is not pushable.
+BARE_UNREL="$(new_bare origin_punrel)"
+WT_P_UNREL="$(build_parent_gate_wt punrel feat/x "$BARE_UNREL" unrelated-parent)"
+pkg_lane "$PKG_ROOT/lane_punrel.json" "$WT_P_UNREL" feat/x
+run_pkg "package-push: unrelated ancestor refused(4)" 4 package-push --worktree "$WT_P_UNREL" --approved-lane "$PKG_ROOT/lane_punrel.json"
+if [[ -z "$(git -C "$WT_P_UNREL" ls-remote --heads "$BARE_UNREL" feat/x)" ]]; then
+  PASS_COUNT=$((PASS_COUNT+1)); printf 'PASS  %-52s (nothing pushed)\n' "package-push: unrelated ancestor no remote mutation"
+else
+  FAIL_COUNT=$((FAIL_COUNT+1)); printf 'FAIL  %-52s (pushed anyway!)\n' "package-push: unrelated ancestor no remote mutation"
+fi
+
+# refuse: a merge commit cannot be treated as the single package commit.
+BARE_MERGE="$(new_bare origin_pmerge)"
+WT_P_MERGE="$(build_parent_gate_wt pmerge feat/x "$BARE_MERGE" merge-commit)"
+pkg_lane "$PKG_ROOT/lane_pmerge.json" "$WT_P_MERGE" feat/x
+run_pkg "package-push: merge commit refused(4)" 4 package-push --worktree "$WT_P_MERGE" --approved-lane "$PKG_ROOT/lane_pmerge.json"
+
+# refuse: origin/main must still be the approved base parent.
+BARE_STALE="$(new_bare origin_pstale)"
+WT_P_STALE="$(build_parent_gate_wt pstale feat/x "$BARE_STALE" stale-approved-base)"
+pkg_lane "$PKG_ROOT/lane_pstale.json" "$WT_P_STALE" feat/x
+run_pkg "package-push: stale approved base refused(4)" 4 package-push --worktree "$WT_P_STALE" --approved-lane "$PKG_ROOT/lane_pstale.json"
 
 # refuse: remote branch exists at a DIFFERENT sha -> refuse(4), no force.
 BARE_COLL="$(new_bare origin_pcoll)"
@@ -686,6 +752,8 @@ run_case "package-push: missing args -> usage(2)"     2 package-push --worktree 
 # ---- package-push static invariants ----------------------------------------
 static_assert "package-push subcommand present"          'cmd_package_push\(\)'                          present
 static_assert "package-push verifies HEAD diff==declared" 'HEAD commit diff != declared set'             present
+static_assert "package-push checks package parent"       'PACKAGE_COMMIT_PARENT_MISMATCH'                present
+static_assert "package-push rejects merge package commit" 'PACKAGE_COMMIT_PARENT_COUNT_INVALID'          present
 static_assert "package-push refuses diff-sha remote collision" 'already exists at a DIFFERENT sha'        present
 static_assert "package-push evidence pushed=true"        '"pushed": True'                               present
 static_assert "package-push evidence pr_opened=false"    '"pr_opened": False'                           present
@@ -832,6 +900,30 @@ git -C "$WT_PR_DS" push -q origin "HEAD~1:refs/heads/feat/x"   # remote feat/x =
 pkg_lane "$PKG_ROOT/lane_prds.json" "$WT_PR_DS" feat/x
 run_pr "package-pr: remote sha != commit refused(4)" 4 none package-pr --worktree "$WT_PR_DS" --approved-lane "$PKG_ROOT/lane_prds.json"
 
+# invalid package ancestry/topology refuses before any gh view/create invocation.
+BARE_PR_UNREL="$(new_bare origin_prunrel)"
+WT_PR_UNREL="$(build_parent_gate_wt prunrel feat/x "$BARE_PR_UNREL" unrelated-parent)"
+git -C "$WT_PR_UNREL" push -q origin feat/x:feat/x
+pkg_lane "$PKG_ROOT/lane_prunrel.json" "$WT_PR_UNREL" feat/x
+run_pr "package-pr: unrelated ancestor refused(4)" 4 none package-pr --worktree "$WT_PR_UNREL" --approved-lane "$PKG_ROOT/lane_prunrel.json"
+if [[ ! -s "$FAKE_GH_LOG" ]]; then
+  PASS_COUNT=$((PASS_COUNT+1)); printf 'PASS  %-52s (no gh invocation)\n' "package-pr: unrelated ancestor before PR creation"
+else
+  FAIL_COUNT=$((FAIL_COUNT+1)); printf 'FAIL  %-52s (gh invoked!)\n' "package-pr: unrelated ancestor before PR creation"
+fi
+
+BARE_PR_MERGE="$(new_bare origin_prmerge)"
+WT_PR_MERGE="$(build_parent_gate_wt prmerge feat/x "$BARE_PR_MERGE" merge-commit)"
+git -C "$WT_PR_MERGE" push -q origin feat/x:feat/x
+pkg_lane "$PKG_ROOT/lane_prmerge.json" "$WT_PR_MERGE" feat/x
+run_pr "package-pr: merge commit refused(4)" 4 none package-pr --worktree "$WT_PR_MERGE" --approved-lane "$PKG_ROOT/lane_prmerge.json"
+
+BARE_PR_STALE="$(new_bare origin_prstale)"
+WT_PR_STALE="$(build_parent_gate_wt prstale feat/x "$BARE_PR_STALE" stale-approved-base)"
+git -C "$WT_PR_STALE" push -q origin feat/x:feat/x
+pkg_lane "$PKG_ROOT/lane_prstale.json" "$WT_PR_STALE" feat/x
+run_pr "package-pr: stale approved base refused(4)" 4 none package-pr --worktree "$WT_PR_STALE" --approved-lane "$PKG_ROOT/lane_prstale.json"
+
 # dirty disposable worktree (uncommitted tracked change) -> refuse(4).
 BARE_PR_DW="$(new_bare origin_prdw)"
 WT_PR_DW="$(build_pushed_wt prdw feat/x "$BARE_PR_DW")"
@@ -888,6 +980,7 @@ run_case "package-pr: missing args -> usage(2)"      2 package-pr --worktree "$P
 # ---- package-pr static invariants ------------------------------------------
 static_assert "package-pr subcommand present"            'cmd_package_pr\(\)'                            present
 static_assert "package-pr opens DRAFT via fixed --draft" 'pr create --draft'                             present
+static_assert "package-pr checks package parent"         'PACKAGE_COMMIT_PARENT_MISMATCH'                present
 static_assert "package-pr requires branch already pushed" 'is not pushed to'                             present
 static_assert "package-pr success needs a real PR URL"   'returned no PR URL'                            present
 static_assert "package-pr evidence marked_ready=false"   '"marked_ready": False'                         present
