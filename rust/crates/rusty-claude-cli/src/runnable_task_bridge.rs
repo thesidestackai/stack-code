@@ -96,6 +96,12 @@ struct PlannerCandidate {
     response_sha256: String,
 }
 
+#[derive(Debug, Clone)]
+struct ModelBinding {
+    requested_model: String,
+    resolved_model: String,
+}
+
 trait PlannerClient {
     fn request_plan(&self, request: &PlannerRequest) -> Result<PlannerCandidate, BridgeRefusal>;
 }
@@ -208,6 +214,7 @@ fn run_task(
         model: task.model.clone(),
     };
     let candidate = planner.request_plan(&request)?;
+    let model_binding = model_binding_from_task(&task, &candidate.resolved_model)?;
     write_receipt(
         &task.receipt_dir,
         "broker-plan.json",
@@ -222,7 +229,8 @@ fn run_task(
             "base_sha": task.base_sha,
             "caller_id": task.caller_id,
             "broker_route": candidate.broker_route,
-            "resolved_model": candidate.resolved_model,
+            "requested_model": model_binding.requested_model.as_str(),
+            "resolved_model": model_binding.resolved_model.as_str(),
             "response_sha256": candidate.response_sha256,
         }),
     )?;
@@ -245,14 +253,15 @@ fn run_task(
             "base_sha": task.base_sha,
             "caller_id": task.caller_id,
             "broker_route": task.broker_url,
-            "resolved_model": task.model,
+            "requested_model": model_binding.requested_model.as_str(),
+            "resolved_model": model_binding.resolved_model.as_str(),
             "allowed_paths": task.allowed_paths,
             "planner_output_path": planner_output_path,
             "planner_output_sha256": sha256_hex(candidate.planner_output_json.as_bytes()),
         }),
     )?;
 
-    let pre_apply_package_control_gate = run_package_control_checkout_gate(&task)?;
+    let pre_apply_package_control_gate = run_package_control_checkout_gate(&task, &model_binding)?;
     write_receipt(
         &task.receipt_dir,
         "package-control-preflight.json",
@@ -291,7 +300,8 @@ fn run_task(
             "base_sha": task.base_sha,
             "caller_id": task.caller_id,
             "broker_route": task.broker_url,
-            "resolved_model": task.model,
+            "requested_model": model_binding.requested_model.as_str(),
+            "resolved_model": model_binding.resolved_model.as_str(),
             "allowed_paths": task.allowed_paths,
             "target_path": task.target_path,
             "preview_bundle_path": preview_result.preview_bundle_path,
@@ -333,7 +343,8 @@ fn run_task(
             "base_sha": task.base_sha,
             "caller_id": task.caller_id,
             "broker_route": task.broker_url,
-            "resolved_model": task.model,
+            "requested_model": model_binding.requested_model.as_str(),
+            "resolved_model": model_binding.resolved_model.as_str(),
             "allowed_paths": task.allowed_paths,
             "actual_changed_paths": changed_paths,
         }),
@@ -342,10 +353,10 @@ fn run_task(
     write_receipt(
         &task.receipt_dir,
         "validation.json",
-        &validation_receipt(&task),
+        &validation_receipt(&task, &model_binding),
     )?;
 
-    let package_plan_gate = run_package_plan_gate(&task, &approved_lane_path)?;
+    let package_plan_gate = run_package_plan_gate(&task, &approved_lane_path, &model_binding)?;
     write_receipt(
         &task.receipt_dir,
         "package-plan-readiness.json",
@@ -356,13 +367,14 @@ fn run_task(
         &changed_paths,
         &approved_lane_path,
         &package_plan_gate,
+        &model_binding,
     );
     write_receipt(
         &task.receipt_dir,
         "package-handoff-readiness.json",
         &package_handoff,
     )?;
-    let complete = final_success_result(&task, &changed_paths, &approved_lane_path);
+    let complete = final_success_result(&task, &changed_paths, &approved_lane_path, &model_binding);
     write_receipt(&task.receipt_dir, "task-complete.json", &complete)?;
     Ok(complete)
 }
@@ -494,35 +506,53 @@ impl PlannerClient for PythonBrokerPlanner {
                 ),
             ));
         }
-        let wrapper: Value = serde_json::from_slice(&output.stdout).map_err(|e| {
-            refusal(
-                "broker-adapter-json-error",
-                format!("planner adapter stdout was not valid JSON: {e}"),
-            )
-        })?;
-        let content = wrapper
-            .get("response")
-            .and_then(|response| response.get("choices"))
-            .and_then(Value::as_array)
-            .and_then(|choices| choices.first())
-            .and_then(|choice| choice.get("message"))
-            .and_then(|message| message.get("content"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                refusal(
-                    "broker-response-content-missing",
-                    "broker response did not contain choices[0].message.content",
-                )
-            })?
-            .trim()
-            .to_string();
-        Ok(PlannerCandidate {
-            response_sha256: sha256_hex(&output.stdout),
-            planner_output_json: content,
-            broker_route: request.broker_url.clone(),
-            resolved_model: request.model.clone(),
-        })
+        planner_candidate_from_broker_wrapper(request, &output.stdout)
     }
+}
+
+fn planner_candidate_from_broker_wrapper(
+    request: &PlannerRequest,
+    stdout: &[u8],
+) -> Result<PlannerCandidate, BridgeRefusal> {
+    let wrapper: Value = serde_json::from_slice(stdout).map_err(|e| {
+        refusal(
+            "broker-adapter-json-error",
+            format!("planner adapter stdout was not valid JSON: {e}"),
+        )
+    })?;
+    let resolved_model = broker_response_model(&wrapper)?;
+    let content = wrapper
+        .get("response")
+        .and_then(|response| response.get("choices"))
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            refusal(
+                "broker-response-content-missing",
+                "broker response did not contain choices[0].message.content",
+            )
+        })?
+        .trim()
+        .to_string();
+    Ok(PlannerCandidate {
+        response_sha256: sha256_hex(stdout),
+        planner_output_json: content,
+        broker_route: request.broker_url.clone(),
+        resolved_model,
+    })
+}
+
+fn broker_response_model(wrapper: &Value) -> Result<String, BridgeRefusal> {
+    nonempty_json_string(
+        wrapper
+            .get("response")
+            .and_then(|response| response.get("model")),
+        "broker-response-model-missing",
+        "broker response did not contain a nonempty response.model",
+    )
 }
 
 impl PlannerValidator for ScriptPlannerValidator {
@@ -859,6 +889,7 @@ fn write_approved_lane(task: &NormalizedTask) -> Result<PathBuf, BridgeRefusal> 
 fn run_package_plan_gate(
     task: &NormalizedTask,
     approved_lane_path: &Path,
+    model_binding: &ModelBinding,
 ) -> Result<Value, BridgeRefusal> {
     let script = package_plan_script(task);
     if !script.is_file() {
@@ -909,7 +940,8 @@ fn run_package_plan_gate(
         "branch": task.branch,
         "caller_id": task.caller_id,
         "broker_route": task.broker_url,
-        "resolved_model": task.model,
+        "requested_model": model_binding.requested_model.as_str(),
+        "resolved_model": model_binding.resolved_model.as_str(),
         "approved_lane_path": approved_lane_path,
         "command": "scripts/a2-tier3-write-orchestrator.sh package-plan",
         "stdout_sha256": sha256_hex(&output.stdout),
@@ -917,7 +949,10 @@ fn run_package_plan_gate(
     }))
 }
 
-fn run_package_control_checkout_gate(task: &NormalizedTask) -> Result<Value, BridgeRefusal> {
+fn run_package_control_checkout_gate(
+    task: &NormalizedTask,
+    model_binding: &ModelBinding,
+) -> Result<Value, BridgeRefusal> {
     let script = package_plan_script(task);
     if !script.is_file() {
         return Err(refusal(
@@ -971,7 +1006,8 @@ fn run_package_control_checkout_gate(task: &NormalizedTask) -> Result<Value, Bri
         "branch": task.branch,
         "caller_id": task.caller_id,
         "broker_route": task.broker_url,
-        "resolved_model": task.model,
+        "requested_model": model_binding.requested_model.as_str(),
+        "resolved_model": model_binding.resolved_model.as_str(),
         "control_checkout": control,
         "command": "git status --porcelain --untracked-files=all",
         "stdout_sha256": sha256_hex(&output.stdout),
@@ -1095,6 +1131,7 @@ fn final_success_result(
     task: &NormalizedTask,
     changed_paths: &[String],
     approved_lane: &Path,
+    model_binding: &ModelBinding,
 ) -> Value {
     json!({
         "schema_version": RESULT_SCHEMA_V1,
@@ -1107,7 +1144,8 @@ fn final_success_result(
         "branch": task.branch,
         "caller_id": task.caller_id,
         "broker_route": task.broker_url,
-        "resolved_model": task.model,
+        "requested_model": model_binding.requested_model.as_str(),
+        "resolved_model": model_binding.resolved_model.as_str(),
         "allowed_paths": task.allowed_paths,
         "target_path": task.target_path,
         "task_type": task.task_type,
@@ -1122,7 +1160,7 @@ fn final_success_result(
     })
 }
 
-fn validation_receipt(task: &NormalizedTask) -> Value {
+fn validation_receipt(task: &NormalizedTask, model_binding: &ModelBinding) -> Value {
     json!({
         "schema_version": RECEIPT_SCHEMA_V1,
         "receipt": "validation",
@@ -1133,7 +1171,8 @@ fn validation_receipt(task: &NormalizedTask) -> Value {
         "base_sha": task.base_sha,
         "caller_id": task.caller_id,
         "broker_route": task.broker_url,
-        "resolved_model": task.model,
+        "requested_model": model_binding.requested_model.as_str(),
+        "resolved_model": model_binding.resolved_model.as_str(),
         "validation_profile": task.validation_profile,
         "command": "docs-only content guard + git diff --check",
     })
@@ -1144,6 +1183,7 @@ fn package_handoff_receipt(
     changed_paths: &[String],
     approved_lane_path: &Path,
     package_plan_gate: &Value,
+    model_binding: &ModelBinding,
 ) -> Value {
     json!({
         "schema_version": RECEIPT_SCHEMA_V1,
@@ -1155,7 +1195,8 @@ fn package_handoff_receipt(
         "base_sha": task.base_sha,
         "caller_id": task.caller_id,
         "broker_route": task.broker_url,
-        "resolved_model": task.model,
+        "requested_model": model_binding.requested_model.as_str(),
+        "resolved_model": model_binding.resolved_model.as_str(),
         "allowed_paths": task.allowed_paths,
         "actual_changed_paths": changed_paths,
         "approved_lane_path": approved_lane_path,
@@ -1206,7 +1247,7 @@ fn completed_task_result_if_current(task: &NormalizedTask) -> Result<Option<Valu
             format!("completed receipt was not valid JSON: {e}"),
         )
     })?;
-    validate_cached_completion(task, &value)?;
+    let model_binding = validate_cached_completion(task, &value)?;
     if value.get("base_sha").and_then(Value::as_str) != Some(task.base_sha.as_str()) {
         return Err(refusal(
             "completed-task-base-mismatch",
@@ -1221,7 +1262,7 @@ fn completed_task_result_if_current(task: &NormalizedTask) -> Result<Option<Valu
     }
     let changed_paths = verify_changed_paths(task)?;
     let approved_lane_path = approved_lane_path_from_result(&value)?;
-    let package_plan_gate = run_package_plan_gate(task, &approved_lane_path)?;
+    let package_plan_gate = run_package_plan_gate(task, &approved_lane_path, &model_binding)?;
     value["actual_changed_paths"] = json!(changed_paths);
     value["package_plan_gate"] = package_plan_gate;
     value["package_ready"] = Value::Bool(true);
@@ -1229,11 +1270,19 @@ fn completed_task_result_if_current(task: &NormalizedTask) -> Result<Option<Valu
     Ok(Some(value))
 }
 
-fn validate_cached_completion(task: &NormalizedTask, value: &Value) -> Result<(), BridgeRefusal> {
+fn validate_cached_completion(
+    task: &NormalizedTask,
+    value: &Value,
+) -> Result<ModelBinding, BridgeRefusal> {
+    let model_binding = model_binding_from_receipt(
+        task,
+        value,
+        "completed-task-spec-mismatch",
+        "task-complete receipt does not bind to the current requested model",
+    )?;
     if value.get("task_id").and_then(Value::as_str) != Some(task.task_id.as_str())
         || value.get("caller_id").and_then(Value::as_str) != Some(task.caller_id.as_str())
         || value.get("broker_route").and_then(Value::as_str) != Some(task.broker_url.as_str())
-        || value.get("resolved_model").and_then(Value::as_str) != Some(task.model.as_str())
         || value.get("target_path").and_then(Value::as_str) != Some(task.target_path.as_str())
         || value.get("task_type").and_then(Value::as_str) != Some(task.task_type.as_str())
         || value.get("validation_profile").and_then(Value::as_str)
@@ -1249,7 +1298,7 @@ fn validate_cached_completion(task: &NormalizedTask, value: &Value) -> Result<()
             "task-complete receipt does not bind to the current task specification",
         ));
     }
-    Ok(())
+    Ok(model_binding)
 }
 
 fn resume_applied_task_if_current(task: &NormalizedTask) -> Result<Option<Value>, BridgeRefusal> {
@@ -1271,15 +1320,15 @@ fn resume_applied_task_if_current(task: &NormalizedTask) -> Result<Option<Value>
         return Ok(None);
     }
     let approved_lane_path = task.receipt_dir.join("approved-lane.json");
-    verify_resume_evidence(task, &approved_lane_path)?;
+    let model_binding = verify_resume_evidence(task, &approved_lane_path)?;
     let changed_paths = verify_changed_paths(task)?;
     run_validation(task)?;
     write_receipt_if_absent(
         &task.receipt_dir,
         "validation.json",
-        &validation_receipt(task),
+        &validation_receipt(task, &model_binding),
     )?;
-    let package_plan_gate = run_package_plan_gate(task, &approved_lane_path)?;
+    let package_plan_gate = run_package_plan_gate(task, &approved_lane_path, &model_binding)?;
     write_receipt_if_absent(
         &task.receipt_dir,
         "package-plan-readiness.json",
@@ -1290,13 +1339,14 @@ fn resume_applied_task_if_current(task: &NormalizedTask) -> Result<Option<Value>
         &changed_paths,
         &approved_lane_path,
         &package_plan_gate,
+        &model_binding,
     );
     write_receipt_if_absent(
         &task.receipt_dir,
         "package-handoff-readiness.json",
         &package_handoff,
     )?;
-    let complete = final_success_result(task, &changed_paths, &approved_lane_path);
+    let complete = final_success_result(task, &changed_paths, &approved_lane_path, &model_binding);
     write_receipt(&task.receipt_dir, "task-complete.json", &complete)?;
     Ok(Some(complete))
 }
@@ -1317,10 +1367,29 @@ fn approved_lane_path_from_result(value: &Value) -> Result<PathBuf, BridgeRefusa
 fn verify_resume_evidence(
     task: &NormalizedTask,
     approved_lane_path: &Path,
-) -> Result<(), BridgeRefusal> {
+) -> Result<ModelBinding, BridgeRefusal> {
+    let broker_plan = read_existing_receipt_json(task, "broker-plan.json")?;
+    let model_binding = validate_resume_receipt_model(
+        task,
+        &broker_plan,
+        "broker_plan",
+        "broker-plan model evidence does not bind to this task",
+    )?;
     let planner_output = read_existing_receipt_string(task, "planner-output.json")?;
     reject_secret_like_candidate(&planner_output)?;
     verify_planner_paths(task, &planner_output)?;
+    validate_existing_model_receipt_if_present(
+        task,
+        "planner-validation.json",
+        "planner_validation",
+        &model_binding,
+    )?;
+    validate_existing_model_receipt_if_present(
+        task,
+        "package-control-preflight.json",
+        "package_control_preflight",
+        &model_binding,
+    )?;
 
     let after_path = task.receipt_dir.join("after.bin");
     require_existing_receipt_file(&after_path)?;
@@ -1346,7 +1415,38 @@ fn verify_resume_evidence(
     let preview_bundle_path = preview_bundle_path_from_result(task, &preview_result)?;
     let preview_bundle = read_preview_bundle(&preview_bundle_path)?;
     let authorization = read_existing_receipt_json(task, "mutation-authorization.json")?;
-    validate_mutation_authorization(task, &authorization, &preview_bundle_path, &preview_bundle)
+    validate_mutation_authorization(
+        task,
+        &authorization,
+        &preview_bundle_path,
+        &preview_bundle,
+        &model_binding,
+    )?;
+    validate_existing_model_receipt_if_present(
+        task,
+        "changed-file-verification.json",
+        "changed_file_verification",
+        &model_binding,
+    )?;
+    validate_existing_model_receipt_if_present(
+        task,
+        "validation.json",
+        "validation",
+        &model_binding,
+    )?;
+    validate_existing_model_receipt_if_present(
+        task,
+        "package-plan-readiness.json",
+        "package_plan_gate",
+        &model_binding,
+    )?;
+    validate_existing_model_receipt_if_present(
+        task,
+        "package-handoff-readiness.json",
+        "package_handoff_readiness",
+        &model_binding,
+    )?;
+    Ok(model_binding)
 }
 
 fn validate_approved_lane(task: &NormalizedTask, path: &Path) -> Result<(), BridgeRefusal> {
@@ -1416,6 +1516,7 @@ fn validate_mutation_authorization(
     value: &Value,
     preview_bundle_path: &Path,
     preview_bundle: &PreviewBundleRead,
+    model_binding: &ModelBinding,
 ) -> Result<(), BridgeRefusal> {
     let preview_path = preview_bundle_path.to_string_lossy();
     if value.get("schema_version").and_then(Value::as_str) != Some(RECEIPT_SCHEMA_V1)
@@ -1423,6 +1524,10 @@ fn validate_mutation_authorization(
         || value.get("task_id").and_then(Value::as_str) != Some(task.task_id.as_str())
         || value.get("base_sha").and_then(Value::as_str) != Some(task.base_sha.as_str())
         || value.get("caller_id").and_then(Value::as_str) != Some(task.caller_id.as_str())
+        || value.get("requested_model").and_then(Value::as_str)
+            != Some(model_binding.requested_model.as_str())
+        || value.get("resolved_model").and_then(Value::as_str)
+            != Some(model_binding.resolved_model.as_str())
         || value.get("target_path").and_then(Value::as_str) != Some(task.target_path.as_str())
         || value.get("preview_bundle_path").and_then(Value::as_str) != Some(preview_path.as_ref())
         || value.get("preview_sha256").and_then(Value::as_str)
@@ -1542,6 +1647,110 @@ fn json_array_matches_strings(value: Option<&Value>, expected: &[String]) -> boo
                 .all(|(actual, expected)| actual.as_str() == Some(expected.as_str())))
 }
 
+fn model_binding_from_task(
+    task: &NormalizedTask,
+    resolved_model: &str,
+) -> Result<ModelBinding, BridgeRefusal> {
+    Ok(ModelBinding {
+        requested_model: task.model.clone(),
+        resolved_model: nonempty_model_string(
+            resolved_model,
+            "broker-response-model-missing",
+            "broker response did not contain a nonempty response.model",
+        )?,
+    })
+}
+
+fn validate_resume_receipt_model(
+    task: &NormalizedTask,
+    value: &Value,
+    expected_receipt: &str,
+    reason: &'static str,
+) -> Result<ModelBinding, BridgeRefusal> {
+    if value.get("schema_version").and_then(Value::as_str) != Some(RECEIPT_SCHEMA_V1)
+        || value.get("receipt").and_then(Value::as_str) != Some(expected_receipt)
+        || value.get("task_id").and_then(Value::as_str) != Some(task.task_id.as_str())
+        || value.get("base_sha").and_then(Value::as_str) != Some(task.base_sha.as_str())
+        || value.get("caller_id").and_then(Value::as_str) != Some(task.caller_id.as_str())
+        || value.get("broker_route").and_then(Value::as_str) != Some(task.broker_url.as_str())
+    {
+        return Err(refusal("applied-task-evidence-mismatch", reason));
+    }
+    model_binding_from_receipt(task, value, "applied-task-evidence-mismatch", reason)
+}
+
+fn validate_existing_model_receipt_if_present(
+    task: &NormalizedTask,
+    name: &str,
+    expected_receipt: &str,
+    model_binding: &ModelBinding,
+) -> Result<(), BridgeRefusal> {
+    let path = task.receipt_dir.join(name);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(refusal(
+                "applied-task-evidence-stat-error",
+                format!("could not stat task-bound evidence {}: {e}", path.display()),
+            ));
+        }
+    }
+    let value = read_existing_json(&path)?;
+    let existing = validate_resume_receipt_model(
+        task,
+        &value,
+        expected_receipt,
+        "existing model receipt does not bind to this task",
+    )?;
+    if existing.resolved_model != model_binding.resolved_model {
+        return Err(refusal(
+            "applied-task-evidence-mismatch",
+            "existing model receipt conflicts with broker-plan resolved model",
+        ));
+    }
+    Ok(())
+}
+
+fn model_binding_from_receipt(
+    task: &NormalizedTask,
+    value: &Value,
+    refusal_kind: &'static str,
+    reason: &'static str,
+) -> Result<ModelBinding, BridgeRefusal> {
+    if value.get("requested_model").and_then(Value::as_str) != Some(task.model.as_str()) {
+        return Err(refusal(refusal_kind, reason));
+    }
+    Ok(ModelBinding {
+        requested_model: task.model.clone(),
+        resolved_model: nonempty_json_string(value.get("resolved_model"), refusal_kind, reason)?,
+    })
+}
+
+fn nonempty_json_string(
+    value: Option<&Value>,
+    refusal_kind: &'static str,
+    reason: impl Into<String>,
+) -> Result<String, BridgeRefusal> {
+    match value.and_then(Value::as_str).map(str::trim) {
+        Some(model) if !model.is_empty() => Ok(model.to_string()),
+        _ => Err(refusal(refusal_kind, reason)),
+    }
+}
+
+fn nonempty_model_string(
+    value: &str,
+    refusal_kind: &'static str,
+    reason: impl Into<String>,
+) -> Result<String, BridgeRefusal> {
+    let model = value.trim();
+    if model.is_empty() {
+        Err(refusal(refusal_kind, reason))
+    } else {
+        Ok(model.to_string())
+    }
+}
+
 fn task_acceptance_receipt(task: &NormalizedTask, status: &str) -> Value {
     json!({
         "schema_version": RECEIPT_SCHEMA_V1,
@@ -1554,7 +1763,8 @@ fn task_acceptance_receipt(task: &NormalizedTask, status: &str) -> Value {
         "caller_id": task.caller_id,
         "task_type": task.task_type,
         "broker_route": task.broker_url,
-        "resolved_model": task.model,
+        "requested_model": task.model,
+        "resolved_model": Value::Null,
         "allowed_paths": task.allowed_paths,
         "target_path": task.target_path,
         "validation_profile": task.validation_profile,
@@ -2411,11 +2621,19 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    const TEST_RESOLVED_MODEL: &str = "concrete-test-model";
+
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[derive(Debug)]
     struct StubPlanner {
         output: String,
+    }
+
+    #[derive(Debug)]
+    struct ModelPlanner {
+        output: String,
+        resolved_model: String,
     }
 
     #[derive(Debug)]
@@ -2442,7 +2660,22 @@ mod tests {
             Ok(PlannerCandidate {
                 planner_output_json: self.output.clone(),
                 broker_route: request.broker_url.clone(),
-                resolved_model: request.model.clone(),
+                resolved_model: TEST_RESOLVED_MODEL.to_string(),
+                response_sha256: sha256_hex(self.output.as_bytes()),
+            })
+        }
+    }
+
+    impl PlannerClient for ModelPlanner {
+        fn request_plan(
+            &self,
+            request: &PlannerRequest,
+        ) -> Result<PlannerCandidate, BridgeRefusal> {
+            assert_eq!(request.broker_url, DEFAULT_BROKER_URL);
+            Ok(PlannerCandidate {
+                planner_output_json: self.output.clone(),
+                broker_route: request.broker_url.clone(),
+                resolved_model: self.resolved_model.clone(),
                 response_sha256: sha256_hex(self.output.as_bytes()),
             })
         }
@@ -2467,7 +2700,7 @@ mod tests {
             Ok(PlannerCandidate {
                 planner_output_json: self.output.clone(),
                 broker_route: request.broker_url.clone(),
-                resolved_model: request.model.clone(),
+                resolved_model: TEST_RESOLVED_MODEL.to_string(),
                 response_sha256: sha256_hex(self.output.as_bytes()),
             })
         }
@@ -2603,6 +2836,45 @@ mod tests {
         }
     }
 
+    fn planner_request_for_test(worktree: &Path) -> PlannerRequest {
+        PlannerRequest {
+            task_id: "cert-task".to_string(),
+            objective: "Create a certification document".to_string(),
+            worktree: worktree.to_path_buf(),
+            workspace_binding: workspace_binding_for_test(worktree),
+            base_sha: "base".to_string(),
+            allowed_paths: vec!["docs/cert.md".to_string()],
+            target_path: "docs/cert.md".to_string(),
+            broker_url: DEFAULT_BROKER_URL.to_string(),
+            model: DEFAULT_MODEL.to_string(),
+        }
+    }
+
+    fn broker_wrapper(model: Value, planner_output: &str) -> Value {
+        json!({
+            "response": {
+                "model": model,
+                "choices": [
+                    {
+                        "message": {
+                            "content": planner_output
+                        }
+                    }
+                ]
+            }
+        })
+    }
+
+    fn receipt_value(result: &Value, name: &str) -> Value {
+        let receipt_dir = PathBuf::from(result["receipt_dir"].as_str().expect("receipt dir"));
+        read_existing_json(&receipt_dir.join(name)).expect("receipt json")
+    }
+
+    fn assert_requested_and_resolved(value: &Value, requested: &str, resolved: &str) {
+        assert_eq!(value["requested_model"], requested);
+        assert_eq!(value["resolved_model"], resolved);
+    }
+
     #[test]
     fn valid_single_file_mutation_applies_and_emits_package_handoff() {
         let repo = git_repo("valid");
@@ -2625,6 +2897,112 @@ mod tests {
         let receipt_dir = PathBuf::from(result["receipt_dir"].as_str().unwrap());
         assert!(receipt_dir.join("package-plan-readiness.json").is_file());
         assert_eq!(result["package_ready"], true);
+    }
+
+    #[test]
+    fn requested_alias_and_broker_resolved_model_are_reported_separately() {
+        let repo = git_repo("resolved-model-alias");
+        let mut task = spec(&repo, vec!["docs/cert.md"], None);
+        task.model = Some("fast".to_string());
+        let result = run_task(
+            task,
+            &ModelPlanner {
+                output: valid_planner_output(&repo, "docs/cert.md"),
+                resolved_model: "concrete-test-model".to_string(),
+            },
+            &InlineValidator,
+        )
+        .expect("task succeeds");
+        assert_requested_and_resolved(&result, "fast", "concrete-test-model");
+
+        let acceptance = receipt_value(&result, "task-acceptance.json");
+        assert_eq!(acceptance["requested_model"], "fast");
+        assert_eq!(acceptance["resolved_model"], Value::Null);
+
+        for receipt in [
+            "broker-plan.json",
+            "planner-validation.json",
+            "package-control-preflight.json",
+            "mutation-authorization.json",
+            "changed-file-verification.json",
+            "validation.json",
+            "package-plan-readiness.json",
+            "package-handoff-readiness.json",
+            "task-complete.json",
+        ] {
+            let value = receipt_value(&result, receipt);
+            assert_requested_and_resolved(&value, "fast", "concrete-test-model");
+        }
+        let package_handoff = receipt_value(&result, "package-handoff-readiness.json");
+        assert_requested_and_resolved(
+            &package_handoff["package_plan_gate"],
+            "fast",
+            "concrete-test-model",
+        );
+    }
+
+    #[test]
+    fn same_name_requested_and_resolved_models_remain_distinct_fields() {
+        let repo = git_repo("resolved-model-same-name");
+        let mut task = spec(&repo, vec!["docs/cert.md"], None);
+        task.model = Some("concrete-test-model".to_string());
+        let result = run_task(
+            task,
+            &ModelPlanner {
+                output: valid_planner_output(&repo, "docs/cert.md"),
+                resolved_model: "concrete-test-model".to_string(),
+            },
+            &InlineValidator,
+        )
+        .expect("task succeeds");
+        assert_requested_and_resolved(&result, "concrete-test-model", "concrete-test-model");
+        assert_requested_and_resolved(
+            &receipt_value(&result, "broker-plan.json"),
+            "concrete-test-model",
+            "concrete-test-model",
+        );
+    }
+
+    #[test]
+    fn broker_response_model_must_be_nonempty_string() {
+        let repo = git_repo("broker-model-required");
+        let request = planner_request_for_test(&repo);
+        let output = valid_planner_output(&repo, "docs/cert.md");
+        for wrapper in [
+            json!({
+                "response": {
+                    "choices": [{"message": {"content": output}}]
+                }
+            }),
+            broker_wrapper(Value::Null, &output),
+            broker_wrapper(json!(""), &output),
+            broker_wrapper(json!("   "), &output),
+            broker_wrapper(json!(42), &output),
+            broker_wrapper(json!({}), &output),
+        ] {
+            let bytes = serde_json::to_vec(&wrapper).unwrap();
+            let err = planner_candidate_from_broker_wrapper(&request, &bytes)
+                .expect_err("missing broker response model must fail closed");
+            assert_eq!(err.kind, "broker-response-model-missing");
+        }
+    }
+
+    #[test]
+    fn empty_resolved_model_is_refused_before_broker_plan_receipt() {
+        let repo = git_repo("empty-resolved-model");
+        let err = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &ModelPlanner {
+                output: valid_planner_output(&repo, "docs/cert.md"),
+                resolved_model: "  ".to_string(),
+            },
+            &InlineValidator,
+        )
+        .expect_err("empty resolved model must fail before broker-plan receipt");
+        assert_eq!(err.kind, "broker-response-model-missing");
+        assert!(!repo
+            .join(".claw/runnable-task-bridge/cert-task/broker-plan.json")
+            .exists());
     }
 
     #[test]
@@ -3231,6 +3609,7 @@ mod tests {
         let second =
             run_task(second_task, &planner, &InlineValidator).expect("second run succeeds");
         assert_eq!(second["status"], "idempotent_complete");
+        assert_requested_and_resolved(&second, DEFAULT_MODEL, TEST_RESOLVED_MODEL);
     }
 
     #[test]
@@ -3249,6 +3628,25 @@ mod tests {
         changed_spec.caller_id = "other-caller".to_string();
         let err = run_task(changed_spec, &planner, &InlineValidator)
             .expect_err("cached completion must bind to the same task spec");
+        assert_eq!(err.kind, "completed-task-spec-mismatch");
+    }
+
+    #[test]
+    fn cached_completion_requires_same_requested_model() {
+        let repo = git_repo("idempotent-model-binding");
+        let planner = StubPlanner {
+            output: valid_planner_output(&repo, "docs/cert.md"),
+        };
+        run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("first run succeeds");
+        let mut changed_spec = spec(&repo, vec!["docs/cert.md"], None);
+        changed_spec.model = Some("slow".to_string());
+        let err = run_task(changed_spec, &planner, &InlineValidator)
+            .expect_err("cached completion must bind to the requested model identity");
         assert_eq!(err.kind, "completed-task-spec-mismatch");
     }
 
@@ -3305,10 +3703,55 @@ mod tests {
         )
         .expect("existing A2-applied task resumes without replanning");
         assert_eq!(resumed["status"], "applied");
+        assert_requested_and_resolved(&resumed, DEFAULT_MODEL, TEST_RESOLVED_MODEL);
+        assert_requested_and_resolved(
+            &receipt_value(&resumed, "package-plan-readiness.json"),
+            DEFAULT_MODEL,
+            TEST_RESOLVED_MODEL,
+        );
+        assert_requested_and_resolved(
+            &receipt_value(&resumed, "package-handoff-readiness.json"),
+            DEFAULT_MODEL,
+            TEST_RESOLVED_MODEL,
+        );
         assert!(receipt_dir.join("approved-lane.json").is_file());
         assert!(receipt_dir.join("task-complete.json").is_file());
         assert!(receipt_dir.join("package-plan-readiness.json").is_file());
         assert!(receipt_dir.join("package-handoff-readiness.json").is_file());
+    }
+
+    #[test]
+    fn resume_rejects_contradictory_existing_model_receipt() {
+        let repo = git_repo("resume-model-conflict");
+        let planner = StubPlanner {
+            output: valid_planner_output(&repo, "docs/cert.md"),
+        };
+        let first = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("first run succeeds");
+        let receipt_dir = PathBuf::from(first["receipt_dir"].as_str().unwrap());
+        fs::remove_file(receipt_dir.join("task-complete.json")).unwrap();
+        fs::remove_file(receipt_dir.join("package-plan-readiness.json")).unwrap();
+        fs::remove_file(receipt_dir.join("package-handoff-readiness.json")).unwrap();
+        let mut validation = read_existing_json(&receipt_dir.join("validation.json")).unwrap();
+        validation["resolved_model"] = json!("wrong-model");
+        fs::write(
+            receipt_dir.join("validation.json"),
+            serde_json::to_vec_pretty(&validation).unwrap(),
+        )
+        .unwrap();
+        let err = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &FailingPlanner {
+                kind: "planner-must-not-run",
+            },
+            &InlineValidator,
+        )
+        .expect_err("resume must reject contradictory existing model evidence");
+        assert_eq!(err.kind, "applied-task-evidence-mismatch");
     }
 
     #[test]
