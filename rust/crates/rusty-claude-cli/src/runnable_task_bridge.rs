@@ -25,7 +25,7 @@ const RESULT_SCHEMA_V1: &str = "stack-code-runnable-task-result.v1";
 const RECEIPT_SCHEMA_V1: &str = "stack-code-runnable-task-receipt.v1";
 const APPROVAL_RESULT_SCHEMA_V1: &str = "a2-l2b-approval-result.v1";
 const DEFAULT_BROKER_URL: &str = "http://127.0.0.1:11435";
-const DEFAULT_MODEL: &str = "fast";
+const DEFAULT_MODEL: &str = "fast-default";
 const DEFAULT_DISPOSABLE_WORKTREE_ROOT: &str = "/mnt/vast-data/git-worktrees";
 const VALIDATION_DOCS_ONLY: &str = "docs-only";
 const EXIT_REFUSED: i32 = 5;
@@ -4408,6 +4408,142 @@ mod tests {
         )
         .expect_err("cached completion must not hide unrelated drift");
         assert_eq!(err.kind, "changed-paths-mismatch");
+    }
+
+    // The broker registers `fast-default` as a logical alias; a literal `fast`
+    // is not a registered alias and fails to resolve upstream. These tests pin
+    // the default the bridge sends when the operator omits `model`.
+    #[derive(Debug)]
+    struct ModelCapturingPlanner {
+        output: String,
+        seen_model: std::cell::RefCell<Option<String>>,
+    }
+
+    impl PlannerClient for ModelCapturingPlanner {
+        fn request_plan(
+            &self,
+            request: &PlannerRequest,
+        ) -> Result<PlannerCandidate, BridgeRefusal> {
+            *self.seen_model.borrow_mut() = Some(request.model.clone());
+            Ok(PlannerCandidate {
+                planner_output_json: self.output.clone(),
+                broker_route: request.broker_url.clone(),
+                resolved_model: TEST_RESOLVED_MODEL.to_string(),
+                response_sha256: sha256_hex(self.output.as_bytes()),
+            })
+        }
+    }
+
+    #[test]
+    fn omitted_model_normalizes_to_registered_broker_alias() {
+        let repo = git_repo("default-alias-normalize");
+        let task = normalize_task(spec(&repo, vec!["docs/cert.md"], None)).expect("normalizes");
+        assert_eq!(task.model, "fast-default");
+        assert_ne!(
+            task.model, "fast",
+            "bare `fast` is not a registered broker alias and must not be the default"
+        );
+    }
+
+    #[test]
+    fn omitted_model_reaches_planner_request_as_registered_alias() {
+        let repo = git_repo("default-alias-planner-request");
+        let planner = ModelCapturingPlanner {
+            output: valid_planner_output(&repo, "docs/cert.md"),
+            seen_model: std::cell::RefCell::new(None),
+        };
+        let result = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("task succeeds");
+        assert_eq!(
+            planner.seen_model.borrow().as_deref(),
+            Some("fast-default"),
+            "planner request must carry the registered alias when the operator omitted a model"
+        );
+        assert_eq!(result["requested_model"], "fast-default");
+    }
+
+    #[test]
+    fn task_acceptance_receipt_records_default_requested_model() {
+        let repo = git_repo("default-alias-acceptance");
+        let planner = StubPlanner {
+            output: valid_planner_output(&repo, "docs/cert.md"),
+        };
+        let result = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("task succeeds");
+        let acceptance = receipt_value(&result, "task-acceptance.json");
+        assert_eq!(acceptance["requested_model"], "fast-default");
+        // Truthful pre-call state: the broker has not answered yet.
+        assert_eq!(acceptance["resolved_model"], Value::Null);
+    }
+
+    #[test]
+    fn explicit_operator_model_override_is_preserved() {
+        let repo = git_repo("default-alias-override");
+        let mut task = spec(&repo, vec!["docs/cert.md"], None);
+        task.model = Some("qwen3:14b".to_string());
+        let planner = ModelCapturingPlanner {
+            output: valid_planner_output(&repo, "docs/cert.md"),
+            seen_model: std::cell::RefCell::new(None),
+        };
+        let result = run_task(task, &planner, &InlineValidator).expect("task succeeds");
+        assert_eq!(planner.seen_model.borrow().as_deref(), Some("qwen3:14b"));
+        assert_eq!(result["requested_model"], "qwen3:14b");
+    }
+
+    #[test]
+    fn no_code_path_substitutes_the_bare_fast_literal() {
+        assert_eq!(DEFAULT_MODEL, "fast-default");
+        let repo = git_repo("default-alias-no-bare-fast");
+        let planner = ModelCapturingPlanner {
+            output: valid_planner_output(&repo, "docs/cert.md"),
+            seen_model: std::cell::RefCell::new(None),
+        };
+        let result = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("task succeeds");
+        assert_ne!(planner.seen_model.borrow().as_deref(), Some("fast"));
+        assert_ne!(result["requested_model"], "fast");
+        for receipt in [
+            "task-acceptance.json",
+            "broker-plan.json",
+            "validation.json",
+            "task-complete.json",
+        ] {
+            assert_ne!(
+                receipt_value(&result, receipt)["requested_model"],
+                "fast",
+                "{receipt} must not record the unregistered bare `fast` alias"
+            );
+        }
+    }
+
+    #[test]
+    fn default_alias_is_forwarded_opaquely_without_backend_assumption() {
+        // The bridge must forward the alias as-is and report whatever concrete
+        // model the broker resolves. It must never infer the backend itself.
+        let repo = git_repo("default-alias-opaque");
+        let planner = ModelPlanner {
+            output: valid_planner_output(&repo, "docs/cert.md"),
+            resolved_model: "some-other-backend-model".to_string(),
+        };
+        let result = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("task succeeds");
+        assert_requested_and_resolved(&result, "fast-default", "some-other-backend-model");
     }
 
     #[test]
