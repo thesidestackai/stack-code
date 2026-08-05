@@ -1,0 +1,4573 @@
+#![allow(
+    clippy::too_many_lines,
+    clippy::struct_excessive_bools,
+    clippy::missing_panics_doc,
+    clippy::unnecessary_wraps
+)]
+
+use std::collections::BTreeSet;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Component, Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+use a2_plan_runner::{ApprovalContext, ApprovalDecision};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+
+const TASK_SCHEMA_V1: &str = "stack-code-runnable-task.v1";
+const RESULT_SCHEMA_V1: &str = "stack-code-runnable-task-result.v1";
+const RECEIPT_SCHEMA_V1: &str = "stack-code-runnable-task-receipt.v1";
+const APPROVAL_RESULT_SCHEMA_V1: &str = "a2-l2b-approval-result.v1";
+const DEFAULT_BROKER_URL: &str = "http://127.0.0.1:11435";
+const DEFAULT_MODEL: &str = "fast-default";
+const DEFAULT_DISPOSABLE_WORKTREE_ROOT: &str = "/mnt/vast-data/git-worktrees";
+const VALIDATION_DOCS_ONLY: &str = "docs-only";
+const EXIT_REFUSED: i32 = 5;
+const EXIT_APPLY_REFUSED: i32 = 7;
+const EXIT_VALIDATION_FAILED: i32 = 13;
+
+#[cfg(test)]
+static TEST_CONTROL_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunnableTaskSpec {
+    schema_version: String,
+    task_id: String,
+    objective: String,
+    worktree: PathBuf,
+    allowed_paths: Vec<String>,
+    #[serde(default)]
+    target_path: Option<String>,
+    validation_profile: String,
+    caller_id: String,
+    task_type: String,
+    #[serde(default)]
+    broker_url: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    operator_approval: bool,
+    after_text: String,
+}
+
+#[derive(Debug, Clone)]
+struct NormalizedTask {
+    task_id: String,
+    objective: String,
+    worktree: PathBuf,
+    workspace_binding: String,
+    repository_identity: String,
+    base_sha: String,
+    branch: String,
+    allowed_paths: Vec<String>,
+    target_path: String,
+    validation_profile: String,
+    caller_id: String,
+    task_type: String,
+    broker_url: String,
+    model: String,
+    after_text: String,
+    receipt_dir: PathBuf,
+}
+
+#[derive(Debug)]
+struct PlannerRequest {
+    task_id: String,
+    objective: String,
+    worktree: PathBuf,
+    workspace_binding: String,
+    base_sha: String,
+    allowed_paths: Vec<String>,
+    target_path: String,
+    broker_url: String,
+    model: String,
+}
+
+#[derive(Debug)]
+struct PlannerCandidate {
+    planner_output_json: String,
+    broker_route: String,
+    resolved_model: String,
+    response_sha256: String,
+}
+
+#[derive(Debug, Clone)]
+struct ModelBinding {
+    requested_model: String,
+    resolved_model: String,
+}
+
+trait PlannerClient {
+    fn request_plan(&self, request: &PlannerRequest) -> Result<PlannerCandidate, BridgeRefusal>;
+}
+
+trait PlannerValidator {
+    fn validate(
+        &self,
+        task: &NormalizedTask,
+        candidate_json: &str,
+    ) -> Result<PathBuf, BridgeRefusal>;
+}
+
+#[derive(Debug)]
+struct PythonBrokerPlanner;
+
+#[derive(Debug)]
+struct ScriptPlannerValidator;
+
+#[derive(Debug)]
+struct BridgeRefusal {
+    kind: &'static str,
+    reason: String,
+    exit_code: i32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreviewBundleRead {
+    schema_version: String,
+    preview_record: a2_plan_runner::PreviewRecord,
+    #[allow(dead_code)]
+    preview_display: a2_plan_runner::PreviewDisplay,
+    checkpoint_baseline_unchanged: bool,
+}
+
+pub(crate) fn run_task_command(task_spec: &Path, stdout: &mut dyn Write) -> i32 {
+    let planner = PythonBrokerPlanner;
+    let validator = ScriptPlannerValidator;
+    match run_task_from_path(task_spec, &planner, &validator) {
+        Ok(result) => {
+            let _ = serde_json::to_writer_pretty(&mut *stdout, &result);
+            let _ = stdout.write_all(b"\n");
+            0
+        }
+        Err(refusal) => {
+            let payload = json!({
+                "schema_version": RESULT_SCHEMA_V1,
+                "ok": false,
+                "status": "refused",
+                "refusal": refusal.kind,
+                "reason": refusal.reason,
+                "exit_code": refusal.exit_code,
+            });
+            let _ = serde_json::to_writer_pretty(&mut *stdout, &payload);
+            let _ = stdout.write_all(b"\n");
+            refusal.exit_code
+        }
+    }
+}
+
+fn run_task_from_path(
+    task_spec_path: &Path,
+    planner: &dyn PlannerClient,
+    validator: &dyn PlannerValidator,
+) -> Result<Value, BridgeRefusal> {
+    let bytes = fs::read(task_spec_path).map_err(|e| {
+        refusal(
+            "task-spec-io-error",
+            format!("could not read task spec {}: {e}", task_spec_path.display()),
+        )
+    })?;
+    let spec: RunnableTaskSpec = serde_json::from_slice(&bytes).map_err(|e| {
+        refusal(
+            "task-spec-json-error",
+            format!("task spec is not valid {TASK_SCHEMA_V1}: {e}"),
+        )
+    })?;
+    run_task(spec, planner, validator)
+}
+
+fn run_task(
+    spec: RunnableTaskSpec,
+    planner: &dyn PlannerClient,
+    validator: &dyn PlannerValidator,
+) -> Result<Value, BridgeRefusal> {
+    let task = normalize_task(spec)?;
+    if let Some(done) = completed_task_result_if_current(&task)? {
+        return Ok(done);
+    }
+    if let Some(resumed) = resume_applied_task_if_current(&task)? {
+        return Ok(resumed);
+    }
+    verify_clean_start(&task)?;
+    create_dir_0700(&task.receipt_dir)?;
+    write_receipt(
+        &task.receipt_dir,
+        "task-acceptance.json",
+        &task_acceptance_receipt(&task, "accepted"),
+    )?;
+
+    let request = PlannerRequest {
+        task_id: task.task_id.clone(),
+        objective: task.objective.clone(),
+        worktree: task.worktree.clone(),
+        workspace_binding: task.workspace_binding.clone(),
+        base_sha: task.base_sha.clone(),
+        allowed_paths: task.allowed_paths.clone(),
+        target_path: task.target_path.clone(),
+        broker_url: task.broker_url.clone(),
+        model: task.model.clone(),
+    };
+    let candidate = planner.request_plan(&request)?;
+    let model_binding = model_binding_from_task(&task, &candidate.resolved_model)?;
+    write_receipt(
+        &task.receipt_dir,
+        "broker-plan.json",
+        &json!({
+            "schema_version": RECEIPT_SCHEMA_V1,
+            "receipt": "broker_plan",
+            "task_id": task.task_id,
+            "timestamp": timestamp(),
+            "status": "received",
+            "worktree": task.worktree,
+            "workspace_binding": task.workspace_binding,
+            "base_sha": task.base_sha,
+            "caller_id": task.caller_id,
+            "broker_route": candidate.broker_route,
+            "requested_model": model_binding.requested_model.as_str(),
+            "resolved_model": model_binding.resolved_model.as_str(),
+            "response_sha256": candidate.response_sha256,
+        }),
+    )?;
+
+    reject_secret_like_candidate(&candidate.planner_output_json)?;
+    let planner_output_path = validator.validate(&task, &candidate.planner_output_json)?;
+    verify_planner_paths(&task, &candidate.planner_output_json)?;
+    validate_docs_only_after_text(&task)?;
+    write_receipt(
+        &task.receipt_dir,
+        "planner-validation.json",
+        &json!({
+            "schema_version": RECEIPT_SCHEMA_V1,
+            "receipt": "planner_validation",
+            "task_id": task.task_id,
+            "timestamp": timestamp(),
+            "status": "valid",
+            "worktree": task.worktree,
+            "workspace_binding": task.workspace_binding,
+            "base_sha": task.base_sha,
+            "caller_id": task.caller_id,
+            "broker_route": task.broker_url,
+            "requested_model": model_binding.requested_model.as_str(),
+            "resolved_model": model_binding.resolved_model.as_str(),
+            "allowed_paths": task.allowed_paths,
+            "planner_output_path": planner_output_path,
+            "planner_output_sha256": sha256_hex(candidate.planner_output_json.as_bytes()),
+        }),
+    )?;
+
+    let pre_apply_package_control_gate = run_package_control_checkout_gate(&task, &model_binding)?;
+    write_receipt(
+        &task.receipt_dir,
+        "package-control-preflight.json",
+        &pre_apply_package_control_gate,
+    )?;
+    let approved_lane_path = write_approved_lane(&task)?;
+
+    let after_path = task.receipt_dir.join("after.bin");
+    write_file_new(&after_path, task.after_text.as_bytes())?;
+    verify_current_task_binding(&task)?;
+    verify_clean_start(&task)?;
+    let preview_result =
+        crate::try_run_plan_preview_bundle(&task.worktree, &task.target_path, &after_path)
+            .map_err(|e| {
+                refusal(
+                    "a2-preview-refused",
+                    format!("claw plan preview-bundle refused: {}", e.reason()),
+                )
+            })?;
+    let preview_bundle = read_preview_bundle(&preview_result.preview_bundle_path)?;
+    let approval_result_path = preview_result
+        .preview_bundle_path
+        .parent()
+        .ok_or_else(|| refusal("a2-preview-layout-invalid", "preview bundle has no parent"))?
+        .join("approval-result.json");
+    write_approval_result(&approval_result_path, &preview_bundle)?;
+    write_receipt(
+        &task.receipt_dir,
+        "mutation-authorization.json",
+        &json!({
+            "schema_version": RECEIPT_SCHEMA_V1,
+            "receipt": "mutation_authorization",
+            "task_id": task.task_id,
+            "timestamp": timestamp(),
+            "status": "approved",
+            "worktree": task.worktree,
+            "base_sha": task.base_sha,
+            "caller_id": task.caller_id,
+            "broker_route": task.broker_url,
+            "requested_model": model_binding.requested_model.as_str(),
+            "resolved_model": model_binding.resolved_model.as_str(),
+            "allowed_paths": task.allowed_paths,
+            "target_path": task.target_path,
+            "preview_bundle_path": preview_result.preview_bundle_path,
+            "approval_result_path": approval_result_path,
+            "preview_sha256": preview_bundle.preview_record.preview_sha256,
+        }),
+    )?;
+
+    let preview_result_path = task.receipt_dir.join("preview-generator-result.json");
+    let preview_result_json = serde_json::to_value(&preview_result).map_err(|e| {
+        refusal(
+            "preview-result-serialize-failed",
+            format!("could not serialize preview result: {e}"),
+        )
+    })?;
+    write_json_pretty_new(&preview_result_path, &preview_result_json)?;
+    let apply_bundle_path =
+        run_apply_bundle_generator(&preview_result_path, &approval_result_path)?;
+    let apply_result = run_apply(&apply_bundle_path)?;
+    write_receipt(&task.receipt_dir, "a2-apply-result.json", &apply_result)?;
+    if let Some(parent) = apply_bundle_path.parent() {
+        let colocated = parent.join("apply-result.json");
+        if !colocated.exists() {
+            write_json_pretty_new(&colocated, &apply_result)?;
+        }
+    }
+
+    let changed_paths = verify_changed_paths(&task)?;
+    write_receipt(
+        &task.receipt_dir,
+        "changed-file-verification.json",
+        &json!({
+            "schema_version": RECEIPT_SCHEMA_V1,
+            "receipt": "changed_file_verification",
+            "task_id": task.task_id,
+            "timestamp": timestamp(),
+            "status": "verified",
+            "worktree": task.worktree,
+            "base_sha": task.base_sha,
+            "caller_id": task.caller_id,
+            "broker_route": task.broker_url,
+            "requested_model": model_binding.requested_model.as_str(),
+            "resolved_model": model_binding.resolved_model.as_str(),
+            "allowed_paths": task.allowed_paths,
+            "actual_changed_paths": changed_paths,
+        }),
+    )?;
+    run_validation(&task)?;
+    write_receipt(
+        &task.receipt_dir,
+        "validation.json",
+        &validation_receipt(&task, &model_binding),
+    )?;
+
+    let package_plan_gate = run_package_plan_gate(&task, &approved_lane_path, &model_binding)?;
+    write_receipt(
+        &task.receipt_dir,
+        "package-plan-readiness.json",
+        &package_plan_gate,
+    )?;
+    let package_handoff = package_handoff_receipt(
+        &task,
+        &changed_paths,
+        &approved_lane_path,
+        &package_plan_gate,
+        &model_binding,
+    );
+    write_receipt(
+        &task.receipt_dir,
+        "package-handoff-readiness.json",
+        &package_handoff,
+    )?;
+    let complete = final_success_result(&task, &changed_paths, &approved_lane_path, &model_binding);
+    write_receipt(&task.receipt_dir, "task-complete.json", &complete)?;
+    Ok(complete)
+}
+
+fn normalize_task(spec: RunnableTaskSpec) -> Result<NormalizedTask, BridgeRefusal> {
+    if spec.schema_version != TASK_SCHEMA_V1 {
+        return Err(refusal(
+            "task-spec-schema-version",
+            format!("unsupported schema_version {}", spec.schema_version),
+        ));
+    }
+    validate_task_id(&spec.task_id)?;
+    if spec.objective.trim().is_empty() {
+        return Err(refusal(
+            "task-objective-empty",
+            "objective must not be empty",
+        ));
+    }
+    if !spec.operator_approval {
+        return Err(BridgeRefusal {
+            kind: "a2-authorization-invalid",
+            reason: "operator_approval must be true before mutation evidence is generated"
+                .to_string(),
+            exit_code: EXIT_APPLY_REFUSED,
+        });
+    }
+    if spec.validation_profile != VALIDATION_DOCS_ONLY {
+        return Err(refusal(
+            "validation-profile-unsupported",
+            format!(
+                "unsupported validation_profile {}; only {VALIDATION_DOCS_ONLY} is allowed",
+                spec.validation_profile
+            ),
+        ));
+    }
+    if spec.task_type != "code" {
+        return Err(refusal("task-type-unsupported", "task_type must be code"));
+    }
+    let worktree = canonical_worktree(&spec.worktree)?;
+    let workspace_binding = expected_workspace_binding(&worktree)?;
+    let repository_identity = repository_identity(&worktree)?;
+    let base_sha = git_stdout(&worktree, &["rev-parse", "HEAD"])?;
+    verify_approved_base(&worktree, &base_sha)?;
+    let branch = git_stdout(&worktree, &["branch", "--show-current"])?;
+    if branch.is_empty() {
+        return Err(refusal(
+            "worktree-branch-detached",
+            "task worktree must be on a named branch",
+        ));
+    }
+    verify_disposable_worktree(&worktree, &branch)?;
+    let allowed_paths = normalize_allowed_paths(&worktree, &spec.allowed_paths)?;
+    let target_path = match spec.target_path {
+        Some(path) => normalize_one_allowed_path(&worktree, &path)?,
+        None if allowed_paths.len() == 1 => allowed_paths[0].clone(),
+        None => {
+            return Err(refusal(
+                "target-path-required",
+                "target_path is required when allowed_paths contains more than one path",
+            ));
+        }
+    };
+    if !allowed_paths.iter().any(|path| path == &target_path) {
+        return Err(refusal(
+            "target-path-not-allowed",
+            format!("target_path {target_path} is not in allowed_paths"),
+        ));
+    }
+    let broker_url = canonical_broker_url(spec.broker_url.as_deref())?;
+    let model = spec.model.unwrap_or_else(|| DEFAULT_MODEL.to_string());
+    if model.trim().is_empty() {
+        return Err(refusal("model-empty", "model must not be empty"));
+    }
+    let receipt_dir = worktree
+        .join(".claw")
+        .join("runnable-task-bridge")
+        .join(&spec.task_id);
+    Ok(NormalizedTask {
+        task_id: spec.task_id,
+        objective: spec.objective,
+        worktree,
+        workspace_binding,
+        repository_identity,
+        base_sha,
+        branch,
+        allowed_paths,
+        target_path,
+        validation_profile: spec.validation_profile,
+        caller_id: spec.caller_id,
+        task_type: spec.task_type,
+        broker_url,
+        model,
+        after_text: spec.after_text,
+        receipt_dir,
+    })
+}
+
+impl PlannerClient for PythonBrokerPlanner {
+    fn request_plan(&self, request: &PlannerRequest) -> Result<PlannerCandidate, BridgeRefusal> {
+        let context_path = write_context_summary(request)?;
+        let composed_task = format!(
+            "{}\n\nPlanner output task_id must be exactly {}.\nPlanner output workspace_root must be exactly {}.\nAllowed paths: {}\nTarget path: {}\nReturn candidate_files containing only the allowed target path.",
+            request.objective.trim(),
+            request.task_id,
+            request.workspace_binding,
+            request.allowed_paths.join(", "),
+            request.target_path
+        );
+        let output = Command::new("python3")
+            .current_dir(&request.worktree)
+            .arg("scripts/invoke_planner_model_via_broker.py")
+            .arg("--task")
+            .arg(&composed_task)
+            .arg("--context-summary")
+            .arg(&context_path)
+            .arg("--broker-url")
+            .arg(&request.broker_url)
+            .arg("--model")
+            .arg(&request.model)
+            .arg("--allow-live-broker-call")
+            .arg("--json")
+            .output()
+            .map_err(|e| refusal("broker-adapter-launch-failed", format!("{e}")))?;
+        if !output.status.success() {
+            return Err(refusal(
+                "broker-adapter-refused",
+                format!(
+                    "planner adapter exited {:?}: {}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+            ));
+        }
+        planner_candidate_from_broker_wrapper(request, &output.stdout)
+    }
+}
+
+fn planner_candidate_from_broker_wrapper(
+    request: &PlannerRequest,
+    stdout: &[u8],
+) -> Result<PlannerCandidate, BridgeRefusal> {
+    let wrapper: Value = serde_json::from_slice(stdout).map_err(|e| {
+        refusal(
+            "broker-adapter-json-error",
+            format!("planner adapter stdout was not valid JSON: {e}"),
+        )
+    })?;
+    let resolved_model = broker_response_model(&wrapper)?;
+    let content = wrapper
+        .get("response")
+        .and_then(|response| response.get("choices"))
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            refusal(
+                "broker-response-content-missing",
+                "broker response did not contain choices[0].message.content",
+            )
+        })?
+        .trim()
+        .to_string();
+    Ok(PlannerCandidate {
+        response_sha256: sha256_hex(stdout),
+        planner_output_json: content,
+        broker_route: request.broker_url.clone(),
+        resolved_model,
+    })
+}
+
+fn broker_response_model(wrapper: &Value) -> Result<String, BridgeRefusal> {
+    nonempty_json_string(
+        wrapper
+            .get("response")
+            .and_then(|response| response.get("model")),
+        "broker-response-model-missing",
+        "broker response did not contain a nonempty response.model",
+    )
+}
+
+impl PlannerValidator for ScriptPlannerValidator {
+    fn validate(
+        &self,
+        task: &NormalizedTask,
+        candidate_json: &str,
+    ) -> Result<PathBuf, BridgeRefusal> {
+        let candidate_path = task.receipt_dir.join("planner-output.json");
+        write_file_new(&candidate_path, candidate_json.as_bytes())?;
+        let output = Command::new("python3")
+            .current_dir(&task.worktree)
+            .arg("scripts/validate_planner_output_schema.py")
+            .arg(&candidate_path)
+            .output()
+            .map_err(|e| refusal("planner-validator-launch-failed", format!("{e}")))?;
+        if output.status.success() {
+            Ok(candidate_path)
+        } else {
+            Err(refusal(
+                "planner-output-validation-refused",
+                format!(
+                    "validator exited {:?}: {}{}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+            ))
+        }
+    }
+}
+
+fn verify_planner_paths(task: &NormalizedTask, candidate_json: &str) -> Result<(), BridgeRefusal> {
+    let doc: Value = serde_json::from_str(candidate_json).map_err(|e| {
+        refusal(
+            "planner-output-json-error",
+            format!("planner output was not valid JSON after validator pass: {e}"),
+        )
+    })?;
+    let task_id = doc.get("task_id").and_then(Value::as_str).ok_or_else(|| {
+        refusal(
+            "planner-output-task-id-missing",
+            "planner output task_id missing",
+        )
+    })?;
+    if task_id != task.task_id {
+        return Err(refusal(
+            "planner-output-task-id-mismatch",
+            format!(
+                "planner output task_id {task_id} did not match {}",
+                task.task_id
+            ),
+        ));
+    }
+    let workspace_root = doc
+        .get("workspace_root")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            refusal(
+                "planner-output-workspace-root-missing",
+                "planner output workspace_root missing",
+            )
+        })?;
+    if workspace_root != task.workspace_binding {
+        return Err(refusal(
+            "planner-output-workspace-root-mismatch",
+            format!(
+                "planner output workspace_root {workspace_root} did not match {}",
+                task.workspace_binding
+            ),
+        ));
+    }
+    let candidates = doc
+        .get("candidate_files")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            refusal(
+                "planner-output-candidate-files-missing",
+                "planner output must name candidate_files for the bridge target",
+            )
+        })?;
+    let allowed: BTreeSet<&str> = task.allowed_paths.iter().map(String::as_str).collect();
+    let mut saw_target = false;
+    for value in candidates {
+        let Some(path) = value.as_str() else {
+            return Err(refusal(
+                "planner-output-candidate-path-invalid",
+                "candidate_files entries must be strings",
+            ));
+        };
+        if !allowed.contains(path) {
+            return Err(refusal(
+                "planner-output-unauthorized-path",
+                format!("planner output named unauthorized candidate file {path}"),
+            ));
+        }
+        if path == task.target_path {
+            saw_target = true;
+        }
+    }
+    if !saw_target {
+        return Err(refusal(
+            "planner-output-target-missing",
+            format!(
+                "planner output did not name target_path {}",
+                task.target_path
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn read_preview_bundle(path: &Path) -> Result<PreviewBundleRead, BridgeRefusal> {
+    let bytes = fs::read(path).map_err(|e| {
+        refusal(
+            "preview-bundle-read-error",
+            format!("could not read preview bundle {}: {e}", path.display()),
+        )
+    })?;
+    let bundle: PreviewBundleRead = serde_json::from_slice(&bytes).map_err(|e| {
+        refusal(
+            "preview-bundle-json-error",
+            format!("preview bundle was not valid JSON: {e}"),
+        )
+    })?;
+    if bundle.schema_version != "a2-l2b-preview-bundle.v1" {
+        return Err(refusal(
+            "preview-bundle-schema-version",
+            format!("unexpected preview bundle schema {}", bundle.schema_version),
+        ));
+    }
+    Ok(bundle)
+}
+
+fn write_approval_result(path: &Path, bundle: &PreviewBundleRead) -> Result<(), BridgeRefusal> {
+    let line = format!(
+        "apply {} {}\n",
+        bundle.preview_record.step_id, bundle.preview_record.preview_sha256
+    );
+    let decision = a2_plan_runner::evaluate_approval(
+        &line,
+        ApprovalContext {
+            preview: &bundle.preview_record,
+            checkpoint_baseline_unchanged: bundle.checkpoint_baseline_unchanged,
+        },
+    );
+    let ApprovalDecision::Approved { .. } = decision else {
+        return Err(BridgeRefusal {
+            kind: "a2-approval-refused",
+            reason: "operator-owned bridge approval did not bind to preview".to_string(),
+            exit_code: EXIT_APPLY_REFUSED,
+        });
+    };
+    let payload = json!({
+        "schema_version": APPROVAL_RESULT_SCHEMA_V1,
+        "decision": "approved",
+        "preview_id": bundle.preview_record.preview_id,
+        "step_id": bundle.preview_record.step_id,
+        "preview_sha256": bundle.preview_record.preview_sha256,
+        "checkpoint_baseline_unchanged": bundle.checkpoint_baseline_unchanged,
+        "exit_code_hint": 0,
+        "audit_markers": [
+            "a2-l2b-approved",
+            "stack-code-runnable-task-bridge-operator-authorized"
+        ],
+    });
+    write_json_pretty_new(path, &payload)
+}
+
+fn run_apply_bundle_generator(
+    preview_result_path: &Path,
+    approval_result_path: &Path,
+) -> Result<PathBuf, BridgeRefusal> {
+    let mut stdout = Vec::new();
+    let code = crate::run_plan_apply_bundle(preview_result_path, approval_result_path, &mut stdout);
+    let value: Value = serde_json::from_slice(&stdout).map_err(|e| {
+        refusal(
+            "a2-apply-bundle-output-json-error",
+            format!("apply-bundle output was not JSON: {e}"),
+        )
+    })?;
+    if code != 0 {
+        return Err(refusal(
+            "a2-apply-bundle-refused",
+            format!("apply-bundle generator exited {code}: {value}"),
+        ));
+    }
+    value
+        .get("apply_bundle_path")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            refusal(
+                "a2-apply-bundle-path-missing",
+                "apply-bundle success output lacked apply_bundle_path",
+            )
+        })
+}
+
+fn run_apply(apply_bundle_path: &Path) -> Result<Value, BridgeRefusal> {
+    let mut stdout = Vec::new();
+    let code = crate::run_plan_apply(apply_bundle_path, &mut stdout);
+    let value: Value = serde_json::from_slice(&stdout).map_err(|e| {
+        refusal(
+            "a2-apply-output-json-error",
+            format!("apply output was not JSON: {e}"),
+        )
+    })?;
+    if code != 0 {
+        return Err(BridgeRefusal {
+            kind: "a2-apply-refused",
+            reason: format!("claw plan apply exited {code}: {value}"),
+            exit_code: code,
+        });
+    }
+    if value.get("outcome").and_then(Value::as_str) != Some("applied") {
+        return Err(refusal(
+            "a2-apply-not-applied",
+            format!("apply output did not report applied: {value}"),
+        ));
+    }
+    Ok(value)
+}
+
+fn run_validation(task: &NormalizedTask) -> Result<(), BridgeRefusal> {
+    if task.validation_profile != VALIDATION_DOCS_ONLY {
+        return Err(refusal(
+            "validation-profile-unsupported",
+            "only docs-only validation is implemented",
+        ));
+    }
+    validate_docs_only_target(task)?;
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&task.worktree)
+        .arg("diff")
+        .arg("--check")
+        .output()
+        .map_err(|e| refusal("validation-launch-failed", format!("{e}")))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(BridgeRefusal {
+            kind: "validation-failed",
+            reason: format!(
+                "git diff --check failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            exit_code: EXIT_VALIDATION_FAILED,
+        })
+    }
+}
+
+fn validate_docs_only_target(task: &NormalizedTask) -> Result<(), BridgeRefusal> {
+    validate_docs_only_path(&task.target_path)?;
+    let target = task.worktree.join(&task.target_path);
+    let bytes = fs::read(&target).map_err(|e| BridgeRefusal {
+        kind: "validation-failed",
+        reason: format!("could not read validation target {}: {e}", target.display()),
+        exit_code: EXIT_VALIDATION_FAILED,
+    })?;
+    let text = String::from_utf8(bytes).map_err(|e| BridgeRefusal {
+        kind: "validation-failed",
+        reason: format!("validation target is not UTF-8: {e}"),
+        exit_code: EXIT_VALIDATION_FAILED,
+    })?;
+    validate_docs_only_text(task, &text)
+}
+
+fn validate_docs_only_after_text(task: &NormalizedTask) -> Result<(), BridgeRefusal> {
+    validate_docs_only_path(&task.target_path)?;
+    validate_docs_only_text(task, &task.after_text)
+}
+
+fn validate_docs_only_path(target_path: &str) -> Result<(), BridgeRefusal> {
+    if !Path::new(target_path)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+    {
+        return Err(BridgeRefusal {
+            kind: "validation-failed",
+            reason: format!("docs-only validation requires a Markdown target; got {target_path}"),
+            exit_code: EXIT_VALIDATION_FAILED,
+        });
+    }
+    Ok(())
+}
+
+fn validate_docs_only_text(task: &NormalizedTask, text: &str) -> Result<(), BridgeRefusal> {
+    for (index, line) in text.lines().enumerate() {
+        let line_no = index + 1;
+        if line.starts_with("<<<<<<<") || line.starts_with("=======") || line.starts_with(">>>>>>>")
+        {
+            return Err(BridgeRefusal {
+                kind: "validation-failed",
+                reason: format!("conflict marker in {}:{line_no}", task.target_path),
+                exit_code: EXIT_VALIDATION_FAILED,
+            });
+        }
+        if line.ends_with(' ') || line.ends_with('\t') {
+            return Err(BridgeRefusal {
+                kind: "validation-failed",
+                reason: format!("trailing whitespace in {}:{line_no}", task.target_path),
+                exit_code: EXIT_VALIDATION_FAILED,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn write_approved_lane(task: &NormalizedTask) -> Result<PathBuf, BridgeRefusal> {
+    let target_abs = task.worktree.join(&task.target_path);
+    let path = task.receipt_dir.join("approved-lane.json");
+    let payload = json!({
+        "schema_version": "stack-code-runnable-task-approved-lane.v1",
+        "operatorApproved": true,
+        "worktreePlan": {
+            "worktreePath": task.worktree,
+            "branch": task.branch,
+            "base": "origin/main",
+        },
+        "declaredPaths": [target_abs],
+        "proposedWrites": [target_abs],
+        "proposedCommands": [],
+        "taskId": task.task_id,
+        "callerId": task.caller_id,
+        "taskType": task.task_type,
+    });
+    write_json_pretty_new(&path, &payload)?;
+    Ok(path)
+}
+
+fn run_package_plan_gate(
+    task: &NormalizedTask,
+    approved_lane_path: &Path,
+    model_binding: &ModelBinding,
+) -> Result<Value, BridgeRefusal> {
+    verify_current_task_binding(task)?;
+    let script = package_plan_script(task);
+    if !script.is_file() {
+        return Err(refusal(
+            "package-plan-gate-missing",
+            format!("package-plan script not found at {}", script.display()),
+        ));
+    }
+    let mut command = Command::new("bash");
+    command
+        .current_dir(&task.worktree)
+        .arg(&script)
+        .arg("package-plan")
+        .arg("--worktree")
+        .arg(&task.worktree)
+        .arg("--approved-lane")
+        .arg(approved_lane_path);
+    #[cfg(test)]
+    command
+        .env("A2_CONTROL_CHECKOUT", package_control_checkout()?)
+        .env("A2_DISPOSABLE_WORKTREE_ROOT", disposable_worktree_root()?);
+    let output = command.output().map_err(|e| {
+        refusal(
+            "package-plan-gate-launch-failed",
+            format!("could not launch package-plan gate: {e}"),
+        )
+    })?;
+    if !output.status.success() {
+        return Err(BridgeRefusal {
+            kind: "package-plan-gate-failed",
+            reason: format!(
+                "package-plan gate exited {:?}: {}{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            exit_code: EXIT_REFUSED,
+        });
+    }
+    verify_current_task_binding(task)?;
+    Ok(json!({
+        "schema_version": RECEIPT_SCHEMA_V1,
+        "receipt": "package_plan_gate",
+        "task_id": task.task_id,
+        "timestamp": timestamp(),
+        "status": "passed",
+        "worktree": task.worktree,
+        "base_sha": task.base_sha,
+        "branch": task.branch,
+        "caller_id": task.caller_id,
+        "broker_route": task.broker_url,
+        "requested_model": model_binding.requested_model.as_str(),
+        "resolved_model": model_binding.resolved_model.as_str(),
+        "approved_lane_path": approved_lane_path,
+        "command": "scripts/a2-tier3-write-orchestrator.sh package-plan",
+        "stdout_sha256": sha256_hex(&output.stdout),
+        "stderr_sha256": sha256_hex(&output.stderr),
+    }))
+}
+
+fn run_package_control_checkout_gate(
+    task: &NormalizedTask,
+    model_binding: &ModelBinding,
+) -> Result<Value, BridgeRefusal> {
+    let script = package_plan_script(task);
+    if !script.is_file() {
+        return Err(refusal(
+            "package-plan-gate-missing",
+            format!("package-plan script not found at {}", script.display()),
+        ));
+    }
+    let control = package_control_checkout()?;
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&control)
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .output()
+        .map_err(|e| {
+            refusal(
+                "package-control-checkout-unavailable",
+                format!(
+                    "could not inspect package control checkout {}: {e}",
+                    control.display()
+                ),
+            )
+        })?;
+    if !output.status.success() {
+        return Err(refusal(
+            "package-control-checkout-unavailable",
+            format!(
+                "cannot read package control checkout {}: {}{}",
+                control.display(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        ));
+    }
+    if !output.stdout.is_empty() {
+        return Err(refusal(
+            "package-control-checkout-dirty",
+            format!(
+                "package control checkout {} is not clean",
+                control.display()
+            ),
+        ));
+    }
+    Ok(json!({
+        "schema_version": RECEIPT_SCHEMA_V1,
+        "receipt": "package_control_preflight",
+        "task_id": task.task_id,
+        "timestamp": timestamp(),
+        "status": "passed",
+        "worktree": task.worktree,
+        "base_sha": task.base_sha,
+        "branch": task.branch,
+        "caller_id": task.caller_id,
+        "broker_route": task.broker_url,
+        "requested_model": model_binding.requested_model.as_str(),
+        "resolved_model": model_binding.resolved_model.as_str(),
+        "control_checkout": control,
+        "command": "git status --porcelain --untracked-files=all",
+        "stdout_sha256": sha256_hex(&output.stdout),
+        "stderr_sha256": sha256_hex(&output.stderr),
+    }))
+}
+
+#[cfg(not(test))]
+fn package_plan_script(task: &NormalizedTask) -> PathBuf {
+    task.worktree.join("scripts/a2-tier3-write-orchestrator.sh")
+}
+
+#[cfg(not(test))]
+fn package_control_checkout() -> Result<PathBuf, BridgeRefusal> {
+    Path::new("/home/suki/stack-code")
+        .canonicalize()
+        .map_err(|e| {
+            refusal(
+                "package-control-checkout-unavailable",
+                format!("could not canonicalize package control checkout: {e}"),
+            )
+        })
+}
+
+#[cfg(test)]
+fn package_plan_script(_task: &NormalizedTask) -> PathBuf {
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    crate_dir
+        .ancestors()
+        .nth(3)
+        .expect("crate dir is under repo root")
+        .join("scripts/a2-tier3-write-orchestrator.sh")
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_CONTROL_CHECKOUT_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn package_control_checkout() -> Result<PathBuf, BridgeRefusal> {
+    if let Some(path) = TEST_CONTROL_CHECKOUT_OVERRIDE
+        .with(|override_path| override_path.borrow().as_ref().cloned())
+    {
+        return Ok(path);
+    }
+    test_control_checkout()
+}
+
+#[cfg(test)]
+fn test_control_checkout() -> Result<PathBuf, BridgeRefusal> {
+    let path = std::env::temp_dir().join(format!(
+        "stack-code-task-bridge-control-{}-{}-{}",
+        std::process::id(),
+        timestamp(),
+        TEST_CONTROL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&path).map_err(|e| {
+        refusal(
+            "test-control-checkout-create-failed",
+            format!(
+                "could not create test control checkout {}: {e}",
+                path.display()
+            ),
+        )
+    })?;
+    let init = Command::new("git")
+        .arg("-C")
+        .arg(&path)
+        .args(["init", "-b", "main"])
+        .output()
+        .map_err(|e| refusal("test-control-checkout-git-failed", format!("{e}")))?;
+    if !init.status.success() {
+        return Err(refusal(
+            "test-control-checkout-git-failed",
+            String::from_utf8_lossy(&init.stderr).to_string(),
+        ));
+    }
+    for args in [
+        ["config", "user.email", "test@example.invalid"],
+        ["config", "user.name", "Stack Code Test"],
+    ] {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&path)
+            .args(args)
+            .output()
+            .map_err(|e| refusal("test-control-checkout-git-failed", format!("{e}")))?;
+        if !output.status.success() {
+            return Err(refusal(
+                "test-control-checkout-git-failed",
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ));
+        }
+    }
+    fs::write(path.join("README.md"), "control\n").map_err(|e| {
+        refusal(
+            "test-control-checkout-write-failed",
+            format!("could not write test control README: {e}"),
+        )
+    })?;
+    for args in [&["add", "README.md"][..], &["commit", "-m", "baseline"][..]] {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&path)
+            .args(args)
+            .output()
+            .map_err(|e| refusal("test-control-checkout-git-failed", format!("{e}")))?;
+        if !output.status.success() {
+            return Err(refusal(
+                "test-control-checkout-git-failed",
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ));
+        }
+    }
+    Ok(path)
+}
+
+fn final_success_result(
+    task: &NormalizedTask,
+    changed_paths: &[String],
+    approved_lane: &Path,
+    model_binding: &ModelBinding,
+) -> Value {
+    json!({
+        "schema_version": RESULT_SCHEMA_V1,
+        "ok": true,
+        "status": "applied",
+        "task_id": task.task_id,
+        "timestamp": timestamp(),
+        "worktree": task.worktree,
+        "base_sha": task.base_sha,
+        "branch": task.branch,
+        "caller_id": task.caller_id,
+        "broker_route": task.broker_url,
+        "requested_model": model_binding.requested_model.as_str(),
+        "resolved_model": model_binding.resolved_model.as_str(),
+        "allowed_paths": task.allowed_paths,
+        "target_path": task.target_path,
+        "task_type": task.task_type,
+        "validation_profile": task.validation_profile,
+        "objective_sha256": sha256_hex(task.objective.as_bytes()),
+        "after_sha256": sha256_hex(task.after_text.as_bytes()),
+        "actual_changed_paths": changed_paths,
+        "receipt_dir": task.receipt_dir,
+        "approved_lane_path": approved_lane,
+        "package_ready": true,
+        "manual_git_packaging_required": false,
+    })
+}
+
+fn validation_receipt(task: &NormalizedTask, model_binding: &ModelBinding) -> Value {
+    json!({
+        "schema_version": RECEIPT_SCHEMA_V1,
+        "receipt": "validation",
+        "task_id": task.task_id,
+        "timestamp": timestamp(),
+        "status": "passed",
+        "worktree": task.worktree,
+        "base_sha": task.base_sha,
+        "caller_id": task.caller_id,
+        "broker_route": task.broker_url,
+        "requested_model": model_binding.requested_model.as_str(),
+        "resolved_model": model_binding.resolved_model.as_str(),
+        "validation_profile": task.validation_profile,
+        "command": "docs-only content guard + git diff --check",
+    })
+}
+
+fn package_handoff_receipt(
+    task: &NormalizedTask,
+    changed_paths: &[String],
+    approved_lane_path: &Path,
+    package_plan_gate: &Value,
+    model_binding: &ModelBinding,
+) -> Value {
+    json!({
+        "schema_version": RECEIPT_SCHEMA_V1,
+        "receipt": "package_handoff_readiness",
+        "task_id": task.task_id,
+        "timestamp": timestamp(),
+        "status": "ready",
+        "worktree": task.worktree,
+        "base_sha": task.base_sha,
+        "caller_id": task.caller_id,
+        "broker_route": task.broker_url,
+        "requested_model": model_binding.requested_model.as_str(),
+        "resolved_model": model_binding.resolved_model.as_str(),
+        "allowed_paths": task.allowed_paths,
+        "actual_changed_paths": changed_paths,
+        "approved_lane_path": approved_lane_path,
+        "package_plan_gate": package_plan_gate,
+        "package_rungs": [
+            "scripts/a2-tier3-write-orchestrator.sh package-plan",
+            "scripts/a2-tier3-write-orchestrator.sh package-commit",
+            "scripts/a2-tier3-write-orchestrator.sh package-push",
+            "scripts/a2-tier3-write-orchestrator.sh package-pr"
+        ],
+    })
+}
+
+fn completed_task_result_if_current(task: &NormalizedTask) -> Result<Option<Value>, BridgeRefusal> {
+    let complete_path = task.receipt_dir.join("task-complete.json");
+    if !complete_path.exists() {
+        return Ok(None);
+    }
+    let target = task.worktree.join(&task.target_path);
+    if !target.is_file() {
+        return Err(refusal(
+            "completed-task-target-missing",
+            "task-complete receipt exists but target file is missing",
+        ));
+    }
+    let expected = sha256_hex(task.after_text.as_bytes());
+    let actual = sha256_file_hex(&target).map_err(|e| {
+        refusal(
+            "completed-task-target-hash-error",
+            format!("could not hash completed target {}: {e}", target.display()),
+        )
+    })?;
+    if expected != actual {
+        return Err(refusal(
+            "completed-task-target-mismatch",
+            "task-complete receipt exists but target bytes differ from requested after_text",
+        ));
+    }
+    let bytes = fs::read(&complete_path).map_err(|e| {
+        refusal(
+            "completed-task-receipt-read-error",
+            format!("could not read {}: {e}", complete_path.display()),
+        )
+    })?;
+    let mut value: Value = serde_json::from_slice(&bytes).map_err(|e| {
+        refusal(
+            "completed-task-receipt-json-error",
+            format!("completed receipt was not valid JSON: {e}"),
+        )
+    })?;
+    let model_binding = validate_cached_completion(task, &value)?;
+    if value.get("base_sha").and_then(Value::as_str) != Some(task.base_sha.as_str()) {
+        return Err(refusal(
+            "completed-task-base-mismatch",
+            "task-complete receipt base_sha does not match the current worktree HEAD",
+        ));
+    }
+    if value.get("branch").and_then(Value::as_str) != Some(task.branch.as_str()) {
+        return Err(refusal(
+            "completed-task-branch-mismatch",
+            "task-complete receipt branch does not match the current worktree branch",
+        ));
+    }
+    verify_current_task_binding(task)?;
+    let changed_paths = verify_changed_paths(task)?;
+    let approved_lane_path = approved_lane_path_from_result(&value)?;
+    let package_plan_gate = run_package_plan_gate(task, &approved_lane_path, &model_binding)?;
+    value["actual_changed_paths"] = json!(changed_paths);
+    value["package_plan_gate"] = package_plan_gate;
+    value["package_ready"] = Value::Bool(true);
+    value["status"] = Value::String("idempotent_complete".to_string());
+    Ok(Some(value))
+}
+
+fn validate_cached_completion(
+    task: &NormalizedTask,
+    value: &Value,
+) -> Result<ModelBinding, BridgeRefusal> {
+    let model_binding = model_binding_from_receipt(
+        task,
+        value,
+        "completed-task-spec-mismatch",
+        "task-complete receipt does not bind to the current requested model",
+    )?;
+    if value.get("task_id").and_then(Value::as_str) != Some(task.task_id.as_str())
+        || value.get("caller_id").and_then(Value::as_str) != Some(task.caller_id.as_str())
+        || value.get("broker_route").and_then(Value::as_str) != Some(task.broker_url.as_str())
+        || value.get("target_path").and_then(Value::as_str) != Some(task.target_path.as_str())
+        || value.get("task_type").and_then(Value::as_str) != Some(task.task_type.as_str())
+        || value.get("validation_profile").and_then(Value::as_str)
+            != Some(task.validation_profile.as_str())
+        || value.get("objective_sha256").and_then(Value::as_str)
+            != Some(sha256_hex(task.objective.as_bytes()).as_str())
+        || value.get("after_sha256").and_then(Value::as_str)
+            != Some(sha256_hex(task.after_text.as_bytes()).as_str())
+        || !json_array_matches_strings(value.get("allowed_paths"), &task.allowed_paths)
+    {
+        return Err(refusal(
+            "completed-task-spec-mismatch",
+            "task-complete receipt does not bind to the current task specification",
+        ));
+    }
+    Ok(model_binding)
+}
+
+fn resume_applied_task_if_current(task: &NormalizedTask) -> Result<Option<Value>, BridgeRefusal> {
+    if task.receipt_dir.join("task-complete.json").exists() {
+        return Ok(None);
+    }
+    let target = task.worktree.join(&task.target_path);
+    if !target.is_file() {
+        return Ok(None);
+    }
+    let expected = sha256_hex(task.after_text.as_bytes());
+    let actual = sha256_file_hex(&target).map_err(|e| {
+        refusal(
+            "applied-task-target-hash-error",
+            format!("could not hash applied target {}: {e}", target.display()),
+        )
+    })?;
+    if expected != actual {
+        return Ok(None);
+    }
+    let approved_lane_path = task.receipt_dir.join("approved-lane.json");
+    let model_binding = verify_resume_evidence(task, &approved_lane_path)?;
+    let changed_paths = verify_changed_paths(task)?;
+    verify_current_task_binding(task)?;
+    run_validation(task)?;
+    write_receipt_if_absent(
+        &task.receipt_dir,
+        "validation.json",
+        &validation_receipt(task, &model_binding),
+    )?;
+    let package_plan_gate = run_package_plan_gate(task, &approved_lane_path, &model_binding)?;
+    write_receipt_if_absent(
+        &task.receipt_dir,
+        "package-plan-readiness.json",
+        &package_plan_gate,
+    )?;
+    let package_handoff = package_handoff_receipt(
+        task,
+        &changed_paths,
+        &approved_lane_path,
+        &package_plan_gate,
+        &model_binding,
+    );
+    write_receipt_if_absent(
+        &task.receipt_dir,
+        "package-handoff-readiness.json",
+        &package_handoff,
+    )?;
+    let complete = final_success_result(task, &changed_paths, &approved_lane_path, &model_binding);
+    write_receipt(&task.receipt_dir, "task-complete.json", &complete)?;
+    Ok(Some(complete))
+}
+
+fn approved_lane_path_from_result(value: &Value) -> Result<PathBuf, BridgeRefusal> {
+    value
+        .get("approved_lane_path")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            refusal(
+                "completed-task-approved-lane-missing",
+                "task-complete receipt is missing approved_lane_path",
+            )
+        })
+}
+
+fn verify_resume_evidence(
+    task: &NormalizedTask,
+    approved_lane_path: &Path,
+) -> Result<ModelBinding, BridgeRefusal> {
+    let broker_plan = read_existing_receipt_json(task, "broker-plan.json")?;
+    let model_binding = validate_resume_receipt_model(
+        task,
+        &broker_plan,
+        "broker_plan",
+        "broker-plan model evidence does not bind to this task",
+    )?;
+    let planner_output = read_existing_receipt_string(task, "planner-output.json")?;
+    reject_secret_like_candidate(&planner_output)?;
+    verify_planner_paths(task, &planner_output)?;
+    validate_existing_model_receipt_if_present(
+        task,
+        "planner-validation.json",
+        "planner_validation",
+        &model_binding,
+    )?;
+    validate_existing_model_receipt_if_present(
+        task,
+        "package-control-preflight.json",
+        "package_control_preflight",
+        &model_binding,
+    )?;
+
+    let after_path = task.receipt_dir.join("after.bin");
+    require_existing_receipt_file(&after_path)?;
+    let expected_after = sha256_hex(task.after_text.as_bytes());
+    let recorded_after = sha256_file_hex(&after_path).map_err(|e| {
+        refusal(
+            "applied-task-evidence-hash-error",
+            format!(
+                "could not hash recorded after bytes {}: {e}",
+                after_path.display()
+            ),
+        )
+    })?;
+    if recorded_after != expected_after {
+        return Err(refusal(
+            "applied-task-evidence-mismatch",
+            "recorded after.bin does not match requested after_text",
+        ));
+    }
+
+    validate_approved_lane(task, approved_lane_path)?;
+    let preview_result = read_existing_receipt_json(task, "preview-generator-result.json")?;
+    let preview_bundle_path = preview_bundle_path_from_result(task, &preview_result)?;
+    let preview_bundle = read_preview_bundle(&preview_bundle_path)?;
+    let authorization = read_existing_receipt_json(task, "mutation-authorization.json")?;
+    validate_mutation_authorization(
+        task,
+        &authorization,
+        &preview_bundle_path,
+        &preview_bundle,
+        &model_binding,
+    )?;
+    validate_existing_model_receipt_if_present(
+        task,
+        "changed-file-verification.json",
+        "changed_file_verification",
+        &model_binding,
+    )?;
+    validate_existing_model_receipt_if_present(
+        task,
+        "validation.json",
+        "validation",
+        &model_binding,
+    )?;
+    validate_existing_model_receipt_if_present(
+        task,
+        "package-plan-readiness.json",
+        "package_plan_gate",
+        &model_binding,
+    )?;
+    validate_existing_model_receipt_if_present(
+        task,
+        "package-handoff-readiness.json",
+        "package_handoff_readiness",
+        &model_binding,
+    )?;
+    Ok(model_binding)
+}
+
+fn validate_approved_lane(task: &NormalizedTask, path: &Path) -> Result<(), BridgeRefusal> {
+    let value = read_existing_json(path)?;
+    if value.get("schema_version").and_then(Value::as_str)
+        != Some("stack-code-runnable-task-approved-lane.v1")
+        || value.get("operatorApproved").and_then(Value::as_bool) != Some(true)
+        || value.get("taskId").and_then(Value::as_str) != Some(task.task_id.as_str())
+        || value.get("callerId").and_then(Value::as_str) != Some(task.caller_id.as_str())
+        || value.get("taskType").and_then(Value::as_str) != Some(task.task_type.as_str())
+    {
+        return Err(refusal(
+            "applied-task-evidence-mismatch",
+            "approved-lane receipt does not bind to this task",
+        ));
+    }
+    let worktree = task.worktree.to_string_lossy();
+    if value
+        .pointer("/worktreePlan/worktreePath")
+        .and_then(Value::as_str)
+        != Some(worktree.as_ref())
+        || value
+            .pointer("/worktreePlan/branch")
+            .and_then(Value::as_str)
+            != Some(task.branch.as_str())
+        || value.pointer("/worktreePlan/base").and_then(Value::as_str) != Some("origin/main")
+    {
+        return Err(refusal(
+            "applied-task-evidence-mismatch",
+            "approved-lane worktree binding does not match this task",
+        ));
+    }
+    let target = task.worktree.join(&task.target_path);
+    let target = target.to_string_lossy();
+    if !json_array_is_exact_string(value.get("declaredPaths"), target.as_ref())
+        || !json_array_is_exact_string(value.get("proposedWrites"), target.as_ref())
+    {
+        return Err(refusal(
+            "applied-task-evidence-mismatch",
+            "approved-lane target path does not match this task",
+        ));
+    }
+    Ok(())
+}
+
+fn preview_bundle_path_from_result(
+    task: &NormalizedTask,
+    value: &Value,
+) -> Result<PathBuf, BridgeRefusal> {
+    let raw = value
+        .get("preview_bundle_path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            refusal(
+                "applied-task-evidence-mismatch",
+                "preview-generator-result lacks preview_bundle_path",
+            )
+        })?;
+    let path = PathBuf::from(raw);
+    require_path_inside_worktree(task, &path, "preview_bundle_path")?;
+    require_existing_receipt_file(&path)?;
+    Ok(path)
+}
+
+fn validate_mutation_authorization(
+    task: &NormalizedTask,
+    value: &Value,
+    preview_bundle_path: &Path,
+    preview_bundle: &PreviewBundleRead,
+    model_binding: &ModelBinding,
+) -> Result<(), BridgeRefusal> {
+    let preview_path = preview_bundle_path.to_string_lossy();
+    if value.get("schema_version").and_then(Value::as_str) != Some(RECEIPT_SCHEMA_V1)
+        || value.get("receipt").and_then(Value::as_str) != Some("mutation_authorization")
+        || value.get("task_id").and_then(Value::as_str) != Some(task.task_id.as_str())
+        || value.get("base_sha").and_then(Value::as_str) != Some(task.base_sha.as_str())
+        || value.get("caller_id").and_then(Value::as_str) != Some(task.caller_id.as_str())
+        || value.get("requested_model").and_then(Value::as_str)
+            != Some(model_binding.requested_model.as_str())
+        || value.get("resolved_model").and_then(Value::as_str)
+            != Some(model_binding.resolved_model.as_str())
+        || value.get("target_path").and_then(Value::as_str) != Some(task.target_path.as_str())
+        || value.get("preview_bundle_path").and_then(Value::as_str) != Some(preview_path.as_ref())
+        || value.get("preview_sha256").and_then(Value::as_str)
+            != Some(preview_bundle.preview_record.preview_sha256.as_str())
+    {
+        return Err(refusal(
+            "applied-task-evidence-mismatch",
+            "mutation authorization does not bind to this task and preview",
+        ));
+    }
+    Ok(())
+}
+
+fn read_existing_receipt_string(
+    task: &NormalizedTask,
+    name: &str,
+) -> Result<String, BridgeRefusal> {
+    let path = task.receipt_dir.join(name);
+    require_existing_receipt_file(&path)?;
+    fs::read_to_string(&path).map_err(|e| {
+        refusal(
+            "applied-task-evidence-read-error",
+            format!("could not read task-bound evidence {}: {e}", path.display()),
+        )
+    })
+}
+
+fn read_existing_receipt_json(task: &NormalizedTask, name: &str) -> Result<Value, BridgeRefusal> {
+    read_existing_json(&task.receipt_dir.join(name))
+}
+
+fn read_existing_json(path: &Path) -> Result<Value, BridgeRefusal> {
+    require_existing_receipt_file(path)?;
+    let bytes = fs::read(path).map_err(|e| {
+        refusal(
+            "applied-task-evidence-read-error",
+            format!("could not read task-bound evidence {}: {e}", path.display()),
+        )
+    })?;
+    serde_json::from_slice(&bytes).map_err(|e| {
+        refusal(
+            "applied-task-evidence-json-error",
+            format!(
+                "task-bound evidence {} was not valid JSON: {e}",
+                path.display()
+            ),
+        )
+    })
+}
+
+fn require_existing_receipt_file(path: &Path) -> Result<(), BridgeRefusal> {
+    let metadata = fs::symlink_metadata(path).map_err(|e| {
+        if e.kind() == io::ErrorKind::NotFound {
+            refusal(
+                "applied-task-evidence-missing",
+                format!(
+                    "required task-bound evidence is missing: {}",
+                    path.display()
+                ),
+            )
+        } else {
+            refusal(
+                "applied-task-evidence-stat-error",
+                format!("could not stat task-bound evidence {}: {e}", path.display()),
+            )
+        }
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(refusal(
+            "applied-task-evidence-invalid",
+            format!(
+                "task-bound evidence must be a regular file: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn require_path_inside_worktree(
+    task: &NormalizedTask,
+    path: &Path,
+    label: &str,
+) -> Result<(), BridgeRefusal> {
+    if !path.is_absolute() {
+        return Err(refusal(
+            "applied-task-evidence-mismatch",
+            format!("{label} must be an absolute A2 evidence path"),
+        ));
+    }
+    let canonical = path.canonicalize().map_err(|e| {
+        refusal(
+            "applied-task-evidence-stat-error",
+            format!("could not canonicalize {label} {}: {e}", path.display()),
+        )
+    })?;
+    if !canonical.starts_with(&task.worktree) {
+        return Err(refusal(
+            "applied-task-evidence-mismatch",
+            format!("{label} does not belong to this task worktree"),
+        ));
+    }
+    Ok(())
+}
+
+fn json_array_is_exact_string(value: Option<&Value>, expected: &str) -> bool {
+    matches!(value.and_then(Value::as_array), Some(items)
+        if items.len() == 1 && items[0].as_str() == Some(expected))
+}
+
+fn json_array_matches_strings(value: Option<&Value>, expected: &[String]) -> bool {
+    matches!(value.and_then(Value::as_array), Some(items)
+        if items.len() == expected.len()
+            && items
+                .iter()
+                .zip(expected)
+                .all(|(actual, expected)| actual.as_str() == Some(expected.as_str())))
+}
+
+fn model_binding_from_task(
+    task: &NormalizedTask,
+    resolved_model: &str,
+) -> Result<ModelBinding, BridgeRefusal> {
+    Ok(ModelBinding {
+        requested_model: task.model.clone(),
+        resolved_model: nonempty_model_string(
+            resolved_model,
+            "broker-response-model-missing",
+            "broker response did not contain a nonempty response.model",
+        )?,
+    })
+}
+
+fn validate_resume_receipt_model(
+    task: &NormalizedTask,
+    value: &Value,
+    expected_receipt: &str,
+    reason: &'static str,
+) -> Result<ModelBinding, BridgeRefusal> {
+    if value.get("schema_version").and_then(Value::as_str) != Some(RECEIPT_SCHEMA_V1)
+        || value.get("receipt").and_then(Value::as_str) != Some(expected_receipt)
+        || value.get("task_id").and_then(Value::as_str) != Some(task.task_id.as_str())
+        || value.get("base_sha").and_then(Value::as_str) != Some(task.base_sha.as_str())
+        || value.get("caller_id").and_then(Value::as_str) != Some(task.caller_id.as_str())
+        || value.get("broker_route").and_then(Value::as_str) != Some(task.broker_url.as_str())
+    {
+        return Err(refusal("applied-task-evidence-mismatch", reason));
+    }
+    model_binding_from_receipt(task, value, "applied-task-evidence-mismatch", reason)
+}
+
+fn validate_existing_model_receipt_if_present(
+    task: &NormalizedTask,
+    name: &str,
+    expected_receipt: &str,
+    model_binding: &ModelBinding,
+) -> Result<(), BridgeRefusal> {
+    let path = task.receipt_dir.join(name);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(refusal(
+                "applied-task-evidence-stat-error",
+                format!("could not stat task-bound evidence {}: {e}", path.display()),
+            ));
+        }
+    }
+    let value = read_existing_json(&path)?;
+    let existing = validate_resume_receipt_model(
+        task,
+        &value,
+        expected_receipt,
+        "existing model receipt does not bind to this task",
+    )?;
+    if existing.resolved_model != model_binding.resolved_model {
+        return Err(refusal(
+            "applied-task-evidence-mismatch",
+            "existing model receipt conflicts with broker-plan resolved model",
+        ));
+    }
+    Ok(())
+}
+
+fn model_binding_from_receipt(
+    task: &NormalizedTask,
+    value: &Value,
+    refusal_kind: &'static str,
+    reason: &'static str,
+) -> Result<ModelBinding, BridgeRefusal> {
+    if value.get("requested_model").and_then(Value::as_str) != Some(task.model.as_str()) {
+        return Err(refusal(refusal_kind, reason));
+    }
+    Ok(ModelBinding {
+        requested_model: task.model.clone(),
+        resolved_model: nonempty_json_string(value.get("resolved_model"), refusal_kind, reason)?,
+    })
+}
+
+fn nonempty_json_string(
+    value: Option<&Value>,
+    refusal_kind: &'static str,
+    reason: impl Into<String>,
+) -> Result<String, BridgeRefusal> {
+    match value.and_then(Value::as_str).map(str::trim) {
+        Some(model) if !model.is_empty() => Ok(model.to_string()),
+        _ => Err(refusal(refusal_kind, reason)),
+    }
+}
+
+fn nonempty_model_string(
+    value: &str,
+    refusal_kind: &'static str,
+    reason: impl Into<String>,
+) -> Result<String, BridgeRefusal> {
+    let model = value.trim();
+    if model.is_empty() {
+        Err(refusal(refusal_kind, reason))
+    } else {
+        Ok(model.to_string())
+    }
+}
+
+fn task_acceptance_receipt(task: &NormalizedTask, status: &str) -> Value {
+    json!({
+        "schema_version": RECEIPT_SCHEMA_V1,
+        "receipt": "task_acceptance",
+        "task_id": task.task_id,
+        "timestamp": timestamp(),
+        "status": status,
+        "worktree": task.worktree,
+        "base_sha": task.base_sha,
+        "caller_id": task.caller_id,
+        "task_type": task.task_type,
+        "broker_route": task.broker_url,
+        "requested_model": task.model,
+        "resolved_model": Value::Null,
+        "allowed_paths": task.allowed_paths,
+        "target_path": task.target_path,
+        "validation_profile": task.validation_profile,
+        "objective_sha256": sha256_hex(task.objective.as_bytes()),
+        "after_sha256": sha256_hex(task.after_text.as_bytes()),
+    })
+}
+
+fn verify_clean_start(task: &NormalizedTask) -> Result<(), BridgeRefusal> {
+    let receipt_prefix = format!(".claw/runnable-task-bridge/{}/", task.task_id);
+    let non_bridge_status: Vec<String> = git_status_porcelain_paths(&task.worktree)?
+        .into_iter()
+        .filter(|path| !is_bridge_owned_retry_artifact(task, path, &receipt_prefix))
+        .collect();
+    if non_bridge_status.is_empty() {
+        Ok(())
+    } else {
+        Err(refusal(
+            "worktree-dirty",
+            format!(
+                "worktree must be clean before task run; git status: {}",
+                non_bridge_status.join("\n")
+            ),
+        ))
+    }
+}
+
+fn is_bridge_owned_retry_artifact(task: &NormalizedTask, path: &str, receipt_prefix: &str) -> bool {
+    if path.starts_with(receipt_prefix) {
+        return true;
+    }
+    task.receipt_dir.exists()
+        && [
+            ".claw/l2b-checkpoints/",
+            ".claw/l2b-payloads/",
+            ".claw/l2b-preview-bundles/",
+            ".claw/l2b-runs/",
+        ]
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+}
+
+fn verify_changed_paths(task: &NormalizedTask) -> Result<Vec<String>, BridgeRefusal> {
+    let mut changed = Vec::new();
+    for path in git_status_porcelain_paths(&task.worktree)? {
+        if path == ".claw" || path.starts_with(".claw/") {
+            continue;
+        }
+        changed.push(path);
+    }
+    changed.sort();
+    changed.dedup();
+    if changed == [task.target_path.clone()] {
+        Ok(changed)
+    } else {
+        Err(refusal(
+            "changed-paths-mismatch",
+            format!(
+                "actual changed paths {:?} did not equal target {:?}",
+                changed, task.target_path
+            ),
+        ))
+    }
+}
+
+fn verify_current_task_binding(task: &NormalizedTask) -> Result<(), BridgeRefusal> {
+    let root = git_stdout(&task.worktree, &["rev-parse", "--show-toplevel"])?;
+    let root = PathBuf::from(root).canonicalize().map_err(|e| {
+        refusal(
+            "repository-binding-changed",
+            format!("could not canonicalize current git toplevel: {e}"),
+        )
+    })?;
+    if root != task.worktree {
+        return Err(refusal(
+            "repository-binding-changed",
+            format!(
+                "current git toplevel {} no longer matches task worktree {}",
+                root.display(),
+                task.worktree.display()
+            ),
+        ));
+    }
+    let workspace_binding = expected_workspace_binding(&root)?;
+    if workspace_binding != task.workspace_binding {
+        return Err(refusal(
+            "repository-binding-changed",
+            "current worktree binding no longer matches the normalized task binding",
+        ));
+    }
+    let repository_identity = repository_identity(&task.worktree)?;
+    if repository_identity != task.repository_identity {
+        return Err(refusal(
+            "repository-binding-changed",
+            "current repository identity no longer matches the normalized task binding",
+        ));
+    }
+    let branch = git_stdout(&task.worktree, &["branch", "--show-current"])?;
+    if branch != task.branch {
+        return Err(refusal(
+            "worktree-branch-changed",
+            format!(
+                "current branch {branch} no longer matches normalized task branch {}",
+                task.branch
+            ),
+        ));
+    }
+    let head = git_stdout(&task.worktree, &["rev-parse", "HEAD"])?;
+    if head != task.base_sha {
+        return Err(refusal(
+            "worktree-head-changed",
+            format!(
+                "current HEAD {head} no longer matches normalized task base {}",
+                task.base_sha
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn git_status_porcelain_paths(worktree: &Path) -> Result<Vec<String>, BridgeRefusal> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .output()
+        .map_err(|e| refusal("git-launch-failed", format!("{e}")))?;
+    if !output.status.success() {
+        return Err(refusal(
+            "git-status-failed",
+            format!(
+                "git status failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        ));
+    }
+    parse_porcelain_z_paths(&output.stdout)
+}
+
+fn parse_porcelain_z_paths(bytes: &[u8]) -> Result<Vec<String>, BridgeRefusal> {
+    let mut paths = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        let Some(offset) = bytes[index..].iter().position(|byte| *byte == 0) else {
+            return Err(refusal(
+                "git-status-parse-failed",
+                "git status -z output was missing a trailing NUL",
+            ));
+        };
+        let end = index + offset;
+        let entry = &bytes[index..end];
+        index = end + 1;
+        if entry.is_empty() {
+            continue;
+        }
+        if entry.len() < 4 || entry[2] != b' ' {
+            return Err(refusal(
+                "git-status-parse-failed",
+                "git status -z output had an unexpected record shape",
+            ));
+        }
+        let path = String::from_utf8(entry[3..].to_vec()).map_err(|e| {
+            refusal(
+                "git-status-path-utf8-failed",
+                format!("git status path was not UTF-8: {e}"),
+            )
+        })?;
+        paths.push(path);
+        if matches!(entry[0], b'R' | b'C') || matches!(entry[1], b'R' | b'C') {
+            let Some(old_offset) = bytes[index..].iter().position(|byte| *byte == 0) else {
+                return Err(refusal(
+                    "git-status-parse-failed",
+                    "git status rename/copy record was missing its source path",
+                ));
+            };
+            index += old_offset + 1;
+        }
+    }
+    Ok(paths)
+}
+
+fn normalize_allowed_paths(
+    worktree: &Path,
+    paths: &[String],
+) -> Result<Vec<String>, BridgeRefusal> {
+    if paths.is_empty() {
+        return Err(refusal(
+            "allowed-paths-empty",
+            "allowed_paths must not be empty",
+        ));
+    }
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for path in paths {
+        let normalized = normalize_one_allowed_path(worktree, path)?;
+        if seen.insert(normalized.clone()) {
+            out.push(normalized);
+        }
+    }
+    Ok(out)
+}
+
+fn normalize_one_allowed_path(worktree: &Path, path: &str) -> Result<String, BridgeRefusal> {
+    if path.trim().is_empty() {
+        return Err(refusal("path-empty", "allowed path must not be empty"));
+    }
+    if path.contains(char::is_whitespace) {
+        return Err(refusal(
+            "path-whitespace-unsupported",
+            format!("path contains whitespace: {path}"),
+        ));
+    }
+    let rel = Path::new(path);
+    if rel.is_absolute() {
+        return Err(refusal(
+            "path-absolute-refused",
+            format!("path must be repository-relative: {path}"),
+        ));
+    }
+    if rel
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(refusal(
+            "path-traversal-refused",
+            format!("path must not contain traversal: {path}"),
+        ));
+    }
+    if rel.components().any(|component| {
+        matches!(
+            component,
+            Component::RootDir | Component::Prefix(_) | Component::CurDir
+        )
+    }) {
+        return Err(refusal(
+            "path-component-refused",
+            format!("path contains an unsupported component: {path}"),
+        ));
+    }
+    let mut normalized_rel = PathBuf::new();
+    for component in rel.components() {
+        if let Component::Normal(part) = component {
+            normalized_rel.push(part);
+        }
+    }
+    if normalized_rel.as_os_str().is_empty() {
+        return Err(refusal("path-empty", "allowed path must not be empty"));
+    }
+    let normalized = normalized_rel.to_str().ok_or_else(|| {
+        refusal(
+            "path-utf8-unsupported",
+            format!("path is not valid UTF-8 after normalization: {path}"),
+        )
+    })?;
+    if is_reserved_claw_path(normalized) {
+        return Err(refusal(
+            "reserved-target-path",
+            format!("operator tasks may not target reserved internal path: {normalized}"),
+        ));
+    }
+    let target = worktree.join(&normalized_rel);
+    let Some(parent) = target.parent() else {
+        return Err(refusal("path-parent-missing", "target has no parent"));
+    };
+    let parent_canonical = parent.canonicalize().map_err(|e| {
+        refusal(
+            "path-parent-unavailable",
+            format!("parent for {path} must exist inside the worktree: {e}"),
+        )
+    })?;
+    if !parent_canonical.starts_with(worktree) {
+        return Err(refusal(
+            "path-parent-escape",
+            format!("parent for {path} escapes the worktree"),
+        ));
+    }
+    if let Ok(meta) = fs::symlink_metadata(&target) {
+        if meta.file_type().is_symlink() {
+            return Err(refusal(
+                "path-symlink-refused",
+                format!("target path is a symlink: {path}"),
+            ));
+        }
+    }
+    Ok(normalized.to_string())
+}
+
+fn is_reserved_claw_path(path: &str) -> bool {
+    let mut components = Path::new(path).components();
+    matches!(
+        components.next(),
+        Some(Component::Normal(component)) if component == ".claw"
+    )
+}
+
+fn canonical_worktree(path: &Path) -> Result<PathBuf, BridgeRefusal> {
+    if !path.is_absolute() {
+        return Err(refusal(
+            "worktree-not-absolute",
+            "worktree must be an absolute path",
+        ));
+    }
+    let canonical = path.canonicalize().map_err(|e| {
+        refusal(
+            "worktree-canonicalize-failed",
+            format!("could not canonicalize worktree {}: {e}", path.display()),
+        )
+    })?;
+    let inside = Command::new("git")
+        .arg("-C")
+        .arg(&canonical)
+        .arg("rev-parse")
+        .arg("--is-inside-work-tree")
+        .output()
+        .map_err(|e| refusal("git-launch-failed", format!("{e}")))?;
+    if inside.status.success() && String::from_utf8_lossy(&inside.stdout).trim() == "true" {
+        let top_level = git_stdout(&canonical, &["rev-parse", "--show-toplevel"])?;
+        let top_level = PathBuf::from(top_level).canonicalize().map_err(|e| {
+            refusal(
+                "worktree-root-canonicalize-failed",
+                format!(
+                    "could not canonicalize git toplevel for {}: {e}",
+                    canonical.display()
+                ),
+            )
+        })?;
+        if top_level == canonical {
+            Ok(canonical)
+        } else {
+            Err(refusal(
+                "worktree-not-root",
+                format!(
+                    "worktree path must be the git worktree root {}; got {}",
+                    top_level.display(),
+                    canonical.display()
+                ),
+            ))
+        }
+    } else {
+        Err(refusal(
+            "worktree-not-git",
+            format!("{} is not a git worktree", canonical.display()),
+        ))
+    }
+}
+
+fn verify_disposable_worktree(worktree: &Path, branch: &str) -> Result<(), BridgeRefusal> {
+    if matches!(branch, "main" | "master") {
+        return Err(refusal(
+            "worktree-branch-protected",
+            "task worktree must not be on main or master",
+        ));
+    }
+    let root = disposable_worktree_root()?;
+    if worktree == root || !worktree.starts_with(&root) {
+        return Err(refusal(
+            "worktree-not-disposable",
+            format!(
+                "task worktree must be under disposable root {}",
+                root.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn disposable_worktree_root() -> Result<PathBuf, BridgeRefusal> {
+    Path::new(DEFAULT_DISPOSABLE_WORKTREE_ROOT)
+        .canonicalize()
+        .map_err(|e| {
+            refusal(
+                "disposable-worktree-root-unavailable",
+                format!("could not canonicalize {DEFAULT_DISPOSABLE_WORKTREE_ROOT}: {e}"),
+            )
+        })
+}
+
+#[cfg(test)]
+fn disposable_worktree_root() -> Result<PathBuf, BridgeRefusal> {
+    let root = std::env::temp_dir().join(format!(
+        "stack-code-bridge-disposable-root-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&root).map_err(|e| {
+        refusal(
+            "disposable-worktree-root-unavailable",
+            format!(
+                "could not create test disposable root {}: {e}",
+                root.display()
+            ),
+        )
+    })?;
+    root.canonicalize().map_err(|e| {
+        refusal(
+            "disposable-worktree-root-unavailable",
+            format!(
+                "could not canonicalize test disposable root {}: {e}",
+                root.display()
+            ),
+        )
+    })
+}
+
+fn canonical_broker_url(input: Option<&str>) -> Result<String, BridgeRefusal> {
+    let raw = input.unwrap_or(DEFAULT_BROKER_URL).trim();
+    let forbidden = ["114", "34"].concat();
+    if raw.contains(&forbidden) {
+        return Err(refusal(
+            "broker-route-raw-upstream-refused",
+            "broker_url must route through the broker, not the raw upstream port",
+        ));
+    }
+    if raw == DEFAULT_BROKER_URL || raw == "http://localhost:11435" {
+        return Ok(DEFAULT_BROKER_URL.to_string());
+    }
+    Err(refusal(
+        "broker-route-unsupported",
+        format!("broker_url must be {DEFAULT_BROKER_URL}"),
+    ))
+}
+
+fn validate_task_id(task_id: &str) -> Result<(), BridgeRefusal> {
+    if task_id.is_empty() || task_id.len() > 128 || matches!(task_id, "." | "..") {
+        return Err(refusal(
+            "task-id-invalid",
+            "task_id must be 1..128 chars and not . or ..",
+        ));
+    }
+    if task_id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    {
+        Ok(())
+    } else {
+        Err(refusal(
+            "task-id-invalid",
+            "task_id must contain only ASCII alphanumeric, underscore, dash, or dot",
+        ))
+    }
+}
+
+fn expected_workspace_binding(worktree: &Path) -> Result<String, BridgeRefusal> {
+    let Some(name) = worktree.file_name().and_then(|value| value.to_str()) else {
+        return Err(refusal(
+            "worktree-binding-invalid",
+            "task worktree must have a UTF-8 final path component",
+        ));
+    };
+    if name.is_empty() || matches!(name, "." | "..") || name.contains('/') || name.contains('\\') {
+        return Err(refusal(
+            "worktree-binding-invalid",
+            "task worktree final path component is not a safe workspace binding",
+        ));
+    }
+    Ok(name.to_string())
+}
+
+fn verify_approved_base(worktree: &Path, base_sha: &str) -> Result<(), BridgeRefusal> {
+    let origin_main = git_stdout(worktree, &["rev-parse", "origin/main"])?;
+    if origin_main != base_sha {
+        return Err(refusal(
+            "worktree-base-mismatch",
+            format!(
+                "task worktree HEAD {base_sha} must equal approved base origin/main {origin_main}"
+            ),
+        ));
+    }
+    verify_repository_origin(worktree)
+}
+
+fn repository_identity(worktree: &Path) -> Result<String, BridgeRefusal> {
+    git_stdout(worktree, &["remote", "get-url", "origin"])
+        .map(|origin| normalize_remote_url(&origin))
+}
+
+#[cfg(not(test))]
+fn verify_repository_origin(worktree: &Path) -> Result<(), BridgeRefusal> {
+    let task_origin = git_stdout(worktree, &["remote", "get-url", "origin"])?;
+    let control = package_control_checkout()?;
+    let control_origin = git_stdout(&control, &["remote", "get-url", "origin"])?;
+    if normalize_remote_url(&task_origin) == normalize_remote_url(&control_origin) {
+        Ok(())
+    } else {
+        Err(refusal(
+            "worktree-repository-mismatch",
+            "task worktree origin must match the Stack-Code control checkout origin",
+        ))
+    }
+}
+
+#[cfg(test)]
+fn verify_repository_origin(worktree: &Path) -> Result<(), BridgeRefusal> {
+    let _ = git_stdout(worktree, &["remote", "get-url", "origin"])?;
+    Ok(())
+}
+
+fn normalize_remote_url(value: &str) -> String {
+    value
+        .trim()
+        .trim_end_matches(".git")
+        .replace(':', "/")
+        .to_ascii_lowercase()
+}
+
+fn reject_secret_like_candidate(candidate: &str) -> Result<(), BridgeRefusal> {
+    // Serialized-text scan: catches syntax-level shapes that do not depend on
+    // JSON string-escape decoding, and is a defense-in-depth backstop should
+    // the decoded walk below ever diverge from the parser.
+    reject_secret_like_text(candidate)?;
+
+    // Fail closed: the decoded walk requires valid JSON. A candidate that
+    // fails to parse is refused here, before the validator would otherwise
+    // write it to disk on its way to discovering the same parse error.
+    let doc: Value = serde_json::from_str(candidate).map_err(|e| {
+        refusal(
+            "planner-output-json-error",
+            format!("planner output was not valid JSON before secret scan: {e}"),
+        )
+    })?;
+    reject_secret_like_value(&doc)
+}
+
+// Recursively scans every decoded JSON string in `value` — object keys,
+// string values, and array elements at any nesting depth — against the same
+// secret-pattern policy as `reject_secret_like_text`. This catches secrets
+// that are only visible after JSON string-escape decoding (e.g. a token
+// hidden behind a unicode escape sequence), which a scan of the raw
+// serialized text would miss.
+fn reject_secret_like_value(value: &Value) -> Result<(), BridgeRefusal> {
+    match value {
+        Value::String(text) => reject_secret_like_text(text),
+        Value::Array(items) => {
+            for item in items {
+                reject_secret_like_value(item)?;
+            }
+            Ok(())
+        }
+        Value::Object(map) => {
+            for (key, val) in map {
+                reject_secret_like_text(key)?;
+                reject_secret_like_value(val)?;
+            }
+            Ok(())
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => Ok(()),
+    }
+}
+
+fn reject_secret_like_text(candidate: &str) -> Result<(), BridgeRefusal> {
+    if contains_raw_upstream_endpoint(candidate) {
+        return Err(refusal(
+            "planner-output-raw-upstream-refused",
+            "planner output referenced the raw upstream port",
+        ));
+    }
+    if candidate.contains("-----BEGIN ") && candidate.contains("KEY-----") {
+        return Err(refusal(
+            "planner-output-secret-like-refused",
+            "planner output contained key-block shaped text",
+        ));
+    }
+    if [
+        ("sk-proj-", 8),
+        ("sk-ant-", 8),
+        ("sk_live_", 8),
+        ("sk-", 16),
+        ("ghp_", 20),
+        ("gho_", 20),
+        ("ghu_", 20),
+        ("ghs_", 20),
+        ("ghr_", 20),
+        ("github_pat_", 20),
+    ]
+    .iter()
+    .any(|(prefix, min_tail_len)| contains_prefixed_token_shape(candidate, prefix, *min_tail_len))
+    {
+        return Err(refusal(
+            "planner-output-secret-like-refused",
+            "planner output contained token-shaped text",
+        ));
+    }
+    if contains_aws_access_key_shape(candidate) || contains_secret_assignment_shape(candidate) {
+        return Err(refusal(
+            "planner-output-secret-like-refused",
+            "planner output contained validator-recognized secret-shaped text",
+        ));
+    }
+    Ok(())
+}
+
+fn contains_raw_upstream_endpoint(candidate: &str) -> bool {
+    let lower = candidate.to_ascii_lowercase();
+    lower
+        .match_indices(":11434")
+        .any(|(idx, _)| raw_upstream_endpoint_at(&lower, idx))
+}
+
+fn raw_upstream_endpoint_at(lower: &str, port_idx: usize) -> bool {
+    let after_ok = lower[port_idx + ":11434".len()..]
+        .chars()
+        .next()
+        .is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_');
+    if !after_ok {
+        return false;
+    }
+
+    let before = &lower[..port_idx];
+    if before.ends_with("localhost") || before.ends_with("127.0.0.1") || before.ends_with("[::1]") {
+        return true;
+    }
+
+    if let Some(scheme_idx) = before.rfind("://") {
+        let host = &before[scheme_idx + 3..];
+        return !host.is_empty()
+            && !host.contains('/')
+            && !host.contains(char::is_whitespace)
+            && !host.contains('\'')
+            && !host.contains('"')
+            && !host.contains('<')
+            && !host.contains('>');
+    }
+
+    false
+}
+
+fn contains_prefixed_token_shape(text: &str, prefix: &str, min_tail_len: usize) -> bool {
+    text.match_indices(prefix).any(|(idx, _)| {
+        let before_ok = text[..idx]
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !is_word_char(ch));
+        let tail = &text[idx + prefix.len()..];
+        let token_len = prefixed_token_tail_len(prefix, tail);
+        let after_ok = tail
+            .chars()
+            .nth(token_len)
+            .is_none_or(|ch| !is_word_char(ch));
+        before_ok && after_ok && token_len >= min_tail_len
+    })
+}
+
+fn contains_aws_access_key_shape(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.len() < 20 {
+        return false;
+    }
+    (0..=bytes.len() - 20).any(|idx| {
+        bytes[idx..].starts_with(b"AKIA")
+            && (idx == 0 || !is_word_byte(bytes[idx - 1]))
+            && bytes[idx + 4..idx + 20]
+                .iter()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+            && (idx + 20 == bytes.len() || !is_word_byte(bytes[idx + 20]))
+    })
+}
+
+fn contains_secret_assignment_shape(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    [
+        "api_key",
+        "api-key",
+        "apikey",
+        "secret",
+        "token",
+        "password",
+        "passwd",
+        "access_token",
+        "access-token",
+        "accesstoken",
+        "bearer",
+    ]
+    .iter()
+    .any(|key| {
+        lower.match_indices(key).any(|(idx, _)| {
+            let after_key = idx + key.len();
+            if (idx > 0 && is_word_byte(bytes[idx - 1]))
+                || (after_key < bytes.len() && is_word_byte(bytes[after_key]))
+            {
+                return false;
+            }
+            let mut cursor = after_key;
+            while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                cursor += 1;
+            }
+            if !bytes
+                .get(cursor)
+                .is_some_and(|byte| matches!(byte, b':' | b'='))
+            {
+                return false;
+            }
+            cursor += 1;
+            while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                cursor += 1;
+            }
+            if bytes
+                .get(cursor)
+                .is_some_and(|byte| matches!(byte, b'\'' | b'"'))
+            {
+                cursor += 1;
+            }
+            let value_len = bytes[cursor..]
+                .iter()
+                .take_while(|byte| is_secret_assignment_value_byte(**byte))
+                .count();
+            value_len >= 8
+        })
+    })
+}
+
+fn is_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn is_secret_assignment_value_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/' | b'+')
+}
+
+fn prefixed_token_tail_len(prefix: &str, tail: &str) -> usize {
+    if matches!(prefix, "sk-proj-" | "sk-ant-" | "sk_live_" | "github_pat_") {
+        tail.chars()
+            .take_while(|ch| is_word_char(*ch) || matches!(*ch, '-' | '.'))
+            .count()
+    } else {
+        tail.chars().take_while(char::is_ascii_alphanumeric).count()
+    }
+}
+
+fn is_word_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
+}
+
+fn write_context_summary(request: &PlannerRequest) -> Result<PathBuf, BridgeRefusal> {
+    let dir = std::env::temp_dir().join(format!(
+        "stack-code-task-bridge-context-{}-{}",
+        std::process::id(),
+        request.task_id
+    ));
+    create_dir_0700(&dir)?;
+    let path = dir.join(format!("context-{}.json", timestamp()));
+    let payload = json!({
+        "schema_version": "stack-code-runnable-task-context.v1",
+        "task_id": request.task_id,
+        "workspace_root": request.workspace_binding,
+        "worktree": request.worktree,
+        "base_sha": request.base_sha,
+        "allowed_paths": request.allowed_paths,
+        "target_path": request.target_path,
+        "operator_after_bytes_owned": true,
+        "planner_authority": "advisory_only",
+    });
+    write_json_pretty_new(&path, &payload)?;
+    Ok(path)
+}
+
+fn git_stdout(worktree: &Path, args: &[&str]) -> Result<String, BridgeRefusal> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(args)
+        .output()
+        .map_err(|e| refusal("git-launch-failed", format!("{e}")))?;
+    if !output.status.success() {
+        return Err(refusal(
+            "git-command-failed",
+            format!(
+                "git -C {} {} failed: {}{}",
+                worktree.display(),
+                args.join(" "),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn create_dir_0700(path: &Path) -> Result<(), BridgeRefusal> {
+    reject_existing_symlink_components(path)?;
+    fs::create_dir_all(path).map_err(|e| {
+        refusal(
+            "receipt-dir-create-failed",
+            format!("could not create {}: {e}", path.display()),
+        )
+    })?;
+    let metadata = fs::symlink_metadata(path).map_err(|e| {
+        refusal(
+            "receipt-dir-stat-failed",
+            format!("could not stat {}: {e}", path.display()),
+        )
+    })?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(refusal(
+            "receipt-dir-invalid",
+            format!("{} must be a real directory", path.display()),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|e| {
+            refusal(
+                "receipt-dir-permission-failed",
+                format!(
+                    "could not set private permissions on {}: {e}",
+                    path.display()
+                ),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn reject_existing_symlink_components(path: &Path) -> Result<(), BridgeRefusal> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir | Component::Normal(_) => current.push(component.as_os_str()),
+            Component::CurDir => continue,
+            Component::ParentDir => {
+                return Err(refusal(
+                    "receipt-dir-invalid",
+                    format!(
+                        "{} must not contain parent-directory traversal",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(refusal(
+                    "receipt-dir-invalid",
+                    format!(
+                        "receipt directory component {} must not be a symlink",
+                        current.display()
+                    ),
+                ));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(refusal(
+                    "receipt-dir-stat-failed",
+                    format!("could not stat {}: {e}", current.display()),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_receipt(dir: &Path, name: &str, value: &Value) -> Result<(), BridgeRefusal> {
+    write_json_pretty_new(&dir.join(name), value)
+}
+
+fn write_receipt_if_absent(dir: &Path, name: &str, value: &Value) -> Result<(), BridgeRefusal> {
+    let path = dir.join(name);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(refusal(
+                "receipt-file-invalid",
+                format!("receipt file {} must not be a symlink", path.display()),
+            ));
+        }
+        Ok(_) => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(refusal(
+                "receipt-file-stat-failed",
+                format!("could not stat {}: {e}", path.display()),
+            ));
+        }
+    }
+    write_json_pretty_new(&path, value)
+}
+
+fn write_json_pretty_new(path: &Path, value: &Value) -> Result<(), BridgeRefusal> {
+    let bytes = serde_json::to_vec_pretty(value).map_err(|e| {
+        refusal(
+            "receipt-json-serialize-failed",
+            format!("could not serialize receipt: {e}"),
+        )
+    })?;
+    write_file_new(path, &bytes)
+}
+
+fn write_file_new(path: &Path, bytes: &[u8]) -> Result<(), BridgeRefusal> {
+    let Some(parent) = path.parent() else {
+        return Err(refusal("write-path-parent-missing", "path has no parent"));
+    };
+    create_dir_0700(parent)?;
+    let temp = path.with_file_name(format!(
+        ".{}.tmp-{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("bridge-receipt"),
+        timestamp()
+    ));
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temp).map_err(|e| {
+        refusal(
+            "receipt-write-failed",
+            format!("could not create {}: {e}", temp.display()),
+        )
+    })?;
+    file.write_all(bytes).map_err(|e| {
+        refusal(
+            "receipt-write-failed",
+            format!("could not write {}: {e}", temp.display()),
+        )
+    })?;
+    file.flush().map_err(|e| {
+        refusal(
+            "receipt-write-failed",
+            format!("could not flush {}: {e}", temp.display()),
+        )
+    })?;
+    drop(file);
+    fs::rename(&temp, path).map_err(|e| {
+        refusal(
+            "receipt-write-failed",
+            format!(
+                "could not atomically install {} as {}: {e}",
+                temp.display(),
+                path.display()
+            ),
+        )
+    })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+fn sha256_file_hex(path: &Path) -> io::Result<String> {
+    fs::read(path).map(|bytes| sha256_hex(&bytes))
+}
+
+fn timestamp() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("unix-{}.{:09}Z", now.as_secs(), now.subsec_nanos())
+}
+
+fn refusal(kind: &'static str, reason: impl Into<String>) -> BridgeRefusal {
+    BridgeRefusal {
+        kind,
+        reason: reason.into(),
+        exit_code: EXIT_REFUSED,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const TEST_RESOLVED_MODEL: &str = "concrete-test-model";
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Debug)]
+    struct StubPlanner {
+        output: String,
+    }
+
+    #[derive(Debug)]
+    struct ModelPlanner {
+        output: String,
+        resolved_model: String,
+    }
+
+    #[derive(Debug)]
+    struct FailingPlanner {
+        kind: &'static str,
+    }
+
+    #[derive(Debug)]
+    struct MutatingPlanner {
+        output: String,
+        path: PathBuf,
+        bytes: String,
+    }
+
+    #[derive(Debug)]
+    struct HeadAdvancingPlanner {
+        output: String,
+        repo: PathBuf,
+    }
+
+    #[derive(Debug)]
+    struct BranchChangingPlanner {
+        output: String,
+        repo: PathBuf,
+    }
+
+    #[derive(Debug)]
+    struct InlineValidator;
+
+    impl PlannerClient for StubPlanner {
+        fn request_plan(
+            &self,
+            request: &PlannerRequest,
+        ) -> Result<PlannerCandidate, BridgeRefusal> {
+            assert_eq!(request.broker_url, DEFAULT_BROKER_URL);
+            Ok(PlannerCandidate {
+                planner_output_json: self.output.clone(),
+                broker_route: request.broker_url.clone(),
+                resolved_model: TEST_RESOLVED_MODEL.to_string(),
+                response_sha256: sha256_hex(self.output.as_bytes()),
+            })
+        }
+    }
+
+    impl PlannerClient for ModelPlanner {
+        fn request_plan(
+            &self,
+            request: &PlannerRequest,
+        ) -> Result<PlannerCandidate, BridgeRefusal> {
+            assert_eq!(request.broker_url, DEFAULT_BROKER_URL);
+            Ok(PlannerCandidate {
+                planner_output_json: self.output.clone(),
+                broker_route: request.broker_url.clone(),
+                resolved_model: self.resolved_model.clone(),
+                response_sha256: sha256_hex(self.output.as_bytes()),
+            })
+        }
+    }
+
+    impl PlannerClient for FailingPlanner {
+        fn request_plan(
+            &self,
+            _request: &PlannerRequest,
+        ) -> Result<PlannerCandidate, BridgeRefusal> {
+            Err(refusal(self.kind, "simulated planner failure"))
+        }
+    }
+
+    impl PlannerClient for MutatingPlanner {
+        fn request_plan(
+            &self,
+            request: &PlannerRequest,
+        ) -> Result<PlannerCandidate, BridgeRefusal> {
+            assert_eq!(request.broker_url, DEFAULT_BROKER_URL);
+            fs::write(&self.path, &self.bytes).expect("concurrent mutation succeeds");
+            Ok(PlannerCandidate {
+                planner_output_json: self.output.clone(),
+                broker_route: request.broker_url.clone(),
+                resolved_model: TEST_RESOLVED_MODEL.to_string(),
+                response_sha256: sha256_hex(self.output.as_bytes()),
+            })
+        }
+    }
+
+    impl PlannerClient for HeadAdvancingPlanner {
+        fn request_plan(
+            &self,
+            request: &PlannerRequest,
+        ) -> Result<PlannerCandidate, BridgeRefusal> {
+            assert_eq!(request.broker_url, DEFAULT_BROKER_URL);
+            git(
+                &self.repo,
+                &["commit", "--allow-empty", "-m", "advance during broker"],
+            );
+            Ok(PlannerCandidate {
+                planner_output_json: self.output.clone(),
+                broker_route: request.broker_url.clone(),
+                resolved_model: TEST_RESOLVED_MODEL.to_string(),
+                response_sha256: sha256_hex(self.output.as_bytes()),
+            })
+        }
+    }
+
+    impl PlannerClient for BranchChangingPlanner {
+        fn request_plan(
+            &self,
+            request: &PlannerRequest,
+        ) -> Result<PlannerCandidate, BridgeRefusal> {
+            assert_eq!(request.broker_url, DEFAULT_BROKER_URL);
+            git(&self.repo, &["checkout", "-q", "-b", "cert-other"]);
+            Ok(PlannerCandidate {
+                planner_output_json: self.output.clone(),
+                broker_route: request.broker_url.clone(),
+                resolved_model: TEST_RESOLVED_MODEL.to_string(),
+                response_sha256: sha256_hex(self.output.as_bytes()),
+            })
+        }
+    }
+
+    impl PlannerValidator for InlineValidator {
+        fn validate(
+            &self,
+            task: &NormalizedTask,
+            candidate_json: &str,
+        ) -> Result<PathBuf, BridgeRefusal> {
+            let _: Value = serde_json::from_str(candidate_json)
+                .map_err(|e| refusal("planner-output-validation-refused", format!("{e}")))?;
+            let path = task.receipt_dir.join("planner-output.json");
+            write_file_new(&path, candidate_json.as_bytes())?;
+            Ok(path)
+        }
+    }
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock sane")
+            .as_nanos();
+        let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = disposable_worktree_root().expect("test disposable root");
+        let dir = root.join(format!(
+            "stack-code-bridge-{label}-{}-{nanos}-{seq}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir.canonicalize().expect("canonicalize temp dir")
+    }
+
+    fn non_disposable_temp_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock sane")
+            .as_nanos();
+        let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "stack-code-bridge-nondisposable-{label}-{}-{nanos}-{seq}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir.canonicalize().expect("canonicalize temp dir")
+    }
+
+    fn git(worktree: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(worktree)
+            .args(args)
+            .output()
+            .expect("git launches");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: stdout={} stderr={}",
+            args,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_repo(label: &str) -> PathBuf {
+        git_repo_at(unique_temp_dir(label))
+    }
+
+    fn non_disposable_git_repo(label: &str) -> PathBuf {
+        git_repo_at(non_disposable_temp_dir(label))
+    }
+
+    fn git_repo_at(dir: PathBuf) -> PathBuf {
+        git(&dir, &["init", "-b", "cert"]);
+        git(&dir, &["config", "user.email", "test@example.invalid"]);
+        git(&dir, &["config", "user.name", "Stack Code Test"]);
+        fs::create_dir_all(dir.join("docs")).unwrap();
+        fs::write(dir.join("README.md"), "baseline\n").unwrap();
+        git(&dir, &["add", "README.md"]);
+        git(&dir, &["commit", "-m", "baseline"]);
+        git(&dir, &["remote", "add", "origin", "."]);
+        git(&dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        dir
+    }
+
+    fn with_test_control_checkout<T>(path: &Path, f: impl FnOnce() -> T) -> T {
+        TEST_CONTROL_CHECKOUT_OVERRIDE.with(|override_path| {
+            let previous = override_path.replace(Some(path.to_path_buf()));
+            let result = f();
+            override_path.replace(previous);
+            result
+        })
+    }
+
+    fn workspace_binding_for_test(worktree: &Path) -> String {
+        worktree
+            .file_name()
+            .and_then(|value| value.to_str())
+            .expect("test worktree has utf-8 name")
+            .to_string()
+    }
+
+    fn valid_planner_output(worktree: &Path, path: &str) -> String {
+        serde_json::to_string(&json!({
+            "schema_version": "a2-l4-planner-output.v1",
+            "task_id": "cert-task",
+            "workspace_root": workspace_binding_for_test(worktree),
+            "task_summary": "create certification document",
+            "plan_steps": [{"step_id": "step-1", "description": "write the allowed file"}],
+            "risk_notes": [],
+            "operator_next_steps": ["review A2 evidence"],
+            "candidate_files": [path],
+            "patch_intent": {"summary": "create file", "notes": ["operator after_text supplies bytes"]}
+        }))
+        .unwrap()
+    }
+
+    // Builds planner-output.json wire text directly (rather than through
+    // serde_json::to_string) so a test can embed literal JSON string escapes
+    // (e.g. -) that only reveal a secret shape after decoding.
+    // `extra_fields` must start with a leading comma, e.g. `,"risk_notes":[...]`.
+    fn planner_output_json_text(worktree: &Path, extra_fields: &str) -> String {
+        format!(
+            r#"{{"schema_version":"a2-l4-planner-output.v1","task_id":"cert-task","workspace_root":"{ws}","task_summary":"create certification document","plan_steps":[{{"step_id":"step-1","description":"write the allowed file"}}],"risk_notes":[],"operator_next_steps":["review A2 evidence"],"candidate_files":["docs/cert.md"],"patch_intent":{{"summary":"create file","notes":["operator after_text supplies bytes"]}}{extra_fields}}}"#,
+            ws = workspace_binding_for_test(worktree),
+            extra_fields = extra_fields,
+        )
+    }
+
+    fn spec(worktree: &Path, allowed: Vec<&str>, target: Option<&str>) -> RunnableTaskSpec {
+        RunnableTaskSpec {
+            schema_version: TASK_SCHEMA_V1.to_string(),
+            task_id: "cert-task".to_string(),
+            objective: "Create a certification document".to_string(),
+            worktree: worktree.to_path_buf(),
+            allowed_paths: allowed.into_iter().map(str::to_string).collect(),
+            target_path: target.map(str::to_string),
+            validation_profile: VALIDATION_DOCS_ONLY.to_string(),
+            caller_id: "stack-code".to_string(),
+            task_type: "code".to_string(),
+            broker_url: None,
+            model: None,
+            operator_approval: true,
+            after_text: "# Purpose\n\nCertification.\n".to_string(),
+        }
+    }
+
+    fn planner_request_for_test(worktree: &Path) -> PlannerRequest {
+        PlannerRequest {
+            task_id: "cert-task".to_string(),
+            objective: "Create a certification document".to_string(),
+            worktree: worktree.to_path_buf(),
+            workspace_binding: workspace_binding_for_test(worktree),
+            base_sha: "base".to_string(),
+            allowed_paths: vec!["docs/cert.md".to_string()],
+            target_path: "docs/cert.md".to_string(),
+            broker_url: DEFAULT_BROKER_URL.to_string(),
+            model: DEFAULT_MODEL.to_string(),
+        }
+    }
+
+    fn broker_wrapper(model: Value, planner_output: &str) -> Value {
+        json!({
+            "response": {
+                "model": model,
+                "choices": [
+                    {
+                        "message": {
+                            "content": planner_output
+                        }
+                    }
+                ]
+            }
+        })
+    }
+
+    fn receipt_value(result: &Value, name: &str) -> Value {
+        let receipt_dir = PathBuf::from(result["receipt_dir"].as_str().expect("receipt dir"));
+        read_existing_json(&receipt_dir.join(name)).expect("receipt json")
+    }
+
+    fn assert_requested_and_resolved(value: &Value, requested: &str, resolved: &str) {
+        assert_eq!(value["requested_model"], requested);
+        assert_eq!(value["resolved_model"], resolved);
+    }
+
+    fn repo_root_for_test() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .expect("crate dir is under repo root")
+            .to_path_buf()
+    }
+
+    fn minimal_validator_doc() -> Value {
+        json!({
+            "schema_version": "a2-l4-planner-output.v1",
+            "task_id": "task-0001",
+            "workspace_root": "stack-code",
+            "task_summary": "Validate semantic guard parity.",
+            "plan_steps": [
+                {"step_id": "s1", "description": "Review the bounded target."}
+            ],
+            "risk_notes": [],
+            "operator_next_steps": ["review evidence"],
+            "candidate_files": ["docs/cert.md"]
+        })
+    }
+
+    fn production_validator_accepts(doc: &Value, label: &str) -> bool {
+        let root = repo_root_for_test();
+        let dir = unique_temp_dir(label);
+        let path = dir.join("planner-output.json");
+        fs::write(&path, serde_json::to_vec_pretty(doc).unwrap()).unwrap();
+        let output = Command::new("python3")
+            .current_dir(&root)
+            .arg(root.join("scripts/validate_planner_output_schema.py"))
+            .arg(&path)
+            .output()
+            .expect("production validator launches");
+        output.status.success()
+    }
+
+    #[test]
+    fn valid_single_file_mutation_applies_and_emits_package_handoff() {
+        let repo = git_repo("valid");
+        let planner = StubPlanner {
+            output: valid_planner_output(&repo, "docs/cert.md"),
+        };
+        let result = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("task succeeds");
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["actual_changed_paths"], json!(["docs/cert.md"]));
+        assert!(repo.join("docs/cert.md").is_file());
+        assert!(result["approved_lane_path"]
+            .as_str()
+            .unwrap()
+            .ends_with("approved-lane.json"));
+        let receipt_dir = PathBuf::from(result["receipt_dir"].as_str().unwrap());
+        assert!(receipt_dir.join("package-plan-readiness.json").is_file());
+        assert_eq!(result["package_ready"], true);
+    }
+
+    #[test]
+    fn requested_alias_and_broker_resolved_model_are_reported_separately() {
+        let repo = git_repo("resolved-model-alias");
+        let mut task = spec(&repo, vec!["docs/cert.md"], None);
+        task.model = Some("fast".to_string());
+        let result = run_task(
+            task,
+            &ModelPlanner {
+                output: valid_planner_output(&repo, "docs/cert.md"),
+                resolved_model: "concrete-test-model".to_string(),
+            },
+            &InlineValidator,
+        )
+        .expect("task succeeds");
+        assert_requested_and_resolved(&result, "fast", "concrete-test-model");
+
+        let acceptance = receipt_value(&result, "task-acceptance.json");
+        assert_eq!(acceptance["requested_model"], "fast");
+        assert_eq!(acceptance["resolved_model"], Value::Null);
+
+        for receipt in [
+            "broker-plan.json",
+            "planner-validation.json",
+            "package-control-preflight.json",
+            "mutation-authorization.json",
+            "changed-file-verification.json",
+            "validation.json",
+            "package-plan-readiness.json",
+            "package-handoff-readiness.json",
+            "task-complete.json",
+        ] {
+            let value = receipt_value(&result, receipt);
+            assert_requested_and_resolved(&value, "fast", "concrete-test-model");
+        }
+        let package_handoff = receipt_value(&result, "package-handoff-readiness.json");
+        assert_requested_and_resolved(
+            &package_handoff["package_plan_gate"],
+            "fast",
+            "concrete-test-model",
+        );
+    }
+
+    #[test]
+    fn same_name_requested_and_resolved_models_remain_distinct_fields() {
+        let repo = git_repo("resolved-model-same-name");
+        let mut task = spec(&repo, vec!["docs/cert.md"], None);
+        task.model = Some("concrete-test-model".to_string());
+        let result = run_task(
+            task,
+            &ModelPlanner {
+                output: valid_planner_output(&repo, "docs/cert.md"),
+                resolved_model: "concrete-test-model".to_string(),
+            },
+            &InlineValidator,
+        )
+        .expect("task succeeds");
+        assert_requested_and_resolved(&result, "concrete-test-model", "concrete-test-model");
+        assert_requested_and_resolved(
+            &receipt_value(&result, "broker-plan.json"),
+            "concrete-test-model",
+            "concrete-test-model",
+        );
+    }
+
+    #[test]
+    fn broker_response_model_must_be_nonempty_string() {
+        let repo = git_repo("broker-model-required");
+        let request = planner_request_for_test(&repo);
+        let output = valid_planner_output(&repo, "docs/cert.md");
+        for wrapper in [
+            json!({
+                "response": {
+                    "choices": [{"message": {"content": output}}]
+                }
+            }),
+            broker_wrapper(Value::Null, &output),
+            broker_wrapper(json!(""), &output),
+            broker_wrapper(json!("   "), &output),
+            broker_wrapper(json!(42), &output),
+            broker_wrapper(json!({}), &output),
+        ] {
+            let bytes = serde_json::to_vec(&wrapper).unwrap();
+            let err = planner_candidate_from_broker_wrapper(&request, &bytes)
+                .expect_err("missing broker response model must fail closed");
+            assert_eq!(err.kind, "broker-response-model-missing");
+        }
+    }
+
+    #[test]
+    fn empty_resolved_model_is_refused_before_broker_plan_receipt() {
+        let repo = git_repo("empty-resolved-model");
+        let err = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &ModelPlanner {
+                output: valid_planner_output(&repo, "docs/cert.md"),
+                resolved_model: "  ".to_string(),
+            },
+            &InlineValidator,
+        )
+        .expect_err("empty resolved model must fail before broker-plan receipt");
+        assert_eq!(err.kind, "broker-response-model-missing");
+        assert!(!repo
+            .join(".claw/runnable-task-bridge/cert-task/broker-plan.json")
+            .exists());
+    }
+
+    #[test]
+    fn ordinary_sk_substring_in_planner_json_is_allowed() {
+        let repo = git_repo("ordinary-sk");
+        let planner = StubPlanner {
+            output: valid_planner_output(&repo, "docs/task-notes.md"),
+        };
+        let result = run_task(
+            spec(&repo, vec!["docs/task-notes.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("ordinary task-notes path must not look credential-shaped");
+        assert_eq!(
+            result["actual_changed_paths"],
+            json!(["docs/task-notes.md"])
+        );
+    }
+
+    #[test]
+    fn redundant_path_separators_are_normalized_before_apply() {
+        let repo = git_repo("redundant-separators");
+        let planner = StubPlanner {
+            output: valid_planner_output(&repo, "docs/cert.md"),
+        };
+        let result = run_task(
+            spec(&repo, vec!["docs//cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("redundant separators normalize before changed-path verification");
+        assert_eq!(result["target_path"], json!("docs/cert.md"));
+        assert_eq!(result["actual_changed_paths"], json!(["docs/cert.md"]));
+        assert!(repo.join("docs/cert.md").is_file());
+    }
+
+    #[test]
+    fn git_quoted_porcelain_paths_are_verified_with_raw_status() {
+        let repo = git_repo("quoted-porcelain");
+        fs::write(repo.join("docs/é.md"), "accented path\n").unwrap();
+        let paths = git_status_porcelain_paths(&repo)
+            .expect("raw porcelain status preserves non-ascii task paths");
+        assert_eq!(paths, vec!["docs/é.md"]);
+    }
+
+    #[test]
+    fn task_id_with_raw_port_digits_is_allowed() {
+        let repo = git_repo("task-port-digits");
+        let mut task = spec(&repo, vec!["docs/cert.md"], None);
+        task.task_id = "task-11434".to_string();
+        let mut output: Value =
+            serde_json::from_str(&valid_planner_output(&repo, "docs/cert.md")).unwrap();
+        output["task_id"] = json!("task-11434");
+        let result = run_task(
+            task,
+            &StubPlanner {
+                output: serde_json::to_string(&output).unwrap(),
+            },
+            &InlineValidator,
+        )
+        .expect("bare digits in task metadata must not look like an endpoint");
+        assert_eq!(result["ok"], true);
+    }
+
+    #[test]
+    fn production_validator_allows_plain_11434_digits_but_rejects_endpoints() {
+        for (label, field, text) in [
+            ("task-id-port-digits", "task_id", "task-11434"),
+            (
+                "plain-prose-port-digits",
+                "task_summary",
+                "Track issue 11434.",
+            ),
+            ("path-port-digits", "candidate_files", "docs/11434-notes.md"),
+            (
+                "broker-port-valid",
+                "risk_notes",
+                "Application inference uses http://127.0.0.1:11435.",
+            ),
+        ] {
+            assert!(
+                !contains_raw_upstream_endpoint(text),
+                "Rust endpoint prefilter should accept {label}"
+            );
+            let mut doc = minimal_validator_doc();
+            match field {
+                "candidate_files" | "risk_notes" => doc[field] = json!([text]),
+                _ => doc[field] = json!(text),
+            }
+            assert!(
+                production_validator_accepts(&doc, label),
+                "production validator should accept {label}"
+            );
+        }
+
+        // The shared validator's raw-endpoint regex (scripts/validate_planner_output_schema.py,
+        // RAW_11434_ENDPOINT_RE) is intentionally more conservative than the
+        // lighter-weight Rust prefilter above: a bare "word:11434" is treated
+        // as endpoint-shaped even when "word" isn't a known loopback
+        // hostname, since a planner cannot be trusted to only ever write
+        // real hostnames there. This is a deliberate fail-closed choice —
+        // colon-adjacent digits should be written with a space (as in
+        // "plain-prose-port-digits" above) to avoid it.
+        {
+            let mut doc = minimal_validator_doc();
+            doc["task_summary"] = json!("Track issue:11434 without endpoint syntax.");
+            assert!(
+                !production_validator_accepts(&doc, "plain-colon-prose-port-digits"),
+                "production validator conservatively rejects colon-adjacent digits, even in prose"
+            );
+        }
+
+        for (label, text) in [
+            ("raw-localhost-url", "http://localhost:11434"),
+            ("raw-loopback-url", "http://127.0.0.1:11434"),
+            ("raw-localhost-bare", "localhost:11434"),
+            ("raw-loopback-bare", "127.0.0.1:11434"),
+            ("raw-ipv6-bare", "[::1]:11434"),
+            ("raw-url-path", "http://localhost:11434/v1/chat/completions"),
+            ("raw-generic-url", "http://example.invalid:11434/v1"),
+        ] {
+            assert!(
+                contains_raw_upstream_endpoint(text),
+                "Rust endpoint prefilter should reject {label}"
+            );
+            let mut doc = minimal_validator_doc();
+            doc["risk_notes"] = json!([text]);
+            assert!(
+                !production_validator_accepts(&doc, label),
+                "production validator should reject {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn planner_output_raw_upstream_endpoint_is_refused() {
+        let repo = git_repo("raw-endpoint");
+        let mut output: Value =
+            serde_json::from_str(&valid_planner_output(&repo, "docs/cert.md")).unwrap();
+        output["risk_notes"] = json!(["do not call http://localhost:11434/v1"]);
+        let err = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &StubPlanner {
+                output: serde_json::to_string(&output).unwrap(),
+            },
+            &InlineValidator,
+        )
+        .expect_err("raw upstream endpoint must be refused");
+        assert_eq!(err.kind, "planner-output-raw-upstream-refused");
+    }
+
+    #[test]
+    fn credential_shaped_planner_json_is_refused() {
+        let repo = git_repo("secret-shaped");
+        let mut output: Value =
+            serde_json::from_str(&valid_planner_output(&repo, "docs/cert.md")).unwrap();
+        output["risk_notes"] = json!(["sk-ABCDEFGHIJKLMNOP"]);
+        let err = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &StubPlanner {
+                output: serde_json::to_string(&output).unwrap(),
+            },
+            &InlineValidator,
+        )
+        .expect_err("credential-shaped planner output must be refused");
+        assert_eq!(err.kind, "planner-output-secret-like-refused");
+    }
+
+    #[test]
+    fn validator_recognized_secret_shapes_are_refused_before_persistence() {
+        for (label, secret) in [
+            ("aws-access-key", "AKIA1234567890ABCDEF"),
+            ("assignment", "api_key=abcdefgh"),
+            ("punctuated-openai-token", "sk-abcdefghijklmnop."),
+        ] {
+            let repo = git_repo(label);
+            let mut output: Value =
+                serde_json::from_str(&valid_planner_output(&repo, "docs/cert.md")).unwrap();
+            output["risk_notes"] = json!([secret]);
+            let err = run_task(
+                spec(&repo, vec!["docs/cert.md"], None),
+                &StubPlanner {
+                    output: serde_json::to_string(&output).unwrap(),
+                },
+                &InlineValidator,
+            )
+            .expect_err("validator-recognized secret-shaped output must be refused");
+            assert_eq!(err.kind, "planner-output-secret-like-refused");
+            assert!(!repo
+                .join(".claw/runnable-task-bridge/cert-task/planner-output.json")
+                .exists());
+        }
+    }
+
+    #[test]
+    fn credential_prefilter_matches_validator_word_boundaries() {
+        for (label, secret) in [
+            ("token-equals", "sk-abcdefghijklmnop="),
+            ("token-period", "sk-abcdefghijklmnop."),
+            ("token-comma", "sk-abcdefghijklmnop,"),
+            ("token-bracket", "sk-abcdefghijklmnop]"),
+            ("token-brace", "sk-abcdefghijklmnop}"),
+            ("token-quote", "sk-abcdefghijklmnop\""),
+            ("token-newline", "sk-abcdefghijklmnop\n"),
+        ] {
+            assert!(
+                contains_prefixed_token_shape(secret, "sk-", 16),
+                "Rust prefilter should reject {label}"
+            );
+            let mut doc = minimal_validator_doc();
+            doc["risk_notes"] = json!([secret]);
+            assert!(
+                !production_validator_accepts(&doc, label),
+                "production validator should reject {label}"
+            );
+            let repo = git_repo(label);
+            let mut output: Value =
+                serde_json::from_str(&valid_planner_output(&repo, "docs/cert.md")).unwrap();
+            output["risk_notes"] = json!([secret]);
+            let err = run_task(
+                spec(&repo, vec!["docs/cert.md"], None),
+                &StubPlanner {
+                    output: serde_json::to_string(&output).unwrap(),
+                },
+                &InlineValidator,
+            )
+            .expect_err("word-boundary secret-shaped output must be refused before persistence");
+            assert_eq!(err.kind, "planner-output-secret-like-refused");
+            assert!(!repo
+                .join(".claw/runnable-task-bridge/cert-task/planner-output.json")
+                .exists());
+        }
+
+        for (label, benign) in [
+            ("ordinary-sk-substring", "document the sk- prefix"),
+            ("short-token", "sk-short"),
+            ("embedded-word-token", "xsk-abcdefghijklmnopx"),
+        ] {
+            assert!(
+                !contains_prefixed_token_shape(benign, "sk-", 16),
+                "Rust prefilter should allow {label}"
+            );
+            let mut doc = minimal_validator_doc();
+            doc["risk_notes"] = json!([benign]);
+            assert!(
+                production_validator_accepts(&doc, label),
+                "production validator should allow {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn dashed_vendor_credential_shapes_are_refused() {
+        for (label, token) in [
+            (
+                "openai-project",
+                "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789",
+            ),
+            ("anthropic", "sk-ant-api03-deadbeefdeadbeef"),
+        ] {
+            let repo = git_repo(label);
+            let mut output: Value =
+                serde_json::from_str(&valid_planner_output(&repo, "docs/cert.md")).unwrap();
+            output["risk_notes"] = json!([token]);
+            let err = run_task(
+                spec(&repo, vec!["docs/cert.md"], None),
+                &StubPlanner {
+                    output: serde_json::to_string(&output).unwrap(),
+                },
+                &InlineValidator,
+            )
+            .expect_err("dashed vendor token-shaped planner output must be refused");
+            assert_eq!(err.kind, "planner-output-secret-like-refused");
+        }
+    }
+
+    // Builds a 6-byte JSON unicode-escape sequence (backslash + 'u' + 4 hex
+    // digits) at runtime from separate fragments, so the literal escape text
+    // never appears contiguously in this source file (a contiguous
+    // \u-plus-4-hex-digits run in this file would itself get decoded away
+    // long before reaching the compiler). `"\\"` below is Rust's own escape
+    // for a single backslash character.
+    fn json_u_escape(hex4: &str) -> String {
+        format!("{}u{}", "\\", hex4)
+    }
+
+    #[test]
+    fn decoded_json_escape_secret_shapes_are_refused_before_persistence() {
+        let e_hyphen = json_u_escape("002d"); // decodes to '-'
+        let e_p = json_u_escape("0070"); // decodes to 'p'
+        let e_f = json_u_escape("0046"); // decodes to 'F'
+        let e_i = json_u_escape("0069"); // decodes to 'i'
+
+        let openai_hyphen_escaped = format!("sk{e_hyphen}abcdefghijklmnop");
+        let github_token_escaped = format!("gh{e_p}_XXXXXXXXXXXXXXXXXXXXXXXX");
+        let aws_key_escaped = format!("AKIA1234567890ABCDE{e_f}");
+        let api_key_escaped = format!("ap{e_i}_key: abcdefgh12");
+        let punctuated_escaped = format!("sk{e_hyphen}abcdefghijklmnop,");
+
+        // Each case's JSON *wire text* never contains a literal "sk-" (or
+        // similar) substring — only after serde_json decodes the \uXXXX
+        // escape does the secret shape appear. A scan of the raw serialized
+        // text alone would accept every one of these; only the decoded-value
+        // walk added in this change catches them.
+        for (label, extra_fields) in [
+            (
+                "escaped-openai-hyphen",
+                format!(r#","risk_notes":["{openai_hyphen_escaped}"]"#),
+            ),
+            (
+                "escaped-github-token",
+                format!(r#","risk_notes":["{github_token_escaped}"]"#),
+            ),
+            (
+                "escaped-aws-access-key",
+                format!(r#","risk_notes":["{aws_key_escaped}"]"#),
+            ),
+            (
+                "escaped-api-key-assignment",
+                format!(r#","risk_notes":["{api_key_escaped}"]"#),
+            ),
+            (
+                "escaped-token-followed-by-punctuation",
+                format!(r#","risk_notes":["{punctuated_escaped}"]"#),
+            ),
+            (
+                "credential-in-object-key",
+                r#","sk-ABCDEFGHIJKLMNOP":"marker""#.to_string(),
+            ),
+            (
+                "credential-in-nested-array",
+                r#","risk_notes":[["nested","sk-ABCDEFGHIJKLMNOP"]]"#.to_string(),
+            ),
+        ] {
+            let repo = git_repo(label);
+            let text = planner_output_json_text(&repo, &extra_fields);
+            let err = run_task(
+                spec(&repo, vec!["docs/cert.md"], None),
+                &StubPlanner { output: text },
+                &InlineValidator,
+            )
+            .expect_err("decoded secret-shaped planner output must be refused");
+            assert_eq!(
+                err.kind, "planner-output-secret-like-refused",
+                "{label} should be refused as secret-shaped"
+            );
+            assert!(
+                !repo
+                    .join(".claw/runnable-task-bridge/cert-task/planner-output.json")
+                    .exists(),
+                "{label} must not persist planner-output.json"
+            );
+        }
+    }
+
+    #[test]
+    fn decoded_scan_accepts_harmless_escaped_and_unicode_content() {
+        let e_hyphen = json_u_escape("002d"); // decodes to '-'
+        let e_acute = json_u_escape("00e9"); // decodes to 'é'
+        let harmless_escaped_hyphen = format!("sk{e_hyphen}short token mention");
+        let escaped_unicode_content = format!("caf{e_acute} r{e_acute}sum{e_acute}");
+
+        for (label, extra_fields) in [
+            (
+                "short-sk-token",
+                r#","risk_notes":["sk-short token mention"]"#.to_string(),
+            ),
+            (
+                "escaped-harmless-hyphen",
+                format!(r#","risk_notes":["{harmless_escaped_hyphen}"]"#),
+            ),
+            (
+                "ordinary-11434-digits",
+                r#","task_summary":"Track issue 11434 in the tracker.""#.to_string(),
+            ),
+            (
+                "valid-unicode-content",
+                r#","task_summary":"Résumé: café ☕ 中文 задача""#.to_string(),
+            ),
+            (
+                "escaped-unicode-content",
+                format!(r#","task_summary":"{escaped_unicode_content}""#),
+            ),
+        ] {
+            let repo = git_repo(label);
+            let text = planner_output_json_text(&repo, &extra_fields);
+            let result = run_task(
+                spec(&repo, vec!["docs/cert.md"], None),
+                &StubPlanner { output: text },
+                &InlineValidator,
+            )
+            .unwrap_or_else(|e| panic!("{label} must be accepted, got refusal: {}", e.reason));
+            assert_eq!(result["ok"], true, "{label} must succeed");
+        }
+    }
+
+    #[test]
+    fn ordinary_task_id_digits_are_accepted_through_decoded_scan() {
+        let repo = git_repo("ordinary-task-id-digits");
+        let mut task = spec(&repo, vec!["docs/cert.md"], None);
+        task.task_id = "task-123".to_string();
+        let mut output: Value =
+            serde_json::from_str(&valid_planner_output(&repo, "docs/cert.md")).unwrap();
+        output["task_id"] = json!("task-123");
+        let result = run_task(
+            task,
+            &StubPlanner {
+                output: serde_json::to_string(&output).unwrap(),
+            },
+            &InlineValidator,
+        )
+        .expect("ordinary task id digits must be accepted");
+        assert_eq!(result["ok"], true);
+    }
+
+    #[test]
+    fn malformed_planner_json_fails_closed_before_persistence() {
+        let repo = git_repo("decoded-scan-malformed");
+        let err = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &StubPlanner {
+                output: r#"{"task_id": "cert-task", "risk_notes": ["unterminated]"#.to_string(),
+            },
+            &InlineValidator,
+        )
+        .expect_err("malformed JSON must be refused before the decoded scan can run");
+        assert_eq!(err.kind, "planner-output-json-error");
+        assert!(!repo
+            .join(".claw/runnable-task-bridge/cert-task/planner-output.json")
+            .exists());
+    }
+
+    #[test]
+    fn approved_lane_is_accepted_by_tier4_package_plan() {
+        let disposable_root = unique_temp_dir("package-plan-root");
+        let repo_dir = disposable_root.join("package-plan-worktree");
+        fs::create_dir_all(&repo_dir).expect("create disposable worktree fixture");
+        let repo = git_repo_at(repo_dir.canonicalize().expect("canonicalize fixture"));
+        let planner = StubPlanner {
+            output: valid_planner_output(&repo, "docs/cert.md"),
+        };
+        let result = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("task succeeds");
+        let lane = PathBuf::from(result["approved_lane_path"].as_str().unwrap());
+        let control = git_repo("package-plan-control");
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let repo_root = crate_dir
+            .ancestors()
+            .nth(3)
+            .expect("crate dir is under repo root");
+        let script = repo_root.join("scripts/a2-tier3-write-orchestrator.sh");
+        let output = Command::new("bash")
+            .env("A2_CONTROL_CHECKOUT", &control)
+            .env("A2_DISPOSABLE_WORKTREE_ROOT", &disposable_root)
+            .arg(script)
+            .arg("package-plan")
+            .arg("--worktree")
+            .arg(&repo)
+            .arg("--approved-lane")
+            .arg(&lane)
+            .output()
+            .expect("package-plan launches");
+        assert!(
+            output.status.success(),
+            "package-plan refused bridge lane: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("\"schema\": \"a2-tier4-package-plan.v0\""));
+        assert!(stdout.contains("\"would_open_pr\": false"));
+        assert!(stdout.contains("\"would_push\": false"));
+    }
+
+    #[test]
+    fn multiple_allowed_files_are_accepted_when_target_is_explicit() {
+        let repo = git_repo("multiple-allowed");
+        let planner = StubPlanner {
+            output: valid_planner_output(&repo, "docs/cert.md"),
+        };
+        let result = run_task(
+            spec(
+                &repo,
+                vec!["docs/cert.md", "docs/notes.md"],
+                Some("docs/cert.md"),
+            ),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("task succeeds");
+        assert_eq!(result["actual_changed_paths"], json!(["docs/cert.md"]));
+    }
+
+    #[test]
+    fn unauthorized_candidate_file_is_rejected_before_apply() {
+        let repo = git_repo("unauthorized");
+        let planner = StubPlanner {
+            output: valid_planner_output(&repo, "docs/other.md"),
+        };
+        let err = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect_err("unauthorized candidate must fail");
+        assert_eq!(err.kind, "planner-output-unauthorized-path");
+        assert!(!repo.join("docs/cert.md").exists());
+    }
+
+    #[test]
+    fn non_disposable_worktree_is_rejected_before_apply() {
+        let repo = non_disposable_git_repo("outside-root");
+        let err = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &StubPlanner {
+                output: valid_planner_output(&repo, "docs/cert.md"),
+            },
+            &InlineValidator,
+        )
+        .expect_err("non-disposable worktree must fail");
+        assert_eq!(err.kind, "worktree-not-disposable");
+        assert!(!repo.join("docs/cert.md").exists());
+    }
+
+    #[test]
+    fn worktree_subdirectory_is_rejected_before_apply() {
+        let repo = git_repo("subdir-worktree");
+        let subdir = repo.join("docs");
+        let err = run_task(
+            spec(&subdir, vec!["cert.md"], None),
+            &StubPlanner {
+                output: valid_planner_output(&repo, "docs/cert.md"),
+            },
+            &InlineValidator,
+        )
+        .expect_err("task worktree must be the git root, not a subdirectory");
+        assert_eq!(err.kind, "worktree-not-root");
+        assert!(!repo.join("docs/cert.md").exists());
+    }
+
+    #[test]
+    fn stale_base_worktree_is_rejected_before_apply() {
+        let repo = git_repo("stale-base");
+        fs::write(repo.join("README.md"), "baseline\nsecond\n").unwrap();
+        git(&repo, &["add", "README.md"]);
+        git(&repo, &["commit", "-m", "advance branch"]);
+        let err = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &StubPlanner {
+                output: valid_planner_output(&repo, "docs/cert.md"),
+            },
+            &InlineValidator,
+        )
+        .expect_err("worktree HEAD must equal the approved base before apply");
+        assert_eq!(err.kind, "worktree-base-mismatch");
+        assert!(!repo.join("docs/cert.md").exists());
+    }
+
+    #[test]
+    fn clean_head_change_during_planning_is_rejected_before_preview() {
+        let repo = git_repo("head-change-during-planning");
+        let err = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &HeadAdvancingPlanner {
+                output: valid_planner_output(&repo, "docs/cert.md"),
+                repo: repo.clone(),
+            },
+            &InlineValidator,
+        )
+        .expect_err("clean HEAD drift during planning must fail before preview");
+        assert_eq!(err.kind, "worktree-head-changed");
+        assert!(!repo.join("docs/cert.md").exists());
+        assert!(!repo
+            .join(".claw/runnable-task-bridge/cert-task/package-plan-readiness.json")
+            .exists());
+    }
+
+    #[test]
+    fn branch_change_during_planning_is_rejected_before_preview() {
+        let repo = git_repo("branch-change-during-planning");
+        let err = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &BranchChangingPlanner {
+                output: valid_planner_output(&repo, "docs/cert.md"),
+                repo: repo.clone(),
+            },
+            &InlineValidator,
+        )
+        .expect_err("branch drift during planning must fail before preview");
+        assert_eq!(err.kind, "worktree-branch-changed");
+        assert!(!repo.join("docs/cert.md").exists());
+        assert!(!repo
+            .join(".claw/runnable-task-bridge/cert-task/package-plan-readiness.json")
+            .exists());
+    }
+
+    #[test]
+    fn main_branch_worktree_is_rejected_before_apply() {
+        let repo = git_repo("main-branch");
+        git(&repo, &["checkout", "-b", "main"]);
+        let err = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &StubPlanner {
+                output: valid_planner_output(&repo, "docs/cert.md"),
+            },
+            &InlineValidator,
+        )
+        .expect_err("main branch worktree must fail");
+        assert_eq!(err.kind, "worktree-branch-protected");
+        assert!(!repo.join("docs/cert.md").exists());
+    }
+
+    #[test]
+    fn stale_planner_task_id_is_rejected_before_apply() {
+        let repo = git_repo("stale-plan-id");
+        let mut output: Value =
+            serde_json::from_str(&valid_planner_output(&repo, "docs/cert.md")).unwrap();
+        output["task_id"] = json!("other-task");
+        let err = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &StubPlanner {
+                output: output.to_string(),
+            },
+            &InlineValidator,
+        )
+        .expect_err("stale task identity must fail");
+        assert_eq!(err.kind, "planner-output-task-id-mismatch");
+        assert!(!repo.join("docs/cert.md").exists());
+    }
+
+    #[test]
+    fn stale_planner_workspace_root_is_rejected_before_apply() {
+        let repo = git_repo("stale-workspace");
+        let mut output: Value =
+            serde_json::from_str(&valid_planner_output(&repo, "docs/cert.md")).unwrap();
+        output["workspace_root"] = json!("other-worktree");
+        let err = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &StubPlanner {
+                output: output.to_string(),
+            },
+            &InlineValidator,
+        )
+        .expect_err("stale workspace identity must fail");
+        assert_eq!(err.kind, "planner-output-workspace-root-mismatch");
+        assert!(!repo.join("docs/cert.md").exists());
+    }
+
+    #[test]
+    fn bridge_owned_partial_receipts_do_not_block_retry() {
+        let repo = git_repo("retry");
+        let task = spec(&repo, vec!["docs/cert.md"], None);
+        let first = run_task(
+            task,
+            &FailingPlanner {
+                kind: "broker-failed",
+            },
+            &InlineValidator,
+        )
+        .expect_err("simulated planner failure leaves partial receipt");
+        assert_eq!(first.kind, "broker-failed");
+        assert!(repo
+            .join(".claw/runnable-task-bridge/cert-task/task-acceptance.json")
+            .is_file());
+
+        let planner = StubPlanner {
+            output: valid_planner_output(&repo, "docs/cert.md"),
+        };
+        let second = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("retry succeeds with only bridge-owned receipt dirt");
+        assert_eq!(second["ok"], true);
+        assert_eq!(second["actual_changed_paths"], json!(["docs/cert.md"]));
+    }
+
+    #[test]
+    fn concurrent_target_change_before_preview_is_rejected() {
+        let repo = git_repo("concurrent-before-preview");
+        let target = repo.join("docs/cert.md");
+        let concurrent = "# Purpose\n\nConcurrent edit.\n".to_string();
+        let planner = MutatingPlanner {
+            output: valid_planner_output(&repo, "docs/cert.md"),
+            path: target.clone(),
+            bytes: concurrent.clone(),
+        };
+        let err = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect_err("concurrent target dirt must be caught before preview/apply");
+        assert_eq!(err.kind, "worktree-dirty");
+        assert_eq!(fs::read_to_string(target).unwrap(), concurrent);
+    }
+
+    #[test]
+    fn bridge_owned_a2_artifacts_do_not_block_retry() {
+        let repo = git_repo("retry-a2-artifacts");
+        let normalized =
+            normalize_task(spec(&repo, vec!["docs/cert.md"], None)).expect("task normalizes");
+        create_dir_0700(&normalized.receipt_dir).expect("receipt dir exists");
+        write_receipt(
+            &normalized.receipt_dir,
+            "task-acceptance.json",
+            &task_acceptance_receipt(&normalized, "accepted"),
+        )
+        .expect("partial receipt written");
+        for rel in [
+            ".claw/l2b-checkpoints/run/step/manifest.json",
+            ".claw/l2b-payloads/run/step/after.bin",
+            ".claw/l2b-preview-bundles/run/step/preview-bundle.json",
+            ".claw/l2b-runs/run/status.json",
+        ] {
+            let path = repo.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "{}\n").unwrap();
+        }
+        let err = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &FailingPlanner {
+                kind: "broker-failed-after-a2-artifacts",
+            },
+            &InlineValidator,
+        )
+        .expect_err("retry should reach planner despite bridge-owned A2 artifacts");
+        assert_eq!(err.kind, "broker-failed-after-a2-artifacts");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn receipt_directory_symlink_ancestor_is_rejected() {
+        let repo = git_repo("receipt-symlink");
+        let outside = unique_temp_dir("receipt-outside");
+        std::os::unix::fs::symlink(&outside, repo.join(".claw")).expect("create .claw symlink");
+        git(&repo, &["add", ".claw"]);
+        git(&repo, &["commit", "-m", "track claw symlink"]);
+        git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        let err = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &StubPlanner {
+                output: valid_planner_output(&repo, "docs/cert.md"),
+            },
+            &InlineValidator,
+        )
+        .expect_err("receipt writes must not follow symlinked ancestors");
+        assert_eq!(err.kind, "receipt-dir-invalid");
+        assert!(!outside.join("runnable-task-bridge").exists());
+        assert!(!repo.join("docs/cert.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bridge_receipts_are_private() {
+        let repo = git_repo("private-modes");
+        let planner = StubPlanner {
+            output: valid_planner_output(&repo, "docs/cert.md"),
+        };
+        let result = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("task succeeds");
+        let receipt_dir = PathBuf::from(result["receipt_dir"].as_str().unwrap());
+        let dir_mode = fs::metadata(&receipt_dir).unwrap().permissions().mode() & 0o777;
+        let after_mode = fs::metadata(receipt_dir.join("after.bin"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let planner_mode = fs::metadata(receipt_dir.join("planner-output.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(after_mode, 0o600);
+        assert_eq!(planner_mode, 0o600);
+    }
+
+    #[test]
+    fn absolute_path_is_rejected() {
+        let repo = git_repo("absolute");
+        let err = run_task(
+            spec(&repo, vec!["/tmp/out.md"], None),
+            &StubPlanner {
+                output: valid_planner_output(&repo, "docs/cert.md"),
+            },
+            &InlineValidator,
+        )
+        .expect_err("absolute path must fail");
+        assert_eq!(err.kind, "path-absolute-refused");
+    }
+
+    #[test]
+    fn traversal_path_is_rejected() {
+        let repo = git_repo("traversal");
+        let err = run_task(
+            spec(&repo, vec!["../out.md"], None),
+            &StubPlanner {
+                output: valid_planner_output(&repo, "docs/cert.md"),
+            },
+            &InlineValidator,
+        )
+        .expect_err("traversal must fail");
+        assert_eq!(err.kind, "path-traversal-refused");
+    }
+
+    #[test]
+    fn reserved_claw_target_is_rejected_before_receipts_or_planner() {
+        for (label, allowed, target) in [
+            ("reserved-claw-file", vec![".claw/notes.md"], None),
+            (
+                "reserved-claw-allowed",
+                vec!["docs/cert.md", ".claw/notes.md"],
+                Some("docs/cert.md"),
+            ),
+        ] {
+            let repo = git_repo(label);
+            let err = run_task(
+                spec(&repo, allowed, target),
+                &FailingPlanner {
+                    kind: "planner-must-not-run",
+                },
+                &InlineValidator,
+            )
+            .expect_err("reserved .claw paths must fail during normalization");
+            assert_eq!(err.kind, "reserved-target-path");
+            assert!(!repo.join(".claw").exists());
+            assert!(!repo.join("docs/cert.md").exists());
+        }
+    }
+
+    #[test]
+    fn reserved_claw_lookalikes_are_allowed() {
+        for (label, target) in [
+            ("claws-lookalike", ".claws/notes.md"),
+            ("doc-claw-notes", "docs/.claw-notes.md"),
+        ] {
+            let repo = git_repo(label);
+            if let Some(parent) = repo.join(target).parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            let result = run_task(
+                spec(&repo, vec![target], None),
+                &StubPlanner {
+                    output: valid_planner_output(&repo, target),
+                },
+                &InlineValidator,
+            )
+            .expect("lookalike paths are ordinary task targets");
+            assert_eq!(result["actual_changed_paths"], json!([target]));
+            assert!(repo.join(target).is_file());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_escape_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let repo = git_repo("symlink");
+        let outside = unique_temp_dir("outside");
+        symlink(outside.join("cert.md"), repo.join("docs/cert.md")).unwrap();
+        let err = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &StubPlanner {
+                output: valid_planner_output(&repo, "docs/cert.md"),
+            },
+            &InlineValidator,
+        )
+        .expect_err("symlink target must fail");
+        assert_eq!(err.kind, "path-symlink-refused");
+    }
+
+    #[test]
+    fn dirty_starting_worktree_is_rejected() {
+        let repo = git_repo("dirty");
+        fs::write(repo.join("docs/dirty.md"), "dirty\n").unwrap();
+        let err = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &StubPlanner {
+                output: valid_planner_output(&repo, "docs/cert.md"),
+            },
+            &InlineValidator,
+        )
+        .expect_err("dirty worktree must fail");
+        assert_eq!(err.kind, "worktree-dirty");
+    }
+
+    #[test]
+    fn malformed_planner_output_is_rejected() {
+        let repo = git_repo("malformed");
+        let err = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &StubPlanner {
+                output: "{not json".to_string(),
+            },
+            &InlineValidator,
+        )
+        .expect_err("malformed planner output must fail");
+        // The decoded secret scan fails closed on invalid JSON before the
+        // validator would otherwise write the candidate to disk.
+        assert_eq!(err.kind, "planner-output-json-error");
+        assert!(!repo.join("docs/cert.md").exists());
+        assert!(!repo
+            .join(".claw/runnable-task-bridge/cert-task/planner-output.json")
+            .exists());
+    }
+
+    #[test]
+    fn raw_upstream_broker_route_is_rejected() {
+        let repo = git_repo("broker-route");
+        let mut task = spec(&repo, vec!["docs/cert.md"], None);
+        task.broker_url = Some("http://127.0.0.1:11434".to_string());
+        let err = run_task(
+            task,
+            &StubPlanner {
+                output: valid_planner_output(&repo, "docs/cert.md"),
+            },
+            &InlineValidator,
+        )
+        .expect_err("raw upstream route must fail");
+        assert_eq!(err.kind, "broker-route-raw-upstream-refused");
+    }
+
+    #[test]
+    fn missing_operator_approval_is_rejected() {
+        let repo = git_repo("approval");
+        let mut task = spec(&repo, vec!["docs/cert.md"], None);
+        task.operator_approval = false;
+        let err = run_task(
+            task,
+            &StubPlanner {
+                output: valid_planner_output(&repo, "docs/cert.md"),
+            },
+            &InlineValidator,
+        )
+        .expect_err("missing approval must fail");
+        assert_eq!(err.kind, "a2-authorization-invalid");
+    }
+
+    #[test]
+    fn validation_failure_blocks_package_readiness() {
+        let repo = git_repo("validation");
+        let mut task = spec(&repo, vec!["docs/cert.md"], None);
+        task.after_text = "# Purpose\n\n<<<<<<< HEAD\n".to_string();
+        let err = run_task(
+            task,
+            &StubPlanner {
+                output: valid_planner_output(&repo, "docs/cert.md"),
+            },
+            &InlineValidator,
+        )
+        .expect_err("diff check must fail");
+        assert_eq!(err.kind, "validation-failed");
+        assert!(!repo.join("docs/cert.md").exists());
+    }
+
+    #[test]
+    fn completed_task_id_is_idempotent() {
+        let repo = git_repo("idempotent");
+        let planner = StubPlanner {
+            output: valid_planner_output(&repo, "docs/cert.md"),
+        };
+        let task = spec(&repo, vec!["docs/cert.md"], None);
+        let first = run_task(task, &planner, &InlineValidator).expect("first run succeeds");
+        assert_eq!(first["status"], "applied");
+        let second_task = spec(&repo, vec!["docs/cert.md"], None);
+        let second =
+            run_task(second_task, &planner, &InlineValidator).expect("second run succeeds");
+        assert_eq!(second["status"], "idempotent_complete");
+        assert_requested_and_resolved(&second, DEFAULT_MODEL, TEST_RESOLVED_MODEL);
+    }
+
+    #[test]
+    fn cached_completion_requires_same_task_specification() {
+        let repo = git_repo("idempotent-spec-binding");
+        let planner = StubPlanner {
+            output: valid_planner_output(&repo, "docs/cert.md"),
+        };
+        run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("first run succeeds");
+        let mut changed_spec = spec(&repo, vec!["docs/cert.md"], None);
+        changed_spec.caller_id = "other-caller".to_string();
+        let err = run_task(changed_spec, &planner, &InlineValidator)
+            .expect_err("cached completion must bind to the same task spec");
+        assert_eq!(err.kind, "completed-task-spec-mismatch");
+    }
+
+    #[test]
+    fn cached_completion_requires_same_requested_model() {
+        let repo = git_repo("idempotent-model-binding");
+        let planner = StubPlanner {
+            output: valid_planner_output(&repo, "docs/cert.md"),
+        };
+        run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("first run succeeds");
+        let mut changed_spec = spec(&repo, vec!["docs/cert.md"], None);
+        changed_spec.model = Some("slow".to_string());
+        let err = run_task(changed_spec, &planner, &InlineValidator)
+            .expect_err("cached completion must bind to the requested model identity");
+        assert_eq!(err.kind, "completed-task-spec-mismatch");
+    }
+
+    #[test]
+    fn cached_completion_reruns_package_gate() {
+        let repo = git_repo("idempotent-package-gate");
+        let planner = StubPlanner {
+            output: valid_planner_output(&repo, "docs/cert.md"),
+        };
+        run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("first run succeeds");
+        let dirty_control = git_repo("dirty-package-control");
+        fs::write(dirty_control.join("untracked.txt"), "dirty\n").unwrap();
+        let err = with_test_control_checkout(&dirty_control, || {
+            run_task(
+                spec(&repo, vec!["docs/cert.md"], None),
+                &planner,
+                &InlineValidator,
+            )
+        })
+        .expect_err(
+            "cached success must not claim package readiness with a dirty control checkout",
+        );
+        assert_eq!(err.kind, "package-plan-gate-failed");
+    }
+
+    #[test]
+    fn applied_task_without_completion_receipts_can_resume() {
+        let repo = git_repo("resume-applied");
+        let planner = StubPlanner {
+            output: valid_planner_output(&repo, "docs/cert.md"),
+        };
+        let first = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("first run succeeds");
+        let receipt_dir = PathBuf::from(first["receipt_dir"].as_str().unwrap());
+        fs::remove_file(receipt_dir.join("task-complete.json")).unwrap();
+        fs::remove_file(receipt_dir.join("package-plan-readiness.json")).unwrap();
+        fs::remove_file(receipt_dir.join("package-handoff-readiness.json")).unwrap();
+        fs::remove_file(receipt_dir.join("a2-apply-result.json")).unwrap();
+        let resumed = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &FailingPlanner {
+                kind: "planner-must-not-run",
+            },
+            &InlineValidator,
+        )
+        .expect("existing A2-applied task resumes without replanning");
+        assert_eq!(resumed["status"], "applied");
+        assert_requested_and_resolved(&resumed, DEFAULT_MODEL, TEST_RESOLVED_MODEL);
+        assert_requested_and_resolved(
+            &receipt_value(&resumed, "package-plan-readiness.json"),
+            DEFAULT_MODEL,
+            TEST_RESOLVED_MODEL,
+        );
+        assert_requested_and_resolved(
+            &receipt_value(&resumed, "package-handoff-readiness.json"),
+            DEFAULT_MODEL,
+            TEST_RESOLVED_MODEL,
+        );
+        assert!(receipt_dir.join("approved-lane.json").is_file());
+        assert!(receipt_dir.join("task-complete.json").is_file());
+        assert!(receipt_dir.join("package-plan-readiness.json").is_file());
+        assert!(receipt_dir.join("package-handoff-readiness.json").is_file());
+    }
+
+    #[test]
+    fn resume_rejects_contradictory_existing_model_receipt() {
+        let repo = git_repo("resume-model-conflict");
+        let planner = StubPlanner {
+            output: valid_planner_output(&repo, "docs/cert.md"),
+        };
+        let first = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("first run succeeds");
+        let receipt_dir = PathBuf::from(first["receipt_dir"].as_str().unwrap());
+        fs::remove_file(receipt_dir.join("task-complete.json")).unwrap();
+        fs::remove_file(receipt_dir.join("package-plan-readiness.json")).unwrap();
+        fs::remove_file(receipt_dir.join("package-handoff-readiness.json")).unwrap();
+        let mut validation = read_existing_json(&receipt_dir.join("validation.json")).unwrap();
+        validation["resolved_model"] = json!("wrong-model");
+        fs::write(
+            receipt_dir.join("validation.json"),
+            serde_json::to_vec_pretty(&validation).unwrap(),
+        )
+        .unwrap();
+        let err = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &FailingPlanner {
+                kind: "planner-must-not-run",
+            },
+            &InlineValidator,
+        )
+        .expect_err("resume must reject contradictory existing model evidence");
+        assert_eq!(err.kind, "applied-task-evidence-mismatch");
+    }
+
+    #[test]
+    fn applied_target_without_task_bound_evidence_is_rejected() {
+        let repo = git_repo("resume-no-evidence");
+        let task = spec(&repo, vec!["docs/cert.md"], None);
+        fs::write(repo.join("docs/cert.md"), task.after_text.as_bytes()).unwrap();
+        let err = run_task(
+            task,
+            &FailingPlanner {
+                kind: "planner-must-not-run",
+            },
+            &InlineValidator,
+        )
+        .expect_err("matching target bytes are not enough to resume");
+        assert_eq!(err.kind, "applied-task-evidence-missing");
+    }
+
+    #[test]
+    fn applied_target_without_approved_lane_cannot_resume() {
+        let repo = git_repo("resume-no-lane");
+        let planner = StubPlanner {
+            output: valid_planner_output(&repo, "docs/cert.md"),
+        };
+        let first = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("first run succeeds");
+        let receipt_dir = PathBuf::from(first["receipt_dir"].as_str().unwrap());
+        fs::remove_file(receipt_dir.join("task-complete.json")).unwrap();
+        fs::remove_file(receipt_dir.join("approved-lane.json")).unwrap();
+        let err = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &FailingPlanner {
+                kind: "planner-must-not-run",
+            },
+            &InlineValidator,
+        )
+        .expect_err("resume must require task-bound approved-lane evidence");
+        assert_eq!(err.kind, "applied-task-evidence-missing");
+    }
+
+    #[test]
+    fn cached_completion_revalidates_current_changed_paths() {
+        let repo = git_repo("idempotent-drift");
+        let planner = StubPlanner {
+            output: valid_planner_output(&repo, "docs/cert.md"),
+        };
+        let task = spec(&repo, vec!["docs/cert.md"], None);
+        run_task(task, &planner, &InlineValidator).expect("first run succeeds");
+        fs::write(repo.join("docs/unrelated.md"), "unexpected\n").unwrap();
+        let err = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect_err("cached completion must not hide unrelated drift");
+        assert_eq!(err.kind, "changed-paths-mismatch");
+    }
+
+    // The broker registers `fast-default` as a logical alias; a literal `fast`
+    // is not a registered alias and fails to resolve upstream. These tests pin
+    // the default the bridge sends when the operator omits `model`.
+    #[derive(Debug)]
+    struct ModelCapturingPlanner {
+        output: String,
+        seen_model: std::cell::RefCell<Option<String>>,
+    }
+
+    impl PlannerClient for ModelCapturingPlanner {
+        fn request_plan(
+            &self,
+            request: &PlannerRequest,
+        ) -> Result<PlannerCandidate, BridgeRefusal> {
+            *self.seen_model.borrow_mut() = Some(request.model.clone());
+            Ok(PlannerCandidate {
+                planner_output_json: self.output.clone(),
+                broker_route: request.broker_url.clone(),
+                resolved_model: TEST_RESOLVED_MODEL.to_string(),
+                response_sha256: sha256_hex(self.output.as_bytes()),
+            })
+        }
+    }
+
+    #[test]
+    fn omitted_model_normalizes_to_registered_broker_alias() {
+        let repo = git_repo("default-alias-normalize");
+        let task = normalize_task(spec(&repo, vec!["docs/cert.md"], None)).expect("normalizes");
+        assert_eq!(task.model, "fast-default");
+        assert_ne!(
+            task.model, "fast",
+            "bare `fast` is not a registered broker alias and must not be the default"
+        );
+    }
+
+    #[test]
+    fn omitted_model_reaches_planner_request_as_registered_alias() {
+        let repo = git_repo("default-alias-planner-request");
+        let planner = ModelCapturingPlanner {
+            output: valid_planner_output(&repo, "docs/cert.md"),
+            seen_model: std::cell::RefCell::new(None),
+        };
+        let result = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("task succeeds");
+        assert_eq!(
+            planner.seen_model.borrow().as_deref(),
+            Some("fast-default"),
+            "planner request must carry the registered alias when the operator omitted a model"
+        );
+        assert_eq!(result["requested_model"], "fast-default");
+    }
+
+    #[test]
+    fn task_acceptance_receipt_records_default_requested_model() {
+        let repo = git_repo("default-alias-acceptance");
+        let planner = StubPlanner {
+            output: valid_planner_output(&repo, "docs/cert.md"),
+        };
+        let result = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("task succeeds");
+        let acceptance = receipt_value(&result, "task-acceptance.json");
+        assert_eq!(acceptance["requested_model"], "fast-default");
+        // Truthful pre-call state: the broker has not answered yet.
+        assert_eq!(acceptance["resolved_model"], Value::Null);
+    }
+
+    #[test]
+    fn explicit_operator_model_override_is_preserved() {
+        let repo = git_repo("default-alias-override");
+        let mut task = spec(&repo, vec!["docs/cert.md"], None);
+        task.model = Some("qwen3:14b".to_string());
+        let planner = ModelCapturingPlanner {
+            output: valid_planner_output(&repo, "docs/cert.md"),
+            seen_model: std::cell::RefCell::new(None),
+        };
+        let result = run_task(task, &planner, &InlineValidator).expect("task succeeds");
+        assert_eq!(planner.seen_model.borrow().as_deref(), Some("qwen3:14b"));
+        assert_eq!(result["requested_model"], "qwen3:14b");
+    }
+
+    #[test]
+    fn no_code_path_substitutes_the_bare_fast_literal() {
+        assert_eq!(DEFAULT_MODEL, "fast-default");
+        let repo = git_repo("default-alias-no-bare-fast");
+        let planner = ModelCapturingPlanner {
+            output: valid_planner_output(&repo, "docs/cert.md"),
+            seen_model: std::cell::RefCell::new(None),
+        };
+        let result = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("task succeeds");
+        assert_ne!(planner.seen_model.borrow().as_deref(), Some("fast"));
+        assert_ne!(result["requested_model"], "fast");
+        for receipt in [
+            "task-acceptance.json",
+            "broker-plan.json",
+            "validation.json",
+            "task-complete.json",
+        ] {
+            assert_ne!(
+                receipt_value(&result, receipt)["requested_model"],
+                "fast",
+                "{receipt} must not record the unregistered bare `fast` alias"
+            );
+        }
+    }
+
+    #[test]
+    fn default_alias_is_forwarded_opaquely_without_backend_assumption() {
+        // The bridge must forward the alias as-is and report whatever concrete
+        // model the broker resolves. It must never infer the backend itself.
+        let repo = git_repo("default-alias-opaque");
+        let planner = ModelPlanner {
+            output: valid_planner_output(&repo, "docs/cert.md"),
+            resolved_model: "some-other-backend-model".to_string(),
+        };
+        let result = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("task succeeds");
+        assert_requested_and_resolved(&result, "fast-default", "some-other-backend-model");
+    }
+
+    #[test]
+    fn context_summary_uses_private_child_of_temp_dir() {
+        let repo = git_repo("context-summary");
+        let request = PlannerRequest {
+            task_id: "cert-task".to_string(),
+            objective: "Create a certification document".to_string(),
+            worktree: repo,
+            workspace_binding: "context-summary".to_string(),
+            base_sha: "base".to_string(),
+            allowed_paths: vec!["docs/cert.md".to_string()],
+            target_path: "docs/cert.md".to_string(),
+            broker_url: DEFAULT_BROKER_URL.to_string(),
+            model: DEFAULT_MODEL.to_string(),
+        };
+        let path = write_context_summary(&request).expect("context summary written");
+        let parent = path.parent().expect("context file has parent");
+        assert_ne!(parent, std::env::temp_dir());
+        assert!(parent.starts_with(std::env::temp_dir()));
+        #[cfg(unix)]
+        {
+            let mode = fs::metadata(parent).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
+    }
+}
