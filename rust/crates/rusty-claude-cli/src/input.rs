@@ -345,8 +345,23 @@ fn write_echo(stdout: &mut io::Stdout, bytes: &[u8]) -> io::Result<()> {
 /// bracketed paste is collected verbatim (including any embedded control
 /// bytes) between the exact begin/end markers and folded into a single
 /// logical submission once the trailing Enter is pressed.
-fn read_line_capability_safe_interactive(stdout: &mut io::Stdout) -> io::Result<ReadOutcome> {
+///
+/// Emits the prompt itself, and only after raw mode is active, so that a
+/// visible prompt is a reliable readiness barrier: any peer that waits for
+/// the prompt before writing is guaranteed to find this reader already
+/// owning the tty. Flushing the prompt first would leave a window in which
+/// the line discipline still owns it, and input arriving in that window is
+/// cooked rather than delivered raw -- control bytes echoed as `^[`-style
+/// renderings, and Enter (`\r`) translated to `\n` by ICRNL. A translated
+/// `\n` is Ctrl-J here, which inserts a newline instead of submitting, so
+/// the read would never complete.
+fn read_line_capability_safe_interactive(
+    stdout: &mut io::Stdout,
+    prompt: &str,
+) -> io::Result<ReadOutcome> {
     let _raw_mode = RawModeGuard::enable()?;
+    write!(stdout, "{prompt}")?;
+    stdout.flush()?;
     let mut stdin = io::stdin().lock();
     let mut reader = PasteAwareBuffer::new();
     let mut byte = [0u8; 1];
@@ -526,12 +541,14 @@ impl LineEditor {
 
     fn read_line_fallback(&self) -> io::Result<ReadOutcome> {
         let mut stdout = io::stdout();
-        write!(stdout, "{}", self.prompt)?;
-        stdout.flush()?;
 
         if io::stdin().is_terminal() {
-            read_line_capability_safe_interactive(&mut stdout)
+            // The interactive reader emits the prompt itself, after raw mode
+            // is enabled, so a visible prompt implies a ready reader.
+            read_line_capability_safe_interactive(&mut stdout, &self.prompt)
         } else {
+            write!(stdout, "{}", self.prompt)?;
+            stdout.flush()?;
             read_line_capability_safe_piped(&mut io::stdin().lock())
         }
     }
