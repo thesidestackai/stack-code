@@ -1185,6 +1185,12 @@ import time
 
 exe, child, term, ops_raw, redirect = sys.argv[1:6]
 
+# Optional 6th argv: cap on how many bytes one PTY read may return. Omitted by
+# every ordinary test, which keeps the default whole-chunk read. A test that
+# passes 1 forces terminal control sequences to straddle read boundaries, which
+# is exactly what a real PTY may do under scheduling pressure.
+READ_SIZE = int(sys.argv[6]) if len(sys.argv) > 6 else 4096
+
 # Linux <termios.h>. Python's termios module does not expose IUTF8; setting it
 # makes the canonical-mode line discipline erase one whole UTF-8 character on
 # ERASE, which is what a real UTF-8 terminal does.
@@ -1240,10 +1246,17 @@ def scan():
     for seq, on in ((ENABLE, True), (DISABLE, False)):
         i = window.find(seq)
         while i != -1:
-            events.append((start + i, on))
+            events.append((start + i, start + i + len(seq), on))
             i = window.find(seq, i + 1)
-    for pos, on in sorted(events):
-        if pos < scan_pos:
+    # The backup window deliberately reaches behind the previous frontier so a
+    # sequence split across two reads is still found. Judge an event by where it
+    # ENDS, not where it starts: an event ending at or before the frontier was
+    # already complete last time and has been processed, while one ending beyond
+    # it only just became whole and must be applied now. Rejecting on start
+    # position instead would discard precisely the split sequences the backup
+    # window exists to recover.
+    for _, end, on in sorted(events):
+        if end <= scan_pos:
             continue
         bracketed_active = on
         if on:
@@ -1261,7 +1274,7 @@ def pump(budget):
     if not ready:
         return False
     try:
-        chunk = os.read(master, 4096)
+        chunk = os.read(master, READ_SIZE)
     except OSError:
         return False
     if not chunk:
@@ -1436,17 +1449,28 @@ sys.stdout.flush()
             format!("paste:{}", hex(text.as_bytes()))
         }
 
-        fn run_peer_child(child: &str, term: &str, ops: &[String], redirect: &str) -> PeerRun {
-            let output = Command::new("python3")
+        /// `read_size` caps one peer PTY read. `None` leaves the peer on its
+        /// default whole-chunk read, which is what every ordinary test wants.
+        fn run_peer_child_with_read_size(
+            child: &str,
+            term: &str,
+            ops: &[String],
+            redirect: &str,
+            read_size: Option<usize>,
+        ) -> PeerRun {
+            let mut command = Command::new("python3");
+            command
                 .arg("-c")
                 .arg(PEER_SCRIPT)
                 .arg(std::env::current_exe().expect("test exe should exist"))
                 .arg(child)
                 .arg(term)
                 .arg(ops.join(";"))
-                .arg(redirect)
-                .output()
-                .expect("terminal peer harness should run");
+                .arg(redirect);
+            if let Some(read_size) = read_size {
+                command.arg(read_size.to_string());
+            }
+            let output = command.output().expect("terminal peer harness should run");
             let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
             assert!(
                 output.status.success(),
@@ -1457,8 +1481,18 @@ sys.stdout.flush()
             PeerRun { stdout }
         }
 
+        fn run_peer_child(child: &str, term: &str, ops: &[String], redirect: &str) -> PeerRun {
+            run_peer_child_with_read_size(child, term, ops, redirect, None)
+        }
+
         fn run_peer(term: &str, ops: &[String]) -> PeerRun {
             run_peer_child(SINGLE_READ_CHILD, term, ops, "")
+        }
+
+        /// Peer restricted to one byte per PTY read, which guarantees every
+        /// terminal control sequence is split across reads.
+        fn run_peer_split_reads(term: &str, ops: &[String]) -> PeerRun {
+            run_peer_child_with_read_size(SINGLE_READ_CHILD, term, ops, "", Some(1))
         }
 
         fn assert_single_submit(run: &PeerRun, expected: &str) {
@@ -1631,6 +1665,45 @@ sys.stdout.flush()
                 "bracketed paste was enabled but never disabled: {:?}",
                 run.tty()
             );
+        }
+
+        /// A PTY read boundary may land in the middle of `ESC[?2004h` or
+        /// `ESC[?2004l`; nothing guarantees a control sequence arrives whole.
+        /// The peer must still recognise the mode change, otherwise it waits
+        /// out its timeout, refuses to frame a paste on a terminal that really
+        /// did enable bracketed paste, and fails correct behaviour at random.
+        ///
+        /// One byte per read is the worst case, so every sequence here is
+        /// split. Passing under it means the scanner's overlap window is
+        /// actually load-bearing rather than decorative.
+        #[test]
+        fn terminal_peer_detects_bracketed_mode_across_split_reads() {
+            let content = "Create the project.\n\nRequirements:\n- one\n- two";
+            let run = run_peer_split_reads("xterm-256color", &real_paste_ops(None, content));
+
+            assert!(
+                run.enable_observed(),
+                "peer missed a bracketed-paste enable split across reads: {:?}",
+                run.tty()
+            );
+            assert_eq!(
+                run.paste_framing(),
+                "1",
+                "peer refused to frame despite the terminal having enabled the mode: {:?}",
+                run.tty()
+            );
+            assert_single_submit(&run, content);
+            assert!(
+                run.app_output().contains("HISTORY_LEN=1"),
+                "{:?}",
+                run.app_output()
+            );
+            assert!(
+                run.disable_observed(),
+                "peer missed a bracketed-paste disable split across reads: {:?}",
+                run.tty()
+            );
+            assert_no_marker_leakage(&run);
         }
 
         #[test]
