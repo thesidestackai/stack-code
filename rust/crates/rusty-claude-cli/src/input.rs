@@ -284,28 +284,80 @@ fn is_rustyline_unsupported_term(term: &OsStr) -> bool {
         .any(|unsupported| term.eq_ignore_ascii_case(unsupported))
 }
 
-/// Whether the current process environment describes a terminal rustyline
-/// can drive directly. Never mutates the environment: it only reads `TERM`.
-/// Unset or empty `TERM` is treated as unsupported so we fall back to the
-/// cooked path rather than guessing at capabilities.
-fn is_current_term_supported() -> bool {
-    match env::var_os("TERM") {
-        Some(term) if !term.is_empty() => !is_rustyline_unsupported_term(&term),
-        _ => false,
+/// Which platform family's terminal-capability rules apply to this build.
+///
+/// The capability question is not the same one on every target, so the answer
+/// must not be either. `TERM` is a Unix variable, and rustyline reads it only
+/// from its Unix tty backend; its Windows console backend never consults it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalPolicy {
+    /// rustyline's Unix backend gates on `TERM`, so Stack-Code does too.
+    Unix,
+    /// rustyline's Windows console backend does not read `TERM`.
+    Windows,
+    /// Any other target family. Stack-Code claims nothing about it.
+    Other,
+}
+
+fn current_terminal_policy() -> TerminalPolicy {
+    if cfg!(windows) {
+        TerminalPolicy::Windows
+    } else if cfg!(unix) {
+        TerminalPolicy::Unix
+    } else {
+        TerminalPolicy::Other
     }
+}
+
+/// Whether `policy` lets rustyline drive a terminal described by `term` -- the
+/// process `TERM` value, or `None` when it is unset.
+///
+/// This is the platform half of the native-editor decision; the
+/// interactive-terminal half lives in [`should_use_line_editor`]. Keeping it a
+/// pure function of its inputs is what makes the Windows rule testable from a
+/// Unix development host.
+///
+/// * Windows: allowed, whatever `TERM` says. `TERM` is a Unix variable that a
+///   native Windows console normally leaves unset, and rustyline's Windows
+///   backend never reads it, so refusing an unset value here would send every
+///   interactive Windows session to the cooked fallback for no reason.
+/// * Unix: allowed only for a `TERM` rustyline's Unix backend will drive.
+///   Unset or empty is refused rather than guessed at, as is every entry in
+///   [`RUSTYLINE_UNSUPPORTED_TERMS`].
+/// * Other: refused. There is no evidence about such a target here, and this
+///   module does not invent optimistic capabilities for one.
+fn policy_allows_line_editor(policy: TerminalPolicy, term: Option<&OsStr>) -> bool {
+    match policy {
+        TerminalPolicy::Windows => true,
+        TerminalPolicy::Unix => match term {
+            Some(term) if !term.is_empty() => !is_rustyline_unsupported_term(term),
+            _ => false,
+        },
+        TerminalPolicy::Other => false,
+    }
+}
+
+/// Whether this build's platform and environment describe a terminal rustyline
+/// can drive directly. Never mutates the environment: it only reads `TERM`,
+/// and only on the platform where `TERM` is the deciding factor.
+fn current_platform_allows_line_editor() -> bool {
+    policy_allows_line_editor(current_terminal_policy(), env::var_os("TERM").as_deref())
 }
 
 /// Selects the native interactive editor (rustyline) only when every
 /// requirement for it holds: an interactive input terminal, an interactive
-/// output terminal, and a `TERM` rustyline is willing to drive.
+/// output terminal, and a platform capability rule rustyline agrees with -- on
+/// Unix a `TERM` it is willing to drive, on Windows a console backend that
+/// needs no such variable.
 ///
 /// When this is true rustyline owns the terminal completely -- raw mode,
 /// bracketed-paste enable/disable negotiation, insertion at the cursor,
 /// editing, UTF-8-aware erase, and Ctrl-C. Stack-Code neither duplicates nor
 /// intercepts any of it. Every other configuration takes the cooked
-/// fallback, which asserts no capabilities at all.
+/// fallback, which asserts no capabilities at all. A redirected stdout is one
+/// such configuration on every platform, Windows included.
 fn should_use_line_editor() -> bool {
-    io::stdin().is_terminal() && io::stdout().is_terminal() && is_current_term_supported()
+    io::stdin().is_terminal() && io::stdout().is_terminal() && current_platform_allows_line_editor()
 }
 
 /// Cooked line reader used for every input source Stack-Code does not drive
@@ -483,14 +535,16 @@ fn normalize_completions(completions: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_rustyline_unsupported_term, newline_key_bindings, slash_command_prefix, LineEditor,
-        SlashCommandHelper,
+        current_terminal_policy, is_rustyline_unsupported_term, newline_key_bindings,
+        policy_allows_line_editor, slash_command_prefix, LineEditor, SlashCommandHelper,
+        TerminalPolicy,
     };
     use rustyline::completion::Completer;
     use rustyline::highlight::Highlighter;
     use rustyline::history::{DefaultHistory, History};
     use rustyline::Context;
     use rustyline::{Cmd, KeyCode, KeyEvent, Modifiers};
+    use std::ffi::OsStr;
 
     #[test]
     fn extracts_terminal_slash_command_prefixes_with_arguments() {
@@ -623,6 +677,96 @@ mod tests {
         assert!(is_rustyline_unsupported_term("DUMB".as_ref()));
         assert!(is_rustyline_unsupported_term("emacs".as_ref()));
         assert!(!is_rustyline_unsupported_term("xterm-256color".as_ref()));
+    }
+
+    /// P1 contract: `TERM` is a Unix capability signal, not a universal one.
+    ///
+    /// rustyline's Windows console backend never reads `TERM`, and a native
+    /// Windows console normally leaves it unset. Gating Windows on it sent
+    /// every interactive Windows REPL to the cooked fallback, costing exactly
+    /// the completion, history, Ctrl-J/Shift-Enter and bracketed-paste
+    /// behavior the native path exists to provide. The policy is a pure
+    /// function of its inputs, so this holds the Windows rule from any host.
+    #[test]
+    fn windows_policy_does_not_require_term() {
+        for term in [None, Some(""), Some("dumb"), Some("cons25"), Some("emacs")] {
+            assert!(
+                policy_allows_line_editor(TerminalPolicy::Windows, term.map(OsStr::new)),
+                "Windows must keep the native editor for TERM={term:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_policy_keeps_native_editor_for_any_term_value() {
+        for term in [Some("xterm"), Some("xterm-256color"), Some("vt100")] {
+            assert!(
+                policy_allows_line_editor(TerminalPolicy::Windows, term.map(OsStr::new)),
+                "Windows must keep the native editor for TERM={term:?}"
+            );
+        }
+    }
+
+    /// The single case that separates the repair from the platform-neutral
+    /// gate it replaces: one absent `TERM`, two different answers.
+    #[test]
+    fn windows_and_unix_policies_disagree_on_an_absent_term() {
+        assert!(policy_allows_line_editor(TerminalPolicy::Windows, None));
+        assert!(!policy_allows_line_editor(TerminalPolicy::Unix, None));
+    }
+
+    /// Option C's Unix tier is unchanged by the Windows repair.
+    #[test]
+    fn unix_policy_refuses_terminals_rustyline_will_not_drive() {
+        for term in [
+            None,
+            Some(""),
+            Some("dumb"),
+            Some("DUMB"),
+            Some("cons25"),
+            Some("emacs"),
+        ] {
+            assert!(
+                !policy_allows_line_editor(TerminalPolicy::Unix, term.map(OsStr::new)),
+                "Unix must take the cooked fallback for TERM={term:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unix_policy_keeps_native_editor_for_capable_terminals() {
+        for term in [Some("xterm"), Some("xterm-256color"), Some("screen")] {
+            assert!(
+                policy_allows_line_editor(TerminalPolicy::Unix, term.map(OsStr::new)),
+                "Unix must keep the native editor for TERM={term:?}"
+            );
+        }
+    }
+
+    /// Neither Unix nor Windows: no capability is claimed, whatever `TERM` says.
+    #[test]
+    fn other_platform_policy_stays_conservative() {
+        for term in [None, Some(""), Some("xterm"), Some("xterm-256color")] {
+            assert!(
+                !policy_allows_line_editor(TerminalPolicy::Other, term.map(OsStr::new)),
+                "an unmodelled target must take the cooked fallback for TERM={term:?}"
+            );
+        }
+    }
+
+    /// Windows permissiveness must reach Windows builds only. Without this,
+    /// the repair could silently promote a Unix `TERM`-unset session to the
+    /// native editor and regress Option C.
+    #[cfg(unix)]
+    #[test]
+    fn unix_build_selects_the_unix_policy() {
+        assert_eq!(current_terminal_policy(), TerminalPolicy::Unix);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_build_selects_the_windows_policy() {
+        assert_eq!(current_terminal_policy(), TerminalPolicy::Windows);
     }
 
     #[test]
