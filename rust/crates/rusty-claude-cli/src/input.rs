@@ -11,6 +11,7 @@ use rustyline::error::ReadlineError;
 use rustyline::highlight::{CmdKind, Highlighter};
 use rustyline::hint::Hinter;
 use rustyline::history::DefaultHistory;
+use rustyline::line_buffer::{ChangeListener, DeleteListener, Direction, LineBuffer};
 use rustyline::validate::Validator;
 use rustyline::{
     Cmd, CompletionType, Config, Context, EditMode, Editor, Helper, KeyCode, KeyEvent, Modifiers,
@@ -19,6 +20,10 @@ use rustyline::{
 const RUSTYLINE_UNSUPPORTED_TERMS: [&str; 3] = ["dumb", "cons25", "emacs"];
 const BRACKETED_PASTE_BEGIN: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
+/// `Ctrl-H`. Some terminals send this for Backspace while the line
+/// discipline's `VERASE` stays on DEL, so the kernel never consumes it and it
+/// reaches userspace as literal input.
+const CTRL_H: u8 = 0x08;
 /// Deterministic upper bound on one cooked logical line, including verbatim
 /// bracketed-paste payload.
 const MAX_DIRECT_INPUT_BYTES: usize = 1024 * 1024;
@@ -113,6 +118,73 @@ pub struct LineEditor {
     editor: Editor<SlashCommandHelper, DefaultHistory>,
 }
 
+/// Which cooked route one [`read_line_cooked`] call is serving.
+///
+/// This exists for exactly one behavior: whether a literal `Ctrl-H` arriving
+/// outside bracketed-paste payload is interactive editing or ordinary stream
+/// content. It confers no other capability and asserts nothing else about the
+/// input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CookedInput {
+    /// Both stdin and stdout are terminals, but the platform capability rule
+    /// refused to let rustyline drive this one -- a limited or unknown
+    /// terminal. The user is editing a line by hand, so `Ctrl-H` is Backspace.
+    InteractiveTerminal,
+    /// A pipe, a redirected stdin, or a terminal whose stdout is redirected.
+    /// Nobody is editing here, so every byte is content.
+    Stream,
+}
+
+/// Classifies a cooked invocation from the two facts that distinguish the
+/// routes. Pure, so the mapping is testable without a terminal.
+///
+/// Only meaningful once [`should_use_line_editor`] has already declined:
+/// two terminals plus a declined native editor is precisely the limited or
+/// unknown interactive terminal.
+fn cooked_input_for(stdin_is_terminal: bool, stdout_is_terminal: bool) -> CookedInput {
+    if stdin_is_terminal && stdout_is_terminal {
+        CookedInput::InteractiveTerminal
+    } else {
+        CookedInput::Stream
+    }
+}
+
+/// A listener that discards edit notifications.
+///
+/// [`LineBuffer`] reports every mutation so an editor can maintain undo
+/// state. This reader keeps none: it borrows the buffer only to ask where a
+/// grapheme boundary is.
+struct IgnoredEdits;
+
+impl DeleteListener for IgnoredEdits {
+    fn delete(&mut self, _idx: usize, _string: &str, _dir: Direction) {}
+}
+
+impl ChangeListener for IgnoredEdits {
+    fn insert_char(&mut self, _idx: usize, _c: char) {}
+
+    fn insert_str(&mut self, _idx: usize, _string: &str) {}
+
+    fn replace(&mut self, _idx: usize, _old: &str, _new: &str) {}
+}
+
+/// Byte length of `text` with its last logical grapheme removed, or
+/// `text.len()` when there is nothing to remove.
+///
+/// Delegates the boundary decision to rustyline's own [`LineBuffer`], whose
+/// `backspace` resolves it with `grapheme_indices(true)` -- the same extended
+/// grapheme rule `apply_backspace_direct` uses in the unsupported-terminal
+/// reader this path replaced. Sharing the pinned dependency is what keeps the
+/// two in agreement, rather than a second implementation that could drift.
+fn len_without_last_grapheme(text: &str) -> usize {
+    // `with_capacity` disallows growth, and `update` truncates only when the
+    // new length exceeds capacity, so sizing to the text is exact.
+    let mut buffer = LineBuffer::with_capacity(text.len());
+    buffer.update(text, text.len(), &mut IgnoredEdits);
+    buffer.backspace(1, &mut IgnoredEdits);
+    buffer.len()
+}
+
 /// An accumulator for cooked (non-rustyline) line input.
 ///
 /// Recognizes an exact bracketed-paste begin marker at the *current* input
@@ -133,16 +205,18 @@ struct PasteAwareBuffer {
     begin_match: usize,
     end_match: usize,
     strip_floor: usize,
+    mode: CookedInput,
 }
 
 impl PasteAwareBuffer {
-    fn new() -> Self {
+    fn new(mode: CookedInput) -> Self {
         Self {
             content: Vec::new(),
             in_paste: false,
             begin_match: 0,
             end_match: 0,
             strip_floor: 0,
+            mode,
         }
     }
 
@@ -217,7 +291,30 @@ impl PasteAwareBuffer {
             return Ok(());
         }
 
+        if self.mode == CookedInput::InteractiveTerminal && byte == CTRL_H {
+            self.backspace_grapheme();
+            return Ok(());
+        }
+
         self.append(&[byte])
+    }
+
+    /// Removes the last logical grapheme, as Backspace does.
+    ///
+    /// A no-op on an empty buffer, so a leading or over-run `Ctrl-H` neither
+    /// underflows nor becomes visible content. Invalid UTF-8 is left exactly
+    /// as it is: such a line already fails [`take_line`]'s strict decode, and
+    /// guessing at a boundary inside it could only make the bytes worse.
+    fn backspace_grapheme(&mut self) {
+        let Ok(text) = std::str::from_utf8(&self.content) else {
+            return;
+        };
+
+        let kept = len_without_last_grapheme(text);
+        self.content.truncate(kept);
+        // Erasing into pasted payload moves the floor with it, so the floor
+        // can never point past the end of the content it guards.
+        self.strip_floor = self.strip_floor.min(kept);
     }
 
     /// Moves any partially-matched framing-marker bytes back into content.
@@ -367,10 +464,22 @@ fn should_use_line_editor() -> bool {
 /// Stack-Code never enables raw mode here, never emits terminal-capability
 /// sequences, and never manufactures replacement echo. When stdin is a
 /// terminal it stays in canonical mode, so the OS line discipline owns echo,
-/// erase (whole UTF-8 characters where `IUTF8` is set), and the interrupt and
-/// end-of-file characters -- exactly as it did before Stack-Code grew a
-/// direct interactive reader, and exactly as rustyline's own unsupported-
-/// terminal fallback behaves.
+/// the interrupt and end-of-file characters, and erase for *its own*
+/// configured `VERASE` character (whole UTF-8 characters where `IUTF8` is
+/// set).
+///
+/// `VERASE` is one character, so a terminal that sends `Ctrl-H` for Backspace
+/// while `VERASE` stays on DEL leaves that `0x08` in the input stream for the
+/// application. On the interactive cooked route only --
+/// [`CookedInput::InteractiveTerminal`] -- this reader therefore keeps the
+/// normalization rustyline's unsupported-terminal reader used to perform,
+/// deleting the preceding logical grapheme. That is a pure edit of bytes already received:
+/// still no raw mode, no capability request, and no replacement echo.
+///
+/// Streams are not editors. On [`CookedInput::Stream`] -- a pipe, a
+/// redirected stdin, or a tty whose stdout is redirected -- `0x08` stays
+/// literal content, exactly as the prior `BufRead::read_line` fallback left
+/// it.
 ///
 /// Matches the prior `BufRead::read_line` fallback contract: LF alone
 /// terminates a line, a trailing run of CR/LF is stripped (so CRLF is one
@@ -384,8 +493,8 @@ fn should_use_line_editor() -> bool {
 /// therefore submits line by line rather than as one message. Stack-Code does
 /// not fake framing to hide this, because it cannot prove such a terminal
 /// would understand the sequences required to request it.
-fn read_line_cooked(source: &mut impl Read) -> io::Result<ReadOutcome> {
-    let mut reader = PasteAwareBuffer::new();
+fn read_line_cooked(source: &mut impl Read, mode: CookedInput) -> io::Result<ReadOutcome> {
+    let mut reader = PasteAwareBuffer::new(mode);
     let mut byte = [0u8; 1];
     let mut read_any = false;
 
@@ -495,18 +604,24 @@ impl LineEditor {
     /// Cooked fallback for every configuration that is not a rustyline-driven
     /// interactive terminal.
     ///
-    /// There is no `stdin().is_terminal()` branch here on purpose. A terminal
+    /// No branch here takes a terminal into a reader of its own. A terminal
     /// left in canonical mode buffers typed input until it is read, so there
-    /// is no readiness race to close and no reason to treat a tty differently
-    /// from a pipe. Critically, this means a TTY stdin with redirected stdout
-    /// no longer enters a raw reader: terminal echo stays with the tty, and
+    /// is no readiness race to close. Critically, a TTY stdin with redirected
+    /// stdout never enters a raw reader: terminal echo stays with the tty, and
     /// redirected output is never contaminated with keystrokes or erase
     /// sequences.
+    ///
+    /// The interactive-terminal classification passed along is not a
+    /// capability claim. It decides one thing -- whether a literal `Ctrl-H`
+    /// is Backspace or content -- and reaching here at all means
+    /// [`should_use_line_editor`] already declined, so two terminals here can
+    /// only mean a limited or unknown one being typed at by hand.
     fn read_line_fallback(&self) -> io::Result<ReadOutcome> {
         let mut stdout = io::stdout();
         write!(stdout, "{}", self.prompt)?;
         stdout.flush()?;
-        read_line_cooked(&mut io::stdin().lock())
+        let mode = cooked_input_for(io::stdin().is_terminal(), io::stdout().is_terminal());
+        read_line_cooked(&mut io::stdin().lock(), mode)
     }
 }
 
@@ -850,12 +965,13 @@ mod tests {
     }
 
     mod direct_piped_tests {
-        use super::super::{read_line_cooked, ReadOutcome};
+        use super::super::{read_line_cooked, CookedInput, ReadOutcome};
 
         fn drain(mut stream: &[u8]) -> Vec<ReadOutcome> {
             let mut outcomes = Vec::new();
             loop {
-                let outcome = read_line_cooked(&mut stream).expect("piped read should succeed");
+                let outcome = read_line_cooked(&mut stream, CookedInput::Stream)
+                    .expect("piped read should succeed");
                 let done = outcome == ReadOutcome::Exit;
                 outcomes.push(outcome);
                 if done {
@@ -918,9 +1034,19 @@ mod tests {
         #[test]
         fn invalid_utf8_returns_invalid_data_matching_prior_contract() {
             let mut stream: &[u8] = b"he\xffllo\n";
-            let error = read_line_cooked(&mut stream)
+            let error = read_line_cooked(&mut stream, CookedInput::Stream)
                 .expect_err("invalid UTF-8 must not be silently substituted");
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        }
+
+        /// SCOPE GUARD. A pipe is not an interactive editor, and the prior
+        /// `BufRead::read_line` fallback never edited its bytes. `Ctrl-H`
+        /// stays literal content here no matter what the same reader does for
+        /// a terminal.
+        #[test]
+        fn piped_ctrl_h_stays_literal_content() {
+            assert_eq!(submits(b"helloo\x08\n"), vec!["helloo\u{8}".to_string()]);
+            assert_eq!(submits(b"\x08\n"), vec!["\u{8}".to_string()]);
         }
 
         #[test]
@@ -981,7 +1107,7 @@ mod tests {
     }
 
     mod paste_aware_buffer_tests {
-        use super::super::PasteAwareBuffer;
+        use super::super::{CookedInput, PasteAwareBuffer};
 
         fn feed_all(buffer: &mut PasteAwareBuffer, bytes: &[u8]) {
             for &byte in bytes {
@@ -991,14 +1117,14 @@ mod tests {
 
         #[test]
         fn plain_bytes_pass_through_unmodified() {
-            let mut buffer = PasteAwareBuffer::new();
+            let mut buffer = PasteAwareBuffer::new(CookedInput::Stream);
             feed_all(&mut buffer, b"hello");
             assert_eq!(buffer.take_line(false).expect("valid utf-8"), "hello");
         }
 
         #[test]
         fn bracketed_paste_strips_markers_and_preserves_newlines() {
-            let mut buffer = PasteAwareBuffer::new();
+            let mut buffer = PasteAwareBuffer::new(CookedInput::Stream);
             feed_all(&mut buffer, b"\x1b[200~line one\nline two\x1b[201~");
             assert!(!buffer.in_paste());
             assert_eq!(
@@ -1009,7 +1135,7 @@ mod tests {
 
         #[test]
         fn fragmented_begin_and_end_markers_are_still_recognized() {
-            let mut buffer = PasteAwareBuffer::new();
+            let mut buffer = PasteAwareBuffer::new(CookedInput::Stream);
             for &byte in b"\x1b[200~" {
                 buffer.push(byte).unwrap();
             }
@@ -1026,7 +1152,7 @@ mod tests {
 
         #[test]
         fn false_start_on_begin_marker_preserves_literal_bytes() {
-            let mut buffer = PasteAwareBuffer::new();
+            let mut buffer = PasteAwareBuffer::new(CookedInput::Stream);
             feed_all(&mut buffer, b"\x1b[2XY");
             assert!(!buffer.in_paste());
             assert_eq!(buffer.take_line(false).expect("valid utf-8"), "\x1b[2XY");
@@ -1034,7 +1160,7 @@ mod tests {
 
         #[test]
         fn over_limit_content_is_rejected_deterministically() {
-            let mut buffer = PasteAwareBuffer::new();
+            let mut buffer = PasteAwareBuffer::new(CookedInput::Stream);
             let mut result = Ok(());
             for _ in 0..(1024 * 1024 + 1) {
                 result = buffer.push(b'a');
@@ -1050,7 +1176,7 @@ mod tests {
 
         #[test]
         fn large_bounded_content_is_accepted() {
-            let mut buffer = PasteAwareBuffer::new();
+            let mut buffer = PasteAwareBuffer::new(CookedInput::Stream);
             for _ in 0..1024 {
                 buffer.push(b'a').expect("push should succeed within bound");
             }
@@ -1059,7 +1185,7 @@ mod tests {
 
         #[test]
         fn partial_end_marker_inside_paste_flushes_then_keeps_collecting() {
-            let mut buffer = PasteAwareBuffer::new();
+            let mut buffer = PasteAwareBuffer::new(CookedInput::Stream);
             feed_all(&mut buffer, b"\x1b[200~body\x1b[20\rmore");
             // An unterminated paste keeps collecting: CR is payload here, and
             // the abandoned end-marker prefix must survive as literal bytes.
@@ -1074,7 +1200,7 @@ mod tests {
 
         #[test]
         fn explicit_framing_after_typed_prefix_is_recognized_not_leaked() {
-            let mut buffer = PasteAwareBuffer::new();
+            let mut buffer = PasteAwareBuffer::new(CookedInput::Stream);
             feed_all(&mut buffer, b"prefix: \x1b[200~line1\nline2\x1b[201~");
             assert!(!buffer.in_paste());
             assert_eq!(
@@ -1085,7 +1211,7 @@ mod tests {
 
         #[test]
         fn explicit_framing_mid_content_never_leaks_marker_bytes() {
-            let mut buffer = PasteAwareBuffer::new();
+            let mut buffer = PasteAwareBuffer::new(CookedInput::Stream);
             feed_all(&mut buffer, b"a\x1b[200~B\x1b[201~c");
             let line = buffer.take_line(false).expect("valid utf-8");
             assert_eq!(line, "aBc");
@@ -1094,7 +1220,7 @@ mod tests {
 
         #[test]
         fn begin_marker_after_prefix_is_recognized_when_fragmented() {
-            let mut buffer = PasteAwareBuffer::new();
+            let mut buffer = PasteAwareBuffer::new(CookedInput::Stream);
             feed_all(&mut buffer, b"prefix: ");
             for &byte in b"\x1b[200~" {
                 buffer.push(byte).unwrap();
@@ -1111,7 +1237,7 @@ mod tests {
         fn repeated_escape_restarts_marker_matching_instead_of_swallowing_it() {
             // A false start immediately followed by a real marker: the stray
             // ESC must stay literal AND the real marker must still be honored.
-            let mut buffer = PasteAwareBuffer::new();
+            let mut buffer = PasteAwareBuffer::new(CookedInput::Stream);
             feed_all(&mut buffer, b"\x1b\x1b[200~body\x1b[201~");
             assert!(!buffer.in_paste());
             assert_eq!(buffer.take_line(false).expect("valid utf-8"), "\x1bbody");
@@ -1136,7 +1262,7 @@ mod tests {
 
         #[test]
         fn partial_prefix_after_content_still_survives_termination() {
-            let mut buffer = PasteAwareBuffer::new();
+            let mut buffer = PasteAwareBuffer::new(CookedInput::Stream);
             feed_all(&mut buffer, b"typed\x1b[20");
             assert_eq!(
                 buffer.take_line(false).expect("valid utf-8"),
@@ -1157,6 +1283,161 @@ mod tests {
     /// unsupported-terminal path look as though it supported bracketed paste
     /// even though it never enabled it. Any regression back to parsing
     /// framing without enabling it now fails here instead of passing.
+    /// The interactive-cooked `Ctrl-H` contract, exercised without a
+    /// terminal so the rules stay legible and deterministic.
+    mod cooked_ctrl_h_tests {
+        use super::super::{
+            cooked_input_for, len_without_last_grapheme, read_line_cooked, CookedInput, ReadOutcome,
+        };
+
+        fn submit(stream: &[u8], mode: CookedInput) -> String {
+            match read_line_cooked(&mut { stream }, mode).expect("cooked read should succeed") {
+                ReadOutcome::Submit(line) => line,
+                other => panic!("expected a submit, got {other:?}"),
+            }
+        }
+
+        fn interactive(stream: &[u8]) -> String {
+            submit(stream, CookedInput::InteractiveTerminal)
+        }
+
+        // -----------------------------------------------------------
+        // Route selection. Two terminals plus an already-declined native
+        // editor is the interactive cooked tier; everything else is a stream.
+        // -----------------------------------------------------------
+
+        #[test]
+        fn only_two_terminals_select_the_interactive_cooked_route() {
+            assert_eq!(
+                cooked_input_for(true, true),
+                CookedInput::InteractiveTerminal
+            );
+            assert_eq!(cooked_input_for(true, false), CookedInput::Stream);
+            assert_eq!(cooked_input_for(false, true), CookedInput::Stream);
+            assert_eq!(cooked_input_for(false, false), CookedInput::Stream);
+        }
+
+        // -----------------------------------------------------------
+        // Parity with the locked rustyline 15 unsupported-terminal reader.
+        // -----------------------------------------------------------
+
+        /// The fixture from rustyline 15's own `apply_backspace_direct`
+        /// test, run through this reader. If the two ever disagree about
+        /// what a backspace removes, this fails.
+        #[test]
+        fn matches_the_locked_rustyline_direct_reader_fixture() {
+            assert_eq!(
+                interactive("Hel\u{8}\u{8}el\u{8}llo \u{2639}\u{8}\u{263a}\n".as_bytes()),
+                "Hello \u{263a}"
+            );
+        }
+
+        /// Graphemes, not scalars: rustyline resolves the boundary with
+        /// `grapheme_indices(true)`, so a base character and its combining
+        /// mark are removed together.
+        #[test]
+        fn deletes_a_whole_grapheme_cluster_not_a_scalar() {
+            assert_eq!(len_without_last_grapheme("ae\u{301}"), 1);
+            assert_eq!(interactive("ae\u{301}\u{8}\n".as_bytes()), "a");
+            assert_eq!(
+                interactive("a\u{1f469}\u{200d}\u{1f680}\u{8}\n".as_bytes()),
+                "a"
+            );
+        }
+
+        #[test]
+        fn deletes_a_whole_multibyte_character() {
+            assert_eq!(interactive("\u{e9}\u{8}x\n".as_bytes()), "x");
+        }
+
+        #[test]
+        fn deletes_ascii_and_never_leaves_the_control_byte_behind() {
+            let line = interactive(b"helloo\x08\n");
+            assert_eq!(line, "hello");
+            assert!(
+                !line.contains('\u{8}'),
+                "control byte became content: {line:?}"
+            );
+        }
+
+        #[test]
+        fn leading_and_over_run_backspaces_are_no_ops() {
+            assert_eq!(interactive(b"\x08ab\n"), "ab");
+            assert_eq!(interactive(b"ab\x08\x08\x08\x08z\n"), "z");
+            assert_eq!(interactive(b"\x08\n"), "");
+        }
+
+        #[test]
+        fn repeated_backspaces_remove_successive_graphemes() {
+            assert_eq!(interactive(b"abc\x08\x08\x08z\n"), "z");
+            assert_eq!(interactive("\u{e9}\u{e9}\u{8}\u{8}z\n".as_bytes()), "z");
+        }
+
+        #[test]
+        fn empty_input_has_no_last_grapheme_to_remove() {
+            assert_eq!(len_without_last_grapheme(""), 0);
+        }
+
+        // -----------------------------------------------------------
+        // SCOPE GUARDS.
+        // -----------------------------------------------------------
+
+        /// Pasted payload is verbatim. A `0x08` between genuine framing
+        /// markers is content the user pasted, not a key they pressed, so it
+        /// survives even on the route that does normalize typed backspaces.
+        #[test]
+        fn ctrl_h_inside_framed_paste_stays_payload() {
+            assert_eq!(interactive(b"\x1b[200~ab\x08cd\x1b[201~\n"), "ab\u{8}cd");
+        }
+
+        /// Editing before a paste must not reach into the paste, and the
+        /// paste must not lose bytes to it.
+        #[test]
+        fn typed_backspace_before_a_paste_leaves_the_payload_intact() {
+            assert_eq!(
+                interactive(b"prefixx\x08: \x1b[200~a\x08b\x1b[201~\n"),
+                "prefix: a\u{8}b"
+            );
+        }
+
+        /// Once framing has ended the user is typing again, so this is
+        /// ordinary editing -- matching what the native editor would do.
+        #[test]
+        fn backspace_after_a_paste_ends_is_ordinary_editing() {
+            assert_eq!(interactive(b"\x1b[200~abc\x1b[201~\x08\n"), "ab");
+        }
+
+        /// Erasing into pasted payload must not leave the no-strip floor
+        /// pointing past the content it guards: the trailing newline of the
+        /// payload is still protected from terminator stripping.
+        #[test]
+        fn erasing_into_payload_keeps_the_strip_floor_coherent() {
+            assert_eq!(interactive(b"\x1b[200~ab\nc\x1b[201~\x08\n"), "ab\n");
+        }
+
+        /// A partially matched begin marker is literal input, so a backspace
+        /// arriving mid-prefix edits those literal bytes and leaves the
+        /// parser able to recognize the next marker cleanly.
+        #[test]
+        fn backspace_during_a_partial_marker_keeps_the_parser_coherent() {
+            assert_eq!(interactive(b"\x1b[20\x08\n"), "\u{1b}[2");
+            assert_eq!(
+                interactive(b"\x1b[20\x08\x1b[200~p\x1b[201~\n"),
+                "\u{1b}[2p"
+            );
+        }
+
+        /// The same bytes, on the stream route, are untouched content.
+        #[test]
+        fn the_stream_route_edits_nothing() {
+            assert_eq!(submit(b"helloo\x08\n", CookedInput::Stream), "helloo\u{8}");
+            assert_eq!(
+                submit(b"\x1b[200~ab\x08cd\x1b[201~\n", CookedInput::Stream),
+                "ab\u{8}cd"
+            );
+        }
+    }
+
     #[cfg(unix)]
     mod pty_tests {
         use super::LineEditor;
@@ -1195,6 +1476,11 @@ READ_SIZE = int(sys.argv[6]) if len(sys.argv) > 6 else 4096
 # makes the canonical-mode line discipline erase one whole UTF-8 character on
 # ERASE, which is what a real UTF-8 terminal does.
 IUTF8 = 0o040000
+# The erase character the line discipline consumes. DEL is already the default
+# on Linux; pinning it makes the Ctrl-H tests state the configuration they
+# depend on instead of inheriting it, because the whole point of those tests is
+# that 0x08 is NOT this character and so survives into userspace.
+VERASE_CHAR = b"\x7f"
 ENABLE = b"\x1b[?2004h"
 DISABLE = b"\x1b[?2004l"
 PASTE_BEGIN = b"\x1b[200~"
@@ -1204,7 +1490,9 @@ TIMEOUT = 15.0
 master, slave = pty.openpty()
 attrs = termios.tcgetattr(slave)
 attrs[0] |= IUTF8
+attrs[6][termios.VERASE] = VERASE_CHAR
 termios.tcsetattr(slave, termios.TCSANOW, attrs)
+assert termios.tcgetattr(slave)[6][termios.VERASE] == VERASE_CHAR
 
 env = os.environ.copy()
 env["STACK_CODE_LINE_EDITOR_PTY_CHILD"] = "1"
@@ -1706,6 +1994,29 @@ sys.stdout.flush()
             assert_no_marker_leakage(&run);
         }
 
+        /// SCOPE GUARD. A capable terminal is still driven entirely by
+        /// rustyline, which maps `0x08` to Backspace in its own raw-mode
+        /// keymap. The cooked reader -- and its Ctrl-H handling -- must never
+        /// come near this path.
+        #[test]
+        fn native_xterm_leaves_ctrl_h_to_the_native_editor() {
+            let ops = vec![
+                "wait_prompt".to_string(),
+                "wait_enable".to_string(),
+                op_type("helloo"),
+                op_send(b"\x08"),
+                op_send(b"\r"),
+            ];
+            let run = run_peer("xterm", &ops);
+
+            assert!(
+                run.enable_observed(),
+                "xterm must still be driven natively: {:?}",
+                run.tty()
+            );
+            assert_single_submit(&run, "hello");
+        }
+
         #[test]
         fn native_enter_submits_single_line() {
             let ops = vec![
@@ -1891,6 +2202,87 @@ sys.stdout.flush()
             );
         }
 
+        /// The Ctrl-H finding, on a real pty.
+        ///
+        /// `VERASE` is DEL (the peer pins it), so the line discipline never
+        /// consumes `0x08` and it arrives as literal input. Before this
+        /// reader existed rustyline's unsupported-terminal path normalized
+        /// it; a terminal on this tier must not start submitting a control
+        /// byte instead of erasing.
+        #[test]
+        fn cooked_ctrl_h_erases_last_typed_character_when_verase_is_del() {
+            let ops = vec![
+                "wait_prompt".to_string(),
+                op_type("helloo"),
+                op_send(b"\x08"),
+                op_send(b"\r"),
+            ];
+            let run = run_peer("dumb", &ops);
+
+            assert_single_submit(&run, "hello");
+            assert!(
+                !run.submits().iter().any(|line| line.contains("\\u{8}")),
+                "literal Ctrl-H was submitted: {:?}",
+                run.submits()
+            );
+            assert!(
+                !run.enable_observed(),
+                "erase parity must not cost a capability request"
+            );
+        }
+
+        #[test]
+        fn cooked_ctrl_h_removes_a_whole_multibyte_character() {
+            let ops = vec![
+                "wait_prompt".to_string(),
+                op_type("\u{e9}"),
+                op_send(b"\x08"),
+                op_type("x"),
+                op_send(b"\r"),
+            ];
+            let run = run_peer("dumb", &ops);
+
+            assert_single_submit(&run, "x");
+            assert!(
+                !run.app_output().contains("InvalidData"),
+                "partial UTF-8 survived the erase: {:?}",
+                run.tty()
+            );
+        }
+
+        /// A base character plus a combining mark is one grapheme, which is
+        /// the unit rustyline's direct reader removed.
+        #[test]
+        fn cooked_ctrl_h_removes_a_whole_grapheme_cluster() {
+            let ops = vec![
+                "wait_prompt".to_string(),
+                op_type("ae\u{301}"),
+                op_send(b"\x08"),
+                op_send(b"\r"),
+            ];
+            let run = run_peer("dumb", &ops);
+
+            assert_single_submit(&run, "a");
+        }
+
+        #[test]
+        fn cooked_ctrl_h_is_a_no_op_on_an_empty_line_and_repeats_correctly() {
+            let ops = vec![
+                "wait_prompt".to_string(),
+                op_send(b"\x08"),
+                op_type("abc"),
+                op_send(b"\x08"),
+                op_send(b"\x08"),
+                op_send(b"\x08"),
+                op_send(b"\x08"),
+                op_type("z"),
+                op_send(b"\r"),
+            ];
+            let run = run_peer("dumb", &ops);
+
+            assert_single_submit(&run, "z");
+        }
+
         #[test]
         fn partial_begin_marker_then_enter_is_not_lost_on_limited_terminal() {
             let ops = vec![
@@ -1932,6 +2324,42 @@ sys.stdout.flush()
         /// cooked: the terminal keeps echoing (so the user is not typing
         /// blind) and no keystroke or erase byte is written into the captured
         /// output.
+        /// SCOPE GUARD for the Ctrl-H repair.
+        ///
+        /// A tty stdin whose stdout is redirected is a stream, not an
+        /// interactive editor -- that is exactly the distinction the cooked
+        /// route classification draws. `VERASE` still erases (the line
+        /// discipline owns that regardless), but a literal `0x08` must stay
+        /// content here, unchanged from the pre-repair fallback contract.
+        #[test]
+        fn redirected_stdout_keeps_ctrl_h_literal() {
+            let path = temp_redirect_path("redirected-ctrl-h");
+            let ops = vec![
+                "wait_prompt".to_string(),
+                op_type("helloo"),
+                op_send(b"\x08"),
+                op_send(b"\r"),
+            ];
+            let run = run_peer_child(
+                SINGLE_READ_CHILD,
+                "dumb",
+                &ops,
+                path.to_str().expect("temp path should be utf-8"),
+            );
+            let _ = std::fs::remove_file(&path);
+
+            assert_eq!(
+                run.submits(),
+                vec!["\"helloo\\u{8}\"".to_string()],
+                "redirected-stdout semantics changed: {:?}",
+                run.app_output()
+            );
+            assert!(
+                !run.enable_observed(),
+                "no capability request may be made here"
+            );
+        }
+
         #[test]
         fn stdin_tty_with_redirected_stdout_stays_cooked_and_uncontaminated() {
             let path = temp_redirect_path("redirected-stdout");
