@@ -15,7 +15,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-use a2_plan_runner::{ApprovalContext, ApprovalDecision};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -24,6 +23,9 @@ const TASK_SCHEMA_V1: &str = "stack-code-runnable-task.v1";
 const RESULT_SCHEMA_V1: &str = "stack-code-runnable-task-result.v1";
 const RECEIPT_SCHEMA_V1: &str = "stack-code-runnable-task-receipt.v1";
 const APPROVAL_RESULT_SCHEMA_V1: &str = "a2-l2b-approval-result.v1";
+const AWAITING_APPROVAL_RECEIPT: &str = "preview-awaiting-approval.json";
+const AWAITING_APPROVAL_STATUS: &str = "awaiting_preview_approval";
+const APPROVAL_RESULT_FILE: &str = "approval-result.json";
 const DEFAULT_BROKER_URL: &str = "http://127.0.0.1:11435";
 const DEFAULT_MODEL: &str = "fast-default";
 const DEFAULT_DISPOSABLE_WORKTREE_ROOT: &str = "/mnt/vast-data/git-worktrees";
@@ -195,6 +197,9 @@ fn run_task(
     if let Some(resumed) = resume_applied_task_if_current(&task)? {
         return Ok(resumed);
     }
+    if let Some(previewed) = resume_previewed_task_if_current(&task)? {
+        return Ok(previewed);
+    }
     verify_clean_start(&task)?;
     create_dir_0700(&task.receipt_dir)?;
     write_receipt(
@@ -283,34 +288,8 @@ fn run_task(
                 )
             })?;
     let preview_bundle = read_preview_bundle(&preview_result.preview_bundle_path)?;
-    let approval_result_path = preview_result
-        .preview_bundle_path
-        .parent()
-        .ok_or_else(|| refusal("a2-preview-layout-invalid", "preview bundle has no parent"))?
-        .join("approval-result.json");
-    write_approval_result(&approval_result_path, &preview_bundle)?;
-    write_receipt(
-        &task.receipt_dir,
-        "mutation-authorization.json",
-        &json!({
-            "schema_version": RECEIPT_SCHEMA_V1,
-            "receipt": "mutation_authorization",
-            "task_id": task.task_id,
-            "timestamp": timestamp(),
-            "status": "approved",
-            "worktree": task.worktree,
-            "base_sha": task.base_sha,
-            "caller_id": task.caller_id,
-            "broker_route": task.broker_url,
-            "requested_model": model_binding.requested_model.as_str(),
-            "resolved_model": model_binding.resolved_model.as_str(),
-            "allowed_paths": task.allowed_paths,
-            "target_path": task.target_path,
-            "preview_bundle_path": preview_result.preview_bundle_path,
-            "approval_result_path": approval_result_path,
-            "preview_sha256": preview_bundle.preview_record.preview_sha256,
-        }),
-    )?;
+    let approval_result_path =
+        approval_result_path_for_preview(&preview_result.preview_bundle_path)?;
 
     let preview_result_path = task.receipt_dir.join("preview-generator-result.json");
     let preview_result_json = serde_json::to_value(&preview_result).map_err(|e| {
@@ -320,8 +299,62 @@ fn run_task(
         )
     })?;
     write_json_pretty_new(&preview_result_path, &preview_result_json)?;
-    let apply_bundle_path =
-        run_apply_bundle_generator(&preview_result_path, &approval_result_path)?;
+
+    // Preview-bound authorization boundary. `operator_approval` authorized
+    // planning, validation and preview generation only; it does not authorize
+    // target mutation. The operator now approves this exact preview through
+    // the existing `claw plan approve` surface, and a rerun of the same task
+    // consumes the approval-result they produced.
+    write_receipt(
+        &task.receipt_dir,
+        AWAITING_APPROVAL_RECEIPT,
+        &awaiting_preview_approval_receipt(
+            &task,
+            &model_binding,
+            &approved_lane_path,
+            &preview_result.preview_bundle_path,
+            &preview_bundle,
+            &approval_result_path,
+        ),
+    )?;
+    Ok(awaiting_preview_approval_result(
+        &task,
+        &model_binding,
+        &approved_lane_path,
+        &preview_result.preview_bundle_path,
+        &preview_bundle,
+        &approval_result_path,
+    ))
+}
+
+/// Applies a preview the operator approved out-of-band.
+///
+/// Reached only from [`resume_previewed_task_if_current`], and only after the
+/// operator's own `claw plan approve` output has been accepted by the existing
+/// A2 apply-bundle authority chain. The bridge never manufactures the approval
+/// it validates here.
+fn apply_approved_preview(
+    task: &NormalizedTask,
+    evidence: &PreviewStageEvidence,
+    approved_lane_path: &Path,
+    approval_result_path: &Path,
+) -> Result<Value, BridgeRefusal> {
+    let model_binding = &evidence.model_binding;
+    let preview_result_path = task.receipt_dir.join("preview-generator-result.json");
+    let apply_bundle_path = run_apply_bundle_generator(&preview_result_path, approval_result_path)?;
+    // The existing A2 authority chain accepted the operator-produced approval
+    // against this exact preview. Only now is mutation authorized.
+    write_receipt(
+        &task.receipt_dir,
+        "mutation-authorization.json",
+        &mutation_authorization_receipt(
+            task,
+            model_binding,
+            &evidence.preview_bundle_path,
+            &evidence.preview_bundle,
+            approval_result_path,
+        ),
+    )?;
     let apply_result = run_apply(&apply_bundle_path)?;
     write_receipt(&task.receipt_dir, "a2-apply-result.json", &apply_result)?;
     if let Some(parent) = apply_bundle_path.parent() {
@@ -331,7 +364,7 @@ fn run_task(
         }
     }
 
-    let changed_paths = verify_changed_paths(&task)?;
+    let changed_paths = verify_changed_paths(task)?;
     write_receipt(
         &task.receipt_dir,
         "changed-file-verification.json",
@@ -351,32 +384,32 @@ fn run_task(
             "actual_changed_paths": changed_paths,
         }),
     )?;
-    run_validation(&task)?;
+    run_validation(task)?;
     write_receipt(
         &task.receipt_dir,
         "validation.json",
-        &validation_receipt(&task, &model_binding),
+        &validation_receipt(task, model_binding),
     )?;
 
-    let package_plan_gate = run_package_plan_gate(&task, &approved_lane_path, &model_binding)?;
+    let package_plan_gate = run_package_plan_gate(task, approved_lane_path, model_binding)?;
     write_receipt(
         &task.receipt_dir,
         "package-plan-readiness.json",
         &package_plan_gate,
     )?;
     let package_handoff = package_handoff_receipt(
-        &task,
+        task,
         &changed_paths,
-        &approved_lane_path,
+        approved_lane_path,
         &package_plan_gate,
-        &model_binding,
+        model_binding,
     );
     write_receipt(
         &task.receipt_dir,
         "package-handoff-readiness.json",
         &package_handoff,
     )?;
-    let complete = final_success_result(&task, &changed_paths, &approved_lane_path, &model_binding);
+    let complete = final_success_result(task, &changed_paths, approved_lane_path, model_binding);
     write_receipt(&task.receipt_dir, "task-complete.json", &complete)?;
     Ok(complete)
 }
@@ -398,7 +431,9 @@ fn normalize_task(spec: RunnableTaskSpec) -> Result<NormalizedTask, BridgeRefusa
     if !spec.operator_approval {
         return Err(BridgeRefusal {
             kind: "a2-authorization-invalid",
-            reason: "operator_approval must be true before mutation evidence is generated"
+            reason: "operator_approval must be true to generate the bounded plan and \
+                 mutation preview; target mutation still requires preview-bound \
+                 approval via `claw plan approve`"
                 .to_string(),
             exit_code: EXIT_APPLY_REFUSED,
         });
@@ -689,41 +724,6 @@ fn read_preview_bundle(path: &Path) -> Result<PreviewBundleRead, BridgeRefusal> 
         ));
     }
     Ok(bundle)
-}
-
-fn write_approval_result(path: &Path, bundle: &PreviewBundleRead) -> Result<(), BridgeRefusal> {
-    let line = format!(
-        "apply {} {}\n",
-        bundle.preview_record.step_id, bundle.preview_record.preview_sha256
-    );
-    let decision = a2_plan_runner::evaluate_approval(
-        &line,
-        ApprovalContext {
-            preview: &bundle.preview_record,
-            checkpoint_baseline_unchanged: bundle.checkpoint_baseline_unchanged,
-        },
-    );
-    let ApprovalDecision::Approved { .. } = decision else {
-        return Err(BridgeRefusal {
-            kind: "a2-approval-refused",
-            reason: "operator-owned bridge approval did not bind to preview".to_string(),
-            exit_code: EXIT_APPLY_REFUSED,
-        });
-    };
-    let payload = json!({
-        "schema_version": APPROVAL_RESULT_SCHEMA_V1,
-        "decision": "approved",
-        "preview_id": bundle.preview_record.preview_id,
-        "step_id": bundle.preview_record.step_id,
-        "preview_sha256": bundle.preview_record.preview_sha256,
-        "checkpoint_baseline_unchanged": bundle.checkpoint_baseline_unchanged,
-        "exit_code_hint": 0,
-        "audit_markers": [
-            "a2-l2b-approved",
-            "stack-code-runnable-task-bridge-operator-authorized"
-        ],
-    });
-    write_json_pretty_new(path, &payload)
 }
 
 fn run_apply_bundle_generator(
@@ -1359,6 +1359,327 @@ fn resume_applied_task_if_current(task: &NormalizedTask) -> Result<Option<Value>
     Ok(Some(complete))
 }
 
+/// Canonical location of the operator-produced approval-result for a preview:
+/// alongside the preview bundle the operator is asked to approve.
+fn approval_result_path_for_preview(preview_bundle_path: &Path) -> Result<PathBuf, BridgeRefusal> {
+    Ok(preview_bundle_path
+        .parent()
+        .ok_or_else(|| refusal("a2-preview-layout-invalid", "preview bundle has no parent"))?
+        .join(APPROVAL_RESULT_FILE))
+}
+
+/// POSIX single-quote one argument for the copy/paste approval command.
+/// Every byte between the quotes is literal; an embedded `'` is closed,
+/// backslash-escaped, and reopened.
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+/// Quote only when a byte outside a conservative shell-safe set is present, so
+/// ordinary paths stay readable while anything exotic is neutralized.
+fn shell_quote_arg(value: &str) -> String {
+    let safe = !value.is_empty()
+        && value.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'_' | b'-' | b'.' | b'/' | b'=' | b':' | b',' | b'+' | b'@'
+                )
+        });
+    if safe {
+        value.to_string()
+    } else {
+        shell_single_quote(value)
+    }
+}
+
+/// The exact existing approval surface the operator must use, as both a
+/// structured argv (authoritative) and a safely quoted display string.
+fn approval_invocation(
+    preview_bundle_path: &Path,
+    approval_result_path: &Path,
+) -> (Vec<String>, String) {
+    let argv = vec![
+        "claw".to_string(),
+        "plan".to_string(),
+        "approve".to_string(),
+        preview_bundle_path.to_string_lossy().into_owned(),
+        "--approval-result-output".to_string(),
+        approval_result_path.to_string_lossy().into_owned(),
+    ];
+    let command = argv
+        .iter()
+        .map(|arg| shell_quote_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    (argv, command)
+}
+
+/// Terminal result of a first `claw task run`: the plan and a concrete preview
+/// exist, the target is untouched, and mutation is blocked until the operator
+/// approves this exact preview.
+fn awaiting_preview_approval_result(
+    task: &NormalizedTask,
+    model_binding: &ModelBinding,
+    approved_lane_path: &Path,
+    preview_bundle_path: &Path,
+    preview_bundle: &PreviewBundleRead,
+    approval_result_path: &Path,
+) -> Value {
+    let (approval_argv, approval_command) =
+        approval_invocation(preview_bundle_path, approval_result_path);
+    json!({
+        "schema_version": RESULT_SCHEMA_V1,
+        "ok": true,
+        "status": AWAITING_APPROVAL_STATUS,
+        "task_id": task.task_id,
+        "timestamp": timestamp(),
+        "worktree": task.worktree,
+        "base_sha": task.base_sha,
+        "branch": task.branch,
+        "caller_id": task.caller_id,
+        "broker_route": task.broker_url,
+        "requested_model": model_binding.requested_model.as_str(),
+        "resolved_model": model_binding.resolved_model.as_str(),
+        "allowed_paths": task.allowed_paths,
+        "target_path": task.target_path,
+        "task_type": task.task_type,
+        "validation_profile": task.validation_profile,
+        "objective_sha256": sha256_hex(task.objective.as_bytes()),
+        "after_sha256": sha256_hex(task.after_text.as_bytes()),
+        "receipt_dir": task.receipt_dir,
+        "approved_lane_path": approved_lane_path,
+        "preview_bundle_path": preview_bundle_path,
+        "preview_step_id": preview_bundle.preview_record.step_id,
+        "preview_sha256": preview_bundle.preview_record.preview_sha256,
+        "approval_result_path": approval_result_path,
+        "approval_result_schema": APPROVAL_RESULT_SCHEMA_V1,
+        "approval_command": approval_command,
+        "approval_argv": approval_argv,
+        "target_mutated": false,
+        "package_ready": false,
+        "manual_git_packaging_required": false,
+        "operator_next_steps": [
+            "Review the exact preview bundle named above.",
+            "Run approval_command to record your decision as approval_result_path.",
+            "Rerun the same `claw task run <task.json>` to apply that approved preview.",
+        ],
+    })
+}
+
+/// Bridge-owned record of the awaiting state. Deliberately claims no
+/// authorization: it names what still has to happen, not what was allowed.
+fn awaiting_preview_approval_receipt(
+    task: &NormalizedTask,
+    model_binding: &ModelBinding,
+    approved_lane_path: &Path,
+    preview_bundle_path: &Path,
+    preview_bundle: &PreviewBundleRead,
+    approval_result_path: &Path,
+) -> Value {
+    json!({
+        "schema_version": RECEIPT_SCHEMA_V1,
+        "receipt": "preview_awaiting_approval",
+        "task_id": task.task_id,
+        "timestamp": timestamp(),
+        "status": AWAITING_APPROVAL_STATUS,
+        "worktree": task.worktree,
+        "workspace_binding": task.workspace_binding,
+        "repository_identity": task.repository_identity,
+        "base_sha": task.base_sha,
+        "branch": task.branch,
+        "caller_id": task.caller_id,
+        "task_type": task.task_type,
+        "validation_profile": task.validation_profile,
+        "broker_route": task.broker_url,
+        "requested_model": model_binding.requested_model.as_str(),
+        "resolved_model": model_binding.resolved_model.as_str(),
+        "allowed_paths": task.allowed_paths,
+        "target_path": task.target_path,
+        "objective_sha256": sha256_hex(task.objective.as_bytes()),
+        "after_sha256": sha256_hex(task.after_text.as_bytes()),
+        "approved_lane_path": approved_lane_path,
+        "preview_bundle_path": preview_bundle_path,
+        "preview_step_id": preview_bundle.preview_record.step_id,
+        "preview_sha256": preview_bundle.preview_record.preview_sha256,
+        "approval_result_path": approval_result_path,
+        "target_mutated": false,
+        "operator_preview_approval_required": true,
+    })
+}
+
+/// Truthful record of *why* mutation became allowed. Written only after the
+/// externally produced approval passed the existing apply-bundle authority
+/// chain — never before, and never from a bridge-generated approval.
+fn mutation_authorization_receipt(
+    task: &NormalizedTask,
+    model_binding: &ModelBinding,
+    preview_bundle_path: &Path,
+    preview_bundle: &PreviewBundleRead,
+    approval_result_path: &Path,
+) -> Value {
+    json!({
+        "schema_version": RECEIPT_SCHEMA_V1,
+        "receipt": "mutation_authorization",
+        "task_id": task.task_id,
+        "timestamp": timestamp(),
+        "status": "approved",
+        "approval_source": "external_operator_preview_approval",
+        "approval_surface": "claw plan approve",
+        "worktree": task.worktree,
+        "base_sha": task.base_sha,
+        "caller_id": task.caller_id,
+        "broker_route": task.broker_url,
+        "requested_model": model_binding.requested_model.as_str(),
+        "resolved_model": model_binding.resolved_model.as_str(),
+        "allowed_paths": task.allowed_paths,
+        "target_path": task.target_path,
+        "preview_bundle_path": preview_bundle_path,
+        "approval_result_path": approval_result_path,
+        "preview_step_id": preview_bundle.preview_record.step_id,
+        "preview_sha256": preview_bundle.preview_record.preview_sha256,
+    })
+}
+
+/// Rerun of a task that already has a preview.
+///
+/// Never replans and never regenerates the preview. Without an approval-result
+/// it returns the same awaiting state; with one it hands the original preview
+/// and the operator's approval to the existing A2 apply-bundle validator, which
+/// is the authority that decides whether apply may proceed.
+fn resume_previewed_task_if_current(task: &NormalizedTask) -> Result<Option<Value>, BridgeRefusal> {
+    let awaiting_path = task.receipt_dir.join(AWAITING_APPROVAL_RECEIPT);
+    match fs::symlink_metadata(&awaiting_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(refusal(
+                "receipt-file-invalid",
+                format!(
+                    "receipt file {} must not be a symlink",
+                    awaiting_path.display()
+                ),
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(refusal(
+                "receipt-file-stat-failed",
+                format!("could not stat {}: {e}", awaiting_path.display()),
+            ));
+        }
+    }
+
+    let awaiting = read_existing_receipt_json(task, AWAITING_APPROVAL_RECEIPT)?;
+    let receipt_binding = validate_resume_receipt_model(
+        task,
+        &awaiting,
+        "preview_awaiting_approval",
+        "preview-awaiting-approval receipt does not bind to this task",
+    )?;
+    validate_awaiting_preview_receipt(task, &awaiting)?;
+    verify_current_task_binding(task)?;
+    verify_clean_start(task)?;
+
+    let approved_lane_path = task.receipt_dir.join("approved-lane.json");
+    let evidence = verify_preview_stage_evidence(task, &approved_lane_path)?;
+    if receipt_binding.resolved_model != evidence.model_binding.resolved_model {
+        return Err(refusal(
+            "awaiting-preview-evidence-mismatch",
+            "preview-awaiting-approval receipt conflicts with broker-plan resolved model",
+        ));
+    }
+    validate_awaiting_preview_binding(&awaiting, &evidence)?;
+
+    let approval_result_path = approval_result_path_for_preview(&evidence.preview_bundle_path)?;
+    match fs::symlink_metadata(&approval_result_path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => {
+            return Err(refusal(
+                "a2-approval-result-invalid",
+                format!(
+                    "approval result {} must be a regular file",
+                    approval_result_path.display()
+                ),
+            ));
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            // No operator approval yet. Same state, same guidance, no replan,
+            // no new preview, no mutation.
+            return Ok(Some(awaiting_preview_approval_result(
+                task,
+                &evidence.model_binding,
+                &approved_lane_path,
+                &evidence.preview_bundle_path,
+                &evidence.preview_bundle,
+                &approval_result_path,
+            )));
+        }
+        Err(e) => {
+            return Err(refusal(
+                "a2-approval-result-stat-failed",
+                format!("could not stat {}: {e}", approval_result_path.display()),
+            ));
+        }
+    }
+
+    let applied =
+        apply_approved_preview(task, &evidence, &approved_lane_path, &approval_result_path)?;
+    Ok(Some(applied))
+}
+
+/// Binds the awaiting receipt to the exact current task specification.
+fn validate_awaiting_preview_receipt(
+    task: &NormalizedTask,
+    value: &Value,
+) -> Result<(), BridgeRefusal> {
+    let worktree = task.worktree.to_string_lossy();
+    if value.get("status").and_then(Value::as_str) != Some(AWAITING_APPROVAL_STATUS)
+        || value.get("worktree").and_then(Value::as_str) != Some(worktree.as_ref())
+        || value.get("workspace_binding").and_then(Value::as_str)
+            != Some(task.workspace_binding.as_str())
+        || value.get("repository_identity").and_then(Value::as_str)
+            != Some(task.repository_identity.as_str())
+        || value.get("branch").and_then(Value::as_str) != Some(task.branch.as_str())
+        || value.get("task_type").and_then(Value::as_str) != Some(task.task_type.as_str())
+        || value.get("validation_profile").and_then(Value::as_str)
+            != Some(task.validation_profile.as_str())
+        || value.get("target_path").and_then(Value::as_str) != Some(task.target_path.as_str())
+        || value.get("objective_sha256").and_then(Value::as_str)
+            != Some(sha256_hex(task.objective.as_bytes()).as_str())
+        || value.get("after_sha256").and_then(Value::as_str)
+            != Some(sha256_hex(task.after_text.as_bytes()).as_str())
+        || value.get("target_mutated").and_then(Value::as_bool) != Some(false)
+        || !json_array_matches_strings(value.get("allowed_paths"), &task.allowed_paths)
+    {
+        return Err(refusal(
+            "awaiting-preview-evidence-mismatch",
+            "preview-awaiting-approval receipt does not bind to this task specification",
+        ));
+    }
+    Ok(())
+}
+
+/// Binds the awaiting receipt to the exact preview it was written for, so a
+/// swapped preview bundle cannot be resumed under the old receipt.
+fn validate_awaiting_preview_binding(
+    value: &Value,
+    evidence: &PreviewStageEvidence,
+) -> Result<(), BridgeRefusal> {
+    let preview_path = evidence.preview_bundle_path.to_string_lossy();
+    let record = &evidence.preview_bundle.preview_record;
+    if value.get("preview_bundle_path").and_then(Value::as_str) != Some(preview_path.as_ref())
+        || value.get("preview_step_id").and_then(Value::as_str) != Some(record.step_id.as_str())
+        || value.get("preview_sha256").and_then(Value::as_str)
+            != Some(record.preview_sha256.as_str())
+    {
+        return Err(refusal(
+            "awaiting-preview-evidence-mismatch",
+            "preview-awaiting-approval receipt does not bind to the stored preview",
+        ));
+    }
+    Ok(())
+}
+
 fn approved_lane_path_from_result(value: &Value) -> Result<PathBuf, BridgeRefusal> {
     value
         .get("approved_lane_path")
@@ -1372,10 +1693,20 @@ fn approved_lane_path_from_result(value: &Value) -> Result<PathBuf, BridgeRefusa
         })
 }
 
-fn verify_resume_evidence(
+/// Evidence common to both post-preview stages: everything the bridge wrote
+/// before the preview-bound approval boundary. Revalidated on every resume, so
+/// a stale or tampered receipt set can never reach apply.
+#[derive(Debug)]
+struct PreviewStageEvidence {
+    model_binding: ModelBinding,
+    preview_bundle_path: PathBuf,
+    preview_bundle: PreviewBundleRead,
+}
+
+fn verify_preview_stage_evidence(
     task: &NormalizedTask,
     approved_lane_path: &Path,
-) -> Result<ModelBinding, BridgeRefusal> {
+) -> Result<PreviewStageEvidence, BridgeRefusal> {
     let broker_plan = read_existing_receipt_json(task, "broker-plan.json")?;
     let model_binding = validate_resume_receipt_model(
         task,
@@ -1422,6 +1753,24 @@ fn verify_resume_evidence(
     let preview_result = read_existing_receipt_json(task, "preview-generator-result.json")?;
     let preview_bundle_path = preview_bundle_path_from_result(task, &preview_result)?;
     let preview_bundle = read_preview_bundle(&preview_bundle_path)?;
+    Ok(PreviewStageEvidence {
+        model_binding,
+        preview_bundle_path,
+        preview_bundle,
+    })
+}
+
+/// Full applied-task evidence chain: the shared preview-stage evidence plus the
+/// mutation authorization and post-apply receipts.
+fn verify_resume_evidence(
+    task: &NormalizedTask,
+    approved_lane_path: &Path,
+) -> Result<ModelBinding, BridgeRefusal> {
+    let PreviewStageEvidence {
+        model_binding,
+        preview_bundle_path,
+        preview_bundle,
+    } = verify_preview_stage_evidence(task, approved_lane_path)?;
     let authorization = read_existing_receipt_json(task, "mutation-authorization.json")?;
     validate_mutation_authorization(
         task,
@@ -2893,6 +3242,118 @@ mod tests {
         }
     }
 
+    /// Counts planner invocations so resume tests can prove the broker is
+    /// never called a second time.
+    #[derive(Debug)]
+    struct CountingPlanner {
+        output: String,
+        calls: std::cell::Cell<u32>,
+    }
+
+    impl CountingPlanner {
+        fn new(output: String) -> Self {
+            Self {
+                output,
+                calls: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl PlannerClient for CountingPlanner {
+        fn request_plan(
+            &self,
+            request: &PlannerRequest,
+        ) -> Result<PlannerCandidate, BridgeRefusal> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(PlannerCandidate {
+                planner_output_json: self.output.clone(),
+                broker_route: request.broker_url.clone(),
+                resolved_model: TEST_RESOLVED_MODEL.to_string(),
+                response_sha256: sha256_hex(self.output.as_bytes()),
+            })
+        }
+    }
+
+    /// Fields a test can bend when standing in for the operator's approval.
+    #[derive(Default)]
+    struct ApprovalFixture {
+        decision: Option<&'static str>,
+        preview_id: Option<String>,
+        step_id: Option<String>,
+        preview_sha256: Option<String>,
+    }
+
+    /// Writes the `a2-l2b-approval-result.v1` document that `claw plan approve
+    /// <bundle> --approval-result-output <path>` emits on approval.
+    ///
+    /// TEST-ONLY. Production `runnable_task_bridge.rs` must never construct an
+    /// approval for itself — `production_bridge_cannot_self_approve` guards
+    /// that, and this helper exists precisely so the tests can supply the
+    /// operator half of the contract without the bridge doing it.
+    fn write_operator_approval(
+        path: &Path,
+        bundle: &PreviewBundleRead,
+        overrides: &ApprovalFixture,
+    ) {
+        let record = &bundle.preview_record;
+        let payload = json!({
+            "schema_version": APPROVAL_RESULT_SCHEMA_V1,
+            "decision": overrides.decision.unwrap_or("approved"),
+            "preview_id": overrides
+                .preview_id
+                .clone()
+                .unwrap_or_else(|| record.preview_id.clone()),
+            "step_id": overrides
+                .step_id
+                .clone()
+                .unwrap_or_else(|| record.step_id.clone()),
+            "preview_sha256": overrides
+                .preview_sha256
+                .clone()
+                .unwrap_or_else(|| record.preview_sha256.clone()),
+            "checkpoint_baseline_unchanged": bundle.checkpoint_baseline_unchanged,
+            "exit_code_hint": 0,
+            "audit_markers": ["a2-l2b-approved"],
+        });
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("approval parent dir");
+        }
+        fs::write(path, serde_json::to_vec_pretty(&payload).unwrap())
+            .expect("write operator approval fixture");
+    }
+
+    fn awaiting_path(awaiting: &Value, key: &str) -> PathBuf {
+        PathBuf::from(
+            awaiting[key]
+                .as_str()
+                .unwrap_or_else(|| panic!("{key} present")),
+        )
+    }
+
+    fn approve_awaiting_preview(awaiting: &Value, overrides: &ApprovalFixture) -> PathBuf {
+        let bundle_path = awaiting_path(awaiting, "preview_bundle_path");
+        let bundle = read_preview_bundle(&bundle_path).expect("preview bundle readable");
+        let out = awaiting_path(awaiting, "approval_result_path");
+        write_operator_approval(&out, &bundle, overrides);
+        out
+    }
+
+    /// Drives the full two-pass operator flow: run the task to its preview
+    /// boundary, stand in for `claw plan approve`, then rerun the same task.
+    fn run_task_applied(
+        make_spec: impl Fn() -> RunnableTaskSpec,
+        planner: &dyn PlannerClient,
+        validator: &dyn PlannerValidator,
+    ) -> Result<Value, BridgeRefusal> {
+        let awaiting = run_task(make_spec(), planner, validator)?;
+        assert_eq!(
+            awaiting["status"], AWAITING_APPROVAL_STATUS,
+            "first task run must stop at the preview-approval boundary"
+        );
+        approve_awaiting_preview(&awaiting, &ApprovalFixture::default());
+        run_task(make_spec(), planner, validator)
+    }
+
     fn unique_temp_dir(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -3103,8 +3564,8 @@ mod tests {
         let planner = StubPlanner {
             output: valid_planner_output(&repo, "docs/cert.md"),
         };
-        let result = run_task(
-            spec(&repo, vec!["docs/cert.md"], None),
+        let result = run_task_applied(
+            || spec(&repo, vec!["docs/cert.md"], None),
             &planner,
             &InlineValidator,
         )
@@ -3124,10 +3585,12 @@ mod tests {
     #[test]
     fn requested_alias_and_broker_resolved_model_are_reported_separately() {
         let repo = git_repo("resolved-model-alias");
-        let mut task = spec(&repo, vec!["docs/cert.md"], None);
-        task.model = Some("fast".to_string());
-        let result = run_task(
-            task,
+        let result = run_task_applied(
+            || {
+                let mut task = spec(&repo, vec!["docs/cert.md"], None);
+                task.model = Some("fast".to_string());
+                task
+            },
             &ModelPlanner {
                 output: valid_planner_output(&repo, "docs/cert.md"),
                 resolved_model: "concrete-test-model".to_string(),
@@ -3145,6 +3608,7 @@ mod tests {
             "broker-plan.json",
             "planner-validation.json",
             "package-control-preflight.json",
+            "preview-awaiting-approval.json",
             "mutation-authorization.json",
             "changed-file-verification.json",
             "validation.json",
@@ -3233,8 +3697,8 @@ mod tests {
         let planner = StubPlanner {
             output: valid_planner_output(&repo, "docs/task-notes.md"),
         };
-        let result = run_task(
-            spec(&repo, vec!["docs/task-notes.md"], None),
+        let result = run_task_applied(
+            || spec(&repo, vec!["docs/task-notes.md"], None),
             &planner,
             &InlineValidator,
         )
@@ -3251,8 +3715,8 @@ mod tests {
         let planner = StubPlanner {
             output: valid_planner_output(&repo, "docs/cert.md"),
         };
-        let result = run_task(
-            spec(&repo, vec!["docs//cert.md"], None),
+        let result = run_task_applied(
+            || spec(&repo, vec!["docs//cert.md"], None),
             &planner,
             &InlineValidator,
         )
@@ -3667,8 +4131,8 @@ mod tests {
         let planner = StubPlanner {
             output: valid_planner_output(&repo, "docs/cert.md"),
         };
-        let result = run_task(
-            spec(&repo, vec!["docs/cert.md"], None),
+        let result = run_task_applied(
+            || spec(&repo, vec!["docs/cert.md"], None),
             &planner,
             &InlineValidator,
         )
@@ -3710,12 +4174,14 @@ mod tests {
         let planner = StubPlanner {
             output: valid_planner_output(&repo, "docs/cert.md"),
         };
-        let result = run_task(
-            spec(
-                &repo,
-                vec!["docs/cert.md", "docs/notes.md"],
-                Some("docs/cert.md"),
-            ),
+        let result = run_task_applied(
+            || {
+                spec(
+                    &repo,
+                    vec!["docs/cert.md", "docs/notes.md"],
+                    Some("docs/cert.md"),
+                )
+            },
             &planner,
             &InlineValidator,
         )
@@ -3898,8 +4364,8 @@ mod tests {
         let planner = StubPlanner {
             output: valid_planner_output(&repo, "docs/cert.md"),
         };
-        let second = run_task(
-            spec(&repo, vec!["docs/cert.md"], None),
+        let second = run_task_applied(
+            || spec(&repo, vec!["docs/cert.md"], None),
             &planner,
             &InlineValidator,
         )
@@ -4076,8 +4542,8 @@ mod tests {
             if let Some(parent) = repo.join(target).parent() {
                 fs::create_dir_all(parent).unwrap();
             }
-            let result = run_task(
-                spec(&repo, vec![target], None),
+            let result = run_task_applied(
+                || spec(&repo, vec![target], None),
                 &StubPlanner {
                     output: valid_planner_output(&repo, target),
                 },
@@ -4164,15 +4630,21 @@ mod tests {
         let repo = git_repo("approval");
         let mut task = spec(&repo, vec!["docs/cert.md"], None);
         task.operator_approval = false;
-        let err = run_task(
-            task,
-            &StubPlanner {
-                output: valid_planner_output(&repo, "docs/cert.md"),
-            },
-            &InlineValidator,
-        )
-        .expect_err("missing approval must fail");
+        let planner = CountingPlanner::new(valid_planner_output(&repo, "docs/cert.md"));
+        let err =
+            run_task(task, &planner, &InlineValidator).expect_err("missing approval must fail");
         assert_eq!(err.kind, "a2-authorization-invalid");
+        assert!(
+            err.reason.contains("claw plan approve"),
+            "refusal must name the real approval surface: {}",
+            err.reason
+        );
+        assert_eq!(planner.calls.get(), 0, "planner must not run");
+        assert!(
+            !repo.join(".claw").exists(),
+            "no receipt, preview or approval state may be produced"
+        );
+        assert!(!repo.join("docs/cert.md").exists());
     }
 
     #[test]
@@ -4198,8 +4670,12 @@ mod tests {
         let planner = StubPlanner {
             output: valid_planner_output(&repo, "docs/cert.md"),
         };
-        let task = spec(&repo, vec!["docs/cert.md"], None);
-        let first = run_task(task, &planner, &InlineValidator).expect("first run succeeds");
+        let first = run_task_applied(
+            || spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("first run succeeds");
         assert_eq!(first["status"], "applied");
         let second_task = spec(&repo, vec!["docs/cert.md"], None);
         let second =
@@ -4214,8 +4690,8 @@ mod tests {
         let planner = StubPlanner {
             output: valid_planner_output(&repo, "docs/cert.md"),
         };
-        run_task(
-            spec(&repo, vec!["docs/cert.md"], None),
+        run_task_applied(
+            || spec(&repo, vec!["docs/cert.md"], None),
             &planner,
             &InlineValidator,
         )
@@ -4233,8 +4709,8 @@ mod tests {
         let planner = StubPlanner {
             output: valid_planner_output(&repo, "docs/cert.md"),
         };
-        run_task(
-            spec(&repo, vec!["docs/cert.md"], None),
+        run_task_applied(
+            || spec(&repo, vec!["docs/cert.md"], None),
             &planner,
             &InlineValidator,
         )
@@ -4252,8 +4728,8 @@ mod tests {
         let planner = StubPlanner {
             output: valid_planner_output(&repo, "docs/cert.md"),
         };
-        run_task(
-            spec(&repo, vec!["docs/cert.md"], None),
+        run_task_applied(
+            || spec(&repo, vec!["docs/cert.md"], None),
             &planner,
             &InlineValidator,
         )
@@ -4279,8 +4755,8 @@ mod tests {
         let planner = StubPlanner {
             output: valid_planner_output(&repo, "docs/cert.md"),
         };
-        let first = run_task(
-            spec(&repo, vec!["docs/cert.md"], None),
+        let first = run_task_applied(
+            || spec(&repo, vec!["docs/cert.md"], None),
             &planner,
             &InlineValidator,
         )
@@ -4290,6 +4766,7 @@ mod tests {
         fs::remove_file(receipt_dir.join("package-plan-readiness.json")).unwrap();
         fs::remove_file(receipt_dir.join("package-handoff-readiness.json")).unwrap();
         fs::remove_file(receipt_dir.join("a2-apply-result.json")).unwrap();
+        assert!(receipt_dir.join(AWAITING_APPROVAL_RECEIPT).is_file());
         let resumed = run_task(
             spec(&repo, vec!["docs/cert.md"], None),
             &FailingPlanner {
@@ -4322,8 +4799,8 @@ mod tests {
         let planner = StubPlanner {
             output: valid_planner_output(&repo, "docs/cert.md"),
         };
-        let first = run_task(
-            spec(&repo, vec!["docs/cert.md"], None),
+        let first = run_task_applied(
+            || spec(&repo, vec!["docs/cert.md"], None),
             &planner,
             &InlineValidator,
         )
@@ -4372,8 +4849,8 @@ mod tests {
         let planner = StubPlanner {
             output: valid_planner_output(&repo, "docs/cert.md"),
         };
-        let first = run_task(
-            spec(&repo, vec!["docs/cert.md"], None),
+        let first = run_task_applied(
+            || spec(&repo, vec!["docs/cert.md"], None),
             &planner,
             &InlineValidator,
         )
@@ -4398,8 +4875,12 @@ mod tests {
         let planner = StubPlanner {
             output: valid_planner_output(&repo, "docs/cert.md"),
         };
-        let task = spec(&repo, vec!["docs/cert.md"], None);
-        run_task(task, &planner, &InlineValidator).expect("first run succeeds");
+        run_task_applied(
+            || spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("first run succeeds");
         fs::write(repo.join("docs/unrelated.md"), "unexpected\n").unwrap();
         let err = run_task(
             spec(&repo, vec!["docs/cert.md"], None),
@@ -4506,8 +4987,8 @@ mod tests {
             output: valid_planner_output(&repo, "docs/cert.md"),
             seen_model: std::cell::RefCell::new(None),
         };
-        let result = run_task(
-            spec(&repo, vec!["docs/cert.md"], None),
+        let result = run_task_applied(
+            || spec(&repo, vec!["docs/cert.md"], None),
             &planner,
             &InlineValidator,
         )
@@ -4569,5 +5050,446 @@ mod tests {
             let mode = fs::metadata(parent).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o700);
         }
+    }
+
+    // =====================================================================
+    // Preview-bound task-run authorization
+    //
+    // `operator_approval` authorizes planning, validation and preview
+    // generation. Target mutation is authorized only by an approval-result
+    // the operator produces through the existing `claw plan approve`
+    // surface, which a later run of the same task consumes.
+    // =====================================================================
+
+    fn find_files_named(root: &Path, name: &str) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let Ok(entries) = fs::read_dir(root) else {
+            return found;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                found.extend(find_files_named(&path, name));
+            } else if path.file_name().and_then(|n| n.to_str()) == Some(name) {
+                found.push(path);
+            }
+        }
+        found
+    }
+
+    /// Runs a task to its preview boundary and returns `(worktree, awaiting)`.
+    fn preview_fixture(label: &str) -> (PathBuf, Value) {
+        let repo = git_repo(label);
+        let planner = StubPlanner {
+            output: valid_planner_output(&repo, "docs/cert.md"),
+        };
+        let awaiting = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("preview generation succeeds");
+        assert_eq!(awaiting["status"], AWAITING_APPROVAL_STATUS);
+        (repo, awaiting)
+    }
+
+    /// Reruns the task with a planner that refuses, so any replan is a
+    /// loud failure rather than a silent broker call.
+    fn rerun_must_not_replan(repo: &Path) -> Result<Value, BridgeRefusal> {
+        run_task(
+            spec(repo, vec!["docs/cert.md"], None),
+            &FailingPlanner {
+                kind: "planner-must-not-run",
+            },
+            &InlineValidator,
+        )
+    }
+
+    fn assert_no_mutation(repo: &Path, awaiting: &Value) {
+        assert!(
+            !repo.join("docs/cert.md").exists(),
+            "target must remain unwritten"
+        );
+        let receipt_dir = awaiting_path(awaiting, "receipt_dir");
+        assert!(
+            !receipt_dir.join("mutation-authorization.json").exists(),
+            "mutation must not be authorized"
+        );
+        assert!(!receipt_dir.join("a2-apply-result.json").exists());
+        assert!(!receipt_dir.join("task-complete.json").exists());
+    }
+
+    // ---- Test B: first invocation is preview-only ----
+    #[test]
+    fn first_task_run_previews_without_mutating_or_self_approving() {
+        let repo = git_repo("preview-stop");
+        let planner = CountingPlanner::new(valid_planner_output(&repo, "docs/cert.md"));
+        let awaiting = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("planning and preview generation succeed");
+
+        assert_eq!(planner.calls.get(), 1, "planner runs exactly once");
+        assert_eq!(awaiting["ok"], true);
+        assert_eq!(awaiting["status"], AWAITING_APPROVAL_STATUS);
+        assert_eq!(awaiting["target_mutated"], false);
+        assert_eq!(awaiting["package_ready"], false);
+        assert_no_mutation(&repo, &awaiting);
+
+        let receipt_dir = awaiting_path(&awaiting, "receipt_dir");
+        assert!(receipt_dir.join("planner-validation.json").is_file());
+        assert!(receipt_dir.join("package-control-preflight.json").is_file());
+        assert!(receipt_dir.join(AWAITING_APPROVAL_RECEIPT).is_file());
+
+        let approval_result_path = awaiting_path(&awaiting, "approval_result_path");
+        assert!(
+            !approval_result_path.exists(),
+            "the bridge must never write its own approval-result"
+        );
+        assert!(
+            find_files_named(&repo.join(".claw"), "apply-bundle.json").is_empty(),
+            "no apply bundle may exist before external approval"
+        );
+
+        let bundle_path = awaiting_path(&awaiting, "preview_bundle_path");
+        let bundle = read_preview_bundle(&bundle_path).expect("preview bundle readable");
+        assert_eq!(
+            awaiting["preview_step_id"],
+            json!(bundle.preview_record.step_id)
+        );
+        assert_eq!(
+            awaiting["preview_sha256"],
+            json!(bundle.preview_record.preview_sha256)
+        );
+
+        let argv: Vec<String> =
+            serde_json::from_value(awaiting["approval_argv"].clone()).expect("approval argv");
+        assert_eq!(argv[0..3], ["claw", "plan", "approve"]);
+        assert_eq!(PathBuf::from(&argv[3]), bundle_path);
+        assert_eq!(argv[4], "--approval-result-output");
+        assert_eq!(PathBuf::from(&argv[5]), approval_result_path);
+        let command = awaiting["approval_command"].as_str().expect("command");
+        assert!(command.starts_with("claw plan approve "));
+        assert!(command.contains("--approval-result-output"));
+    }
+
+    // ---- Test C: rerun before approval ----
+    #[test]
+    fn rerun_before_approval_repeats_awaiting_state_without_replanning() {
+        let repo = git_repo("preview-rerun");
+        let planner = CountingPlanner::new(valid_planner_output(&repo, "docs/cert.md"));
+        let first = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("first pass previews");
+        assert_eq!(planner.calls.get(), 1);
+        let bundle_path = awaiting_path(&first, "preview_bundle_path");
+        let bundle_bytes = fs::read(&bundle_path).expect("preview bundle bytes");
+
+        let second = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("rerun stays in the awaiting state");
+
+        assert_eq!(planner.calls.get(), 1, "resume must not call the planner");
+        assert_eq!(second["status"], AWAITING_APPROVAL_STATUS);
+        assert_eq!(awaiting_path(&second, "preview_bundle_path"), bundle_path);
+        assert_eq!(second["preview_sha256"], first["preview_sha256"]);
+        assert_eq!(second["preview_step_id"], first["preview_step_id"]);
+        assert_eq!(
+            fs::read(&bundle_path).expect("preview bundle bytes"),
+            bundle_bytes,
+            "the preview must be reused, not regenerated"
+        );
+        assert_no_mutation(&repo, &second);
+    }
+
+    // ---- Test D: valid external approval applies the exact preview ----
+    #[test]
+    fn external_operator_approval_applies_the_exact_preview() {
+        let repo = git_repo("preview-approved");
+        let planner = CountingPlanner::new(valid_planner_output(&repo, "docs/cert.md"));
+        let awaiting = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("preview generation succeeds");
+        let receipt_dir = awaiting_path(&awaiting, "receipt_dir");
+
+        approve_awaiting_preview(&awaiting, &ApprovalFixture::default());
+        assert!(
+            !receipt_dir.join("mutation-authorization.json").exists(),
+            "approving a preview must not by itself authorize mutation"
+        );
+
+        let applied = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("approved preview applies");
+
+        assert_eq!(planner.calls.get(), 1, "apply pass must not replan");
+        assert_eq!(applied["status"], "applied");
+        assert_eq!(applied["actual_changed_paths"], json!(["docs/cert.md"]));
+        assert_eq!(
+            fs::read_to_string(repo.join("docs/cert.md")).expect("target applied"),
+            "# Purpose\n\nCertification.\n"
+        );
+
+        let authorization = receipt_value(&applied, "mutation-authorization.json");
+        assert_eq!(
+            authorization["approval_source"],
+            "external_operator_preview_approval"
+        );
+        assert_eq!(authorization["approval_surface"], "claw plan approve");
+        assert_eq!(
+            authorization["approval_result_path"],
+            awaiting["approval_result_path"]
+        );
+        assert_eq!(authorization["preview_sha256"], awaiting["preview_sha256"]);
+        assert_eq!(
+            authorization["preview_step_id"],
+            awaiting["preview_step_id"]
+        );
+        assert_eq!(authorization["base_sha"], awaiting["base_sha"]);
+
+        assert!(receipt_dir.join("validation.json").is_file());
+        assert!(receipt_dir.join("package-plan-readiness.json").is_file());
+        assert!(receipt_dir.join("package-handoff-readiness.json").is_file());
+        assert_eq!(applied["package_ready"], true);
+        assert_eq!(applied["manual_git_packaging_required"], false);
+    }
+
+    // ---- Test E: mismatched preview SHA ----
+    #[test]
+    fn approval_with_wrong_preview_sha_fails_closed() {
+        let (repo, awaiting) = preview_fixture("approval-wrong-sha");
+        approve_awaiting_preview(
+            &awaiting,
+            &ApprovalFixture {
+                preview_sha256: Some("0".repeat(64)),
+                ..ApprovalFixture::default()
+            },
+        );
+        let err = rerun_must_not_replan(&repo).expect_err("wrong preview hash must fail closed");
+        assert_eq!(err.kind, "a2-apply-bundle-refused");
+        assert_no_mutation(&repo, &awaiting);
+    }
+
+    // ---- Test F: mismatched step ID ----
+    #[test]
+    fn approval_with_wrong_step_id_fails_closed() {
+        let (repo, awaiting) = preview_fixture("approval-wrong-step");
+        approve_awaiting_preview(
+            &awaiting,
+            &ApprovalFixture {
+                step_id: Some("step-not-this-one".to_string()),
+                ..ApprovalFixture::default()
+            },
+        );
+        let err = rerun_must_not_replan(&repo).expect_err("wrong step id must fail closed");
+        assert_eq!(err.kind, "a2-apply-bundle-refused");
+        assert_no_mutation(&repo, &awaiting);
+    }
+
+    // ---- Test G: denied approval ----
+    #[test]
+    fn denied_approval_never_applies() {
+        let (repo, awaiting) = preview_fixture("approval-denied");
+        approve_awaiting_preview(
+            &awaiting,
+            &ApprovalFixture {
+                decision: Some("refused"),
+                ..ApprovalFixture::default()
+            },
+        );
+        let err = rerun_must_not_replan(&repo).expect_err("a refusal must never apply");
+        assert_eq!(err.kind, "a2-apply-bundle-refused");
+        assert_no_mutation(&repo, &awaiting);
+    }
+
+    // ---- Test H: stale base after preview ----
+    #[test]
+    fn base_advance_after_preview_refuses_before_apply() {
+        let (repo, awaiting) = preview_fixture("preview-stale-base");
+        approve_awaiting_preview(&awaiting, &ApprovalFixture::default());
+        git(&repo, &["commit", "--allow-empty", "-m", "advance base"]);
+        git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        let err = rerun_must_not_replan(&repo).expect_err("a stale preview must not apply");
+        assert_eq!(err.kind, "applied-task-evidence-mismatch");
+        assert_no_mutation(&repo, &awaiting);
+    }
+
+    // ---- Test I: branch mismatch after preview ----
+    #[test]
+    fn branch_change_after_preview_refuses_before_apply() {
+        let (repo, awaiting) = preview_fixture("preview-branch-change");
+        approve_awaiting_preview(&awaiting, &ApprovalFixture::default());
+        git(&repo, &["checkout", "-q", "-b", "cert-other"]);
+        let err = rerun_must_not_replan(&repo).expect_err("a branch change must not apply");
+        assert_eq!(err.kind, "awaiting-preview-evidence-mismatch");
+        assert_no_mutation(&repo, &awaiting);
+    }
+
+    // ---- Test J: repository/worktree binding mismatch ----
+    #[test]
+    fn repository_identity_change_after_preview_refuses_before_apply() {
+        let (repo, awaiting) = preview_fixture("preview-repo-rebind");
+        approve_awaiting_preview(&awaiting, &ApprovalFixture::default());
+        git(
+            &repo,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.invalid/other-repo.git",
+            ],
+        );
+        let err = rerun_must_not_replan(&repo).expect_err("a rebound repository must not apply");
+        assert_eq!(err.kind, "awaiting-preview-evidence-mismatch");
+        assert_no_mutation(&repo, &awaiting);
+    }
+
+    // ---- Test K: preview tampering after approval ----
+    #[test]
+    fn tampered_preview_is_rejected_by_the_existing_a2_chain() {
+        let (repo, awaiting) = preview_fixture("preview-tamper");
+        approve_awaiting_preview(&awaiting, &ApprovalFixture::default());
+        let bundle_path = awaiting_path(&awaiting, "preview_bundle_path");
+        let mut bundle = read_existing_json(&bundle_path).expect("preview bundle json");
+        bundle["preview_record"]["after_sha256"] = json!("0".repeat(64));
+        fs::write(&bundle_path, serde_json::to_vec_pretty(&bundle).unwrap())
+            .expect("rewrite tampered preview");
+        let err = rerun_must_not_replan(&repo).expect_err("a tampered preview must be rejected");
+        assert_eq!(err.kind, "a2-apply-bundle-refused");
+        assert_no_mutation(&repo, &awaiting);
+    }
+
+    // ---- Test L: approval replayed from another preview ----
+    #[test]
+    fn approval_replayed_from_another_preview_is_rejected() {
+        let (repo, awaiting) = preview_fixture("replay-target");
+        let (_donor_repo, donor_awaiting) = preview_fixture("replay-source");
+        let donor_bundle =
+            read_preview_bundle(&awaiting_path(&donor_awaiting, "preview_bundle_path"))
+                .expect("donor preview bundle");
+        // A genuinely operator-approved artifact — for a different preview.
+        write_operator_approval(
+            &awaiting_path(&awaiting, "approval_result_path"),
+            &donor_bundle,
+            &ApprovalFixture::default(),
+        );
+        let err = rerun_must_not_replan(&repo).expect_err("a replayed approval must be rejected");
+        assert_eq!(err.kind, "a2-apply-bundle-refused");
+        assert_no_mutation(&repo, &awaiting);
+    }
+
+    // ---- Test M: applied-task resume stays idempotent ----
+    #[test]
+    fn applied_task_does_not_apply_twice_on_rerun() {
+        let repo = git_repo("no-double-apply");
+        let planner = CountingPlanner::new(valid_planner_output(&repo, "docs/cert.md"));
+        let applied = run_task_applied(
+            || spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("two-pass apply succeeds");
+        assert_eq!(applied["status"], "applied");
+
+        let receipt_dir = awaiting_path(&applied, "receipt_dir");
+        let apply_result_before =
+            fs::read(receipt_dir.join("a2-apply-result.json")).expect("apply result");
+        let target_before = fs::read(repo.join("docs/cert.md")).expect("applied target");
+
+        let again = run_task(
+            spec(&repo, vec!["docs/cert.md"], None),
+            &planner,
+            &InlineValidator,
+        )
+        .expect("rerun of a completed task is idempotent");
+
+        assert_eq!(again["status"], "idempotent_complete");
+        assert_eq!(planner.calls.get(), 1, "completed tasks must not replan");
+        assert_eq!(
+            fs::read(receipt_dir.join("a2-apply-result.json")).expect("apply result"),
+            apply_result_before,
+            "apply must not run a second time"
+        );
+        assert_eq!(
+            fs::read(repo.join("docs/cert.md")).expect("applied target"),
+            target_before
+        );
+    }
+
+    // ---- Awaiting receipt claims no authorization ----
+    #[test]
+    fn awaiting_receipt_claims_no_authorization() {
+        let (_repo, awaiting) = preview_fixture("awaiting-receipt-claims");
+        let receipt_dir = awaiting_path(&awaiting, "receipt_dir");
+        let receipt = read_existing_json(&receipt_dir.join(AWAITING_APPROVAL_RECEIPT))
+            .expect("awaiting receipt json");
+        assert_eq!(receipt["receipt"], "preview_awaiting_approval");
+        assert_eq!(receipt["status"], AWAITING_APPROVAL_STATUS);
+        assert_eq!(receipt["target_mutated"], false);
+        assert_eq!(receipt["operator_preview_approval_required"], true);
+        assert!(
+            receipt.get("decision").is_none(),
+            "an awaiting receipt must not record a decision"
+        );
+    }
+
+    // ---- §18 guard: production must not self-authorize ----
+    #[test]
+    fn production_bridge_cannot_self_approve() {
+        let src = include_str!("runnable_task_bridge.rs");
+        let cut = src
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("bridge test module marker present");
+        let production = &src[..cut];
+        for banned in [
+            "evaluate_approval",
+            "ApprovalContext",
+            "ApprovalDecision",
+            "write_approval_result",
+            "apply {} {}",
+            "\"decision\": \"approved\"",
+        ] {
+            assert!(
+                !production.contains(banned),
+                "production bridge must not contain `{banned}`; \
+                 preview approval is operator-owned"
+            );
+        }
+    }
+
+    // ---- Operator guidance must not become a shell-injection vector ----
+    #[test]
+    fn approval_command_quotes_shell_hostile_paths() {
+        assert_eq!(shell_quote_arg("/tmp/plain.json"), "/tmp/plain.json");
+        assert_eq!(shell_quote_arg("/tmp/a b.json"), "'/tmp/a b.json'");
+        assert_eq!(
+            shell_quote_arg("/tmp/x';rm -rf /;'.json"),
+            r"'/tmp/x'\'';rm -rf /;'\''.json'"
+        );
+        let (argv, command) = approval_invocation(
+            Path::new("/tmp/p q/preview-bundle.json"),
+            Path::new("/tmp/p q/approval-result.json"),
+        );
+        assert_eq!(argv[3], "/tmp/p q/preview-bundle.json");
+        assert_eq!(argv[5], "/tmp/p q/approval-result.json");
+        assert_eq!(
+            command,
+            "claw plan approve '/tmp/p q/preview-bundle.json' \
+             --approval-result-output '/tmp/p q/approval-result.json'"
+        );
     }
 }
