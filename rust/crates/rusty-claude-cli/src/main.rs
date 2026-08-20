@@ -371,6 +371,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             commands,
             output_format,
         } => resume_session(&session_path, &commands, output_format),
+        CliAction::ResumeRepl {
+            session_reference,
+            context,
+        } => run_repl(
+            context.model,
+            context.allowed_tools,
+            context.permission_mode,
+            context.base_commit,
+            context.reasoning_effort,
+            context.allow_broad_cwd,
+            Some(session_reference),
+        )?,
         CliAction::Status {
             model,
             model_flag_raw,
@@ -463,6 +475,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             base_commit,
             reasoning_effort,
             allow_broad_cwd,
+            None,
         )?,
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
@@ -3494,6 +3507,71 @@ fn run_plan_status<W: Write>(
 // END A2-L2d Read-Only Artifact Inspector — scope sentinel
 // =========================================================================
 
+/// Global REPL settings carried through a top-level `--resume` so an
+/// interactively continued session starts with exactly the same model,
+/// tool allowlist and permission mode the operator passed on the command
+/// line -- matching what the in-REPL `/resume` path would have used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResumeReplContext {
+    model: String,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode: PermissionMode,
+    base_commit: Option<String>,
+    reasoning_effort: Option<String>,
+    allow_broad_cwd: bool,
+}
+
+/// Unresolved form of [`ResumeReplContext`], carried through parsing so the
+/// environment/config-backed default permission mode is only resolved when the
+/// resume actually continues interactively.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingResumeReplContext {
+    model: String,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode_override: Option<PermissionMode>,
+    base_commit: Option<String>,
+    reasoning_effort: Option<String>,
+    allow_broad_cwd: bool,
+}
+
+impl PendingResumeReplContext {
+    fn resolve(self) -> ResumeReplContext {
+        ResumeReplContext {
+            model: self.model,
+            allowed_tools: self.allowed_tools,
+            permission_mode: self
+                .permission_mode_override
+                .unwrap_or_else(default_permission_mode),
+            base_commit: self.base_commit,
+            reasoning_effort: self.reasoning_effort,
+            allow_broad_cwd: self.allow_broad_cwd,
+        }
+    }
+}
+
+/// Decide whether a top-level `--resume` continues into the interactive REPL.
+///
+/// Interactive continuation requires ALL of:
+/// - bare resume (no explicit resumed slash commands) -- explicit commands stay
+///   one-shot;
+/// - text output -- structured JSON stays machine-consumable;
+/// - stdin AND stdout both on a terminal -- so a pipeline, redirect or CI run
+///   can never be turned into a REPL that blocks waiting for operator input.
+///
+/// Pure on purpose: the terminal probes are injected by the caller so both
+/// branches are deterministically unit-testable.
+fn resume_should_continue_interactively(
+    commands_are_empty: bool,
+    output_format: CliOutputFormat,
+    stdin_is_tty: bool,
+    stdout_is_tty: bool,
+) -> bool {
+    commands_are_empty
+        && matches!(output_format, CliOutputFormat::Text)
+        && stdin_is_tty
+        && stdout_is_tty
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CliAction {
     DumpManifests {
@@ -3532,6 +3610,14 @@ enum CliAction {
         session_path: PathBuf,
         commands: Vec<String>,
         output_format: CliOutputFormat,
+    },
+    /// Bare `--resume <ref>` from an interactive terminal: restore the managed
+    /// session and continue into the normal REPL. Deliberately a sibling of
+    /// `ResumeSession` rather than a field on it, so the one-shot resumed
+    /// command contract stays byte-for-byte unchanged.
+    ResumeRepl {
+        session_reference: String,
+        context: ResumeReplContext,
     },
     Status {
         model: String,
@@ -3750,8 +3836,23 @@ impl CliOutputFormat {
     }
 }
 
-#[allow(clippy::too_many_lines)]
+/// Production entry point: probe the real terminal state and parse.
 fn parse_args(args: &[String]) -> Result<CliAction, String> {
+    parse_args_with_terminal(
+        args,
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+    )
+}
+
+/// Parse with terminal state injected, so interactive-vs-automation behavior
+/// is deterministic under test regardless of how the runner is invoked.
+#[allow(clippy::too_many_lines)]
+fn parse_args_with_terminal(
+    args: &[String],
+    stdin_is_tty: bool,
+    stdout_is_tty: bool,
+) -> Result<CliAction, String> {
     let mut model = DEFAULT_MODEL.to_string();
     // #148: when user passes --model/--model=, capture the raw input so we
     // can attribute source: "flag" later. None means no flag was supplied.
@@ -3982,7 +4083,26 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         });
     }
     if rest.first().map(String::as_str) == Some("--resume") {
-        return parse_resume_args(&rest[1..], output_format);
+        // The REPL context is resolved lazily inside `parse_resume_args`, only
+        // on the interactive branch. The one-shot resumed-command path therefore
+        // performs exactly the same work it did before this feature existed --
+        // in particular it never resolves the default permission mode, which
+        // reads config/env.
+        let repl_context = PendingResumeReplContext {
+            model: model.clone(),
+            allowed_tools: allowed_tools.clone(),
+            permission_mode_override,
+            base_commit: base_commit.clone(),
+            reasoning_effort: reasoning_effort.clone(),
+            allow_broad_cwd,
+        };
+        return parse_resume_args(
+            &rest[1..],
+            output_format,
+            repl_context,
+            stdin_is_tty,
+            stdout_is_tty,
+        );
     }
     if let Some(action) = parse_local_help_action(&rest) {
         return action;
@@ -5403,7 +5523,13 @@ fn parse_dump_manifests_args(
     })
 }
 
-fn parse_resume_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
+fn parse_resume_args(
+    args: &[String],
+    output_format: CliOutputFormat,
+    repl_context: PendingResumeReplContext,
+    stdin_is_tty: bool,
+    stdout_is_tty: bool,
+) -> Result<CliAction, String> {
     let (session_path, command_tokens): (PathBuf, &[String]) = match args.first() {
         None => (PathBuf::from(LATEST_SESSION_REFERENCE), &[]),
         Some(first) if looks_like_slash_command_token(first) => {
@@ -5438,6 +5564,18 @@ fn parse_resume_args(args: &[String], output_format: CliOutputFormat) -> Result<
 
     if !current_command.is_empty() {
         commands.push(current_command);
+    }
+
+    if resume_should_continue_interactively(
+        commands.is_empty(),
+        output_format,
+        stdin_is_tty,
+        stdout_is_tty,
+    ) {
+        return Ok(CliAction::ResumeRepl {
+            session_reference: session_path.display().to_string(),
+            context: repl_context.resolve(),
+        });
     }
 
     Ok(CliAction::ResumeSession {
@@ -7239,9 +7377,24 @@ fn run_repl(
     base_commit: Option<String>,
     reasoning_effort: Option<String>,
     allow_broad_cwd: bool,
+    initial_resume: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
     run_stale_base_preflight(base_commit.as_deref());
+
+    // Pin the requested session to a concrete path BEFORE `LiveCli::new`.
+    //
+    // `LiveCli::new` mints and persists a brand-new managed session, which
+    // immediately becomes the newest session on disk. Resolving afterwards
+    // would make aliases (`latest` / `last` / `recent`) point at that empty
+    // just-created session instead of the operator's actual conversation.
+    // Resolving first also fails fast on an unknown reference, before a REPL
+    // banner or a throwaway session file has been produced.
+    let resolved_resume = match initial_resume {
+        Some(reference) => Some(resolve_session_reference(&reference)?.path),
+        None => None,
+    };
+
     let resolved_model = resolve_repl_model(model);
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
     cli.set_reasoning_effort(reasoning_effort);
@@ -7249,6 +7402,21 @@ fn run_repl(
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
     println!("{}", cli.startup_banner());
     println!("{}", format_connected_line(&cli.model));
+
+    // Natural top-level resume (`claw --resume latest` on a terminal).
+    //
+    // Reuses the exact in-REPL `/resume` primitive, so managed-session
+    // resolution, workspace confinement, runtime rebuild and the resume report
+    // all stay single-sourced -- no second session format, no duplicated
+    // workspace validation, no nested process, no synthetic stdin injection.
+    //
+    // Runs BEFORE the prompt loop and propagates its error, so a failed restore
+    // (missing / malformed / cross-workspace session) exits instead of dropping
+    // the operator into an empty conversation. Restoring performs no provider
+    // request; the first model call still waits for operator input.
+    if let Some(session_path) = resolved_resume {
+        cli.resume_session(Some(session_path.display().to_string()))?;
+    }
 
     loop {
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
@@ -12973,13 +13141,18 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         "  claw [--model MODEL] [--output-format text|json] TEXT"
     )?;
     writeln!(out, "      Shorthand non-interactive prompt mode")?;
+    writeln!(out, "  claw --resume [SESSION.jsonl|session-id|latest]")?;
+    writeln!(
+        out,
+        "      Continue the saved session in the interactive REPL (from a terminal)"
+    )?;
     writeln!(
         out,
         "  claw --resume [SESSION.jsonl|session-id|latest] [/status] [/compact] [...]"
     )?;
     writeln!(
         out,
-        "      Inspect or maintain a saved session without entering the REPL"
+        "      Run resumed commands one-shot, without entering the REPL"
     )?;
     writeln!(out, "  claw help")?;
     writeln!(out, "      Alias for --help")?;
@@ -13129,30 +13302,31 @@ mod tests {
     use super::{
         build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
         classify_error_kind, collect_session_prompt_history, create_managed_session_handle,
-        describe_tool_progress, filter_tool_specs, format_bughunter_report,
-        format_commit_preflight_report, format_commit_skipped_report, format_compact_report,
-        format_connected_line, format_cost_report, format_history_timestamp,
+        default_permission_mode, describe_tool_progress, filter_tool_specs,
+        format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
+        format_compact_report, format_connected_line, format_cost_report, format_history_timestamp,
         format_internal_prompt_progress_line, format_issue_report, format_model_report,
         format_model_switch_report, format_permissions_report, format_permissions_switch_report,
         format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
         format_tool_result, format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error,
         maybe_parse_tool_result_json_envelope, merge_prompt_with_stdin, normalize_permission_mode,
-        parse_args, parse_export_args, parse_git_status_branch, parse_git_status_metadata_for,
-        parse_git_workspace_summary, parse_history_count, permission_policy, print_help_to,
-        push_output_block, render_config_report, render_diff_report, render_diff_report_for,
-        render_help_topic, render_memory_report, render_prompt_history_report, render_repl_help,
-        render_resume_usage, render_session_markdown, resolve_model_alias,
-        resolve_model_alias_with_config, resolve_model_env_alias, resolve_repl_model,
-        resolve_session_reference, response_to_events, resume_supported_slash_commands,
-        run_resume_command, runtime_mcp_inventory_json_for_loader, short_tool_id,
+        parse_args, parse_args_with_terminal, parse_export_args, parse_git_status_branch,
+        parse_git_status_metadata_for, parse_git_workspace_summary, parse_history_count,
+        permission_policy, print_help_to, push_output_block, render_config_report,
+        render_diff_report, render_diff_report_for, render_help_topic, render_memory_report,
+        render_prompt_history_report, render_repl_help, render_resume_usage,
+        render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
+        resolve_model_env_alias, resolve_repl_model, resolve_session_reference, response_to_events,
+        resume_should_continue_interactively, resume_supported_slash_commands, run_resume_command,
+        runtime_mcp_inventory_json_for_loader, short_tool_id,
         slash_command_completion_candidates_with_sessions, split_error_hint, status_context,
         summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt, validate_model_syntax,
         validate_no_args, write_mcp_server_fixture, write_mcp_tools_list_disconnect_fixture,
         CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
         InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
-        PromptHistoryEntry, RuntimePluginState, SlashCommand, StatusUsage, DEFAULT_MODEL,
-        LATEST_SESSION_REFERENCE, STUB_COMMANDS,
+        PromptHistoryEntry, ResumeReplContext, RuntimePluginState, SlashCommand, StatusUsage,
+        DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
     use api::{
         ApiError, InputContentBlock, MessageResponse, OutputContentBlock, ToolResultContentBlock,
@@ -15382,7 +15556,7 @@ mod tests {
             "/compact".to_string(),
         ];
         assert_eq!(
-            parse_args(&args).expect("args should parse"),
+            parse_args_with_terminal(&args, false, false).expect("args should parse"),
             CliAction::ResumeSession {
                 session_path: PathBuf::from("session.jsonl"),
                 commands: vec!["/compact".to_string()],
@@ -15394,7 +15568,8 @@ mod tests {
     #[test]
     fn parses_resume_flag_without_path_as_latest_session() {
         assert_eq!(
-            parse_args(&["--resume".to_string()]).expect("args should parse"),
+            parse_args_with_terminal(&["--resume".to_string()], false, false)
+                .expect("args should parse"),
             CliAction::ResumeSession {
                 session_path: PathBuf::from("latest"),
                 commands: vec![],
@@ -15402,8 +15577,12 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_args(&["--resume".to_string(), "/status".to_string()])
-                .expect("resume shortcut should parse"),
+            parse_args_with_terminal(
+                &["--resume".to_string(), "/status".to_string()],
+                false,
+                false
+            )
+            .expect("resume shortcut should parse"),
             CliAction::ResumeSession {
                 session_path: PathBuf::from("latest"),
                 commands: vec!["/status".to_string()],
@@ -15422,7 +15601,7 @@ mod tests {
             "/cost".to_string(),
         ];
         assert_eq!(
-            parse_args(&args).expect("args should parse"),
+            parse_args_with_terminal(&args, false, false).expect("args should parse"),
             CliAction::ResumeSession {
                 session_path: PathBuf::from("session.jsonl"),
                 commands: vec![
@@ -15454,7 +15633,7 @@ mod tests {
             "--confirm".to_string(),
         ];
         assert_eq!(
-            parse_args(&args).expect("args should parse"),
+            parse_args_with_terminal(&args, false, false).expect("args should parse"),
             CliAction::ResumeSession {
                 session_path: PathBuf::from("session.jsonl"),
                 commands: vec![
@@ -15476,7 +15655,7 @@ mod tests {
             "/status".to_string(),
         ];
         assert_eq!(
-            parse_args(&args).expect("args should parse"),
+            parse_args_with_terminal(&args, false, false).expect("args should parse"),
             CliAction::ResumeSession {
                 session_path: PathBuf::from("session.jsonl"),
                 commands: vec!["/export /tmp/notes.txt".to_string(), "/status".to_string()],
@@ -15637,6 +15816,294 @@ mod tests {
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
         std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    // ---------------------------------------------------------------
+    // Natural top-level resume (`claw --resume latest` continues the
+    // managed session interactively when run from a terminal).
+    // ---------------------------------------------------------------
+
+    fn resume_repl_context() -> ResumeReplContext {
+        ResumeReplContext {
+            model: DEFAULT_MODEL.to_string(),
+            allowed_tools: None,
+            permission_mode: default_permission_mode(),
+            base_commit: None,
+            reasoning_effort: None,
+            allow_broad_cwd: false,
+        }
+    }
+
+    #[test]
+    fn resume_continues_interactively_only_for_bare_text_resume_on_a_terminal() {
+        // bare + text + both ends on a TTY => interactive continuation
+        assert!(resume_should_continue_interactively(
+            true,
+            CliOutputFormat::Text,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn resume_stays_one_shot_for_explicit_commands_json_and_automation() {
+        // explicit resumed slash command stays one-shot even on a terminal
+        assert!(!resume_should_continue_interactively(
+            false,
+            CliOutputFormat::Text,
+            true,
+            true
+        ));
+        // structured output stays machine-consumable
+        assert!(!resume_should_continue_interactively(
+            true,
+            CliOutputFormat::Json,
+            true,
+            true
+        ));
+        // piped stdin (CI / automation) must never open a REPL
+        assert!(!resume_should_continue_interactively(
+            true,
+            CliOutputFormat::Text,
+            false,
+            true
+        ));
+        // piped stdout must never open a REPL either, or the pipe would block
+        assert!(!resume_should_continue_interactively(
+            true,
+            CliOutputFormat::Text,
+            true,
+            false
+        ));
+        // fully non-interactive
+        assert!(!resume_should_continue_interactively(
+            true,
+            CliOutputFormat::Text,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn bare_resume_on_a_terminal_parses_as_interactive_resume() {
+        // resolves the env/config-backed default permission mode
+        let _env = env_lock();
+        assert_eq!(
+            parse_args_with_terminal(&["--resume".to_string()], true, true)
+                .expect("bare resume should parse"),
+            CliAction::ResumeRepl {
+                session_reference: LATEST_SESSION_REFERENCE.to_string(),
+                context: resume_repl_context(),
+            }
+        );
+    }
+
+    #[test]
+    fn bare_resume_on_a_terminal_accepts_explicit_session_reference_and_aliases() {
+        // resolves the env/config-backed default permission mode
+        let _env = env_lock();
+        for reference in [
+            LATEST_SESSION_REFERENCE,
+            "last",
+            "recent",
+            "session-1234-0",
+            "session.jsonl",
+        ] {
+            assert_eq!(
+                parse_args_with_terminal(
+                    &["--resume".to_string(), reference.to_string()],
+                    true,
+                    true
+                )
+                .expect("resume should parse"),
+                CliAction::ResumeRepl {
+                    session_reference: reference.to_string(),
+                    context: resume_repl_context(),
+                },
+                "reference {reference} should continue interactively"
+            );
+        }
+    }
+
+    #[test]
+    fn resumed_slash_commands_stay_one_shot_even_on_a_terminal() {
+        // #177 follow-up: `--resume latest /diff` must NOT become a REPL.
+        assert_eq!(
+            parse_args_with_terminal(&["--resume".to_string(), "/diff".to_string()], true, true)
+                .expect("resumed command should parse"),
+            CliAction::ResumeSession {
+                session_path: PathBuf::from(LATEST_SESSION_REFERENCE),
+                commands: vec!["/diff".to_string()],
+                output_format: CliOutputFormat::Text,
+            }
+        );
+    }
+
+    #[test]
+    fn json_resume_never_becomes_interactive() {
+        assert_eq!(
+            parse_args_with_terminal(
+                &[
+                    "--output-format".to_string(),
+                    "json".to_string(),
+                    "--resume".to_string(),
+                ],
+                true,
+                true
+            )
+            .expect("json resume should parse"),
+            CliAction::ResumeSession {
+                session_path: PathBuf::from(LATEST_SESSION_REFERENCE),
+                commands: vec![],
+                output_format: CliOutputFormat::Json,
+            }
+        );
+    }
+
+    #[test]
+    fn non_tty_bare_resume_keeps_existing_one_shot_behavior() {
+        // Automation contract: identical to the pre-change behavior, so a
+        // pipeline can never be left blocking on terminal input.
+        for (stdin_is_tty, stdout_is_tty) in [(false, false), (false, true), (true, false)] {
+            assert_eq!(
+                parse_args_with_terminal(&["--resume".to_string()], stdin_is_tty, stdout_is_tty)
+                    .expect("resume should parse"),
+                CliAction::ResumeSession {
+                    session_path: PathBuf::from(LATEST_SESSION_REFERENCE),
+                    commands: vec![],
+                    output_format: CliOutputFormat::Text,
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn interactive_resume_carries_global_repl_flags() {
+        // resolves the env/config-backed default permission mode
+        let _env = env_lock();
+        // The continued REPL must start with the same model the operator
+        // asked for, matching what in-REPL `/resume` would have used.
+        let action = parse_args_with_terminal(
+            &[
+                "--model".to_string(),
+                "sonnet".to_string(),
+                "--resume".to_string(),
+                LATEST_SESSION_REFERENCE.to_string(),
+            ],
+            true,
+            true,
+        )
+        .expect("resume with model should parse");
+        match action {
+            CliAction::ResumeRepl { context, .. } => {
+                // alias resolved exactly as the plain REPL path would resolve it
+                assert_eq!(context.model, "claude-sonnet-4-6");
+            }
+            other => panic!("expected interactive resume, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interactive_resume_restores_history_into_the_live_runtime() {
+        // Requirement: the restored conversation must be present in the
+        // runtime that serves the operator's NEXT turn, and the live session
+        // handle must point at the resumed file (not a fresh blank session).
+        // NOTE: no cwd_guard() here -- `with_current_dir` takes the same
+        // (non-reentrant) cwd mutex internally, so holding it here would
+        // self-deadlock.
+        let _env = env_lock();
+        std::env::set_var("ANTHROPIC_API_KEY", "test-dummy-key-for-resume-test");
+        let workspace = temp_workspace("interactive-resume-restore");
+        std::fs::create_dir_all(&workspace).expect("workspace should create");
+
+        let (restored_messages, session_path, (session_id, fixture_session_id)) =
+            with_current_dir(&workspace, || {
+                let handle =
+                    create_managed_session_handle("session-resume-target").expect("session handle");
+                let mut session = Session::new()
+                    .with_workspace_root(workspace.clone())
+                    .with_persistence_path(handle.path.clone());
+                session
+                    .messages
+                    .push(ConversationMessage::user_text("magic token zebra-quartz"));
+                session
+                    .save_to_path(&handle.path)
+                    .expect("fixture session should save");
+                let fixture_session_id = session.session_id.clone();
+
+                let mut cli = LiveCli::new(
+                    DEFAULT_MODEL.to_string(),
+                    true,
+                    None,
+                    PermissionMode::DangerFullAccess,
+                )
+                .expect("cli should initialize");
+
+                cli.resume_session(Some(handle.path.display().to_string()))
+                    .expect("resume should succeed");
+
+                (
+                    cli.runtime.session().messages.len(),
+                    cli.session.path.clone(),
+                    (cli.session.id.clone(), fixture_session_id),
+                )
+            });
+
+        assert_eq!(
+            restored_messages, 1,
+            "restored history must be live in the runtime for the next turn"
+        );
+        assert!(
+            session_path.ends_with("session-resume-target.jsonl"),
+            "live session must persist back to the resumed file, got {}",
+            session_path.display()
+        );
+        // identity is carried from the session CONTENT, not the file name
+        assert_eq!(session_id, fixture_session_id);
+
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::fs::remove_dir_all(workspace).ok();
+    }
+
+    #[test]
+    fn interactive_resume_refuses_cross_workspace_session() {
+        // Fail-closed: workspace confinement must survive the new path.
+        // NOTE: no cwd_guard() here -- `with_current_dir` takes the same
+        // (non-reentrant) cwd mutex internally, so holding it here would
+        // self-deadlock.
+        let _env = env_lock();
+        std::env::set_var("ANTHROPIC_API_KEY", "test-dummy-key-for-resume-mismatch");
+        let workspace = temp_workspace("interactive-resume-mismatch");
+        std::fs::create_dir_all(&workspace).expect("workspace should create");
+
+        let error = with_current_dir(&workspace, || {
+            let handle = create_managed_session_handle("session-foreign").expect("session handle");
+            Session::new()
+                .with_workspace_root(PathBuf::from("/some/other/workspace"))
+                .with_persistence_path(handle.path.clone())
+                .save_to_path(&handle.path)
+                .expect("foreign session should save");
+
+            let mut cli = LiveCli::new(
+                DEFAULT_MODEL.to_string(),
+                true,
+                None,
+                PermissionMode::DangerFullAccess,
+            )
+            .expect("cli should initialize");
+
+            cli.resume_session(Some(handle.path.display().to_string()))
+                .expect_err("cross-workspace resume must be refused")
+                .to_string()
+        });
+
+        assert!(
+            error.contains("workspace mismatch"),
+            "expected fail-closed workspace refusal, got: {error}"
+        );
+
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::fs::remove_dir_all(workspace).ok();
     }
 
     #[test]
