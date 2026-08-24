@@ -146,6 +146,10 @@ If these commands succeed, the build is working. `claw doctor` is your first hea
 If you want to run `claw` from any directory without the full path, choose one of these approaches:
 
 **Option 1: Link the active Cargo-built binary (macOS/Linux)**
+
+> [!WARNING]
+> This generic upstream pattern is **not** the SideStackAI canonical setup. Do not symlink a canonical operator entrypoint (`~/.local/bin/claw`) at `target/debug/claw`, `target/release/claw`, or any external Cargo target directory — a Cargo build cache must never be the live operator binary. See [SideStackAI: the canonical `claw` executable](#sidestackai-the-canonical-claw-executable).
+
 ```bash
 TARGET_DIR="$(
   cd rust &&
@@ -161,7 +165,7 @@ claw --help
 
 **Option 2: Use `cargo install` (all platforms)**
 
-Build and install to Cargo's default location (`~/.cargo/bin/`, which is usually on PATH):
+Build and install to Cargo's default location (`~/.cargo/bin/`, which is usually on PATH). This is a generic upstream convenience — `~/.cargo/bin/claw` is **not** the SideStackAI canonical operator entrypoint, and SideStack tooling never executes it:
 ```bash
 # From the claw-code/rust/ directory
 cargo install --path . --force
@@ -187,6 +191,47 @@ Reload your shell:
 source ~/.bashrc  # or source ~/.zshrc
 claw --help
 ```
+
+### SideStackAI: the canonical `claw` executable
+
+On SideStackAI workstations the operator entrypoint is pinned by contract:
+
+| Property | Value |
+|---|---|
+| Canonical path | `~/.local/bin/claw` |
+| Topology | **regular file** — never a symlink |
+| Provenance | built from a clean worktree whose `HEAD` equals the locally known `origin/main` |
+| Build target | forced inside that worktree; never an external Cargo target directory |
+
+`./install.sh` does **not** maintain it. That script is a build helper: it builds
+and verifies a Cargo artifact, prints its location, and stops. Nothing is copied
+onto your PATH by an ordinary build.
+
+Two tracked commands own the canonical executable:
+
+```bash
+# read-only: is the installed claw built from the locally known origin/main?
+# no build, no network, no writes.
+./scripts/claw-canonical-status
+
+# explicit opt-in: rebuild from this worktree and atomically activate it.
+./scripts/claw-canonical-refresh
+```
+
+`claw-canonical-status` exits `0` (CURRENT), `10` (STALE), `11` (MISSING),
+`12` (INVALID_TOPOLOGY), or `13` (UNKNOWN_BASE — no locally known `origin/main`).
+
+`claw-canonical-refresh` must be run from a clean worktree checked out at
+`origin/main`. It refuses a dirty source, refuses a source ahead of or behind
+`origin/main`, refuses to write through a symlinked canonical path, forces its
+own build target inside the worktree, backs up the existing executable before
+building, checks that the built binary reports the source Git SHA, and rolls the
+previous executable back if post-activation verification fails. It never fetches
+and never contacts a model, broker, or provider.
+
+`scripts/claw-sidestack-local` executes that canonical path directly. It does not
+resolve `claw` from PATH, so it cannot silently fall through to `~/.cargo/bin/claw`
+or to a Cargo target artifact, and it refuses to run a stale canonical build.
 
 ### Troubleshooting
 

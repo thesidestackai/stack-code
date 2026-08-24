@@ -9,6 +9,30 @@
 #
 # Liveness of the broker is NOT checked here — use `claw doctor` or a
 # separate runtime check for that.
+#
+# CANONICAL ENTRYPOINT: this wrapper executes the canonical SideStackAI claw
+# at $HOME/.local/bin/claw (override with CLAW_CANONICAL_PATH). It never
+# resolves `claw` from PATH, so it can never silently fall through to a stale
+# ~/.cargo/bin/claw or a Cargo target artifact. Freshness and topology are
+# delegated to scripts/claw-canonical-status, which is offline and read-only.
+#
+# Exit codes:
+#   2  broker profile env file missing
+#   3  LAW 1 refusal (evaluated before any canonical/freshness check)
+#   4  canonical claw missing
+#   5  canonical claw has invalid topology (symlink / not a regular executable)
+#   6  canonical claw is stale relative to the locally known origin/main
+#   7  the canonical status check itself could not run
+#
+# Residual race
+# -------------
+# The status helper runs in a separate process, so its topology check and this
+# wrapper's `exec` cannot be one atomic operation. The topology is therefore
+# revalidated here immediately before `exec`, which is the last practical
+# moment shell affords. POSIX shell cannot exec with O_NOFOLLOW/openat2
+# semantics portably across Linux, macOS, and WSL, so a SAME-USER process
+# racing between that final check and the `exec` remains possible. The window
+# is narrowed, not eliminated.
 
 set -euo pipefail
 
@@ -60,11 +84,100 @@ fi
   fi
 } >&2
 
-if ! command -v claw >/dev/null 2>&1; then
-  # shellcheck disable=SC2016  # backticks in user-facing message are literal
-  printf 'claw-sidestack-local: `claw` not found on PATH.\n' >&2
-  printf '  install Stack-Code (see install.sh / USAGE.md) or add its install dir to PATH.\n' >&2
-  exit 4
+# --- canonical entrypoint ---------------------------------------------------
+#
+# LAW 1 has already been evaluated above; nothing below it may relax that.
+# From here the only question is whether the canonical executable is the one
+# we are allowed to run.
+
+if [[ -z "${CLAW_CANONICAL_PATH:-}" && -z "${HOME:-}" ]]; then
+  printf 'claw-sidestack-local: HOME is unset and CLAW_CANONICAL_PATH was not provided.\n' >&2
+  exit 7
+fi
+CANONICAL_CLAW="${CLAW_CANONICAL_PATH:-${HOME}/.local/bin/claw}"
+if [[ "${CANONICAL_CLAW}" != /* ]]; then
+  printf 'claw-sidestack-local: canonical claw path must be absolute: %s\n' "${CANONICAL_CLAW}" >&2
+  exit 7
+fi
+printf '  canonical claw: %s\n' "${CANONICAL_CLAW}" >&2
+
+CANONICAL_STATUS="${SCRIPT_DIR}/claw-canonical-status"
+if [[ ! -x "${CANONICAL_STATUS}" ]]; then
+  printf 'claw-sidestack-local: canonical status helper missing or not executable: %s\n' "${CANONICAL_STATUS}" >&2
+  exit 7
 fi
 
-exec claw "$@"
+set +e
+status_report="$("${CANONICAL_STATUS}" 2>&1)"
+status_rc=$?
+set -e
+
+print_status_report() {
+  if [[ -n "${status_report}" ]]; then
+    while IFS= read -r status_line; do
+      printf '  %s\n' "${status_line}" >&2
+    done <<<"${status_report}"
+  fi
+}
+
+case "${status_rc}" in
+  0)
+    ;;
+  10)
+    print_status_report
+    if [[ "${CLAW_SIDESTACK_ALLOW_STALE:-0}" == "1" ]]; then
+      printf 'claw-sidestack-local: WARNING — canonical claw is STALE and CLAW_SIDESTACK_ALLOW_STALE=1 was set.\n' >&2
+      printf '  running a build that does not match the locally known origin/main, at your explicit request.\n' >&2
+    else
+      printf 'claw-sidestack-local: refusing to run a STALE canonical claw.\n' >&2
+      printf '  refresh it with: %s/claw-canonical-refresh\n' "${SCRIPT_DIR}" >&2
+      printf '  (or set CLAW_SIDESTACK_ALLOW_STALE=1 to override deliberately)\n' >&2
+      exit 6
+    fi
+    ;;
+  11)
+    print_status_report
+    printf 'claw-sidestack-local: canonical claw is missing: %s\n' "${CANONICAL_CLAW}" >&2
+    printf '  install it with: %s/claw-canonical-refresh\n' "${SCRIPT_DIR}" >&2
+    printf '  this wrapper does NOT fall back to PATH or to ~/.cargo/bin/claw.\n' >&2
+    exit 4
+    ;;
+  12)
+    print_status_report
+    printf 'claw-sidestack-local: canonical claw has an invalid topology: %s\n' "${CANONICAL_CLAW}" >&2
+    printf '  canonical claw must be a regular executable file, never a symlink to a Cargo target.\n' >&2
+    exit 5
+    ;;
+  13)
+    print_status_report
+    printf 'claw-sidestack-local: WARNING — freshness could not be determined (no locally known origin/main).\n' >&2
+    # shellcheck disable=SC2016  # backticks in the user-facing message are literal
+    printf '  running the canonical executable anyway; run `git fetch origin main` to restore the check.\n' >&2
+    ;;
+  *)
+    print_status_report
+    printf 'claw-sidestack-local: canonical status check failed (exit %s).\n' "${status_rc}" >&2
+    exit 7
+    ;;
+esac
+
+# --- final topology revalidation, immediately before exec -------------------
+#
+# Nothing may run between this block and `exec`. See the Residual race note in
+# the header: this narrows the same-user window, it does not close it.
+if [[ -L "${CANONICAL_CLAW}" ]]; then
+  printf 'claw-sidestack-local: canonical claw is a symlink: %s\n' "${CANONICAL_CLAW}" >&2
+  printf '  canonical claw must be a regular executable file, never a symlink to a Cargo target.\n' >&2
+  exit 5
+fi
+if [[ ! -e "${CANONICAL_CLAW}" ]]; then
+  printf 'claw-sidestack-local: canonical claw is missing: %s\n' "${CANONICAL_CLAW}" >&2
+  printf '  this wrapper does NOT fall back to PATH or to ~/.cargo/bin/claw.\n' >&2
+  exit 4
+fi
+if [[ ! -f "${CANONICAL_CLAW}" || ! -x "${CANONICAL_CLAW}" ]]; then
+  printf 'claw-sidestack-local: canonical claw is not a regular executable file: %s\n' "${CANONICAL_CLAW}" >&2
+  exit 5
+fi
+
+exec "${CANONICAL_CLAW}" "$@"

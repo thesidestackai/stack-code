@@ -1,10 +1,43 @@
 use std::env;
+use std::path::PathBuf;
 use std::process::Command;
 
+/// Run `git` with `args`, returning trimmed stdout only on success.
+fn git_output(args: &[&str]) -> Option<String> {
+    let output = Command::new("git").args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+/// Emit a Cargo watcher for `path`, but only once it is known to exist.
+///
+/// Cargo resolves relative `rerun-if-changed` entries against the package
+/// root -- `rust/crates/rusty-claude-cli`, three levels below the repository
+/// -- so a bare `.git/...` entry never names anything real. Absolutise first.
+fn watch_if_present(path: &str) {
+    let raw = PathBuf::from(path);
+    let resolved = std::fs::canonicalize(&raw).unwrap_or(raw);
+    if resolved.exists() {
+        println!("cargo:rerun-if-changed={}", resolved.display());
+    }
+}
+
 fn main() {
-    // Get git SHA (short hash)
+    // Get the FULL git SHA (40 lowercase hex characters).
+    //
+    // The canonical installation safety contract compares this value against
+    // the source HEAD / locally known origin/main for EXACT equality. An
+    // abbreviated hash is not a sufficient provenance proof, so this must stay
+    // `rev-parse HEAD` and must never be shortened again.
     let git_sha = Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
+        .args(["rev-parse", "HEAD"])
         .output()
         .ok()
         .and_then(|output| {
@@ -51,7 +84,28 @@ fn main() {
         });
     println!("cargo:rustc-env=BUILD_DATE={build_date}");
 
-    // Rerun if git state changes
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    println!("cargo:rerun-if-changed=.git/refs");
+    // Rerun if git state changes.
+    //
+    // The provenance SHA above must not outlive a HEAD change in a warm Cargo
+    // target, so these watchers have to name real Git metadata. In a linked
+    // worktree `.git` is a pointer FILE into
+    // `<main-repo>/.git/worktrees/<name>/`, so crate-relative `.git/HEAD` and
+    // `.git/refs` resolve to nothing at all. Ask Git for the true locations
+    // rather than assuming any particular on-disk layout.
+    if let Some(head) = git_output(&["rev-parse", "--git-path", "HEAD"]) {
+        // Worktree-local HEAD. On a detached HEAD this file holds the SHA
+        // itself, which is sufficient to invalidate on checkout.
+        watch_if_present(&head);
+    }
+    if let Some(head_ref) = git_output(&["symbolic-ref", "-q", "HEAD"]) {
+        // On a branch, HEAD only names the ref; the SHA lives in the ref file,
+        // which for a linked worktree usually sits in the common Git dir.
+        if let Some(ref_path) = git_output(&["rev-parse", "--git-path", &head_ref]) {
+            watch_if_present(&ref_path);
+        }
+    }
+    if let Some(packed) = git_output(&["rev-parse", "--git-path", "packed-refs"]) {
+        // Fallback for a branch whose loose ref has been packed away.
+        watch_if_present(&packed);
+    }
 }

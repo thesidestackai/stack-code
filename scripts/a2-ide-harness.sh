@@ -46,8 +46,10 @@ set -euo pipefail
 
 # ---- constants -------------------------------------------------------------
 
-# Canonical local Claw entrypoint. This symlink is maintained by the controlled
-# Stack-Code build/deployment lane and avoids silently selecting stale debug
+# Canonical local Claw entrypoint. This is a REGULAR FILE — never a symlink and
+# never a Cargo target artifact — installed by the tracked canonical refresh
+# lane (scripts/claw-canonical-refresh) and auditable offline with
+# scripts/claw-canonical-status. Using it avoids silently selecting stale debug
 # artifacts. Override explicitly with A2_CLAW=/absolute/path/to/claw. The path
 # may contain spaces; always quote it when printing the command for the
 # operator. Fails closed (via `set -u`) rather than falling back to a debug

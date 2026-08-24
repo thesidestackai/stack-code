@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+# claw-canonical-status — read-only freshness report for the canonical
+# SideStackAI `claw` executable.
+#
+# The canonical SideStackAI operator entrypoint is a *regular file* at
+# $HOME/.local/bin/claw. It is never a symlink, and it is never a Cargo
+# target directory artifact. This script answers one question:
+#
+#   is the canonical executable built from the locally known origin/main?
+#
+# It performs no build, no network request, no write, and no model or
+# provider call. `claw --version` is the only subprocess it runs against
+# the canonical binary, and that is a purely local version banner.
+#
+# Usage:
+#   scripts/claw-canonical-status [--quiet]
+#
+# Environment:
+#   CLAW_CANONICAL_PATH   absolute override for the canonical path
+#                         (default: $HOME/.local/bin/claw)
+#
+# Exit codes (locked by tests/shell/test_claw_canonical_status.sh):
+#   0   CURRENT           regular executable whose FULL 40-character Git SHA
+#                         is exactly equal to origin/main
+#   10  STALE             regular executable whose Git SHA is not exactly
+#                         equal to origin/main, or cannot be read, or is not
+#                         a full 40-character lowercase SHA (a 7- or
+#                         12-character prefix is unproven, not current)
+#   11  MISSING           nothing at the canonical path
+#   12  INVALID_TOPOLOGY  symlink, non-regular file, or not executable —
+#                         including a topology change observed around the
+#                         version-banner call
+#   13  UNKNOWN_BASE      locally known origin/main is unavailable
+#   2   usage error
+#
+# Residual race
+# -------------
+# Topology is revalidated immediately before and immediately after the single
+# `--version` subprocess, and the file identity is compared across it. Shell
+# cannot express openat2/O_NOFOLLOW or exec-on-a-held-descriptor semantics
+# portably, so a SAME-USER process racing inside those windows remains
+# possible. The window is narrowed, not eliminated.
+
+set -euo pipefail
+
+PROG="claw-canonical-status"
+
+EXIT_CURRENT=0
+EXIT_STALE=10
+EXIT_MISSING=11
+EXIT_INVALID_TOPOLOGY=12
+EXIT_UNKNOWN_BASE=13
+EXIT_USAGE=2
+
+QUIET=0
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/claw-canonical-status [--quiet]
+
+Read-only freshness report for the canonical SideStackAI claw executable.
+Performs no build, no network request, and no write.
+
+Options:
+  --quiet     suppress the report; communicate only via exit code
+  -h, --help  show this help and exit
+
+Environment:
+  CLAW_CANONICAL_PATH   absolute override for the canonical path
+                        (default: $HOME/.local/bin/claw)
+
+Exit codes:
+  0   CURRENT
+  10  STALE
+  11  MISSING
+  12  INVALID_TOPOLOGY
+  13  UNKNOWN_BASE
+  2   usage error
+EOF
+}
+
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --quiet) QUIET=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *)
+      printf '%s: unknown argument: %s\n' "${PROG}" "$1" >&2
+      usage >&2
+      exit "${EXIT_USAGE}"
+      ;;
+  esac
+  shift
+done
+
+say() {
+  if [[ "${QUIET}" -eq 0 ]]; then
+    printf '%s\n' "$1"
+  fi
+}
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+
+CANONICAL_PATH="${CLAW_CANONICAL_PATH:-${HOME:-}/.local/bin/claw}"
+if [[ -z "${CLAW_CANONICAL_PATH:-}" && -z "${HOME:-}" ]]; then
+  printf '%s: HOME is unset and CLAW_CANONICAL_PATH was not provided.\n' "${PROG}" >&2
+  exit "${EXIT_USAGE}"
+fi
+if [[ "${CANONICAL_PATH}" != /* ]]; then
+  printf '%s: canonical path must be absolute: %s\n' "${PROG}" "${CANONICAL_PATH}" >&2
+  exit "${EXIT_USAGE}"
+fi
+
+# ---- canonical topology ----------------------------------------------------
+
+# probe_topology <path> — classify the path as it is right now. Called again
+# immediately before and after the version call so a change is caught rather
+# than acted on. See the "Residual race" note in the header.
+probe_topology() {
+  local path="$1"
+  if [[ -L "${path}" ]]; then
+    printf 'symlink\n'
+  elif [[ ! -e "${path}" ]]; then
+    printf 'absent\n'
+  elif [[ ! -f "${path}" ]]; then
+    printf 'not-a-regular-file\n'
+  elif [[ ! -x "${path}" ]]; then
+    printf 'regular-file-not-executable\n'
+  else
+    printf 'regular-executable\n'
+  fi
+}
+
+# file_identity <path> — device:inode:size, or empty if it cannot be read.
+# Compared across the version call so a swapped file is caught even when the
+# replacement is itself a regular executable.
+file_identity() {
+  stat -c '%d:%i:%s' -- "$1" 2>/dev/null || true
+}
+
+TOPOLOGY="$(probe_topology "${CANONICAL_PATH}")"
+
+# ---- locally known origin/main ---------------------------------------------
+#
+# Deliberately NOT `git fetch`. The comparison base is whatever origin/main
+# this checkout already knows about. Review branches and PR worktrees share
+# the same remote-tracking ref, so a healthy main installation is not
+# invalidated by whatever branch happens to be checked out.
+
+ORIGIN_MAIN=""
+if git -C "${REPO_ROOT}" rev-parse --git-dir >/dev/null 2>&1; then
+  ORIGIN_MAIN="$(git -C "${REPO_ROOT}" rev-parse --verify --quiet origin/main 2>/dev/null || true)"
+fi
+
+# ---- installed provenance --------------------------------------------------
+
+INSTALLED_SHA=""
+PROVENANCE_NOTE=""
+if [[ "${TOPOLOGY}" == "regular-executable" ]]; then
+  # Immediately before executing it, look again: if the path became a symlink
+  # or a non-regular file since the classification above, report the new
+  # topology instead of running whatever is now there.
+  TOPOLOGY="$(probe_topology "${CANONICAL_PATH}")"
+fi
+if [[ "${TOPOLOGY}" == "regular-executable" ]]; then
+  identity_before="$(file_identity "${CANONICAL_PATH}")"
+  version_out=""
+  if version_out="$("${CANONICAL_PATH}" --version 2>/dev/null)"; then
+    INSTALLED_SHA="$(printf '%s\n' "${version_out}" \
+      | awk '/^[[:space:]]*Git SHA[[:space:]]/ { print $3; exit }')"
+    # A FULL 40-character lowercase SHA or nothing. A 7- or 12-character
+    # prefix, a 39- or 41-character value, or an uppercase/malformed string
+    # is unproven provenance and must not be able to reach CURRENT.
+    if [[ ! "${INSTALLED_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+      PROVENANCE_NOTE="canonical binary did not report a full 40-character Git SHA"
+      INSTALLED_SHA=""
+    fi
+  else
+    PROVENANCE_NOTE="canonical binary failed to run --version"
+  fi
+
+  # Look again after the call: a verdict must not rest on a banner printed by
+  # a file that is no longer the one at the canonical path.
+  TOPOLOGY="$(probe_topology "${CANONICAL_PATH}")"
+  if [[ "${TOPOLOGY}" != "regular-executable" ]]; then
+    INSTALLED_SHA=""
+    PROVENANCE_NOTE="canonical topology changed while the version banner was being read"
+  elif [[ "$(file_identity "${CANONICAL_PATH}")" != "${identity_before}" ]]; then
+    INSTALLED_SHA=""
+    PROVENANCE_NOTE="canonical file identity changed while the version banner was being read"
+  fi
+fi
+
+report() {
+  say "canonical path:      ${CANONICAL_PATH}"
+  say "canonical topology:  ${TOPOLOGY}"
+  say "installed git sha:   ${INSTALLED_SHA:-<unreadable>}"
+  say "origin/main sha:     ${ORIGIN_MAIN:-<unavailable>}"
+  say "source repo:         ${REPO_ROOT}"
+  say "state:               $1"
+  if [[ -n "${PROVENANCE_NOTE}" ]]; then
+    say "note:                ${PROVENANCE_NOTE}"
+  fi
+  if [[ -n "${2:-}" ]]; then
+    say "note:                $2"
+  fi
+}
+
+case "${TOPOLOGY}" in
+  absent)
+    report "MISSING" "nothing is installed at the canonical path"
+    exit "${EXIT_MISSING}"
+    ;;
+  symlink)
+    report "INVALID_TOPOLOGY" \
+      "canonical claw must be a regular file, not a symlink; do not point it at a Cargo target"
+    exit "${EXIT_INVALID_TOPOLOGY}"
+    ;;
+  not-a-regular-file|regular-file-not-executable)
+    report "INVALID_TOPOLOGY" "canonical claw must be a regular, executable file"
+    exit "${EXIT_INVALID_TOPOLOGY}"
+    ;;
+esac
+
+if [[ -z "${ORIGIN_MAIN}" ]]; then
+  report "UNKNOWN_BASE" \
+    "no locally known origin/main in ${REPO_ROOT}; freshness cannot be determined offline"
+  exit "${EXIT_UNKNOWN_BASE}"
+fi
+
+if [[ -z "${INSTALLED_SHA}" ]]; then
+  report "STALE" "provenance is unreadable, so the install cannot be proven current"
+  exit "${EXIT_STALE}"
+fi
+
+# Exact equality only. Prefix acceptance would let a 7-character legacy build
+# masquerade as current.
+if [[ "${INSTALLED_SHA}" == "${ORIGIN_MAIN}" ]]; then
+  report "CURRENT"
+  exit "${EXIT_CURRENT}"
+fi
+
+report "STALE" "installed build does not match the locally known origin/main"
+exit "${EXIT_STALE}"

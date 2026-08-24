@@ -3,7 +3,16 @@
 #
 # Detects the host OS, verifies the Rust toolchain (rustc + cargo),
 # builds the `claw` binary from the `rust/` workspace, and runs a
-# post-install verification step. Supports Linux, macOS, and WSL.
+# post-build verification step. Supports Linux, macOS, and WSL.
+#
+# BUILD-ONLY: despite the name, this script only *builds* and verifies a
+# Cargo artifact and prints where it landed. It does not copy anything into
+# $HOME/.local/bin, does not touch PATH, and never mutates the canonical
+# SideStackAI `claw` executable. Refreshing that canonical executable is a
+# separate, explicit, opt-in command:
+#
+#   scripts/claw-canonical-refresh   # rebuild + atomically activate canonical claw
+#   scripts/claw-canonical-status    # read-only fresh/stale report
 #
 # Usage:
 #   ./install.sh                # debug build (fast, default)
@@ -72,6 +81,12 @@ EOF
 print_usage() {
     cat <<'EOF'
 Usage: ./install.sh [options]
+
+Builds and verifies the claw binary from the rust/ workspace. This is a build
+helper only: it does not install into $HOME/.local/bin, does not modify PATH,
+and does not touch the canonical SideStackAI claw executable. Use
+scripts/claw-canonical-refresh for that, and scripts/claw-canonical-status for
+a read-only freshness report.
 
 Options:
   --release       Build the optimized release profile (slower, smaller binary).
@@ -398,6 +413,18 @@ ${COLOR_GREEN}Claw Code is built and ready.${COLOR_RESET}
 
   Binary:  ${COLOR_BOLD}${CLAW_BIN}${COLOR_RESET}
   Profile: ${BUILD_PROFILE}
+
+${COLOR_BOLD}This was a build only.${COLOR_RESET} Nothing was installed onto your PATH, and the
+canonical SideStackAI claw executable (~/.local/bin/claw) was not touched.
+Do not symlink ~/.local/bin/claw at the Cargo artifact above — the canonical
+executable is a regular file, and a Cargo build cache must never be the live
+operator binary. To refresh it from a clean worktree at origin/main:
+
+  ${COLOR_DIM}# read-only fresh/stale report${COLOR_RESET}
+  ./scripts/claw-canonical-status
+
+  ${COLOR_DIM}# explicit rebuild + atomic activation${COLOR_RESET}
+  ./scripts/claw-canonical-refresh
 
 Try it out:
 
