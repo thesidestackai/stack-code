@@ -7,6 +7,10 @@
 # destination, and a fake `cargo` on PATH that records its argv/env and
 # fabricates a "built" binary. The real ~/.local/bin/claw and the real
 # ~/.cargo/bin/claw are never read, written, or executed.
+#
+# The last cases additionally shadow PATH with a stand-in BSD userland, so the
+# tracked script -- not a copy of its logic -- is proved to run on a host that
+# has no GNU `realpath -m`, no GNU `stat -c`, and no `sha256sum` at all.
 
 set -euo pipefail
 
@@ -207,6 +211,136 @@ assert_no_leftover_candidate() {
   local name="$1" case_dir="$2"
   if compgen -G "${case_dir}/home/.local/bin/.claw-canonical-candidate.*" >/dev/null; then
     fail_case "${name}" "a candidate file was left behind" "${case_dir}"
+    return 1
+  fi
+}
+
+# stage_bsd_utils <dir> <flavour>
+#
+# Writes a stand-in for a non-GNU userland into <dir>, to be prepended to the
+# fixture PATH. This is what a stock macOS looks like to this script:
+#
+#   bsd      BSD realpath (rejects -m), BSD stat (rejects -c, supports
+#            -f '%Lp'), no sha256sum at all, and macOS's `shasum -a 256`.
+#   minimal  BSD realpath, and none of stat / sha256sum / shasum / openssl,
+#            so only the last-resort implementation is left.
+#
+# Anything not shadowed here still resolves through /usr/bin:/bin, so the
+# script runs against real git, awk, cp, mv, and python3.
+stage_bsd_utils() {
+  local dir="$1" flavour="$2"
+  mkdir -p "${dir}"
+
+  cat > "${dir}/realpath" <<'BSD_REALPATH'
+#!/usr/bin/env bash
+# BSD realpath: no -m, and the path must already exist.
+for arg in "$@"; do
+  case "${arg}" in
+    -m) printf 'realpath: illegal option -- m\n' >&2; exit 1 ;;
+  esac
+done
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --) shift; break ;;
+    -q) shift ;;
+    *) break ;;
+  esac
+done
+for target in "$@"; do
+  if [[ ! -e "${target}" ]]; then
+    printf 'realpath: %s: No such file or directory\n' "${target}" >&2
+    exit 1
+  fi
+  if [[ -d "${target}" ]]; then
+    ( cd -- "${target}" >/dev/null && pwd -P )
+  else
+    parent="$( cd -- "$(dirname -- "${target}")" >/dev/null && pwd -P )"
+    if [[ "${parent}" == "/" ]]; then
+      printf '/%s\n' "$(basename -- "${target}")"
+    else
+      printf '%s/%s\n' "${parent}" "$(basename -- "${target}")"
+    fi
+  fi
+done
+BSD_REALPATH
+
+  cat > "${dir}/sha256sum" <<'NO_TOOL'
+#!/usr/bin/env bash
+printf '%s: command not found\n' "$(basename -- "$0")" >&2
+exit 127
+NO_TOOL
+  chmod 0755 "${dir}/sha256sum"
+
+  if [[ "${flavour}" == "bsd" ]]; then
+    cat > "${dir}/stat" <<'BSD_STAT'
+#!/usr/bin/env bash
+# BSD stat: no GNU -c; permission bits come from -f '%Lp'.
+fmt=""
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    -c*) printf 'stat: illegal option -- c\n' >&2; exit 1 ;;
+    -f) fmt="$2"; shift 2 ;;
+    --) shift; break ;;
+    -*) shift ;;
+    *) break ;;
+  esac
+done
+[[ "${fmt}" == "%Lp" ]] || { printf 'stat: unsupported format %s\n' "${fmt}" >&2; exit 1; }
+for target in "$@"; do
+  python3 -c 'import os, sys; print(format(os.stat(sys.argv[1]).st_mode & 0o7777, "o"))' "${target}" || exit 1
+done
+BSD_STAT
+    cat > "${dir}/shasum" <<'MACOS_SHASUM'
+#!/usr/bin/env bash
+# macOS ships `shasum -a 256` in place of sha256sum.
+algo=256
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    -a) algo="$2"; shift 2 ;;
+    --) shift; break ;;
+    -*) shift ;;
+    *) break ;;
+  esac
+done
+[[ "${algo}" == "256" ]] || { printf 'shasum: unsupported algorithm\n' >&2; exit 1; }
+for target in "$@"; do
+  digest="$(python3 -c 'import hashlib, sys
+print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "${target}")" || exit 1
+  printf '%s  %s\n' "${digest}" "${target}"
+done
+MACOS_SHASUM
+  else
+    cp -- "${dir}/sha256sum" "${dir}/stat"
+    cp -- "${dir}/sha256sum" "${dir}/shasum"
+    cp -- "${dir}/sha256sum" "${dir}/openssl"
+  fi
+
+  chmod 0755 "${dir}"/*
+}
+
+# assert_activated <name> <case_dir> <expected_sha256>
+#
+# The refresh reported success, so the canonical file must BE the built
+# artifact and the reported digest must be a real SHA-256 of it.
+assert_activated() {
+  local name="$1" case_dir="$2" want="$3"
+  local dest="${case_dir}/home/.local/bin/claw"
+  if [[ ! "${want}" =~ ^[0-9a-f]{64}$ ]]; then
+    fail_case "${name}" "no built artifact to compare against: cargo never produced one" \
+      "${case_dir}"
+    return 1
+  fi
+  if [[ -L "${dest}" || ! -f "${dest}" ]]; then
+    fail_case "${name}" "canonical path is not a regular file after refresh" "${case_dir}"
+    return 1
+  fi
+  if [[ "$(hash_of "${dest}")" != "${want}" ]]; then
+    fail_case "${name}" "activated bytes do not match the built artifact" "${case_dir}"
+    return 1
+  fi
+  if ! grep -Fq "new sha256:    ${want}" "${case_dir}/stdout"; then
+    fail_case "${name}" "the report did not carry the true SHA-256 of the activated file" \
+      "${case_dir}"
     return 1
   fi
 }
@@ -686,6 +820,93 @@ elif [[ "$(hash_of "${dest}")" != "${old_hash}" ]]; then
   fail_case "${name}" "the canonical executable was modified" "${case_dir}"
 else
   pass_case "${name}"
+fi
+
+# ---------- portability: a host with no GNU coreutils ----------
+#
+# install.sh supports Linux, macOS, and WSL and points the operator at this
+# command, but the script used to reach for `realpath -m`, `sha256sum`, and
+# `stat -c`. On a stock macOS the first of those aborts under `set -e` in
+# section 1 -- before any backup, build, or activation -- so the whole
+# canonical workflow was unreachable there.
+#
+# This runs the tracked script itself under a stand-in BSD userland. It is not
+# a check that portable-looking text appears somewhere: the refresh has to
+# actually complete, and the SHA-256 it reports has to be the real digest of
+# the file it activated.
+name="refresh_completes_without_gnu_realpath_stat_or_sha256sum"
+case_dir="${WORK_DIR}/${name}"; mkdir -p "${case_dir}"
+root="$(stage "${case_dir}")"
+head_sha="$(git -C "${root}" rev-parse HEAD)"
+dest="${case_dir}/home/.local/bin/claw"
+write_fake_claw "${dest}" "0ddba11"
+stage_bsd_utils "${case_dir}/bsdbin" bsd
+rc="$(FAKE_BUILT_SHA="${head_sha}" run_refresh "${case_dir}" "${root}" \
+  "PATH=${case_dir}/bsdbin:${case_dir}/fakebin:/usr/bin:/bin")"
+built_hash="$(hash_of "${root}/.canonical-refresh-target/release/claw" 2>/dev/null || true)"
+if [[ "${rc}" != "0" ]]; then
+  fail_case "${name}" "expected exit 0 on a non-GNU host, got ${rc}" "${case_dir}"
+elif grep -Eq 'illegal option|command not found' "${case_dir}/stderr"; then
+  fail_case "${name}" "the refresh still reached for a GNU-only utility" "${case_dir}"
+elif ! grep -Fq 'METADATA_SAW_BACKUP=yes' "${case_dir}/cargo.log"; then
+  fail_case "${name}" "the backup no longer precedes cargo metadata" "${case_dir}"
+elif ! assert_backup_is_regular_file "${name}" "${case_dir}"; then :
+elif ! assert_activated "${name}" "${case_dir}" "${built_hash}"; then :
+elif ! grep -Eq 'regular file, mode 0?755' "${case_dir}/stdout"; then
+  fail_case "${name}" "the report did not resolve the canonical file mode" "${case_dir}"
+elif ! assert_no_leftover_candidate "${name}" "${case_dir}"; then :
+else
+  pass_case "${name}"
+fi
+
+# ---------- portability: not even shasum or openssl ----------
+#
+# Guards against trading one hard dependency for another: no single hashing
+# tool may be load-bearing, and the provenance digest must stay an exact
+# SHA-256 whichever implementation ends up being used.
+name="refresh_completes_without_sha256sum_shasum_or_openssl"
+case_dir="${WORK_DIR}/${name}"; mkdir -p "${case_dir}"
+root="$(stage "${case_dir}")"
+head_sha="$(git -C "${root}" rev-parse HEAD)"
+dest="${case_dir}/home/.local/bin/claw"
+write_fake_claw "${dest}" "0ddba11"
+stage_bsd_utils "${case_dir}/bsdbin" minimal
+rc="$(FAKE_BUILT_SHA="${head_sha}" run_refresh "${case_dir}" "${root}" \
+  "PATH=${case_dir}/bsdbin:${case_dir}/fakebin:/usr/bin:/bin")"
+built_hash="$(hash_of "${root}/.canonical-refresh-target/release/claw" 2>/dev/null || true)"
+if [[ "${rc}" != "0" ]]; then
+  fail_case "${name}" "expected exit 0 with no sha256sum/shasum/openssl, got ${rc}" "${case_dir}"
+elif grep -Eq 'illegal option|command not found' "${case_dir}/stderr"; then
+  fail_case "${name}" "the refresh still reached for an unavailable utility" "${case_dir}"
+elif ! assert_activated "${name}" "${case_dir}" "${built_hash}"; then :
+elif ! assert_no_leftover_candidate "${name}" "${case_dir}"; then :
+else
+  pass_case "${name}"
+fi
+
+# ---------- portability: the GNU forms stay inside the helpers ----------
+#
+# The two cases above run on a host that has python3. This one keeps the
+# non-portable forms from creeping back into the body of the script, where
+# they would once again be reached before any fallback could apply.
+name="gnu_only_utilities_stay_inside_the_portable_helpers"
+helper_start="$(grep -n '^# portable utility helpers$' "${REAL_REFRESH}" | head -1 | cut -d: -f1 || true)"
+helper_end="$(grep -n '^assert_dest_topology()' "${REAL_REFRESH}" | head -1 | cut -d: -f1 || true)"
+if [[ -z "${helper_start}" || -z "${helper_end}" || "${helper_start}" -ge "${helper_end}" ]]; then
+  fail_case "${name}" "could not locate the portable helper block" \
+    "start=${helper_start} end=${helper_end}"
+else
+  outside="$(awk -v a="${helper_start}" -v b="${helper_end}" \
+    'NR < a || NR >= b { print NR ": " $0 }' "${REAL_REFRESH}" \
+    | grep -E 'realpath -m|sha256sum|stat -c' || true)"
+  if [[ -n "${outside}" ]]; then
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    printf '\n=== FAIL: %s ===\n' "${name}" >&2
+    printf '  reason: GNU-only utility used outside the portable helpers\n' >&2
+    printf '%s\n' "${outside}" | sed 's/^/    /' >&2
+  else
+    pass_case "${name}"
+  fi
 fi
 
 # ---------- summary ----------

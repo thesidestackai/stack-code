@@ -422,6 +422,583 @@ else
   pass_case "${name}"
 fi
 
+# ---------- portable file identity (Linux / macOS / WSL) ----------
+#
+# install.sh supports Linux, macOS, and WSL. Identity probing is what catches a
+# regular executable being swapped for another regular executable underneath
+# the single `--version` call, where topology alone sees nothing change. A
+# GNU-only `stat -c` makes that guard vacuous on a stock macOS: it fails on
+# both sides of the call, "" compares equal to "", and the swap is waved
+# through as CURRENT.
+#
+# These cases run the tracked script itself under stand-in userlands. They are
+# not a macOS substitute; they are a regression guard for the GNU assumption.
+
+# stage_identity_utils <dir> <flavour>
+#
+# bsd     — BSD/macOS stat: rejects GNU `-c`, serves `-f` with %z for size.
+#           python3 is shimmed to fail so only the BSD branch can succeed.
+# broken  — every supported identity mechanism fails: no usable stat, no
+#           python3. Identity is genuinely unobtainable.
+stage_identity_utils() {
+  local dir="$1" flavour="$2"
+  mkdir -p "${dir}"
+
+  if [[ "${flavour}" == "bsd" ]]; then
+    cat > "${dir}/stat" <<'BSD_STAT'
+#!/usr/bin/env bash
+# Stand-in BSD/macOS stat: no GNU -c, and size is %z rather than %s. `--` is
+# not honoured as an end-of-options marker, matching the BSD documentation.
+set -uo pipefail
+if [[ "${1:-}" == "-c" ]]; then
+  printf 'stat: illegal option -- c\n' >&2
+  exit 1
+fi
+if [[ "${1:-}" == "-f" ]]; then
+  fmt="${2:-}"
+  shift 2
+  if [[ "${1:-}" == "--" ]]; then
+    printf 'stat: --: No such file or directory\n' >&2
+    exit 1
+  fi
+  fmt="${fmt//%z/%s}"
+  fmt="${fmt//%Lp/%a}"
+  /usr/bin/stat -c "${fmt}" -- "$@"
+  exit $?
+fi
+printf 'stat: unsupported invocation\n' >&2
+exit 1
+BSD_STAT
+  else
+    cat > "${dir}/stat" <<'NO_STAT'
+#!/usr/bin/env bash
+printf 'stat: not available\n' >&2
+exit 127
+NO_STAT
+  fi
+  chmod 0755 "${dir}/stat"
+
+  # No python3 fallback in either flavour: the bsd case must prove the BSD
+  # branch itself works, and the broken case must leave nothing that works.
+  cat > "${dir}/python3" <<'NO_PY'
+#!/usr/bin/env bash
+printf 'python3: not available\n' >&2
+exit 127
+NO_PY
+  chmod 0755 "${dir}/python3"
+}
+
+# write_swapping_claw <canonical> <replacement> <sha>
+#
+# Prints a perfectly good full-SHA banner, then atomically replaces itself at
+# the canonical pathname with a different *regular executable*. Topology is
+# identical before and after; only device/inode/size differ.
+write_swapping_claw() {
+  local canonical="$1" replacement="$2" sha="$3"
+  mkdir -p -- "$(dirname -- "${canonical}")" "$(dirname -- "${replacement}")"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf '# replacement executable B\n'
+    printf '# %s\n' "$(printf 'B%.0s' $(seq 1 200))"
+    printf 'exit 0\n'
+  } > "${replacement}"
+  chmod 0755 -- "${replacement}"
+
+  cat > "${canonical}" <<SWAP
+#!/usr/bin/env bash
+printf 'FAKE_CLAW_ARGV=%s\n' "\$*" >> "\${FAKE_CLAW_LOG:-/dev/null}"
+printf 'Claw Code\n'
+printf '  Version          0.1.0\n'
+printf '  Git SHA          %s\n' '${sha}'
+printf '  Target           x86_64-unknown-linux-gnu\n'
+cp -p -- '${replacement}' '${canonical}.staged'
+mv -f -- '${canonical}.staged' '${canonical}'
+exit 0
+SWAP
+  chmod 0755 -- "${canonical}"
+}
+
+# ---------- case 13: BSD/macOS stat, nothing swapped, still CURRENT ----------
+#
+# Ordinary macOS-style execution must remain usable: a correct install is not
+# allowed to become permanently STALE just because the host is not GNU.
+name="bsd_stat_userland_unchanged_binary_is_current"
+case_dir="${WORK_DIR}/${name}"; mkdir -p "${case_dir}"
+root="$(make_repo "${case_dir}")"
+home="${case_dir}/home"
+head_sha="$(git -C "${root}" rev-parse HEAD)"
+set_origin_main "${root}" "${head_sha}"
+write_fake_claw "${home}/.local/bin/claw" "${head_sha}"
+stage_identity_utils "${case_dir}/bsdbin" bsd
+before="$(snapshot "${home}")"
+rc="$(run_status "${case_dir}" "${root}" "${home}" \
+  "PATH=${case_dir}/bsdbin:/usr/bin:/bin")"
+out="${case_dir}/stdout"; errf="${case_dir}/stderr"
+if [[ "${rc}" != "0" ]]; then
+  fail_case "${name}" "expected exit 0 (CURRENT) on a BSD userland, got ${rc}" "${out}" "${errf}"
+elif ! grep -Fq "state:               CURRENT" "${out}"; then
+  fail_case "${name}" "an unchanged install was not CURRENT on a BSD userland" "${out}" "${errf}"
+elif grep -Fq "identity could not be established" "${out}"; then
+  fail_case "${name}" "BSD identity probing did not work; it fell back to unavailable" "${out}" "${errf}"
+elif [[ "$(snapshot "${home}")" != "${before}" ]]; then
+  fail_case "${name}" "status mutated the fixture HOME" "${out}" "${errf}"
+else
+  pass_case "${name}"
+fi
+
+# ---------- case 14: BSD/macOS stat, file swapped under --version ----------
+#
+# The regression this lane exists for. Both files are regular executables, so
+# only the identity comparison can catch the swap — and on a GNU-only
+# implementation that comparison is "" vs "", which passes.
+name="bsd_stat_userland_swapped_binary_is_not_current"
+case_dir="${WORK_DIR}/${name}"; mkdir -p "${case_dir}"
+root="$(make_repo "${case_dir}")"
+home="${case_dir}/home"
+head_sha="$(git -C "${root}" rev-parse HEAD)"
+set_origin_main "${root}" "${head_sha}"
+canonical="${home}/.local/bin/claw"
+write_swapping_claw "${canonical}" "${case_dir}/elsewhere/claw_b" "${head_sha}"
+stage_identity_utils "${case_dir}/bsdbin" bsd
+rc="$(run_status "${case_dir}" "${root}" "${home}" \
+  "PATH=${case_dir}/bsdbin:/usr/bin:/bin")"
+out="${case_dir}/stdout"; errf="${case_dir}/stderr"
+if [[ ! -f "${canonical}" || -L "${canonical}" || ! -x "${canonical}" ]]; then
+  fail_case "${name}" "fixture invalid: the replacement is not a regular executable" "${out}" "${errf}"
+elif grep -Fq "state:               CURRENT" "${out}"; then
+  fail_case "${name}" "a binary swapped under --version was reported CURRENT on a BSD userland" "${out}" "${errf}"
+elif [[ "${rc}" == "0" ]]; then
+  fail_case "${name}" "expected a non-zero exit for a swapped binary, got 0" "${out}" "${errf}"
+elif [[ "${rc}" != "10" ]]; then
+  fail_case "${name}" "expected exit 10 (STALE), got ${rc}" "${out}" "${errf}"
+elif ! grep -Fq "identity changed while the version banner was being read" "${out}"; then
+  fail_case "${name}" "report did not explain the identity change" "${out}" "${errf}"
+else
+  pass_case "${name}"
+fi
+
+# ---------- case 15: identity probing unavailable fails closed ----------
+#
+# Two unreadable identities must never compare equal to each other. A host
+# that cannot prove the file is unchanged must not certify it as CURRENT.
+name="unavailable_identity_probing_fails_closed"
+case_dir="${WORK_DIR}/${name}"; mkdir -p "${case_dir}"
+root="$(make_repo "${case_dir}")"
+home="${case_dir}/home"
+head_sha="$(git -C "${root}" rev-parse HEAD)"
+set_origin_main "${root}" "${head_sha}"
+write_fake_claw "${home}/.local/bin/claw" "${head_sha}"
+stage_identity_utils "${case_dir}/nobin" broken
+before="$(snapshot "${home}")"
+rc="$(run_status "${case_dir}" "${root}" "${home}" \
+  "PATH=${case_dir}/nobin:/usr/bin:/bin")"
+out="${case_dir}/stdout"; errf="${case_dir}/stderr"
+if grep -Fq "state:               CURRENT" "${out}"; then
+  fail_case "${name}" "unprovable identity was reported CURRENT" "${out}" "${errf}"
+elif [[ "${rc}" == "0" ]]; then
+  fail_case "${name}" "expected a non-zero exit when identity is unprovable, got 0" "${out}" "${errf}"
+elif [[ "${rc}" != "10" ]]; then
+  fail_case "${name}" "expected exit 10 (STALE), got ${rc}" "${out}" "${errf}"
+elif ! grep -Fq "identity could not be established" "${out}"; then
+  fail_case "${name}" "report did not explain that identity was unobtainable" "${out}" "${errf}"
+elif [[ "$(snapshot "${home}")" != "${before}" ]]; then
+  fail_case "${name}" "status mutated the fixture HOME" "${out}" "${errf}"
+else
+  pass_case "${name}"
+fi
+
+# ---------- malformed-but-successful identity probes ----------
+#
+# Exit status is not proof. A `stat` on PATH that exits 0 while printing a
+# banner satisfies a status-only probe, and the backend it enshrines may then
+# print something perfectly well-formed for the canonical file — so the swap
+# guard ends up resting on a mechanism that never proved itself. Only the shape
+# of the probe output can tell these backends apart from working ones.
+
+# stage_malformed_identity_utils <dir> <flavour>
+#
+# gnu-only        — GNU `stat -c` exits 0 with a banner for the "/" probe but
+#                   returns a well-formed identity for every other path.
+#                   Nothing else is available.
+# gnu-then-bsd    — GNU `stat -c` is malformed for every path; BSD `stat -f`
+#                   works. A correct detector rejects gnu and selects bsd.
+# gnu-bsd-then-py — both stat mechanisms are malformed for every path; python3
+#                   is left real, so only the python3 backend can succeed.
+#
+# Every invocation is appended to $IDENTITY_PROBE_LOG so a case can show which
+# mechanism was actually used, not merely which verdict came out.
+stage_malformed_identity_utils() {
+  local dir="$1" flavour="$2"
+  mkdir -p "${dir}"
+  local gnu_probe_only="0" bsd_valid="0" shim_python="1"
+  case "${flavour}" in
+    gnu-only) gnu_probe_only="1" ;;
+    gnu-then-bsd) bsd_valid="1" ;;
+    gnu-bsd-then-py) shim_python="0" ;;
+    *)
+      printf 'test setup: unknown malformed identity flavour: %s\n' "${flavour}" >&2
+      exit 2
+      ;;
+  esac
+
+  cat > "${dir}/stat" <<STAT_SHIM
+#!/usr/bin/env bash
+# Stand-in stat that exits 0 while printing something that is not an identity.
+set -uo pipefail
+printf 'stat %s\n' "\$*" >> "\${IDENTITY_PROBE_LOG:-/dev/null}"
+if [[ "\${1:-}" == "-c" ]]; then
+  fmt="\${2:-}"
+  shift 2
+  [[ "\${1:-}" == "--" ]] && shift
+  if [[ "${gnu_probe_only}" == "1" && "\${1:-}" != "/" ]]; then
+    /usr/bin/stat -c "\${fmt}" -- "\${1:-}"
+    exit \$?
+  fi
+  printf 'not-an-identity\n'
+  exit 0
+fi
+if [[ "\${1:-}" == "-f" ]]; then
+  fmt="\${2:-}"
+  shift 2
+  if [[ "\${1:-}" == "--" ]]; then
+    printf 'stat: --: No such file or directory\n' >&2
+    exit 1
+  fi
+  if [[ "${bsd_valid}" == "1" ]]; then
+    fmt="\${fmt//%z/%s}"
+    /usr/bin/stat -c "\${fmt}" -- "\$@"
+    exit \$?
+  fi
+  printf 'not-an-identity\n'
+  exit 0
+fi
+printf 'stat: unsupported invocation\n' >&2
+exit 1
+STAT_SHIM
+  chmod 0755 "${dir}/stat"
+
+  if [[ "${shim_python}" == "1" ]]; then
+    cat > "${dir}/python3" <<'NO_PY'
+#!/usr/bin/env bash
+printf 'python3: not available\n' >&2
+exit 127
+NO_PY
+    chmod 0755 "${dir}/python3"
+  fi
+}
+
+# ---------- case 16: a malformed successful probe is not a backend ----------
+#
+# The exact defect: the probe exits 0 with "not-an-identity", the same backend
+# would answer the canonical path correctly, and no other mechanism exists.
+# Trusting exit status alone yields CURRENT here. Nothing proved itself, so the
+# only honest verdict is STALE.
+name="malformed_successful_identity_probe_is_not_trusted"
+case_dir="${WORK_DIR}/${name}"; mkdir -p "${case_dir}"
+root="$(make_repo "${case_dir}")"
+home="${case_dir}/home"
+head_sha="$(git -C "${root}" rev-parse HEAD)"
+set_origin_main "${root}" "${head_sha}"
+write_fake_claw "${home}/.local/bin/claw" "${head_sha}"
+stage_malformed_identity_utils "${case_dir}/badbin" gnu-only
+before="$(snapshot "${home}")"
+rc="$(run_status "${case_dir}" "${root}" "${home}" \
+  "PATH=${case_dir}/badbin:/usr/bin:/bin" \
+  "IDENTITY_PROBE_LOG=${case_dir}/probe.log")"
+out="${case_dir}/stdout"; errf="${case_dir}/stderr"
+if grep -Fq "state:               CURRENT" "${out}"; then
+  fail_case "${name}" "a backend whose probe returned a non-identity was trusted, and its install reported CURRENT" "${out}" "${errf}"
+elif [[ "${rc}" == "0" ]]; then
+  fail_case "${name}" "expected a non-zero exit when no backend proved itself, got 0" "${out}" "${errf}"
+elif [[ "${rc}" != "10" ]]; then
+  fail_case "${name}" "expected exit 10 (STALE), got ${rc}" "${out}" "${errf}"
+elif ! grep -Fq "identity could not be established" "${out}"; then
+  fail_case "${name}" "report did not explain that no identity mechanism was available" "${out}" "${errf}"
+elif [[ "$(snapshot "${home}")" != "${before}" ]]; then
+  fail_case "${name}" "status mutated the fixture HOME" "${out}" "${errf}"
+else
+  pass_case "${name}"
+fi
+
+# ---------- case 17: a malformed gnu probe falls through to bsd ----------
+#
+# Rejecting a malformed backend must not become a premature global failure. A
+# host whose `stat -c` is unusable but whose `stat -f` works is an ordinary
+# macOS-shaped host, and a correct install there is still CURRENT.
+name="malformed_gnu_probe_falls_through_to_valid_bsd"
+case_dir="${WORK_DIR}/${name}"; mkdir -p "${case_dir}"
+root="$(make_repo "${case_dir}")"
+home="${case_dir}/home"
+head_sha="$(git -C "${root}" rev-parse HEAD)"
+set_origin_main "${root}" "${head_sha}"
+canonical="${home}/.local/bin/claw"
+write_fake_claw "${canonical}" "${head_sha}"
+stage_malformed_identity_utils "${case_dir}/badbin" gnu-then-bsd
+before="$(snapshot "${home}")"
+rc="$(run_status "${case_dir}" "${root}" "${home}" \
+  "PATH=${case_dir}/badbin:/usr/bin:/bin" \
+  "IDENTITY_PROBE_LOG=${case_dir}/probe.log")"
+out="${case_dir}/stdout"; errf="${case_dir}/stderr"
+probe_log="${case_dir}/probe.log"
+if [[ "${rc}" != "0" ]]; then
+  fail_case "${name}" "expected exit 0 (CURRENT) once bsd was selected, got ${rc}" "${out}" "${errf}"
+elif ! grep -Fq "state:               CURRENT" "${out}"; then
+  fail_case "${name}" "an unchanged install was not CURRENT after falling through to bsd" "${out}" "${errf}"
+elif grep -Fq "identity could not be established" "${out}"; then
+  fail_case "${name}" "a malformed gnu probe was turned into a global identity failure" "${out}" "${errf}"
+elif ! grep -Fq -- "-f %d:%i:%z ${canonical}" "${probe_log}"; then
+  fail_case "${name}" "the canonical identity was not read through the bsd mechanism" "${out}" "${errf}"
+elif [[ "$(snapshot "${home}")" != "${before}" ]]; then
+  fail_case "${name}" "status mutated the fixture HOME" "${out}" "${errf}"
+else
+  pass_case "${name}"
+fi
+
+# ---------- case 18: malformed gnu and bsd fall through to python3 ----------
+#
+# Fallthrough is a chain, not a single step: two malformed stat mechanisms must
+# still leave the python3 backend reachable.
+name="malformed_stat_probes_fall_through_to_python3"
+case_dir="${WORK_DIR}/${name}"; mkdir -p "${case_dir}"
+root="$(make_repo "${case_dir}")"
+home="${case_dir}/home"
+head_sha="$(git -C "${root}" rev-parse HEAD)"
+set_origin_main "${root}" "${head_sha}"
+write_fake_claw "${home}/.local/bin/claw" "${head_sha}"
+stage_malformed_identity_utils "${case_dir}/badbin" gnu-bsd-then-py
+before="$(snapshot "${home}")"
+rc="$(run_status "${case_dir}" "${root}" "${home}" \
+  "PATH=${case_dir}/badbin:/usr/bin:/bin" \
+  "IDENTITY_PROBE_LOG=${case_dir}/probe.log")"
+out="${case_dir}/stdout"; errf="${case_dir}/stderr"
+probe_log="${case_dir}/probe.log"
+if [[ "${rc}" != "0" ]]; then
+  fail_case "${name}" "expected exit 0 (CURRENT) once python3 was selected, got ${rc}" "${out}" "${errf}"
+elif ! grep -Fq "state:               CURRENT" "${out}"; then
+  fail_case "${name}" "an unchanged install was not CURRENT after falling through to python3" "${out}" "${errf}"
+elif grep -Fq "identity could not be established" "${out}"; then
+  fail_case "${name}" "malformed stat probes were turned into a global identity failure" "${out}" "${errf}"
+elif ! grep -Fq -- "-c %d:%i:%s -- /" "${probe_log}"; then
+  fail_case "${name}" "the gnu mechanism was never probed" "${out}" "${errf}"
+elif ! grep -Fq -- "-f %d:%i:%z /" "${probe_log}"; then
+  fail_case "${name}" "the bsd mechanism was never probed after gnu was rejected" "${out}" "${errf}"
+elif grep -Fq -- "${home}" "${probe_log}"; then
+  fail_case "${name}" "a rejected stat mechanism was still used to read the canonical identity" "${out}" "${errf}"
+elif [[ "$(snapshot "${home}")" != "${before}" ]]; then
+  fail_case "${name}" "status mutated the fixture HOME" "${out}" "${errf}"
+else
+  pass_case "${name}"
+fi
+
+# ---------- nonzero-status identity probes ----------
+#
+# The other half of "exit status is not proof": output shape is not proof
+# either. A utility that exits nonzero can still print a perfectly well-formed
+# device:inode:size line — a stub on PATH, a wrapper that emits a cached line
+# before failing, a partially written buffer. Accepting it on shape alone
+# enshrines a mechanism whose own report of itself is failure, and the swap
+# guard then rests on a backend that never worked.
+#
+# These cases hold both probe-time selection and the per-file read to the same
+# two-part contract: the command must exit 0 AND print an identity.
+
+# stage_status_identity_utils <dir> <flavour>
+#
+# gnu-nonzero-only    — GNU `stat -c` prints a well-formed identity for the "/"
+#                       probe but exits 9, and answers every other path
+#                       correctly with exit 0. Nothing else is available. A
+#                       status-blind detector trusts gnu here and certifies the
+#                       install; nothing proved itself, so the honest verdict
+#                       is STALE.
+# gnu-nonzero-then-bsd — GNU `stat -c` prints a well-formed identity but exits
+#                       9 for every path; BSD `stat -f` works. A correct
+#                       detector rejects gnu and selects bsd.
+# runtime-nonzero     — every backend probes cleanly, but the read of any path
+#                       other than "/" prints a well-formed identity while
+#                       exiting 7. Probe-time acceptance is not enough: the
+#                       per-file read has to check its own status too.
+#
+# Every invocation is appended to $IDENTITY_PROBE_LOG.
+stage_status_identity_utils() {
+  local dir="$1" flavour="$2"
+  mkdir -p "${dir}"
+  local gnu_probe_rc="0" gnu_all_paths_rc="0" bsd_valid="0" runtime_rc="0"
+  case "${flavour}" in
+    gnu-nonzero-only) gnu_probe_rc="9" ;;
+    gnu-nonzero-then-bsd) gnu_probe_rc="9"; gnu_all_paths_rc="9"; bsd_valid="1" ;;
+    runtime-nonzero) runtime_rc="7" ;;
+    *)
+      printf 'test setup: unknown status identity flavour: %s\n' "${flavour}" >&2
+      exit 2
+      ;;
+  esac
+
+  cat > "${dir}/stat" <<STAT_SHIM
+#!/usr/bin/env bash
+# Stand-in stat whose exit status and output shape are controlled separately.
+set -uo pipefail
+printf 'stat %s\n' "\$*" >> "\${IDENTITY_PROBE_LOG:-/dev/null}"
+if [[ "\${1:-}" == "-c" ]]; then
+  fmt="\${2:-}"
+  shift 2
+  [[ "\${1:-}" == "--" ]] && shift
+  path="\${1:-}"
+  if [[ "\${path}" == "/" ]]; then
+    printf '1:2:3\n'
+    exit ${gnu_probe_rc}
+  fi
+  if [[ "${gnu_all_paths_rc}" != "0" ]]; then
+    printf '1:2:3\n'
+    exit ${gnu_all_paths_rc}
+  fi
+  if [[ "${runtime_rc}" != "0" ]]; then
+    printf '4:5:6\n'
+    exit ${runtime_rc}
+  fi
+  /usr/bin/stat -c "\${fmt}" -- "\${path}"
+  exit \$?
+fi
+if [[ "\${1:-}" == "-f" ]]; then
+  fmt="\${2:-}"
+  shift 2
+  if [[ "\${1:-}" == "--" ]]; then
+    printf 'stat: --: No such file or directory\n' >&2
+    exit 1
+  fi
+  path="\${1:-}"
+  if [[ "${bsd_valid}" != "1" ]]; then
+    printf 'stat: illegal option -- f\n' >&2
+    exit 1
+  fi
+  fmt="\${fmt//%z/%s}"
+  /usr/bin/stat -c "\${fmt}" -- "\${path}"
+  exit \$?
+fi
+printf 'stat: unsupported invocation\n' >&2
+exit 1
+STAT_SHIM
+  chmod 0755 "${dir}/stat"
+
+  cat > "${dir}/python3" <<PY_SHIM
+#!/usr/bin/env bash
+# python3 fallback. Probes cleanly only where the flavour needs a working
+# backend after the stat mechanisms; otherwise it is unavailable, so a case
+# cannot pass through a mechanism it did not mean to exercise.
+set -uo pipefail
+path="\${@: -1}"
+printf 'python3 %s\n' "\${path}" >> "\${IDENTITY_PROBE_LOG:-/dev/null}"
+if [[ "${runtime_rc}" != "0" ]]; then
+  if [[ "\${path}" == "/" ]]; then
+    /usr/bin/stat -c '%d:%i:%s' -- "\${path}"
+    exit \$?
+  fi
+  printf '4:5:6\n'
+  exit ${runtime_rc}
+fi
+printf 'python3: not available\n' >&2
+exit 127
+PY_SHIM
+  chmod 0755 "${dir}/python3"
+}
+
+# ---------- case 19: a nonzero probe is not a backend ----------
+#
+# The exact defect this lane exists for: the "/" probe prints "1:2:3" and exits
+# 9, the same backend answers the canonical path correctly, and no other
+# mechanism exists. Trusting output shape alone yields CURRENT here.
+name="nonzero_valid_looking_identity_probe_is_not_trusted"
+case_dir="${WORK_DIR}/${name}"; mkdir -p "${case_dir}"
+root="$(make_repo "${case_dir}")"
+home="${case_dir}/home"
+head_sha="$(git -C "${root}" rev-parse HEAD)"
+set_origin_main "${root}" "${head_sha}"
+write_fake_claw "${home}/.local/bin/claw" "${head_sha}"
+stage_status_identity_utils "${case_dir}/rcbin" gnu-nonzero-only
+before="$(snapshot "${home}")"
+rc="$(run_status "${case_dir}" "${root}" "${home}" \
+  "PATH=${case_dir}/rcbin:/usr/bin:/bin" \
+  "IDENTITY_PROBE_LOG=${case_dir}/probe.log")"
+out="${case_dir}/stdout"; errf="${case_dir}/stderr"
+if grep -Fq "state:               CURRENT" "${out}"; then
+  fail_case "${name}" "a backend whose probe exited nonzero was trusted on the shape of its output, and its install reported CURRENT" "${out}" "${errf}"
+elif [[ "${rc}" == "0" ]]; then
+  fail_case "${name}" "expected a non-zero exit when no backend proved itself, got 0" "${out}" "${errf}"
+elif [[ "${rc}" != "10" ]]; then
+  fail_case "${name}" "expected exit 10 (STALE), got ${rc}" "${out}" "${errf}"
+elif ! grep -Fq "identity could not be established" "${out}"; then
+  fail_case "${name}" "report did not explain that no identity mechanism was available" "${out}" "${errf}"
+elif ! grep -Fq -- "-c %d:%i:%s -- /" "${case_dir}/probe.log"; then
+  fail_case "${name}" "the gnu mechanism was never probed" "${out}" "${errf}"
+elif [[ "$(snapshot "${home}")" != "${before}" ]]; then
+  fail_case "${name}" "status mutated the fixture HOME" "${out}" "${errf}"
+else
+  pass_case "${name}"
+fi
+
+# ---------- case 20: a nonzero gnu probe falls through to bsd ----------
+#
+# Rejecting a failing backend must not become a premature global failure: the
+# next mechanism in the chain still has to be tried and used.
+name="nonzero_gnu_probe_falls_through_to_valid_bsd"
+case_dir="${WORK_DIR}/${name}"; mkdir -p "${case_dir}"
+root="$(make_repo "${case_dir}")"
+home="${case_dir}/home"
+head_sha="$(git -C "${root}" rev-parse HEAD)"
+set_origin_main "${root}" "${head_sha}"
+canonical="${home}/.local/bin/claw"
+write_fake_claw "${canonical}" "${head_sha}"
+stage_status_identity_utils "${case_dir}/rcbin" gnu-nonzero-then-bsd
+before="$(snapshot "${home}")"
+rc="$(run_status "${case_dir}" "${root}" "${home}" \
+  "PATH=${case_dir}/rcbin:/usr/bin:/bin" \
+  "IDENTITY_PROBE_LOG=${case_dir}/probe.log")"
+out="${case_dir}/stdout"; errf="${case_dir}/stderr"
+probe_log="${case_dir}/probe.log"
+if [[ "${rc}" != "0" ]]; then
+  fail_case "${name}" "expected exit 0 (CURRENT) once bsd was selected, got ${rc}" "${out}" "${errf}"
+elif ! grep -Fq "state:               CURRENT" "${out}"; then
+  fail_case "${name}" "an unchanged install was not CURRENT after falling through to bsd" "${out}" "${errf}"
+elif grep -Fq "identity could not be established" "${out}"; then
+  fail_case "${name}" "a nonzero gnu probe was turned into a global identity failure" "${out}" "${errf}"
+elif ! grep -Fq -- "-f %d:%i:%z ${canonical}" "${probe_log}"; then
+  fail_case "${name}" "the canonical identity was not read through the bsd mechanism" "${out}" "${errf}"
+elif [[ "$(snapshot "${home}")" != "${before}" ]]; then
+  fail_case "${name}" "status mutated the fixture HOME" "${out}" "${errf}"
+else
+  pass_case "${name}"
+fi
+
+# ---------- case 21: a nonzero per-file identity read is not trusted ----------
+#
+# Probe-time acceptance does not license the reads that follow. A backend that
+# probed cleanly and then fails on the canonical path — while still printing
+# something well-formed — has proved nothing about that file, so the binary
+# cannot be certified unchanged across the version banner.
+name="nonzero_status_identity_read_is_not_trusted_at_runtime"
+case_dir="${WORK_DIR}/${name}"; mkdir -p "${case_dir}"
+root="$(make_repo "${case_dir}")"
+home="${case_dir}/home"
+head_sha="$(git -C "${root}" rev-parse HEAD)"
+set_origin_main "${root}" "${head_sha}"
+write_fake_claw "${home}/.local/bin/claw" "${head_sha}"
+stage_status_identity_utils "${case_dir}/rcbin" runtime-nonzero
+before="$(snapshot "${home}")"
+rc="$(run_status "${case_dir}" "${root}" "${home}" \
+  "PATH=${case_dir}/rcbin:/usr/bin:/bin" \
+  "IDENTITY_PROBE_LOG=${case_dir}/probe.log")"
+out="${case_dir}/stdout"; errf="${case_dir}/stderr"
+if grep -Fq "state:               CURRENT" "${out}"; then
+  fail_case "${name}" "an identity read that exited nonzero was accepted on the shape of its output, and the install reported CURRENT" "${out}" "${errf}"
+elif [[ "${rc}" != "10" ]]; then
+  fail_case "${name}" "expected exit 10 (STALE), got ${rc}" "${out}" "${errf}"
+elif ! grep -Fq "identity could not be established" "${out}"; then
+  fail_case "${name}" "report did not explain that the canonical identity was unprovable" "${out}" "${errf}"
+elif [[ "$(snapshot "${home}")" != "${before}" ]]; then
+  fail_case "${name}" "status mutated the fixture HOME" "${out}" "${errf}"
+else
+  pass_case "${name}"
+fi
+
 # ---------- summary ----------
 if [[ "${FAIL_COUNT}" -gt 0 ]]; then
   printf '\nFAIL: %d cases failed, %d passed\n' "${FAIL_COUNT}" "${PASS_COUNT}" >&2

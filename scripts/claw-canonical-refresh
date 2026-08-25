@@ -80,6 +80,120 @@ info()  { printf '%s: %s\n' "${PROG}" "$1"; }
 warn()  { printf '%s: warning: %s\n' "${PROG}" "$1" >&2; }
 fail()  { printf '%s: %s\n' "${PROG}" "$1" >&2; }
 
+# ---------------------------------------------------------------------------
+# portable utility helpers
+# ---------------------------------------------------------------------------
+#
+# install.sh supports Linux, macOS, and WSL and sends the operator straight to
+# this command, so the refresh may not depend on GNU coreutils behaviour. A
+# stock macOS has BSD `realpath` (no `-m`), BSD `stat` (no `-c`), and no
+# `sha256sum` at all, so the GNU-only forms died in section 1 under `set -e`
+# before anything could be backed up, built, or activated.
+#
+# Each helper probes once and caches what it found. None of them ever print
+# file contents, and `hash_file` validates its own output, so a hashing tool
+# that fails can never be mistaken for a hash that matches.
+
+PORTABLE_ABS_IMPL=""
+PORTABLE_HASH_IMPL=""
+PORTABLE_MODE_IMPL=""
+
+# abs_path <path> — absolute, symlink-resolved path for a path that need not
+# exist. These are GNU `realpath -m` semantics; Python's os.path.realpath is
+# non-strict by default and produces the same result on hosts without one.
+abs_path() {
+  if [[ -z "${PORTABLE_ABS_IMPL}" ]]; then
+    if realpath -m -- / >/dev/null 2>&1; then
+      PORTABLE_ABS_IMPL="realpath"
+    elif python3 -c 'import os' >/dev/null 2>&1; then
+      PORTABLE_ABS_IMPL="python3"
+    else
+      fail "cannot resolve absolute paths: need GNU 'realpath -m' or python3."
+      exit "${EXIT_USAGE}"
+    fi
+  fi
+  case "${PORTABLE_ABS_IMPL}" in
+    realpath) realpath -m -- "$1" ;;
+    python3)  python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1" ;;
+  esac
+}
+
+# hash_file <path> — bare lowercase SHA-256 hex digest of <path>.
+#
+# The digest is what binds a backup, a candidate, and the activated file to
+# the built artifact, so this returns non-zero rather than an empty string
+# when it cannot produce exactly 64 lowercase hex characters.
+hash_file() {
+  local out=""
+  if [[ -z "${PORTABLE_HASH_IMPL}" ]]; then
+    if printf '' | sha256sum >/dev/null 2>&1; then
+      PORTABLE_HASH_IMPL="sha256sum"
+    elif printf '' | shasum -a 256 >/dev/null 2>&1; then
+      PORTABLE_HASH_IMPL="shasum"
+    elif printf '' | openssl dgst -sha256 >/dev/null 2>&1; then
+      PORTABLE_HASH_IMPL="openssl"
+    elif python3 -c 'import hashlib' >/dev/null 2>&1; then
+      PORTABLE_HASH_IMPL="python3"
+    else
+      fail "cannot compute SHA-256: need sha256sum, shasum, openssl, or python3."
+      exit "${EXIT_USAGE}"
+    fi
+  fi
+  case "${PORTABLE_HASH_IMPL}" in
+    sha256sum)
+      out="$(sha256sum -- "$1")" || return 1
+      out="${out%% *}"
+      ;;
+    shasum)
+      out="$(shasum -a 256 -- "$1")" || return 1
+      out="${out%% *}"
+      ;;
+    openssl)
+      out="$(openssl dgst -sha256 "$1")" || return 1
+      out="${out##* }"
+      ;;
+    python3)
+      out="$(python3 -c 'import hashlib, sys
+digest = hashlib.sha256()
+with open(sys.argv[1], "rb") as handle:
+    for chunk in iter(lambda: handle.read(1048576), b""):
+        digest.update(chunk)
+print(digest.hexdigest())' "$1")" || return 1
+      ;;
+  esac
+  if [[ ! "${out}" =~ ^[0-9a-f]{64}$ ]]; then
+    fail "SHA-256 computation failed for: $1"
+    return 1
+  fi
+  printf '%s\n' "${out}"
+}
+
+# file_mode <path> — POSIX permission bits as octal digits, e.g. 755.
+#
+# Report-only, so a host with none of these degrades to a literal rather than
+# aborting an otherwise successful refresh at the provenance report.
+file_mode() {
+  if [[ -z "${PORTABLE_MODE_IMPL}" ]]; then
+    if stat -c '%a' -- / >/dev/null 2>&1; then
+      PORTABLE_MODE_IMPL="gnu"
+    elif stat -f '%Lp' -- / >/dev/null 2>&1; then
+      PORTABLE_MODE_IMPL="bsd"
+    elif python3 -c 'import os' >/dev/null 2>&1; then
+      PORTABLE_MODE_IMPL="python3"
+    else
+      PORTABLE_MODE_IMPL="unknown"
+    fi
+  fi
+  case "${PORTABLE_MODE_IMPL}" in
+    gnu) stat -c '%a' -- "$1" ;;
+    bsd) stat -f '%Lp' -- "$1" ;;
+    python3)
+      python3 -c 'import os, sys; print(format(os.stat(sys.argv[1]).st_mode & 0o7777, "o"))' "$1"
+      ;;
+    *) printf 'unknown\n' ;;
+  esac
+}
+
 # assert_dest_topology <path>
 #
 # The canonical destination must never be a symlink (dangling or not) and,
@@ -147,6 +261,14 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 TS="$(date +%Y%m%d_%H%M%S)"
 
+# Resolve the portable helpers now, in THIS shell. Every later call sits
+# inside a command substitution, whose assignment to the cache variables would
+# be discarded, and a host with no usable implementation must be refused here
+# -- before any canonical file is backed up, built over, or activated.
+abs_path / >/dev/null
+hash_file /dev/null >/dev/null
+file_mode / >/dev/null
+
 # ---------------------------------------------------------------------------
 # 1. destination
 # ---------------------------------------------------------------------------
@@ -168,8 +290,8 @@ DEST_DIR="$(dirname -- "${DEST}")"
 # the SideStackAI canonical operator entrypoint and must never be the target
 # of this refresh.
 if [[ -n "${HOME:-}" ]]; then
-  cargo_bin_real="$(realpath -m -- "${HOME}/.cargo/bin")"
-  dest_dir_real="$(realpath -m -- "${DEST_DIR}")"
+  cargo_bin_real="$(abs_path "${HOME}/.cargo/bin")"
+  dest_dir_real="$(abs_path "${DEST_DIR}")"
   if [[ "${dest_dir_real}" == "${cargo_bin_real}" ]]; then
     fail "refusing to install into ~/.cargo/bin: that is not the SideStackAI canonical entrypoint."
     exit "${EXIT_USAGE}"
@@ -261,15 +383,15 @@ LOCKFILE="${RUST_DIR}/Cargo.lock"
 # lockfile_state — content hash of Cargo.lock, or the literal "absent".
 lockfile_state() {
   if [[ -f "${LOCKFILE}" ]]; then
-    sha256sum -- "${LOCKFILE}" | awk '{print $1}'
+    hash_file "${LOCKFILE}"
   else
     printf 'absent\n'
   fi
 }
 
 TARGET_DIR="${REPO_ROOT}/.canonical-refresh-target"
-REPO_REAL="$(realpath -- "${REPO_ROOT}")"
-TARGET_REAL="$(realpath -m -- "${TARGET_DIR}")"
+REPO_REAL="$(abs_path "${REPO_ROOT}")"
+TARGET_REAL="$(abs_path "${TARGET_DIR}")"
 
 assert_target_allowed() {
   local candidate="$1"
@@ -306,7 +428,7 @@ OLD_SHA=""
 
 if [[ -e "${DEST}" || -L "${DEST}" ]]; then
   assert_dest_regular "${DEST}" "pre-hash"
-  OLD_HASH="$(sha256sum -- "${DEST}" | awk '{print $1}')"
+  OLD_HASH="$(hash_file "${DEST}")"
 
   # Reading the previous banner executes the canonical file: recheck first.
   assert_dest_regular "${DEST}" "pre-version"
@@ -346,7 +468,7 @@ if [[ -e "${DEST}" || -L "${DEST}" ]]; then
     fail "  backup: ${BACKUP_FILE}"
     exit "${EXIT_TOPOLOGY}"
   fi
-  backup_hash="$(sha256sum -- "${BACKUP_FILE}" | awk '{print $1}')"
+  backup_hash="$(hash_file "${BACKUP_FILE}")"
   if [[ "${backup_hash}" != "${OLD_HASH}" ]]; then
     fail "backup verification failed; refusing to continue."
     exit "${EXIT_ACTIVATION}"
@@ -406,7 +528,7 @@ if [[ -z "${metadata_target}" ]]; then
   exit "${EXIT_TARGET}"
 fi
 
-metadata_real="$(realpath -m -- "${metadata_target}")"
+metadata_real="$(abs_path "${metadata_target}")"
 assert_target_allowed "${metadata_real}" "cargo-reported build target"
 if [[ "${metadata_real}" != "${TARGET_REAL}" ]]; then
   fail "cargo resolved a build target other than the one this refresh forced; refusing."
@@ -454,7 +576,7 @@ if [[ ! "${BUILT_SHA}" =~ ^[0-9a-f]{40}$ || "${BUILT_SHA}" != "${HEAD_SHA}" ]]; 
   exit "${EXIT_PROVENANCE}"
 fi
 
-NEW_HASH="$(sha256sum -- "${BUILT}" | awk '{print $1}')"
+NEW_HASH="$(hash_file "${BUILT}")"
 info "built:       ${BUILT_SHA} (sha256 ${NEW_HASH})"
 
 # ---------------------------------------------------------------------------
@@ -475,7 +597,7 @@ if [[ -L "${CANDIDATE}" || ! -f "${CANDIDATE}" || ! -x "${CANDIDATE}" ]]; then
   fail "staged candidate is not a regular executable file; canonical executable left untouched."
   exit "${EXIT_ACTIVATION}"
 fi
-candidate_hash="$(sha256sum -- "${CANDIDATE}" | awk '{print $1}')"
+candidate_hash="$(hash_file "${CANDIDATE}")"
 candidate_sha="$("${CANDIDATE}" --version 2>/dev/null \
   | awk '/^[[:space:]]*Git SHA[[:space:]]/ { print $3; exit }' || true)"
 if [[ "${candidate_hash}" != "${NEW_HASH}" || "${candidate_sha}" != "${BUILT_SHA}" ]]; then
@@ -513,7 +635,7 @@ if [[ -L "${DEST}" ]]; then
 elif [[ ! -f "${DEST}" || ! -x "${DEST}" ]]; then
   post_failure="canonical path is not a regular executable file"
 else
-  active_hash="$(sha256sum -- "${DEST}" | awk '{print $1}')"
+  active_hash="$(hash_file "${DEST}")"
   active_sha="$("${DEST}" --version 2>/dev/null \
     | awk '/^[[:space:]]*Git SHA[[:space:]]/ { print $3; exit }' || true)"
   if [[ "${active_hash}" != "${NEW_HASH}" ]]; then
@@ -541,7 +663,7 @@ if [[ -n "${post_failure}" ]]; then
     fail "ROLLBACK FAILED: could not restore ${DEST} from ${BACKUP_FILE}"
     exit "${EXIT_ROLLBACK_FAILED}"
   fi
-  restored_hash="$(sha256sum -- "${DEST}" | awk '{print $1}')"
+  restored_hash="$(hash_file "${DEST}")"
   if [[ "${restored_hash}" != "${OLD_HASH}" ]]; then
     fail "ROLLBACK FAILED: restored bytes do not match the backup."
     fail "  backup: ${BACKUP_FILE}"
@@ -560,7 +682,7 @@ cat <<EOF
 
 canonical claw refreshed
   destination:   ${DEST}
-  topology:      regular file, mode $(stat -c '%a' -- "${DEST}")
+  topology:      regular file, mode $(file_mode "${DEST}")
   source repo:   ${REPO_ROOT}
   source HEAD:   ${HEAD_SHA}
   origin/main:   ${ORIGIN_MAIN}

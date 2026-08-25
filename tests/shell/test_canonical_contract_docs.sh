@@ -1,15 +1,22 @@
 #!/usr/bin/env bash
 # Source-of-truth regression tests for the canonical claw install contract.
 #
-# Purely textual: reads tracked files, executes nothing, writes nothing, and
-# never touches $HOME. Locks the parts of the contract that live in comments
-# and documentation, which are exactly the parts that drifted before:
+# Almost entirely textual: reads tracked files, writes nothing outside a
+# throwaway temp directory, and never touches $HOME or the network. Locks the
+# parts of the contract that live in comments and documentation, which are
+# exactly the parts that drifted before:
 #
 #   * the canonical path is $HOME/.local/bin/claw;
 #   * no tracked surface describes it as a symlink or tells an operator to
 #     point it at a Cargo target directory;
 #   * install.sh is described as build-only;
 #   * the refresh and status commands are documented.
+#
+# The one exception is the last case. The build script's Git-invalidation
+# contract is a BEHAVIOUR, and a purely textual guard already failed to catch
+# a real staleness bug in it, so that case builds a throwaway Cargo/Git
+# fixture around the tracked build.rs and observes what Cargo actually does.
+# It has no dependencies, builds --offline, and lives entirely under mktemp.
 
 # Needles below are single-quoted on purpose: they are literal source text to
 # match, not expressions to expand.
@@ -35,6 +42,10 @@ fail_case() {
     printf '%s\n' "$3" | sed 's/^/    /' >&2
   fi
 }
+
+# hash_of_file <path> — content hash used to prove the fixture isolated the
+# ref transition. Any stable digest will do; this never leaves the fixture.
+hash_of_file() { cksum -- "$1" | awk '{print $1 "-" $2}'; }
 
 # assert_contains <name> <file> <literal>
 assert_contains() {
@@ -316,6 +327,115 @@ if assert_contains "${name}" scripts/claw-canonical-refresh 'Residual race' \
    && assert_contains "${name}" scripts/claw-canonical-status 'SAME-USER' \
    && assert_contains "${name}" scripts/claw-sidestack-local 'SAME-USER'; then
   pass_case "${name}"
+fi
+
+# ---------- the build script actually invalidates across a packed ref ----------
+#
+# Regression guard for the staleness bug the textual case above could not see.
+# When the checked-out branch exists only in `packed-refs`, its loose ref file
+# is absent, so a watcher that only names files that exist drops it. The next
+# commit writes the loose ref back WITHOUT touching `HEAD` or `packed-refs` --
+# and a warm Cargo target happily keeps serving the previous commit's GIT_SHA.
+#
+# Two things have to hold at once, which is why this is behavioural:
+#   * the packed -> loose transition must rerun the build script;
+#   * an idle rebuild must NOT, because "watch the missing file" would fix the
+#     first at the cost of recompiling forever.
+name="build_rs_invalidates_git_sha_across_a_packed_ref_transition"
+if ! command -v cargo >/dev/null 2>&1; then
+  fail_case "${name}" "cargo is required to verify the build-script invalidation contract"
+else
+  fixture="$(mktemp -d -t canonical-build-rs-fixture.XXXXXX)"
+  trap 'rm -rf "${fixture}"' EXIT INT TERM
+  mkdir -p "${fixture}/src"
+  cp -- rust/crates/rusty-claude-cli/build.rs "${fixture}/build.rs"
+  cat > "${fixture}/Cargo.toml" <<'FIXTURE_TOML'
+[package]
+name = "canonical-provenance-fixture"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "canonical-provenance-fixture"
+path = "src/main.rs"
+FIXTURE_TOML
+  cat > "${fixture}/src/main.rs" <<'FIXTURE_MAIN'
+fn main() {
+    println!("{}", env!("GIT_SHA"));
+}
+FIXTURE_MAIN
+  printf '/target\n' > "${fixture}/.gitignore"
+
+  # A nested branch name is deliberate: pack-refs prunes the intermediate
+  # refs/heads/<dir>/ too, so the watcher has to cope with a ref whose parent
+  # directory does not exist either.
+  fixture_branch="fixture/packed-ref-branch"
+  git -C "${fixture}" init -q -b "${fixture_branch}"
+  git -C "${fixture}" config user.name fixture
+  git -C "${fixture}" config user.email fixture@example.invalid
+  git -C "${fixture}" config commit.gpgsign false
+  git -C "${fixture}" add Cargo.toml src/main.rs build.rs .gitignore
+  git -C "${fixture}" commit -q -m "commit A"
+  sha_a="$(git -C "${fixture}" rev-parse HEAD)"
+
+  git -C "${fixture}" pack-refs --all --prune
+  head_before="$(cat "${fixture}/.git/HEAD")"
+  packed_before="$(hash_of_file "${fixture}/.git/packed-refs")"
+
+  fixture_build() {
+    ( cd "${fixture}" \
+      && CARGO_TARGET_DIR="${fixture}/target" cargo build --offline -q 2>&1 )
+  }
+  fixture_sha() { "${fixture}/target/debug/canonical-provenance-fixture"; }
+  # Cargo prints "Fresh <pkg>" under -v only when it skips the unit entirely.
+  fixture_is_fresh() {
+    ( cd "${fixture}" \
+      && CARGO_TARGET_DIR="${fixture}/target" cargo build --offline -v 2>&1 ) \
+      | grep -Fq 'Fresh canonical-provenance-fixture'
+  }
+
+  build_err=""
+  if ! build_err="$(fixture_build)"; then
+    fail_case "${name}" "the fixture did not build at commit A" "${build_err}"
+  elif [[ -e "${fixture}/.git/refs/heads/${fixture_branch}" ]]; then
+    fail_case "${name}" "fixture setup failed: the branch ref was not packed away"
+  elif [[ "$(fixture_sha)" != "${sha_a}" ]]; then
+    fail_case "${name}" "the packed-ref build did not embed commit A" \
+      "expected ${sha_a}, got $(fixture_sha)"
+  elif ! fixture_is_fresh; then
+    # Emitting the nonexistent loose ref path would land here: Cargo treats an
+    # absent rerun-if-changed target as unconditionally stale.
+    fail_case "${name}" "an idle rebuild recompiled; the packed-ref watcher is unconditionally stale"
+  else
+    printf 'unrelated validation content\n' > "${fixture}/VALIDATION.txt"
+    git -C "${fixture}" add VALIDATION.txt
+    git -C "${fixture}" commit -q -m "commit B"
+    sha_b="$(git -C "${fixture}" rev-parse HEAD)"
+    packed_after="$(hash_of_file "${fixture}/.git/packed-refs")"
+
+    if [[ "${sha_b}" == "${sha_a}" ]]; then
+      fail_case "${name}" "fixture setup failed: commit B did not advance HEAD"
+    elif [[ "$(cat "${fixture}/.git/HEAD")" != "${head_before}" ]]; then
+      fail_case "${name}" "fixture setup failed: HEAD changed, so this no longer isolates the ref"
+    elif [[ "${packed_after}" != "${packed_before}" ]]; then
+      fail_case "${name}" "fixture setup failed: packed-refs changed, so this no longer isolates the ref"
+    elif [[ ! -e "${fixture}/.git/refs/heads/${fixture_branch}" ]]; then
+      fail_case "${name}" "fixture setup failed: commit B did not create the loose ref"
+    elif ! build_err="$(fixture_build)"; then
+      fail_case "${name}" "the fixture did not rebuild at commit B" "${build_err}"
+    elif [[ "$(fixture_sha)" == "${sha_a}" ]]; then
+      fail_case "${name}" \
+        "GIT_SHA is stale: the packed -> loose ref transition did not rerun the build script" \
+        "still reporting commit A ${sha_a}; HEAD is now ${sha_b}"
+    elif [[ "$(fixture_sha)" != "${sha_b}" ]]; then
+      fail_case "${name}" "the rebuild embedded neither commit" \
+        "expected ${sha_b}, got $(fixture_sha)"
+    else
+      pass_case "${name}"
+    fi
+  fi
+  rm -rf "${fixture}"
+  trap - EXIT INT TERM
 fi
 
 # ---------- summary ----------

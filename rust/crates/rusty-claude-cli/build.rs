@@ -29,6 +29,44 @@ fn watch_if_present(path: &str) {
     }
 }
 
+/// Emit a Cargo watcher that invalidates the build when the branch ref named
+/// by `ref_path` gains, loses, or changes its loose file.
+///
+/// A branch whose loose ref has been packed away has no file at `ref_path`,
+/// and watching only what exists drops the watcher entirely. That is not
+/// harmless: `HEAD` and `packed-refs` both stay byte-identical when the next
+/// commit writes the loose ref back, so a warm Cargo target keeps serving the
+/// previous commit's `GIT_SHA`.
+///
+/// Naming the missing file directly is not the fix either. Cargo treats an
+/// absent `rerun-if-changed` path as unconditionally stale, which would put
+/// every packed-ref checkout into permanent recompilation. Watch the deepest
+/// directory that does exist on the way to the ref instead: writing the loose
+/// ref creates an entry in that directory (or creates a missing parent of it),
+/// which changes the directory itself. The packed -> loose transition
+/// invalidates the build exactly once, and an idle rebuild stays fresh.
+fn watch_ref_target(ref_path: &str) {
+    let raw = PathBuf::from(ref_path);
+    if raw.exists() {
+        watch_if_present(ref_path);
+        return;
+    }
+    // The ref is packed (or otherwise absent). Walk up to the nearest real
+    // directory and watch that, so the ref file appearing is observable.
+    let mut cursor = raw.as_path();
+    while let Some(parent) = cursor.parent() {
+        if parent.as_os_str().is_empty() {
+            return;
+        }
+        if parent.is_dir() {
+            let resolved = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+            println!("cargo:rerun-if-changed={}", resolved.display());
+            return;
+        }
+        cursor = parent;
+    }
+}
+
 fn main() {
     // Get the FULL git SHA (40 lowercase hex characters).
     //
@@ -101,11 +139,15 @@ fn main() {
         // On a branch, HEAD only names the ref; the SHA lives in the ref file,
         // which for a linked worktree usually sits in the common Git dir.
         if let Some(ref_path) = git_output(&["rev-parse", "--git-path", &head_ref]) {
-            watch_if_present(&ref_path);
+            // Not `watch_if_present`: a packed branch ref has no loose file
+            // yet, and its creation is the event that must invalidate this
+            // build. See `watch_ref_target`.
+            watch_ref_target(&ref_path);
         }
     }
     if let Some(packed) = git_output(&["rev-parse", "--git-path", "packed-refs"]) {
-        // Fallback for a branch whose loose ref has been packed away.
+        // Repacking refs rewrites this file, which `watch_ref_target`'s
+        // directory watcher would not necessarily observe on its own.
         watch_if_present(&packed);
     }
 }

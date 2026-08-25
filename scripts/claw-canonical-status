@@ -25,7 +25,9 @@
 #   10  STALE             regular executable whose Git SHA is not exactly
 #                         equal to origin/main, or cannot be read, or is not
 #                         a full 40-character lowercase SHA (a 7- or
-#                         12-character prefix is unproven, not current)
+#                         12-character prefix is unproven, not current), or
+#                         whose file identity could not be proven unchanged
+#                         across the version-banner call
 #   11  MISSING           nothing at the canonical path
 #   12  INVALID_TOPOLOGY  symlink, non-regular file, or not executable —
 #                         including a topology change observed around the
@@ -40,6 +42,10 @@
 # cannot express openat2/O_NOFOLLOW or exec-on-a-held-descriptor semantics
 # portably, so a SAME-USER process racing inside those windows remains
 # possible. The window is narrowed, not eliminated.
+#
+# The identity comparison itself fails closed: a host on which device/inode/
+# size cannot be read reports STALE rather than letting two unreadable
+# identities compare equal and wave a swapped binary through as CURRENT.
 
 set -euo pipefail
 
@@ -131,11 +137,102 @@ probe_topology() {
   fi
 }
 
-# file_identity <path> — device:inode:size, or empty if it cannot be read.
-# Compared across the version call so a swapped file is caught even when the
-# replacement is itself a regular executable.
+# Identity is a security-relevant comparison, not a report field: it is what
+# catches a regular executable being swapped for another regular executable
+# underneath the single `--version` call, where topology alone sees no change.
+# It therefore has to work on every platform install.sh supports (Linux,
+# macOS, WSL), and it has to fail closed when it cannot be established rather
+# than degrade to a vacuous "" == "" match.
+#
+# GNU coreutils and BSD/macOS stat disagree on both the flag and the size
+# specifier, so the mechanism is probed once and then reused.
+
+IDENTITY_IMPL=""
+
+# valid_identity <value> — true only for device:inode:size, three unsigned
+# decimal fields. A usage banner, a partial expansion, or an error string is
+# not an identity. This is the single identity format contract: backend
+# selection and per-file identity are held to it by the same predicate, so the
+# two cannot drift apart.
+valid_identity() {
+  [[ "$1" =~ ^[0-9]+:[0-9]+:[0-9]+$ ]]
+}
+
+# raw_identity <impl> <path> — whatever <impl> reports for <path>, unvalidated
+# and possibly empty. Callers must run it through valid_identity.
+#
+# The utility's own exit status is the function's return status, deliberately
+# unmasked. A failing utility can still print something that looks exactly like
+# an identity — a stub, a cached line, a partially written buffer — so throwing
+# the status away leaves callers reading well-formed text out of a call that
+# actually failed. Both halves of the answer have to survive: what it printed,
+# and whether it succeeded. Every call site therefore guards the call (see
+# detect_identity_impl and file_identity) so a nonzero utility is a rejection
+# rather than an abrupt `set -e` exit.
+raw_identity() {
+  local impl="$1" path="$2"
+  case "${impl}" in
+    gnu) stat -c '%d:%i:%s' -- "${path}" 2>/dev/null ;;
+    bsd)
+      # BSD/macOS stat. No `--` end-of-options marker is passed: it is not
+      # documented there, and the canonical path is required to be absolute
+      # above, so it can never be mistaken for an option.
+      stat -f '%d:%i:%z' "${path}" 2>/dev/null
+      ;;
+    python3)
+      python3 -c 'import os, sys
+st = os.stat(sys.argv[1])
+print("%d:%d:%d" % (st.st_dev, st.st_ino, st.st_size))' "${path}" 2>/dev/null
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# detect_identity_impl — choose an identity mechanism for this host, once.
+# Probes against "/" so the probe itself never touches the canonical path.
+#
+# A backend is accepted only when its probe both exits successfully AND returns
+# a well-formed identity. Neither half is sufficient on its own:
+#
+#   exit status alone — a `stat` on PATH that exits 0 while printing a banner
+#   would be enshrined as the trusted mechanism, and could then be believed
+#   when it later prints something well-formed for the canonical file;
+#
+#   output shape alone — a utility that exits nonzero can still emit a
+#   well-formed line, so accepting it on shape trusts a mechanism whose own
+#   report of itself is failure.
+#
+# A backend rejected on either count leaves probing to continue, so one broken
+# mechanism does not mask a working one further down the list.
+detect_identity_impl() {
+  if [[ -n "${IDENTITY_IMPL}" ]]; then
+    return 0
+  fi
+  local candidate probe
+  for candidate in gnu bsd python3; do
+    # Guarded so a nonzero probe is a rejection, not a `set -e` exit.
+    if probe="$(raw_identity "${candidate}" /)" && valid_identity "${probe}"; then
+      IDENTITY_IMPL="${candidate}"
+      return 0
+    fi
+  done
+  IDENTITY_IMPL="unavailable"
+}
+
+# file_identity <path> — device:inode:size, or empty when identity cannot be
+# established on this host. Empty is never read as "unchanged" by the caller.
+#
+# Held to the same two-part contract as backend selection: a read that failed
+# proves nothing about the file, however well-formed the text it printed. It
+# always returns 0 and communicates failure by printing nothing, so the
+# unguarded `identity_before=`/`identity_after=` assignments below keep failing
+# closed to STALE instead of aborting the report under `set -e`.
 file_identity() {
-  stat -c '%d:%i:%s' -- "$1" 2>/dev/null || true
+  local raw=""
+  if raw="$(raw_identity "${IDENTITY_IMPL}" "$1")" && valid_identity "${raw}"; then
+    printf '%s\n' "${raw}"
+  fi
+  return 0
 }
 
 TOPOLOGY="$(probe_topology "${CANONICAL_PATH}")"
@@ -163,6 +260,7 @@ if [[ "${TOPOLOGY}" == "regular-executable" ]]; then
   TOPOLOGY="$(probe_topology "${CANONICAL_PATH}")"
 fi
 if [[ "${TOPOLOGY}" == "regular-executable" ]]; then
+  detect_identity_impl
   identity_before="$(file_identity "${CANONICAL_PATH}")"
   version_out=""
   if version_out="$("${CANONICAL_PATH}" --version 2>/dev/null)"; then
@@ -185,9 +283,17 @@ if [[ "${TOPOLOGY}" == "regular-executable" ]]; then
   if [[ "${TOPOLOGY}" != "regular-executable" ]]; then
     INSTALLED_SHA=""
     PROVENANCE_NOTE="canonical topology changed while the version banner was being read"
-  elif [[ "$(file_identity "${CANONICAL_PATH}")" != "${identity_before}" ]]; then
-    INSTALLED_SHA=""
-    PROVENANCE_NOTE="canonical file identity changed while the version banner was being read"
+  else
+    identity_after="$(file_identity "${CANONICAL_PATH}")"
+    if [[ -z "${identity_before}" || -z "${identity_after}" ]]; then
+      # Fail closed. An unreadable identity on either side proves nothing, and
+      # two unreadable identities must never compare equal to each other.
+      INSTALLED_SHA=""
+      PROVENANCE_NOTE="canonical file identity could not be established on this host (${IDENTITY_IMPL}), so the binary cannot be proven unchanged across the version banner"
+    elif [[ "${identity_after}" != "${identity_before}" ]]; then
+      INSTALLED_SHA=""
+      PROVENANCE_NOTE="canonical file identity changed while the version banner was being read"
+    fi
   fi
 fi
 
