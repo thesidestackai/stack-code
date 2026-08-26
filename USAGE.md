@@ -35,6 +35,24 @@ The CLI binary is available under Cargo's active `target_directory` after a debu
 
 On this workstation, `rust/.cargo/config.toml` may redirect Cargo build artifacts to the 18TB build-artifacts drive. Use `cargo metadata --format-version 1 --no-deps` to confirm `target_directory` instead of assuming `rust/target`.
 
+`./install.sh` is a **build helper, not a host installer**. It detects the OS, checks the toolchain, builds the workspace, verifies the artifact, and prints where it landed. It does not copy anything into `~/.local/bin`, does not modify PATH, and does not touch the canonical SideStackAI `claw` executable.
+
+### The canonical SideStackAI `claw` executable
+
+The SideStackAI operator entrypoint is `~/.local/bin/claw`, and it is a **regular file** — never a symlink, and never a Cargo `target/debug/claw` or `target/release/claw` artifact. A Cargo build cache must never be the live operator binary. `cargo install` / `~/.cargo/bin/claw` remain valid generic upstream options, but they are not SideStack's canonical entrypoint and SideStack tooling never executes them.
+
+```bash
+# read-only freshness report: no build, no network, no writes
+./scripts/claw-canonical-status
+
+# explicit opt-in refresh: rebuild from this worktree, atomically activate
+./scripts/claw-canonical-refresh
+```
+
+`claw-canonical-status` exits `0` CURRENT, `10` STALE, `11` MISSING, `12` INVALID_TOPOLOGY, `13` UNKNOWN_BASE (no locally known `origin/main`), and reports the canonical path, its topology, the installed Git SHA, and the `origin/main` SHA it compared against.
+
+`claw-canonical-refresh` runs only from a clean worktree whose `HEAD` equals the locally known `origin/main` — it never fetches, so you decide when the base moves. It refuses a dirty source, refuses a symlinked canonical path rather than writing through it, forces `CARGO_TARGET_DIR` inside the worktree so a repo-local `.cargo/config.toml` cannot redirect the build, backs up the existing executable before building, requires the built binary to report the source Git SHA, activates by same-directory atomic rename, and restores the previous executable if post-activation verification fails.
+
 ## Quick start
 
 ### First-run doctor check
@@ -308,7 +326,9 @@ The wrapper:
 - validates the final effective `OPENAI_BASE_URL` against an allowlist of local SideStackAI broker URLs (`http://127.0.0.1:11435` or `http://localhost:11435`, optionally with a path);
 - refuses to launch `claw` if `OPENAI_BASE_URL` contains the raw Ollama port `:11434` — this is the wrapper's LAW 1 and trips even if the profile itself is edited to point there;
 - prints the active non-secret profile (`OPENAI_BASE_URL`, `RUSTY_CLAUDE_LLM_CALLER`, `RUSTY_CLAUDE_TASK_TYPE`, and the names of any `RUSTY_CLAUDE_MODEL_ALIAS__*` exports) to stderr before exec'ing `claw`;
-- does not probe the broker for liveness. Use `claw doctor` or a separate runtime check (for example a small `curl` against the broker's health endpoint) when you need that signal.
+- does not probe the broker for liveness. Use `claw doctor` or a separate runtime check (for example a small `curl` against the broker's health endpoint) when you need that signal;
+- executes the canonical `~/.local/bin/claw` directly (override with `CLAW_CANONICAL_PATH`) instead of resolving `claw` from PATH, so it can never silently fall through to `~/.cargo/bin/claw` or a Cargo target artifact;
+- delegates topology and freshness to [`scripts/claw-canonical-status`](scripts/claw-canonical-status) — offline, read-only, no provider call — and refuses to launch when the canonical executable is missing (exit 4), is a symlink or otherwise not a regular executable (exit 5), or is stale relative to the locally known `origin/main` (exit 6). Set `CLAW_SIDESTACK_ALLOW_STALE=1` to override the stale refusal deliberately; when `origin/main` is not locally known the wrapper warns loudly and continues. LAW 1 is evaluated before any of these checks.
 
 ###### Editor integration: VS Code task wrapper
 

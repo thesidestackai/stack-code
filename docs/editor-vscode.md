@@ -62,7 +62,7 @@ The `Claw: Prompt (read-only, FAST)` and `Claw: Prompt (read-only, DEEP)` tasks 
 
 This is a **client-side binary/version failure**, not a LAW 1 violation or a broker-routing failure — the request never reaches `:11435`. The wrapper's broker allowlist, the env profile, and the sandbox are all unaffected; only the alias resolution depends on the newer binary.
 
-To check the installed binary's git SHA, run `Claw: Doctor (JSON)` and look at the `system` check's `git_sha` field. If it is older than `7e6fcaf`, rebuild or reinstall `claw` from this repo's current tip before using the FAST or DEEP prompt tasks. The non-prompt tasks (Doctor, Status, Sandbox, State, Init Project, Resume Latest) do not depend on alias resolution and work against older binaries.
+To check the installed binary's git SHA, run `Claw: Doctor (JSON)` and look at the `system` check's `git_sha` field. If it is older than `7e6fcaf`, refresh the canonical executable with `./scripts/claw-canonical-refresh` (from a clean worktree at `origin/main`) before using the FAST or DEEP prompt tasks; `./scripts/claw-canonical-status` reports the installed SHA offline. The non-prompt tasks (Doctor, Status, Sandbox, State, Init Project, Resume Latest) do not depend on alias resolution and work against older binaries.
 
 ## Why no extension
 

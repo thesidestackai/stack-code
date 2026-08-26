@@ -19,6 +19,8 @@ on:
       - rust/**
       - schemas/**
       - scripts/a2-tier3-write-orchestrator.sh
+      - scripts/claw-canonical-refresh
+      - scripts/claw-canonical-status
       - scripts/claw-sidestack-local
       - scripts/validate_planner_output_schema.py
       - tests/a2_l4/**
@@ -40,6 +42,8 @@ on:
       - rust/**
       - schemas/**
       - scripts/a2-tier3-write-orchestrator.sh
+      - scripts/claw-canonical-refresh
+      - scripts/claw-canonical-status
       - scripts/claw-sidestack-local
       - scripts/validate_planner_output_schema.py
       - tests/a2_l4/**
@@ -128,6 +132,11 @@ jobs:
           bash -n scripts/a2-tier3-write-orchestrator.sh
           bash -n tests/shell/test_a2_tier3_write_orchestrator.sh
           bash -n tests/shell/test_a2_ide_harness_plan_path.sh
+          bash -n scripts/claw-canonical-refresh
+          bash -n scripts/claw-canonical-status
+          bash -n tests/shell/test_claw_canonical_refresh.sh
+          bash -n tests/shell/test_claw_canonical_status.sh
+          bash -n tests/shell/test_canonical_contract_docs.sh
       - name: Shellcheck
         run: |
           sudo apt-get update
@@ -137,11 +146,19 @@ jobs:
           shellcheck scripts/a2-tier3-write-orchestrator.sh
           shellcheck tests/shell/test_a2_tier3_write_orchestrator.sh
           shellcheck tests/shell/test_a2_ide_harness_plan_path.sh
+          shellcheck scripts/claw-canonical-refresh
+          shellcheck scripts/claw-canonical-status
+          shellcheck tests/shell/test_claw_canonical_refresh.sh
+          shellcheck tests/shell/test_claw_canonical_status.sh
+          shellcheck tests/shell/test_canonical_contract_docs.sh
       - name: Run shell tests
         run: |
           bash tests/shell/test_claw_sidestack_local.sh
           bash tests/shell/test_a2_tier3_write_orchestrator.sh
           bash tests/shell/test_a2_ide_harness_plan_path.sh
+          bash tests/shell/test_claw_canonical_refresh.sh
+          bash tests/shell/test_claw_canonical_status.sh
+          bash tests/shell/test_canonical_contract_docs.sh
 
   planner-output-validator:
     name: planner-output validator

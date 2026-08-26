@@ -1,0 +1,697 @@
+#!/usr/bin/env bash
+# claw-canonical-refresh — rebuild and atomically re-activate the canonical
+# SideStackAI `claw` executable from THIS worktree.
+#
+# This is the one tracked, explicit, repeatable command that is allowed to
+# mutate the operator's canonical executable. `./install.sh` does not do it:
+# install.sh is a build helper and never touches $HOME/.local/bin.
+#
+# Contract
+# --------
+#   * canonical claw is a REGULAR FILE at $HOME/.local/bin/claw;
+#   * it is never a symlink, and never a Cargo target directory artifact;
+#   * it is only ever built from a clean worktree whose HEAD equals the
+#     locally known origin/main;
+#   * the build target directory is forced inside this worktree, so a
+#     repo-local .cargo/config.toml cannot redirect the artifact;
+#   * an existing regular canonical file is backed up and verified BEFORE any
+#     Cargo command runs, including `cargo metadata`;
+#   * `cargo metadata` runs --locked --offline --no-deps, and may not mutate
+#     the lockfile or any tracked file; if it does, the build never starts;
+#   * the built candidate must report the source HEAD as a FULL 40-character
+#     lowercase Git SHA — a 7- or 12-character prefix is not provenance;
+#   * activation is a same-directory atomic rename of a verified candidate;
+#   * a post-activation verification failure restores the previous file.
+#
+# This script makes no network request: it never fetches, and it builds
+# --locked --offline. It runs no model, provider, or broker call.
+#
+# Residual race
+# -------------
+# The canonical path's topology is revalidated immediately before every
+# dereference, execution, copy, and rename below, and copies are taken with a
+# non-dereferencing primitive. POSIX shell cannot express openat2/O_NOFOLLOW
+# or exec-on-a-held-descriptor semantics portably across Linux, macOS, and
+# WSL, so a SAME-USER process racing between one of those rechecks and the
+# operation that follows it remains possible. The window is narrowed, not
+# eliminated. Closing it entirely would require a native helper, which this
+# contract deliberately does not introduce.
+#
+# Usage:
+#   scripts/claw-canonical-refresh
+#
+# Environment:
+#   CLAW_CANONICAL_PATH   absolute override for the canonical path
+#                         (default: $HOME/.local/bin/claw)
+#
+# Exit codes:
+#   0   canonical refreshed (or already activated from this source)
+#   2   usage error
+#   3   source binding refusal (not a repo / no origin/main / HEAD != origin/main)
+#   4   dirty source refusal (including tracked mutation by cargo metadata)
+#   5   build target refusal
+#   6   canonical topology refusal (symlink or non-regular destination)
+#   7   build failure
+#   8   provenance refusal (built binary does not report the full source Git SHA)
+#   9   activation failure
+#   10  post-activation verification failed; previous executable restored
+#   11  post-activation verification failed AND rollback failed
+
+set -euo pipefail
+
+PROG="claw-canonical-refresh"
+
+EXIT_USAGE=2
+EXIT_SOURCE=3
+EXIT_DIRTY=4
+EXIT_TARGET=5
+EXIT_TOPOLOGY=6
+EXIT_BUILD=7
+EXIT_PROVENANCE=8
+EXIT_ACTIVATION=9
+EXIT_ROLLED_BACK=10
+EXIT_ROLLBACK_FAILED=11
+
+# Build artifacts must never land on the external build-artifacts volume:
+# a Cargo cache there was the original stale-canonical incident.
+FORBIDDEN_TARGET_PREFIX="/media/suki/18TB 2"
+
+info()  { printf '%s: %s\n' "${PROG}" "$1"; }
+warn()  { printf '%s: warning: %s\n' "${PROG}" "$1" >&2; }
+fail()  { printf '%s: %s\n' "${PROG}" "$1" >&2; }
+
+# ---------------------------------------------------------------------------
+# portable utility helpers
+# ---------------------------------------------------------------------------
+#
+# install.sh supports Linux, macOS, and WSL and sends the operator straight to
+# this command, so the refresh may not depend on GNU coreutils behaviour. A
+# stock macOS has BSD `realpath` (no `-m`), BSD `stat` (no `-c`), and no
+# `sha256sum` at all, so the GNU-only forms died in section 1 under `set -e`
+# before anything could be backed up, built, or activated.
+#
+# Each helper probes once and caches what it found. None of them ever print
+# file contents, and `hash_file` validates its own output, so a hashing tool
+# that fails can never be mistaken for a hash that matches.
+
+PORTABLE_ABS_IMPL=""
+PORTABLE_HASH_IMPL=""
+PORTABLE_MODE_IMPL=""
+
+# abs_path <path> — absolute, symlink-resolved path for a path that need not
+# exist. These are GNU `realpath -m` semantics; Python's os.path.realpath is
+# non-strict by default and produces the same result on hosts without one.
+abs_path() {
+  if [[ -z "${PORTABLE_ABS_IMPL}" ]]; then
+    if realpath -m -- / >/dev/null 2>&1; then
+      PORTABLE_ABS_IMPL="realpath"
+    elif python3 -c 'import os' >/dev/null 2>&1; then
+      PORTABLE_ABS_IMPL="python3"
+    else
+      fail "cannot resolve absolute paths: need GNU 'realpath -m' or python3."
+      exit "${EXIT_USAGE}"
+    fi
+  fi
+  case "${PORTABLE_ABS_IMPL}" in
+    realpath) realpath -m -- "$1" ;;
+    python3)  python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1" ;;
+  esac
+}
+
+# hash_file <path> — bare lowercase SHA-256 hex digest of <path>.
+#
+# The digest is what binds a backup, a candidate, and the activated file to
+# the built artifact, so this returns non-zero rather than an empty string
+# when it cannot produce exactly 64 lowercase hex characters.
+hash_file() {
+  local out=""
+  if [[ -z "${PORTABLE_HASH_IMPL}" ]]; then
+    if printf '' | sha256sum >/dev/null 2>&1; then
+      PORTABLE_HASH_IMPL="sha256sum"
+    elif printf '' | shasum -a 256 >/dev/null 2>&1; then
+      PORTABLE_HASH_IMPL="shasum"
+    elif printf '' | openssl dgst -sha256 >/dev/null 2>&1; then
+      PORTABLE_HASH_IMPL="openssl"
+    elif python3 -c 'import hashlib' >/dev/null 2>&1; then
+      PORTABLE_HASH_IMPL="python3"
+    else
+      fail "cannot compute SHA-256: need sha256sum, shasum, openssl, or python3."
+      exit "${EXIT_USAGE}"
+    fi
+  fi
+  case "${PORTABLE_HASH_IMPL}" in
+    sha256sum)
+      out="$(sha256sum -- "$1")" || return 1
+      out="${out%% *}"
+      ;;
+    shasum)
+      out="$(shasum -a 256 -- "$1")" || return 1
+      out="${out%% *}"
+      ;;
+    openssl)
+      out="$(openssl dgst -sha256 "$1")" || return 1
+      out="${out##* }"
+      ;;
+    python3)
+      out="$(python3 -c 'import hashlib, sys
+digest = hashlib.sha256()
+with open(sys.argv[1], "rb") as handle:
+    for chunk in iter(lambda: handle.read(1048576), b""):
+        digest.update(chunk)
+print(digest.hexdigest())' "$1")" || return 1
+      ;;
+  esac
+  if [[ ! "${out}" =~ ^[0-9a-f]{64}$ ]]; then
+    fail "SHA-256 computation failed for: $1"
+    return 1
+  fi
+  printf '%s\n' "${out}"
+}
+
+# file_mode <path> — POSIX permission bits as octal digits, e.g. 755.
+#
+# Report-only, so a host with none of these degrades to a literal rather than
+# aborting an otherwise successful refresh at the provenance report.
+file_mode() {
+  if [[ -z "${PORTABLE_MODE_IMPL}" ]]; then
+    if stat -c '%a' -- / >/dev/null 2>&1; then
+      PORTABLE_MODE_IMPL="gnu"
+    elif stat -f '%Lp' -- / >/dev/null 2>&1; then
+      PORTABLE_MODE_IMPL="bsd"
+    elif python3 -c 'import os' >/dev/null 2>&1; then
+      PORTABLE_MODE_IMPL="python3"
+    else
+      PORTABLE_MODE_IMPL="unknown"
+    fi
+  fi
+  case "${PORTABLE_MODE_IMPL}" in
+    gnu) stat -c '%a' -- "$1" ;;
+    bsd) stat -f '%Lp' -- "$1" ;;
+    python3)
+      python3 -c 'import os, sys; print(format(os.stat(sys.argv[1]).st_mode & 0o7777, "o"))' "$1"
+      ;;
+    *) printf 'unknown\n' ;;
+  esac
+}
+
+# assert_dest_topology <path>
+#
+# The canonical destination must never be a symlink (dangling or not) and,
+# when it exists, must be a regular file. Called once up front and then again
+# immediately before every dereference, copy, and rename. See the "Residual
+# race" note in the header: this narrows the same-user window, it does not
+# close it.
+assert_dest_topology() {
+  local path="$1"
+  if [[ -L "${path}" ]]; then
+    fail "canonical claw at ${path} is a symlink; refusing to refresh through it."
+    fail "Canonical SideStack Claw must be a regular file; do not point it at a Cargo target."
+    fail "Remove or re-point the link deliberately, then re-run this command."
+    exit "${EXIT_TOPOLOGY}"
+  fi
+  if [[ -e "${path}" && ! -f "${path}" ]]; then
+    fail "canonical path exists but is not a regular file: ${path}"
+    exit "${EXIT_TOPOLOGY}"
+  fi
+}
+
+# assert_dest_regular <path> <label>
+#
+# Stronger form for the moment just before an existing canonical file is
+# hashed, executed, or copied: it must still be there, and still be regular.
+assert_dest_regular() {
+  local path="$1" label="$2"
+  assert_dest_topology "${path}"
+  if [[ ! -f "${path}" ]]; then
+    fail "${label}: canonical file is no longer a present regular file: ${path}"
+    exit "${EXIT_TOPOLOGY}"
+  fi
+}
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/claw-canonical-refresh
+
+Rebuilds the canonical SideStackAI claw executable from this worktree and
+atomically activates it at $HOME/.local/bin/claw.
+
+Requires: clean worktree, HEAD == locally known origin/main. Never fetches,
+never installs from a Cargo target directory, never replaces a symlink.
+
+Options:
+  -h, --help  show this help and exit
+
+Environment:
+  CLAW_CANONICAL_PATH   absolute override for the canonical path
+EOF
+}
+
+if [[ "$#" -gt 0 ]]; then
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    *)
+      fail "unknown argument: $1"
+      usage >&2
+      exit "${EXIT_USAGE}"
+      ;;
+  esac
+fi
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+TS="$(date +%Y%m%d_%H%M%S)"
+
+# Resolve the portable helpers now, in THIS shell. Every later call sits
+# inside a command substitution, whose assignment to the cache variables would
+# be discarded, and a host with no usable implementation must be refused here
+# -- before any canonical file is backed up, built over, or activated.
+abs_path / >/dev/null
+hash_file /dev/null >/dev/null
+file_mode / >/dev/null
+
+# ---------------------------------------------------------------------------
+# 1. destination
+# ---------------------------------------------------------------------------
+
+if [[ -z "${CLAW_CANONICAL_PATH:-}" && -z "${HOME:-}" ]]; then
+  fail "HOME is unset and CLAW_CANONICAL_PATH was not provided."
+  exit "${EXIT_USAGE}"
+fi
+
+DEST="${CLAW_CANONICAL_PATH:-${HOME}/.local/bin/claw}"
+if [[ "${DEST}" != /* ]]; then
+  fail "canonical path must be absolute: ${DEST}"
+  exit "${EXIT_USAGE}"
+fi
+
+DEST_DIR="$(dirname -- "${DEST}")"
+
+# ~/.cargo/bin is the generic upstream `cargo install` location. It is NOT
+# the SideStackAI canonical operator entrypoint and must never be the target
+# of this refresh.
+if [[ -n "${HOME:-}" ]]; then
+  cargo_bin_real="$(abs_path "${HOME}/.cargo/bin")"
+  dest_dir_real="$(abs_path "${DEST_DIR}")"
+  if [[ "${dest_dir_real}" == "${cargo_bin_real}" ]]; then
+    fail "refusing to install into ~/.cargo/bin: that is not the SideStackAI canonical entrypoint."
+    exit "${EXIT_USAGE}"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# 2. source binding — clean worktree at the locally known origin/main
+# ---------------------------------------------------------------------------
+
+if ! git -C "${REPO_ROOT}" rev-parse --git-dir >/dev/null 2>&1; then
+  fail "source is not a git worktree: ${REPO_ROOT}"
+  exit "${EXIT_SOURCE}"
+fi
+
+HEAD_SHA="$(git -C "${REPO_ROOT}" rev-parse HEAD)"
+HEAD_SHORT="$(git -C "${REPO_ROOT}" rev-parse --short HEAD)"
+
+# Deliberately no `git fetch` here: refreshing the canonical executable must
+# not reach the network, and the operator must decide when to move the base.
+ORIGIN_MAIN="$(git -C "${REPO_ROOT}" rev-parse --verify --quiet origin/main 2>/dev/null || true)"
+if [[ -z "${ORIGIN_MAIN}" ]]; then
+  fail "no locally known origin/main in ${REPO_ROOT}."
+  fail "run 'git fetch origin main' yourself, then re-run this command."
+  exit "${EXIT_SOURCE}"
+fi
+
+if [[ "${HEAD_SHA}" != "${ORIGIN_MAIN}" ]]; then
+  fail "source HEAD does not equal the locally known origin/main; refusing to install a non-main build."
+  fail "  HEAD:        ${HEAD_SHA}"
+  fail "  origin/main: ${ORIGIN_MAIN}"
+  fail "  source:      ${REPO_ROOT}"
+  fail "refresh from a clean worktree checked out at origin/main."
+  exit "${EXIT_SOURCE}"
+fi
+
+if ! git -C "${REPO_ROOT}" diff --cached --quiet; then
+  fail "source worktree has staged changes; refusing to build the canonical executable from it."
+  exit "${EXIT_DIRTY}"
+fi
+if ! git -C "${REPO_ROOT}" diff --quiet; then
+  fail "source worktree has unstaged tracked changes; refusing to build the canonical executable from it."
+  exit "${EXIT_DIRTY}"
+fi
+
+# Untracked files cannot enter the build without a tracked change (a new
+# module still needs a tracked `mod` declaration), so they are tolerated
+# outside the build tree — but never inside rust/.
+untracked_rust="$(git -C "${REPO_ROOT}" ls-files --others --exclude-standard -- rust 2>/dev/null || true)"
+if [[ -n "${untracked_rust}" ]]; then
+  fail "untracked files inside rust/ would sit in the build tree; refusing:"
+  while IFS= read -r untracked_path; do
+    printf '  %s\n' "${untracked_path}" >&2
+  done <<<"${untracked_rust}"
+  exit "${EXIT_DIRTY}"
+fi
+untracked_other="$(git -C "${REPO_ROOT}" ls-files --others --exclude-standard 2>/dev/null || true)"
+if [[ -n "${untracked_other}" ]]; then
+  warn "untracked files outside rust/ are present and are not build inputs; continuing."
+fi
+
+info "source:      ${REPO_ROOT}"
+info "HEAD:        ${HEAD_SHA} (${HEAD_SHORT})"
+info "origin/main: ${ORIGIN_MAIN}"
+
+# ---------------------------------------------------------------------------
+# 3. canonical topology validation
+# ---------------------------------------------------------------------------
+
+assert_dest_topology "${DEST}"
+
+# ---------------------------------------------------------------------------
+# 4. build target preparation — deterministic and shell-only, no Cargo yet
+# ---------------------------------------------------------------------------
+#
+# Nothing in this section runs Cargo. The existing canonical executable must
+# be backed up and verified before the first Cargo invocation, so the target
+# path is resolved and approved here and `cargo metadata` is deferred to
+# section 6.
+
+RUST_DIR="${REPO_ROOT}/rust"
+if [[ ! -f "${RUST_DIR}/Cargo.toml" ]]; then
+  fail "missing ${RUST_DIR}/Cargo.toml — repository layout looks unexpected."
+  exit "${EXIT_SOURCE}"
+fi
+
+LOCKFILE="${RUST_DIR}/Cargo.lock"
+
+# lockfile_state — content hash of Cargo.lock, or the literal "absent".
+lockfile_state() {
+  if [[ -f "${LOCKFILE}" ]]; then
+    hash_file "${LOCKFILE}"
+  else
+    printf 'absent\n'
+  fi
+}
+
+TARGET_DIR="${REPO_ROOT}/.canonical-refresh-target"
+REPO_REAL="$(abs_path "${REPO_ROOT}")"
+TARGET_REAL="$(abs_path "${TARGET_DIR}")"
+
+assert_target_allowed() {
+  local candidate="$1"
+  local label="$2"
+  if [[ "${candidate}" != "${REPO_REAL}/"* ]]; then
+    fail "${label} escapes the approved source worktree; refusing."
+    fail "  target: ${candidate}"
+    fail "  source: ${REPO_REAL}"
+    exit "${EXIT_TARGET}"
+  fi
+  if [[ "${candidate}" == "${FORBIDDEN_TARGET_PREFIX}"* ]]; then
+    fail "${label} is under the forbidden build-artifacts volume; refusing."
+    fail "  target: ${candidate}"
+    exit "${EXIT_TARGET}"
+  fi
+}
+
+assert_target_allowed "${TARGET_REAL}" "resolved build target"
+
+# CARGO_TARGET_DIR outranks a repo-local .cargo/config.toml `build.target-dir`;
+# --target-dir on the build outranks both. Section 6 proves cargo agrees.
+export CARGO_TARGET_DIR="${TARGET_DIR}"
+
+info "build target: ${TARGET_REAL}"
+
+# ---------------------------------------------------------------------------
+# 5. canonical prestate + backup (BEFORE any Cargo command)
+# ---------------------------------------------------------------------------
+
+FIRST_INSTALL=0
+BACKUP_FILE=""
+OLD_HASH=""
+OLD_SHA=""
+
+if [[ -e "${DEST}" || -L "${DEST}" ]]; then
+  assert_dest_regular "${DEST}" "pre-hash"
+  OLD_HASH="$(hash_file "${DEST}")"
+
+  # Reading the previous banner executes the canonical file: recheck first.
+  assert_dest_regular "${DEST}" "pre-version"
+  OLD_SHA="$("${DEST}" --version 2>/dev/null | awk '/^[[:space:]]*Git SHA[[:space:]]/ { print $3; exit }' || true)"
+  # A canonical binary predating the full-SHA provenance contract reports only
+  # a legacy 7-character abbreviation. That is fine for the file being
+  # REPLACED: only the newly built candidate must satisfy full provenance.
+  # This value only names the backup, so anything unusable becomes "unknown".
+  if [[ ! "${OLD_SHA}" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
+    OLD_SHA="unknown"
+  fi
+
+  BACKUP_DIR="${DEST_DIR}/.claw-canonical-backups"
+  mkdir -p -- "${BACKUP_DIR}"
+  BACKUP_FILE="${BACKUP_DIR}/claw.${TS}.${OLD_SHA}"
+  # Two refreshes inside the same second must not overwrite each other's
+  # backup: an existing backup is never clobbered or deleted.
+  backup_seq=1
+  while [[ -e "${BACKUP_FILE}" ]]; do
+    BACKUP_FILE="${BACKUP_DIR}/claw.${TS}.${OLD_SHA}.${backup_seq}"
+    backup_seq=$((backup_seq + 1))
+  done
+
+  # -P never dereferences. If the canonical path raced into a symlink between
+  # the recheck above and this copy, the LINK is what lands in the backup, and
+  # the assertions below reject it — a symlink is never hashed or executed as
+  # though it were the backed-up executable.
+  assert_dest_regular "${DEST}" "pre-copy"
+  cp -Pp -- "${DEST}" "${BACKUP_FILE}"
+  if [[ -L "${BACKUP_FILE}" ]]; then
+    fail "backup copy is a symlink; the canonical path changed topology mid-refresh."
+    fail "  backup: ${BACKUP_FILE}"
+    exit "${EXIT_TOPOLOGY}"
+  fi
+  if [[ ! -f "${BACKUP_FILE}" ]]; then
+    fail "backup copy is not a regular file; refusing to continue."
+    fail "  backup: ${BACKUP_FILE}"
+    exit "${EXIT_TOPOLOGY}"
+  fi
+  backup_hash="$(hash_file "${BACKUP_FILE}")"
+  if [[ "${backup_hash}" != "${OLD_HASH}" ]]; then
+    fail "backup verification failed; refusing to continue."
+    exit "${EXIT_ACTIVATION}"
+  fi
+  info "backup:      ${BACKUP_FILE}"
+  info "previous:    ${OLD_SHA} (sha256 ${OLD_HASH})"
+else
+  FIRST_INSTALL=1
+  mkdir -p -- "${DEST_DIR}"
+  info "no existing canonical executable — this is a first install."
+fi
+
+# ---------------------------------------------------------------------------
+# 6. cargo metadata — first Cargo command, and it may not mutate the source
+# ---------------------------------------------------------------------------
+#
+# Runs only now that the previous canonical executable is safely backed up.
+# --locked forbids lockfile updates, --offline forbids the network, --no-deps
+# keeps it to this workspace.
+
+lockfile_before="$(lockfile_state)"
+
+metadata_target=""
+if metadata_target="$(
+  cd "${RUST_DIR}" &&
+  cargo metadata --format-version 1 --locked --offline --no-deps 2>/dev/null |
+  python3 -c 'import json, sys; print(json.load(sys.stdin).get("target_directory", ""))'
+)"; then
+  :
+else
+  fail "could not resolve the Cargo target directory via cargo metadata."
+  exit "${EXIT_TARGET}"
+fi
+
+# The expected `.canonical-refresh-target/` build directory is untracked and
+# is not a tracked mutation. Anything Cargo changed in the lockfile or in a
+# tracked file is, and it stops the refresh before the build starts. This is
+# never silently restored: the operator decides what to do with it.
+lockfile_after="$(lockfile_state)"
+if [[ "${lockfile_after}" != "${lockfile_before}" ]]; then
+  fail "cargo metadata modified ${LOCKFILE}; refusing to build."
+  fail "  before: ${lockfile_before}"
+  fail "  after:  ${lockfile_after}"
+  exit "${EXIT_DIRTY}"
+fi
+if ! git -C "${REPO_ROOT}" diff --cached --quiet; then
+  fail "cargo metadata introduced staged tracked changes; refusing to build."
+  exit "${EXIT_DIRTY}"
+fi
+if ! git -C "${REPO_ROOT}" diff --quiet; then
+  fail "cargo metadata introduced unstaged tracked changes; refusing to build."
+  exit "${EXIT_DIRTY}"
+fi
+
+if [[ -z "${metadata_target}" ]]; then
+  fail "cargo metadata did not report target_directory."
+  exit "${EXIT_TARGET}"
+fi
+
+metadata_real="$(abs_path "${metadata_target}")"
+assert_target_allowed "${metadata_real}" "cargo-reported build target"
+if [[ "${metadata_real}" != "${TARGET_REAL}" ]]; then
+  fail "cargo resolved a build target other than the one this refresh forced; refusing."
+  fail "  forced:        ${TARGET_REAL}"
+  fail "  cargo reports: ${metadata_real}"
+  exit "${EXIT_TARGET}"
+fi
+
+# ---------------------------------------------------------------------------
+# 7. build
+# ---------------------------------------------------------------------------
+
+info "building rusty-claude-cli (--locked --offline --release)"
+if ! (
+  cd "${RUST_DIR}" &&
+  cargo build --locked --offline --release -p rusty-claude-cli --target-dir "${TARGET_DIR}"
+); then
+  fail "cargo build failed; canonical executable left untouched."
+  exit "${EXIT_BUILD}"
+fi
+
+BUILT="${TARGET_DIR}/release/claw"
+if [[ ! -f "${BUILT}" || ! -x "${BUILT}" ]]; then
+  fail "expected built binary not found at ${BUILT}"
+  exit "${EXIT_BUILD}"
+fi
+
+# ---------------------------------------------------------------------------
+# 8. provenance — the built binary must report this source's FULL Git SHA
+# ---------------------------------------------------------------------------
+
+built_version="$("${BUILT}" --version 2>/dev/null || true)"
+BUILT_SHA="$(printf '%s\n' "${built_version}" \
+  | awk '/^[[:space:]]*Git SHA[[:space:]]/ { print $3; exit }')"
+
+# EXACT full-SHA equality. A prefix match is not provenance: 7 or 12 hex
+# characters do not bind this candidate to this HEAD, and a 39- or 41-character
+# value is not a Git SHA at all. Only 40 lowercase hex characters equal to the
+# source HEAD are accepted.
+if [[ ! "${BUILT_SHA}" =~ ^[0-9a-f]{40}$ || "${BUILT_SHA}" != "${HEAD_SHA}" ]]; then
+  fail "built binary does not report the source Git SHA; refusing to activate."
+  fail "  source HEAD:  ${HEAD_SHA} (${HEAD_SHORT})"
+  fail "  binary says:  ${BUILT_SHA:-<unreadable>}"
+  fail "  required:     exactly 40 lowercase hex characters equal to the source HEAD"
+  exit "${EXIT_PROVENANCE}"
+fi
+
+NEW_HASH="$(hash_file "${BUILT}")"
+info "built:       ${BUILT_SHA} (sha256 ${NEW_HASH})"
+
+# ---------------------------------------------------------------------------
+# 9. candidate beside the destination, verified, then atomically activated
+# ---------------------------------------------------------------------------
+
+CANDIDATE="${DEST_DIR}/.claw-canonical-candidate.${TS}"
+if ! cp -- "${BUILT}" "${CANDIDATE}"; then
+  fail "could not stage the candidate at ${CANDIDATE}"
+  exit "${EXIT_ACTIVATION}"
+fi
+chmod 0755 -- "${CANDIDATE}"
+
+# The staged candidate is verified as a regular, non-symlink executable
+# BEFORE it is hashed or run, so a raced link is never executed as if it were
+# the candidate.
+if [[ -L "${CANDIDATE}" || ! -f "${CANDIDATE}" || ! -x "${CANDIDATE}" ]]; then
+  fail "staged candidate is not a regular executable file; canonical executable left untouched."
+  exit "${EXIT_ACTIVATION}"
+fi
+candidate_hash="$(hash_file "${CANDIDATE}")"
+candidate_sha="$("${CANDIDATE}" --version 2>/dev/null \
+  | awk '/^[[:space:]]*Git SHA[[:space:]]/ { print $3; exit }' || true)"
+if [[ "${candidate_hash}" != "${NEW_HASH}" || "${candidate_sha}" != "${BUILT_SHA}" ]]; then
+  fail "candidate verification failed; canonical executable left untouched."
+  exit "${EXIT_ACTIVATION}"
+fi
+
+# Last look at the destination directory entry before it is replaced. `mv -f`
+# replaces the entry rather than writing through a link, but a link appearing
+# here means the canonical path is being manipulated: abort rather than
+# activate into it.
+if [[ -L "${DEST}" || ( -e "${DEST}" && ! -f "${DEST}" ) ]]; then
+  rm -f -- "${CANDIDATE}"
+  fail "canonical path changed topology immediately before activation; refusing to activate."
+  fail "  path: ${DEST}"
+  exit "${EXIT_TOPOLOGY}"
+fi
+
+# Same-directory rename: atomic replacement, no window where the canonical
+# path is absent or half-written.
+if ! mv -f -- "${CANDIDATE}" "${DEST}"; then
+  fail "atomic activation failed; canonical executable left untouched."
+  exit "${EXIT_ACTIVATION}"
+fi
+
+# ---------------------------------------------------------------------------
+# 10. post-activation verification + rollback
+# ---------------------------------------------------------------------------
+
+post_failure=""
+active_hash=""
+active_sha=""
+if [[ -L "${DEST}" ]]; then
+  post_failure="canonical path became a symlink"
+elif [[ ! -f "${DEST}" || ! -x "${DEST}" ]]; then
+  post_failure="canonical path is not a regular executable file"
+else
+  active_hash="$(hash_file "${DEST}")"
+  active_sha="$("${DEST}" --version 2>/dev/null \
+    | awk '/^[[:space:]]*Git SHA[[:space:]]/ { print $3; exit }' || true)"
+  if [[ "${active_hash}" != "${NEW_HASH}" ]]; then
+    post_failure="active bytes do not match the built artifact"
+  elif [[ "${active_sha}" != "${BUILT_SHA}" ]]; then
+    post_failure="active binary does not report the built Git SHA"
+  fi
+fi
+
+if [[ -n "${post_failure}" ]]; then
+  fail "post-activation verification failed: ${post_failure}"
+  if [[ "${FIRST_INSTALL}" -eq 1 ]]; then
+    fail "this was a first install, so there is no previous executable to restore."
+    fail "inspect ${DEST} manually before using it."
+    exit "${EXIT_ROLLED_BACK}"
+  fi
+
+  ROLLBACK="${DEST_DIR}/.claw-canonical-rollback.${TS}"
+  if ! cp -p -- "${BACKUP_FILE}" "${ROLLBACK}"; then
+    fail "ROLLBACK FAILED: could not stage ${ROLLBACK} from ${BACKUP_FILE}"
+    exit "${EXIT_ROLLBACK_FAILED}"
+  fi
+  chmod 0755 -- "${ROLLBACK}"
+  if ! mv -f -- "${ROLLBACK}" "${DEST}"; then
+    fail "ROLLBACK FAILED: could not restore ${DEST} from ${BACKUP_FILE}"
+    exit "${EXIT_ROLLBACK_FAILED}"
+  fi
+  restored_hash="$(hash_file "${DEST}")"
+  if [[ "${restored_hash}" != "${OLD_HASH}" ]]; then
+    fail "ROLLBACK FAILED: restored bytes do not match the backup."
+    fail "  backup: ${BACKUP_FILE}"
+    exit "${EXIT_ROLLBACK_FAILED}"
+  fi
+  fail "rolled back to the previous canonical executable (${OLD_SHA}, sha256 ${OLD_HASH})."
+  fail "backup retained at ${BACKUP_FILE}"
+  exit "${EXIT_ROLLED_BACK}"
+fi
+
+# ---------------------------------------------------------------------------
+# 11. provenance report
+# ---------------------------------------------------------------------------
+
+cat <<EOF
+
+canonical claw refreshed
+  destination:   ${DEST}
+  topology:      regular file, mode $(file_mode "${DEST}")
+  source repo:   ${REPO_ROOT}
+  source HEAD:   ${HEAD_SHA}
+  origin/main:   ${ORIGIN_MAIN}
+  new git sha:   ${BUILT_SHA}
+  new sha256:    ${active_hash}
+  old git sha:   ${OLD_SHA:-<none: first install>}
+  old sha256:    ${OLD_HASH:-<none: first install>}
+  backup:        ${BACKUP_FILE:-<none: first install>}
+  build target:  ${TARGET_REAL}
+
+Verify at any time with: scripts/claw-canonical-status
+EOF
