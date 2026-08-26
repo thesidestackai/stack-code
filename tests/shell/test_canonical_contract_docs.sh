@@ -388,9 +388,16 @@ FIXTURE_MAIN
   }
   fixture_sha() { "${fixture}/target/debug/canonical-provenance-fixture"; }
   # Cargo prints "Fresh <pkg>" under -v only when it skips the unit entirely.
+  # Colour is pinned off for this one command on purpose: CI exports
+  # CARGO_TERM_COLOR=always, which wraps the status word so the line arrives as
+  # "<ESC>[1m<ESC>[92m       Fresh<ESC>[0m canonical-provenance-fixture", and the
+  # literal match below would then report a phantom recompile on a fixture Cargo
+  # actually skipped. Only this helper parses Cargo's human output, so only this
+  # helper needs the override.
   fixture_is_fresh() {
     ( cd "${fixture}" \
-      && CARGO_TARGET_DIR="${fixture}/target" cargo build --offline -v 2>&1 ) \
+      && CARGO_TARGET_DIR="${fixture}/target" CARGO_TERM_COLOR=never \
+        cargo build --offline -v 2>&1 ) \
       | grep -Fq 'Fresh canonical-provenance-fixture'
   }
 
