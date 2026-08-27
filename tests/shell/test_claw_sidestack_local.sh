@@ -7,6 +7,12 @@
 # `examples/sidestack-local.env`, and installs a fake canonical `claw` into a
 # throwaway HOME. Decoy `claw` binaries are planted on PATH and in
 # ~/.cargo/bin so that any silent PATH fallback fails the suite loudly.
+#
+# The N6 broker readiness gate is exercised through a fake `curl` planted
+# first on PATH, so the real wrapper logic runs against a controlled HTTP
+# response and the real broker is never contacted. Every case gets one, so a
+# case that reaches the network at all would fail loudly rather than silently
+# querying :11435.
 
 set -euo pipefail
 
@@ -68,6 +74,166 @@ FAKE
   chmod 0755 -- "${path}"
 }
 
+# The curl version the wrapper's capability floor accepts by default. Real
+# curl on this lane is 8.5.0; fixtures mirror that unless a case overrides it.
+FAKE_CURL_DEFAULT_VERSION='curl 8.5.0 (x86_64-pc-linux-gnu) libcurl/8.5.0 OpenSSL/3.0.13 zlib/1.3'
+
+# write_fake_readiness_client <case_dir> <curl_exit> <http_code> <body>
+#                             [version_line] [version_exit] [path]
+#
+# A stand-in for `curl`, planted first on PATH. It appends every argument it
+# was given to <case_dir>/readiness.log so the suite can assert WHICH URL was
+# queried (and that no credential was passed), then emits <body> followed by a
+# newline and <http_code>, matching the `--write-out` contract the wrapper
+# relies on. A non-zero <curl_exit> simulates a transport failure or timeout
+# and suppresses all output.
+#
+# `--version` is answered SEPARATELY, from <version_line>, and is recorded in
+# <case_dir>/curlversion.log rather than readiness.log. Keeping the two logs
+# apart is load-bearing: the capability probe is not a readiness request, so
+# `assert_readiness_not_called` must stay true for a case that refuses at the
+# version floor. Both arms record SELF=$0, so a case can prove the executable
+# that answered `--version` is the same one that performed the GET.
+#
+# <version_exit> simulates `curl --version` itself failing. <path> overrides
+# where the fake is written, for cases that plant more than one curl.
+write_fake_readiness_client() {
+  local case_dir="$1" curl_exit="$2" http_code="$3" body="$4"
+  local version_line="${5-${FAKE_CURL_DEFAULT_VERSION}}"
+  local version_exit="${6-0}"
+  local path="${7-${case_dir}/decoybin/curl}"
+  mkdir -p -- "$(dirname -- "${path}")"
+  cat > "${path}" <<FAKE
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "--version" ]]; then
+  {
+    printf 'CURL_VERSION_PROBE=1\n'
+    printf 'SELF=%s\n' "\$0"
+  } >> '${case_dir}/curlversion.log'
+  printf '%s\n' '${version_line}'
+  exit ${version_exit}
+fi
+{
+  printf 'READINESS_CLIENT_CALLED=1\n'
+  printf 'SELF=%s\n' "\$0"
+  for arg in "\$@"; do
+    printf 'ARG=%s\n' "\${arg}"
+  done
+} >> '${case_dir}/readiness.log'
+if [[ '${curl_exit}' != '0' ]]; then
+  exit ${curl_exit}
+fi
+printf '%s' '${body}'
+printf '\n%s' '${http_code}'
+FAKE
+  chmod 0755 -- "${path}"
+}
+
+# assert_curl_floor_refusal <name> <case_dir>
+#
+# The shape every rejected-version case must have: the capability probe ran,
+# no readiness request was issued, and canonical never executed.
+assert_curl_floor_refusal() {
+  local name="$1" case_dir="$2"
+  local version_log="${case_dir}/curlversion.log"
+  local readiness_log="${case_dir}/readiness.log"
+  local claw_log="${case_dir}/fake_claw.log"
+  if [[ ! -s "${version_log}" ]]; then
+    fail_case "${name}" "the curl capability probe never ran" /dev/null /dev/null "${version_log}"
+    return 1
+  fi
+  if [[ -s "${readiness_log}" ]]; then
+    fail_case "${name}" "a readiness request was issued despite an unproven curl" \
+      /dev/null /dev/null "${readiness_log}"
+    return 1
+  fi
+  if grep -Fq 'FAKE_CLAW_CALLED=1' "${claw_log}"; then
+    fail_case "${name}" "canonical claw executed despite an unproven curl" \
+      /dev/null /dev/null "${claw_log}"
+    return 1
+  fi
+}
+
+# assert_same_curl_command_path <name> <case_dir>
+#
+# The command PATH that answered `--version` must be the same command path
+# that performed the GET. A wrapper that probed one curl and then re-resolved
+# another from PATH would record two different SELF values here.
+#
+# This proves path selection only. SELF is the path each fixture was invoked
+# as, so identical values prove the wrapper did not re-resolve PATH — NOT that
+# the bytes behind that path were unchanged. Executable identity is explicitly
+# outside the wrapper's threat model; see the TRUST_BOUNDARY_RESIDUAL cases
+# below, which demonstrate that the bytes CAN change behind a stable path.
+assert_same_curl_command_path() {
+  local name="$1" case_dir="$2"
+  local probed used
+  probed="$(grep -m1 '^SELF=' "${case_dir}/curlversion.log" | cut -d= -f2- || true)"
+  used="$(grep -m1 '^SELF=' "${case_dir}/readiness.log" | cut -d= -f2- || true)"
+  if [[ -z "${probed}" || -z "${used}" ]]; then
+    fail_case "${name}" "missing SELF record (probed='${probed}' used='${used}')" \
+      /dev/null "${case_dir}/curlversion.log" "${case_dir}/readiness.log"
+    return 1
+  fi
+  if [[ "${probed}" != "${used}" ]]; then
+    fail_case "${name}" "curl command-path binding broken: probed '${probed}' but used '${used}'" \
+      /dev/null "${case_dir}/curlversion.log" "${case_dir}/readiness.log"
+    return 1
+  fi
+}
+
+# The default readiness answer: safe to start a qwen3:14b session.
+READY_QWEN3_14B='{"ready": true, "reason_code": "READY_AFTER_SAFE_EVICTION", "requested_model": "qwen3:14b", "requires_hyperliquid_pause": false}'
+
+# refusal_body <reason_code> [model]
+refusal_body() {
+  printf '{"ready": false, "reason_code": "%s", "requested_model": "%s", "requires_hyperliquid_pause": true}' \
+    "$1" "${2:-qwen3:14b}"
+}
+
+assert_readiness_not_called() {
+  local name="$1" readiness_log="$2"
+  if [[ -s "${readiness_log}" ]]; then
+    fail_case "${name}" "the readiness endpoint was queried when it must not have been" \
+      /dev/null /dev/null "${readiness_log}"
+    return 1
+  fi
+}
+
+assert_readiness_called_for() {
+  local name="$1" readiness_log="$2" encoded_model="$3"
+  if ! grep -Fq "requested_model=${encoded_model}" "${readiness_log}"; then
+    fail_case "${name}" "readiness was not queried for ${encoded_model}" \
+      /dev/null /dev/null "${readiness_log}"
+    return 1
+  fi
+}
+
+# LAW 1 for the readiness call itself: the query may only ever address the
+# allowlisted broker origin, never the raw Ollama port and never a remote host.
+assert_readiness_url_is_broker_only() {
+  local name="$1" readiness_log="$2"
+  local url_lines line url
+  url_lines="$(grep '^ARG=http' "${readiness_log}" || true)"
+  if [[ -z "${url_lines}" ]]; then
+    fail_case "${name}" "no readiness URL was recorded" /dev/null /dev/null "${readiness_log}"
+    return 1
+  fi
+  while IFS= read -r line; do
+    url="${line#ARG=}"
+    if [[ ! "${url}" =~ ^http://(127\.0\.0\.1|localhost):11435/status/n6_planner_ready\? ]]; then
+      fail_case "${name}" "readiness URL is not an allowlisted broker URL: ${url}" \
+        /dev/null /dev/null "${readiness_log}"
+      return 1
+    fi
+  done <<<"${url_lines}"
+  if grep -Fq '11434' "${readiness_log}"; then
+    fail_case "${name}" "the readiness client saw the raw Ollama port" \
+      /dev/null /dev/null "${readiness_log}"
+    return 1
+  fi
+}
+
 # stage_layout <case_name> [env_file_content]
 #
 # Builds an isolated REPO_ROOT under ${WORK_DIR}/<case_name>/root with the
@@ -84,7 +250,8 @@ stage_layout() {
   local content="${2-__COPY_REAL__}"
   local case_dir="${WORK_DIR}/${case_name}"
   local root="${case_dir}/root"
-  mkdir -p "${root}/scripts" "${root}/examples" "${case_dir}/decoybin" "${case_dir}/home"
+  mkdir -p "${root}/scripts" "${root}/examples" "${case_dir}/decoybin" "${case_dir}/home" \
+    "${case_dir}/cwd"
 
   cp "${REAL_WRAPPER}" "${root}/scripts/claw-sidestack-local"
   cp "${REAL_STATUS}" "${root}/scripts/claw-canonical-status"
@@ -108,6 +275,10 @@ stage_layout() {
   # must refuse to select under every condition.
   write_fake_claw "${case_dir}/decoybin/claw" "DECOY_PATH" "dec0y00"
   write_fake_claw "${case_dir}/home/.cargo/bin/claw" "DECOY_CARGO_BIN" "dec0y01"
+
+  # Every case gets a readiness client so no case can silently reach the real
+  # broker. Cases that need a different answer overwrite it.
+  write_fake_readiness_client "${case_dir}" 0 200 "${READY_QWEN3_14B}"
 
   printf '%s\n' "${case_dir}"
 }
@@ -180,15 +351,19 @@ run_case() {
   local stdout_file="${case_dir}/wrapper.stdout"
   local stderr_file="${case_dir}/wrapper.stderr"
   : > "${log_file}"
+  : > "${case_dir}/readiness.log"
+  : > "${case_dir}/curlversion.log"
 
   set +e
-  env -i \
-    HOME="${case_dir}/home" \
-    PATH="${case_dir}/decoybin:${case_dir}/home/.cargo/bin:/usr/bin:/bin" \
-    FAKE_CLAW_LOG="${log_file}" \
-    "${extra_env[@]}" \
-    bash "${wrapper}" "$@" \
-    >"${stdout_file}" 2>"${stderr_file}"
+  (
+    cd "${case_dir}/cwd" || exit 127
+    env -i \
+      HOME="${case_dir}/home" \
+      PATH="${case_dir}/decoybin:${case_dir}/home/.cargo/bin:/usr/bin:/bin" \
+      FAKE_CLAW_LOG="${log_file}" \
+      "${extra_env[@]}" \
+      bash "${wrapper}" "$@"
+  ) >"${stdout_file}" 2>"${stderr_file}"
   local actual_exit=$?
   set -e
 
@@ -270,7 +445,7 @@ assert_no_decoy_executed() {
 case1_name="happy_path_clean_shell"
 case1_dir="$(stage_layout "${case1_name}")"
 install_canonical "${case1_dir}" current
-if run_case "${case1_name}" "${case1_dir}" 0 -- prompt "say hi" >/dev/null; then
+if run_case "${case1_name}" "${case1_dir}" 0 -- --model fast prompt "say hi" >/dev/null; then
   log="${case1_dir}/fake_claw.log"
   if assert_log_contains "${case1_name}" "${log}" 'FAKE_CLAW_CALLED=1' \
      && assert_log_contains "${case1_name}" "${log}" 'IDENTITY=CANONICAL' \
@@ -279,7 +454,9 @@ if run_case "${case1_name}" "${case1_dir}" 0 -- prompt "say hi" >/dev/null; then
      && assert_log_contains "${case1_name}" "${log}" 'ARG=prompt' \
      && assert_log_contains "${case1_name}" "${log}" 'ARG=say hi' \
      && assert_stderr_contains "${case1_name}" "${case1_dir}/wrapper.stderr" \
-          "canonical claw: ${case1_dir}/home/.local/bin/claw"; then
+          "canonical claw: ${case1_dir}/home/.local/bin/claw" \
+     && assert_readiness_called_for "${case1_name}" "${case1_dir}/readiness.log" 'qwen3%3A14b' \
+     && assert_readiness_url_is_broker_only "${case1_name}" "${case1_dir}/readiness.log"; then
     pass_case "${case1_name}"
   fi
 fi
@@ -311,7 +488,8 @@ install_canonical "${case3_dir}" current
 if run_case "${case3_name}" "${case3_dir}" 3 -- prompt "should refuse" >/dev/null; then
   stderr="${case3_dir}/wrapper.stderr"
   log="${case3_dir}/fake_claw.log"
-  if assert_stderr_contains "${case3_name}" "${stderr}" 'LAW 1' \
+  if assert_readiness_not_called "${case3_name}" "${case3_dir}/readiness.log" \
+     && assert_stderr_contains "${case3_name}" "${stderr}" 'LAW 1' \
      && assert_fake_not_called "${case3_name}" "${log}"; then
     pass_case "${case3_name}"
   fi
@@ -325,7 +503,8 @@ install_canonical "${case4_dir}" current
 if run_case "${case4_name}" "${case4_dir}" 3 -- prompt "should refuse" >/dev/null; then
   stderr="${case4_dir}/wrapper.stderr"
   log="${case4_dir}/fake_claw.log"
-  if assert_stderr_contains "${case4_name}" "${stderr}" 'LAW 1' \
+  if assert_readiness_not_called "${case4_name}" "${case4_dir}/readiness.log" \
+     && assert_stderr_contains "${case4_name}" "${stderr}" 'LAW 1' \
      && assert_fake_not_called "${case4_name}" "${log}"; then
     pass_case "${case4_name}"
   fi
@@ -338,7 +517,8 @@ install_canonical "${case5_dir}" current
 if run_case "${case5_name}" "${case5_dir}" 2 -- prompt "should refuse" >/dev/null; then
   stderr="${case5_dir}/wrapper.stderr"
   log="${case5_dir}/fake_claw.log"
-  if assert_stderr_contains "${case5_name}" "${stderr}" 'env file not found' \
+  if assert_readiness_not_called "${case5_name}" "${case5_dir}/readiness.log" \
+     && assert_stderr_contains "${case5_name}" "${stderr}" 'env file not found' \
      && assert_fake_not_called "${case5_name}" "${log}"; then
     pass_case "${case5_name}"
   fi
@@ -351,7 +531,8 @@ install_canonical "${case6_dir}" missing
 if run_case "${case6_name}" "${case6_dir}" 4 -- prompt "should fail" >/dev/null; then
   stderr="${case6_dir}/wrapper.stderr"
   log="${case6_dir}/fake_claw.log"
-  if assert_stderr_contains "${case6_name}" "${stderr}" 'canonical claw is missing' \
+  if assert_readiness_not_called "${case6_name}" "${case6_dir}/readiness.log" \
+     && assert_stderr_contains "${case6_name}" "${stderr}" 'canonical claw is missing' \
      && assert_stderr_contains "${case6_name}" "${stderr}" 'does NOT fall back to PATH or to ~/.cargo/bin/claw' \
      && assert_fake_not_called "${case6_name}" "${log}" \
      && assert_no_decoy_executed "${case6_name}" "${log}"; then
@@ -400,7 +581,8 @@ install_canonical "${case9_dir}" stale
 if run_case "${case9_name}" "${case9_dir}" 6 -- prompt "should refuse" >/dev/null; then
   stderr="${case9_dir}/wrapper.stderr"
   log="${case9_dir}/fake_claw.log"
-  if assert_stderr_contains "${case9_name}" "${stderr}" 'refusing to run a STALE canonical claw' \
+  if assert_readiness_not_called "${case9_name}" "${case9_dir}/readiness.log" \
+     && assert_stderr_contains "${case9_name}" "${stderr}" 'refusing to run a STALE canonical claw' \
      && assert_stderr_contains "${case9_name}" "${stderr}" 'claw-canonical-refresh' \
      && assert_fake_not_called "${case9_name}" "${log}" \
      && assert_no_decoy_executed "${case9_name}" "${log}"; then
@@ -413,7 +595,7 @@ case10_name="canonical_stale_explicit_override_runs_with_warning"
 case10_dir="$(stage_layout "${case10_name}")"
 install_canonical "${case10_dir}" stale
 if run_case "${case10_name}" "${case10_dir}" 0 \
-     "CLAW_SIDESTACK_ALLOW_STALE=1" -- prompt "explicitly allowed" >/dev/null; then
+     "CLAW_SIDESTACK_ALLOW_STALE=1" -- --model fast prompt "explicitly allowed" >/dev/null; then
   stderr="${case10_dir}/wrapper.stderr"
   log="${case10_dir}/fake_claw.log"
   if assert_stderr_contains "${case10_name}" "${stderr}" 'WARNING — canonical claw is STALE' \
@@ -428,7 +610,7 @@ case11_name="unknown_base_warns_and_runs"
 case11_dir="$(stage_layout "${case11_name}")"
 install_canonical "${case11_dir}" current
 git -C "${case11_dir}/root" update-ref -d refs/remotes/origin/main
-if run_case "${case11_name}" "${case11_dir}" 0 -- prompt "unknown base" >/dev/null; then
+if run_case "${case11_name}" "${case11_dir}" 0 -- --model fast prompt "unknown base" >/dev/null; then
   stderr="${case11_dir}/wrapper.stderr"
   log="${case11_dir}/fake_claw.log"
   if assert_stderr_contains "${case11_name}" "${stderr}" 'freshness could not be determined' \
@@ -448,7 +630,8 @@ install_canonical "${case12_dir}" missing
 if run_case "${case12_name}" "${case12_dir}" 3 -- prompt "should refuse" >/dev/null; then
   stderr="${case12_dir}/wrapper.stderr"
   log="${case12_dir}/fake_claw.log"
-  if assert_stderr_contains "${case12_name}" "${stderr}" 'LAW 1' \
+  if assert_readiness_not_called "${case12_name}" "${case12_dir}/readiness.log" \
+     && assert_stderr_contains "${case12_name}" "${stderr}" 'LAW 1' \
      && assert_fake_not_called "${case12_name}" "${log}"; then
     if grep -Fq 'canonical claw is missing' "${stderr}"; then
       fail_case "${case12_name}" "canonical checks ran before the LAW 1 refusal" \
@@ -466,7 +649,8 @@ install_canonical "${case13_dir}" nonexec
 if run_case "${case13_name}" "${case13_dir}" 5 -- prompt "should refuse" >/dev/null; then
   stderr="${case13_dir}/wrapper.stderr"
   log="${case13_dir}/fake_claw.log"
-  if assert_stderr_contains "${case13_name}" "${stderr}" 'invalid topology' \
+  if assert_readiness_not_called "${case13_name}" "${case13_dir}/readiness.log" \
+     && assert_stderr_contains "${case13_name}" "${stderr}" 'invalid topology' \
      && assert_fake_not_called "${case13_name}" "${log}" \
      && assert_no_decoy_executed "${case13_name}" "${log}"; then
     pass_case "${case13_name}"
@@ -481,7 +665,8 @@ rm -f "${case14_dir}/root/scripts/claw-canonical-status"
 if run_case "${case14_name}" "${case14_dir}" 7 -- prompt "should refuse" >/dev/null; then
   stderr="${case14_dir}/wrapper.stderr"
   log="${case14_dir}/fake_claw.log"
-  if assert_stderr_contains "${case14_name}" "${stderr}" 'canonical status helper missing' \
+  if assert_readiness_not_called "${case14_name}" "${case14_dir}/readiness.log" \
+     && assert_stderr_contains "${case14_name}" "${stderr}" 'canonical status helper missing' \
      && assert_fake_not_called "${case14_name}" "${log}" \
      && assert_no_decoy_executed "${case14_name}" "${log}"; then
     pass_case "${case14_name}"
@@ -498,7 +683,8 @@ install_canonical "${case15_dir}" stale_prefix
 if run_case "${case15_name}" "${case15_dir}" 6 -- prompt "should refuse" >/dev/null; then
   stderr="${case15_dir}/wrapper.stderr"
   log="${case15_dir}/fake_claw.log"
-  if assert_stderr_contains "${case15_name}" "${stderr}" 'refusing to run a STALE canonical claw' \
+  if assert_readiness_not_called "${case15_name}" "${case15_dir}/readiness.log" \
+     && assert_stderr_contains "${case15_name}" "${stderr}" 'refusing to run a STALE canonical claw' \
      && assert_fake_not_called "${case15_name}" "${log}" \
      && assert_no_decoy_executed "${case15_name}" "${log}"; then
     pass_case "${case15_name}"
@@ -526,7 +712,7 @@ ln -s '${case16_dir}/swapped-target/claw' '${canonical16}'
 exit 0
 STUB
 chmod 0755 "${case16_dir}/root/scripts/claw-canonical-status"
-if run_case "${case16_name}" "${case16_dir}" 5 -- prompt "should refuse" >/dev/null; then
+if run_case "${case16_name}" "${case16_dir}" 5 -- --model fast prompt "should refuse" >/dev/null; then
   stderr="${case16_dir}/wrapper.stderr"
   log="${case16_dir}/fake_claw.log"
   if assert_stderr_contains "${case16_name}" "${stderr}" 'canonical claw is a symlink' \
@@ -554,7 +740,7 @@ rm -f -- '${canonical17}'
 exit 0
 STUB
 chmod 0755 "${case17_dir}/root/scripts/claw-canonical-status"
-if run_case "${case17_name}" "${case17_dir}" 4 -- prompt "should refuse" >/dev/null; then
+if run_case "${case17_name}" "${case17_dir}" 4 -- --model fast prompt "should refuse" >/dev/null; then
   stderr="${case17_dir}/wrapper.stderr"
   log="${case17_dir}/fake_claw.log"
   if assert_stderr_contains "${case17_name}" "${stderr}" 'canonical claw is missing' \
@@ -562,6 +748,1121 @@ if run_case "${case17_name}" "${case17_dir}" 4 -- prompt "should refuse" >/dev/n
      && assert_fake_not_called "${case17_name}" "${log}" \
      && assert_no_decoy_executed "${case17_name}" "${log}"; then
     pass_case "${case17_name}"
+  fi
+fi
+
+
+# ===========================================================================
+# N6 broker readiness gate
+#
+# The gate runs after the canonical freshness checks and before the final
+# topology revalidation, so cases 3-6/9/12-15 above already prove it is never
+# consulted when an earlier rule refuses, and cases 16/17 prove the final
+# topology recheck still fires after readiness has said yes.
+# ===========================================================================
+
+# ---------- case 18: --model deep is queried as its exact upstream model ----
+case18_name="readiness_queries_the_exact_deep_alias_model"
+case18_dir="$(stage_layout "${case18_name}")"
+install_canonical "${case18_dir}" current
+write_fake_readiness_client "${case18_dir}" 0 200 \
+  '{"ready": true, "reason_code": "READY_SAME_MODEL", "requested_model": "qwen3.5:27b"}'
+if run_case "${case18_name}" "${case18_dir}" 0 -- --model deep prompt "hi" >/dev/null; then
+  if assert_readiness_called_for "${case18_name}" "${case18_dir}/readiness.log" 'qwen3.5%3A27b' \
+     && assert_readiness_url_is_broker_only "${case18_name}" "${case18_dir}/readiness.log" \
+     && assert_log_contains "${case18_name}" "${case18_dir}/fake_claw.log" 'IDENTITY=CANONICAL'; then
+    pass_case "${case18_name}"
+  fi
+fi
+
+# ---------- case 19: explicit model, routing prefix stripped for the wire ----
+case19_name="readiness_queries_explicit_model_with_routing_prefix_stripped"
+case19_dir="$(stage_layout "${case19_name}")"
+install_canonical "${case19_dir}" current
+if run_case "${case19_name}" "${case19_dir}" 0 -- --model openai/qwen3:14b prompt "hi" >/dev/null; then
+  if assert_readiness_called_for "${case19_name}" "${case19_dir}/readiness.log" 'qwen3%3A14b' \
+     && assert_readiness_url_is_broker_only "${case19_name}" "${case19_dir}/readiness.log"; then
+    if grep -Fq 'requested_model=openai' "${case19_dir}/readiness.log"; then
+      fail_case "${case19_name}" "the routing prefix was not stripped before the readiness query" \
+        /dev/null /dev/null "${case19_dir}/readiness.log"
+    else
+      pass_case "${case19_name}"
+    fi
+  fi
+fi
+
+# ---------- case 20: the --model=VALUE form resolves identically ------------
+case20_name="readiness_supports_the_model_equals_form"
+case20_dir="$(stage_layout "${case20_name}")"
+install_canonical "${case20_dir}" current
+if run_case "${case20_name}" "${case20_dir}" 0 -- --model=fast prompt "hi" >/dev/null; then
+  if assert_readiness_called_for "${case20_name}" "${case20_dir}/readiness.log" 'qwen3%3A14b' \
+     && assert_log_contains "${case20_name}" "${case20_dir}/fake_claw.log" 'ARG=--model=fast'; then
+    pass_case "${case20_name}"
+  fi
+fi
+
+# ---------- cases 21-24: every refusal reason_code refuses ------------------
+# ready=false means REFUSE, never wait: the wrapper exits 8 immediately, the
+# canonical claw is never executed, and the reason_code is surfaced verbatim.
+refusal_index=21
+for reason in HYPERLIQUID_LANE_RECENTLY_ACTIVE HYPERLIQUID_HOLDER_PROTECTED BROKER_BUSY INSUFFICIENT_VRAM; do
+  refusal_name="readiness_refuses_${reason}"
+  refusal_dir="$(stage_layout "case${refusal_index}_${reason}")"
+  install_canonical "${refusal_dir}" current
+  write_fake_readiness_client "${refusal_dir}" 0 200 "$(refusal_body "${reason}")"
+  if run_case "${refusal_name}" "${refusal_dir}" 8 -- --model fast prompt "should refuse" >/dev/null; then
+    if assert_stderr_contains "${refusal_name}" "${refusal_dir}/wrapper.stderr" \
+         'local coding readiness refused' \
+       && assert_stderr_contains "${refusal_name}" "${refusal_dir}/wrapper.stderr" \
+            'requested model: qwen3:14b' \
+       && assert_stderr_contains "${refusal_name}" "${refusal_dir}/wrapper.stderr" \
+            "reason_code: ${reason}" \
+       && assert_fake_not_called "${refusal_name}" "${refusal_dir}/fake_claw.log" \
+       && assert_no_decoy_executed "${refusal_name}" "${refusal_dir}/fake_claw.log"; then
+      pass_case "${refusal_name}"
+    fi
+  fi
+  refusal_index=$((refusal_index + 1))
+done
+
+# ---------- cases 25-30: every unusable answer fails closed -----------------
+# Each entry is <label>|<curl_exit>|<http_code>|<body>. In all six the wrapper
+# must exit 9 and must NOT execute the canonical claw.
+fail_closed_index=25
+while IFS='|' read -r fc_label fc_exit fc_code fc_body; do
+  [[ -n "${fc_label}" ]] || continue
+  fc_name="readiness_fails_closed_on_${fc_label}"
+  fc_dir="$(stage_layout "case${fail_closed_index}_${fc_label}")"
+  install_canonical "${fc_dir}" current
+  write_fake_readiness_client "${fc_dir}" "${fc_exit}" "${fc_code}" "${fc_body}"
+  if run_case "${fc_name}" "${fc_dir}" 9 -- --model fast prompt "should refuse" >/dev/null; then
+    if assert_stderr_contains "${fc_name}" "${fc_dir}/wrapper.stderr" \
+         'local coding readiness could not be established' \
+       && assert_fake_not_called "${fc_name}" "${fc_dir}/fake_claw.log" \
+       && assert_no_decoy_executed "${fc_name}" "${fc_dir}/fake_claw.log"; then
+      pass_case "${fc_name}"
+    fi
+  fi
+  fail_closed_index=$((fail_closed_index + 1))
+done <<'FAILCLOSED'
+connection_failure|7|000|
+timeout|28|000|
+non_2xx|0|503|{"detail": "unavailable"}
+malformed_json|0|200|{"ready": true, "reason_code":
+missing_ready_field|0|200|{"reason_code": "READY_SAME_MODEL", "requested_model": "qwen3:14b"}
+answer_for_a_different_model|0|200|{"ready": true, "reason_code": "READY_SAME_MODEL", "requested_model": "devstral-small-2:latest"}
+FAILCLOSED
+
+# ---------- case 31: a duplicated `ready` key is ambiguous, so it refuses ----
+case31_name="readiness_fails_closed_on_duplicate_ready_keys"
+case31_dir="$(stage_layout "${case31_name}")"
+install_canonical "${case31_dir}" current
+write_fake_readiness_client "${case31_dir}" 0 200 \
+  '{"ready": false, "ready": true, "reason_code": "READY_SAME_MODEL", "requested_model": "qwen3:14b"}'
+if run_case "${case31_name}" "${case31_dir}" 9 -- --model fast prompt "should refuse" >/dev/null; then
+  if assert_stderr_contains "${case31_name}" "${case31_dir}/wrapper.stderr" \
+       'local coding readiness could not be established' \
+     && assert_fake_not_called "${case31_name}" "${case31_dir}/fake_claw.log"; then
+    pass_case "${case31_name}"
+  fi
+fi
+
+# ---------- case 32: a non-boolean `ready` is not an answer -----------------
+case32_name="readiness_fails_closed_on_non_boolean_ready"
+case32_dir="$(stage_layout "${case32_name}")"
+install_canonical "${case32_dir}" current
+write_fake_readiness_client "${case32_dir}" 0 200 \
+  '{"ready": "true", "reason_code": "READY_SAME_MODEL", "requested_model": "qwen3:14b"}'
+if run_case "${case32_name}" "${case32_dir}" 9 -- --model fast prompt "should refuse" >/dev/null; then
+  if assert_fake_not_called "${case32_name}" "${case32_dir}/fake_claw.log"; then
+    pass_case "${case32_name}"
+  fi
+fi
+
+# ---------- case 33: an inference invocation with no --model refuses --------
+# `claw` would fall back to the compiled-in DEFAULT_MODEL, which is a cloud
+# model, so there is no local upstream model to ask the broker about.
+case33_name="inference_without_an_explicit_model_refuses_with_a_hint"
+case33_dir="$(stage_layout "${case33_name}")"
+install_canonical "${case33_dir}" current
+if run_case "${case33_name}" "${case33_dir}" 9 -- prompt "no model given" >/dev/null; then
+  if assert_stderr_contains "${case33_name}" "${case33_dir}/wrapper.stderr" \
+       'readiness requires an explicit --model for this invocation' \
+     && assert_stderr_contains "${case33_name}" "${case33_dir}/wrapper.stderr" 'Example: --model fast' \
+     && assert_readiness_not_called "${case33_name}" "${case33_dir}/readiness.log" \
+     && assert_fake_not_called "${case33_name}" "${case33_dir}/fake_claw.log" \
+     && assert_no_decoy_executed "${case33_name}" "${case33_dir}/fake_claw.log"; then
+    pass_case "${case33_name}"
+  fi
+fi
+
+# ---------- case 34: the bare interactive REPL refuses the same way ---------
+case34_name="interactive_repl_without_a_model_refuses"
+case34_dir="$(stage_layout "${case34_name}")"
+install_canonical "${case34_dir}" current
+if run_case "${case34_name}" "${case34_dir}" 9 -- >/dev/null; then
+  if assert_stderr_contains "${case34_name}" "${case34_dir}/wrapper.stderr" \
+       'readiness requires an explicit --model for this invocation' \
+     && assert_readiness_not_called "${case34_name}" "${case34_dir}/readiness.log" \
+     && assert_fake_not_called "${case34_name}" "${case34_dir}/fake_claw.log"; then
+    pass_case "${case34_name}"
+  fi
+fi
+
+# ---------- case 35: a bare name with no env alias is not resolvable --------
+# `sonnet` would go through claw's built-in cloud alias table or a repo config
+# alias; neither is determinable here, so the wrapper refuses instead of
+# guessing which upstream model the broker would be asked for.
+case35_name="bare_model_name_without_an_env_alias_refuses"
+case35_dir="$(stage_layout "${case35_name}")"
+install_canonical "${case35_dir}" current
+if run_case "${case35_name}" "${case35_dir}" 9 -- --model sonnet prompt "x" >/dev/null; then
+  if assert_stderr_contains "${case35_name}" "${case35_dir}/wrapper.stderr" \
+       'could not resolve the requested model' \
+     && assert_stderr_contains "${case35_name}" "${case35_dir}/wrapper.stderr" \
+          'RUSTY_CLAUDE_MODEL_ALIAS__SONNET' \
+     && assert_readiness_not_called "${case35_name}" "${case35_dir}/readiness.log" \
+     && assert_fake_not_called "${case35_name}" "${case35_dir}/fake_claw.log"; then
+    pass_case "${case35_name}"
+  fi
+fi
+
+# ---------- case 36: a claw config alias makes the model undeterminable -----
+# Config aliases can rename ANY model string, and claw consults them whenever
+# the env-alias lookup misses, so their presence is a fail-closed condition.
+case36_name="config_alias_for_the_requested_model_refuses"
+case36_dir="$(stage_layout "${case36_name}")"
+install_canonical "${case36_dir}" current
+mkdir -p "${case36_dir}/cwd/.claw"
+printf '%s\n' '{"aliases": {"qwen3:14b": "devstral-small-2:latest"}}' \
+  > "${case36_dir}/cwd/.claw/settings.json"
+if run_case "${case36_name}" "${case36_dir}" 9 -- --model qwen3:14b prompt "x" >/dev/null; then
+  if assert_stderr_contains "${case36_name}" "${case36_dir}/wrapper.stderr" \
+       'redefined by a claw config alias' \
+     && assert_readiness_not_called "${case36_name}" "${case36_dir}/readiness.log" \
+     && assert_fake_not_called "${case36_name}" "${case36_dir}/fake_claw.log"; then
+    pass_case "${case36_name}"
+  fi
+fi
+
+# ---------- cases 37+: proven non-inference commands bypass the gate --------
+# Each of these dispatches to a local printer/reporter in the CLI and never
+# constructs a LiveCli, so there is no session for the broker to gate. `plan`
+# is included on a narrower proof: its dispatcher makes no provider call, and
+# every inference step it runs is spawned back through THIS wrapper as
+# `--model fast … prompt …`, where it IS gated.
+noninference_index=37
+for noninference_cmd in --help --version version status sandbox doctor acp state init config diff export system-prompt dump-manifests bootstrap-plan agents mcp skills plugins plan; do
+  ni_name="non_inference_bypasses_readiness_${noninference_cmd//-/_}"
+  ni_dir="$(stage_layout "case${noninference_index}_${noninference_cmd#--}")"
+  install_canonical "${ni_dir}" current
+  if run_case "${ni_name}" "${ni_dir}" 0 -- "${noninference_cmd}" >/dev/null; then
+    if assert_readiness_not_called "${ni_name}" "${ni_dir}/readiness.log" \
+       && assert_no_decoy_executed "${ni_name}" "${ni_dir}/fake_claw.log"; then
+      pass_case "${ni_name}"
+    fi
+  fi
+  noninference_index=$((noninference_index + 1))
+done
+
+# ---------- case 58: `<subcommand> --help` still bypasses ------------------
+case58_name="subcommand_help_bypasses_readiness"
+case58_dir="$(stage_layout "${case58_name}")"
+install_canonical "${case58_dir}" current
+if run_case "${case58_name}" "${case58_dir}" 0 -- status --help >/dev/null; then
+  if assert_readiness_not_called "${case58_name}" "${case58_dir}/readiness.log"; then
+    pass_case "${case58_name}"
+  fi
+fi
+
+# ---------- case 59: a bare prompt with --help in it is still inference -----
+# `claw explain this --help` is a shorthand prompt, not a help request, so it
+# must NOT be waved through by a naive "--help appears in argv" check.
+case59_name="shorthand_prompt_containing_help_is_still_gated"
+case59_dir="$(stage_layout "${case59_name}")"
+install_canonical "${case59_dir}" current
+if run_case "${case59_name}" "${case59_dir}" 9 -- explain this --help >/dev/null; then
+  if assert_stderr_contains "${case59_name}" "${case59_dir}/wrapper.stderr" \
+       'readiness requires an explicit --model for this invocation' \
+     && assert_fake_not_called "${case59_name}" "${case59_dir}/fake_claw.log"; then
+    pass_case "${case59_name}"
+  fi
+fi
+
+# ---------- case 60: the readiness query carries no credential -------------
+# The endpoint is unauthenticated. The API key must never reach the readiness
+# client's argument list, and must never be echoed to stderr.
+case60_name="readiness_query_never_carries_the_api_key"
+case60_dir="$(stage_layout "${case60_name}" 'export OPENAI_BASE_URL="http://localhost:11435/v1"
+export OPENAI_API_KEY="sk-n6-sentinel-must-not-leak"
+export RUSTY_CLAUDE_MODEL_ALIAS__FAST="qwen3:14b"')"
+install_canonical "${case60_dir}" current
+if run_case "${case60_name}" "${case60_dir}" 0 -- --model fast prompt "hi" >/dev/null; then
+  if assert_readiness_called_for "${case60_name}" "${case60_dir}/readiness.log" 'qwen3%3A14b' \
+     && assert_readiness_url_is_broker_only "${case60_name}" "${case60_dir}/readiness.log"; then
+    if grep -Fq 'sk-n6-sentinel-must-not-leak' "${case60_dir}/readiness.log"; then
+      fail_case "${case60_name}" "the API key reached the readiness client's arguments" \
+        /dev/null /dev/null "${case60_dir}/readiness.log"
+    elif grep -Fq 'sk-n6-sentinel-must-not-leak' "${case60_dir}/wrapper.stderr"; then
+      fail_case "${case60_name}" "the API key was printed to stderr" \
+        /dev/null "${case60_dir}/wrapper.stderr" /dev/null
+    else
+      pass_case "${case60_name}"
+    fi
+  fi
+fi
+
+# ---------- case 61: the readiness origin follows the validated base URL ----
+# The origin is derived from the already-LAW-1-validated OPENAI_BASE_URL, so a
+# `localhost` profile must produce a `localhost` readiness URL — never a second
+# hard-coded host, and never :11434.
+case61_name="readiness_origin_is_derived_from_the_validated_base_url"
+case61_dir="$(stage_layout "${case61_name}" 'export OPENAI_BASE_URL="http://localhost:11435/v1"
+export OPENAI_API_KEY="local"
+export RUSTY_CLAUDE_MODEL_ALIAS__FAST="qwen3:14b"')"
+install_canonical "${case61_dir}" current
+if run_case "${case61_name}" "${case61_dir}" 0 -- --model fast prompt "hi" >/dev/null; then
+  if assert_readiness_url_is_broker_only "${case61_name}" "${case61_dir}/readiness.log"; then
+    if ! grep -Fq 'ARG=http://localhost:11435/status/n6_planner_ready?' "${case61_dir}/readiness.log"; then
+      fail_case "${case61_name}" "the readiness URL did not follow the profile's localhost origin" \
+        /dev/null /dev/null "${case61_dir}/readiness.log"
+    else
+      pass_case "${case61_name}"
+    fi
+  fi
+fi
+
+# ===========================================================================
+# Repair coverage: tail-aware classification and model-binding proof.
+#
+# The first candidate classified on the LEADING VERB alone. That is wrong for
+# every subcommand whose dispatch depends on its tail, and it silently waved
+# through real `CliAction::Prompt` invocations. Each case below pins one shape
+# against the actual Rust dispatch it mirrors.
+# ===========================================================================
+
+# ---------- skills: tail decides, not the verb -----------------------------
+# `classify_skills_slash_command` (rust/crates/commands/src/lib.rs) keeps the
+# invocation local ONLY for the whole-string forms below. Everything else is
+# SkillSlashDispatch::Invoke -> CliAction::Prompt.
+skills_local_index=62
+while IFS='|' read -r skills_args skills_label; do
+  [[ -n "${skills_label}" ]] || continue
+  sl_name="skills_local_form_${skills_label}"
+  sl_dir="$(stage_layout "case${skills_local_index}_${skills_label}")"
+  install_canonical "${sl_dir}" current
+  # shellcheck disable=SC2086  # deliberate word splitting: these are argv words
+  if run_case "${sl_name}" "${sl_dir}" 0 -- skills ${skills_args} >/dev/null; then
+    if assert_readiness_not_called "${sl_name}" "${sl_dir}/readiness.log" \
+       && assert_no_decoy_executed "${sl_name}" "${sl_dir}/fake_claw.log"; then
+      pass_case "${sl_name}"
+    fi
+  fi
+  skills_local_index=$((skills_local_index + 1))
+done <<'SKILLS_LOCAL'
+|bare
+list|list
+help|help
+-h|dash_h
+--help|dash_dash_help
+install|install
+install ./some/path|install_target
+SKILLS_LOCAL
+
+# Inference-capable skills forms: each must query readiness for the EXACT
+# resolved model before the canonical claw is allowed to run.
+skills_gated_index=69
+while IFS='|' read -r skills_args skills_label; do
+  [[ -n "${skills_label}" ]] || continue
+  sg_name="skills_inference_form_is_gated_${skills_label}"
+  sg_dir="$(stage_layout "case${skills_gated_index}_${skills_label}")"
+  install_canonical "${sg_dir}" current
+  # shellcheck disable=SC2086  # deliberate word splitting: these are argv words
+  if run_case "${sg_name}" "${sg_dir}" 0 -- --model fast skills ${skills_args} >/dev/null; then
+    if assert_readiness_called_for "${sg_name}" "${sg_dir}/readiness.log" 'qwen3%3A14b' \
+       && assert_readiness_url_is_broker_only "${sg_name}" "${sg_dir}/readiness.log" \
+       && assert_no_decoy_executed "${sg_name}" "${sg_dir}/fake_claw.log"; then
+      pass_case "${sg_name}"
+    fi
+  fi
+  skills_gated_index=$((skills_gated_index + 1))
+done <<'SKILLS_GATED'
+help overview|help_overview
+list extra|list_extra
+some-skill|bare_skill
+some-skill arg1 arg2|skill_with_args
+installer|installer_is_not_the_install_subcommand
+SKILLS_GATED
+
+# ---------- the blocking regression, stated as a refusal -------------------
+# THE case the first candidate failed: with the broker refusing, the original
+# wrapper still executed canonical claw for `skills help overview` because it
+# never asked. The repaired wrapper must refuse with exit 8 and never exec.
+case74_name="skills_help_overview_is_refused_when_the_broker_says_not_ready"
+case74_dir="$(stage_layout "${case74_name}")"
+install_canonical "${case74_dir}" current
+write_fake_readiness_client "${case74_dir}" 0 200 "$(refusal_body HYPERLIQUID_ACTIVE)"
+if run_case "${case74_name}" "${case74_dir}" 8 -- --model fast skills help overview >/dev/null; then
+  if assert_stderr_contains "${case74_name}" "${case74_dir}/wrapper.stderr" \
+       'local coding readiness refused' \
+     && assert_stderr_contains "${case74_name}" "${case74_dir}/wrapper.stderr" \
+          'reason_code: HYPERLIQUID_ACTIVE' \
+     && assert_fake_not_called "${case74_name}" "${case74_dir}/fake_claw.log"; then
+    pass_case "${case74_name}"
+  fi
+fi
+
+# ---------- `-p` consumes the rest of argv as a PROMPT ---------------------
+# `parse_args_with_terminal` returns CliAction::Prompt for `-p`, joining every
+# remaining token into the prompt text. `-p status` is a prompt that reads
+# "status", NOT the local status report, so a positional scan must never see
+# "status" here and bypass.
+case75_name="dash_p_with_a_local_looking_word_is_still_inference"
+case75_dir="$(stage_layout "${case75_name}")"
+install_canonical "${case75_dir}" current
+if run_case "${case75_name}" "${case75_dir}" 0 -- --model fast -p status >/dev/null; then
+  if assert_readiness_called_for "${case75_name}" "${case75_dir}/readiness.log" 'qwen3%3A14b' \
+     && assert_no_decoy_executed "${case75_name}" "${case75_dir}/fake_claw.log"; then
+    pass_case "${case75_name}"
+  fi
+fi
+
+case76_name="dash_p_without_a_model_refuses_before_exec"
+case76_dir="$(stage_layout "${case76_name}")"
+install_canonical "${case76_dir}" current
+if run_case "${case76_name}" "${case76_dir}" 9 -- -p doctor >/dev/null; then
+  if assert_stderr_contains "${case76_name}" "${case76_dir}/wrapper.stderr" \
+       'readiness requires an explicit --model for this invocation' \
+     && assert_fake_not_called "${case76_name}" "${case76_dir}/fake_claw.log"; then
+    pass_case "${case76_name}"
+  fi
+fi
+
+# `--model` is a value-taking flag, so a `-p` sitting in its VALUE slot is a
+# model string, not the prompt flag: it must NOT force the inference verdict.
+# The real positional here is `status`, a proven-local report, so this is a
+# local bypass. (The CLI itself then rejects `-p` as a model string; either
+# way no provider is reached.)
+case77_name="dash_p_as_a_flag_value_is_not_treated_as_the_prompt_flag"
+case77_dir="$(stage_layout "${case77_name}")"
+install_canonical "${case77_dir}" current
+if run_case "${case77_name}" "${case77_dir}" 0 -- --model -p status >/dev/null; then
+  if assert_readiness_not_called "${case77_name}" "${case77_dir}/readiness.log" \
+     && assert_no_decoy_executed "${case77_name}" "${case77_dir}/fake_claw.log"; then
+    pass_case "${case77_name}"
+  fi
+fi
+
+# ---------- `--resume` continues a real session ----------------------------
+# `parse_resume_args` yields ResumeSession / ResumeRepl. A session reference
+# that happens to read like a local verb must not be scanned as a subcommand.
+case78_name="resume_with_a_local_looking_reference_is_still_inference"
+case78_dir="$(stage_layout "${case78_name}")"
+install_canonical "${case78_dir}" current
+if run_case "${case78_name}" "${case78_dir}" 0 -- --model fast --resume status >/dev/null; then
+  if assert_readiness_called_for "${case78_name}" "${case78_dir}/readiness.log" 'qwen3%3A14b' \
+     && assert_no_decoy_executed "${case78_name}" "${case78_dir}/fake_claw.log"; then
+    pass_case "${case78_name}"
+  fi
+fi
+
+# ---------- `task run` fails closed ----------------------------------------
+# `CliAction::TaskRun` carries ONLY the spec path. The global `--model` is
+# never propagated into it. The bridge reads `spec.model` (default
+# "fast-default") and the EFFECTIVE upstream model is whatever the broker
+# resolves that to -- readable only from the broker's response, after
+# inference. So the exact model cannot be proven here, and gating on the
+# global --model would query the WRONG model.
+case79_name="task_run_refuses_before_exec_instead_of_guessing_the_model"
+case79_dir="$(stage_layout "${case79_name}")"
+install_canonical "${case79_dir}" current
+if run_case "${case79_name}" "${case79_dir}" 9 -- task run ./task.json >/dev/null; then
+  if assert_stderr_contains "${case79_name}" "${case79_dir}/wrapper.stderr" \
+       'takes its model from the task spec' \
+     && assert_readiness_not_called "${case79_name}" "${case79_dir}/readiness.log" \
+     && assert_fake_not_called "${case79_name}" "${case79_dir}/fake_claw.log"; then
+    pass_case "${case79_name}"
+  fi
+fi
+
+# The decisive one: a global --model must NOT satisfy the task-run gate, and
+# must NOT cause a readiness query for a model the task will never use.
+case80_name="task_run_with_a_global_model_still_refuses_and_queries_nothing"
+case80_dir="$(stage_layout "${case80_name}")"
+install_canonical "${case80_dir}" current
+if run_case "${case80_name}" "${case80_dir}" 9 -- --model fast task run ./task.json >/dev/null; then
+  if assert_readiness_not_called "${case80_name}" "${case80_dir}/readiness.log" \
+     && assert_fake_not_called "${case80_name}" "${case80_dir}/fake_claw.log"; then
+    pass_case "${case80_name}"
+  fi
+fi
+
+# ---------- `plan run` child-step gating depends on the wrapper ------------
+# `build_claw_command` spawns every model-bearing step as
+# `<wrapper> --model fast ... prompt <text>`, so the steps are gated by THIS
+# wrapper -- but only while the runner uses its default wrapper.
+case81_name="plan_run_without_a_wrapper_override_bypasses_and_gates_its_children"
+case81_dir="$(stage_layout "${case81_name}")"
+install_canonical "${case81_dir}" current
+if run_case "${case81_name}" "${case81_dir}" 0 -- plan run ./plan.yaml >/dev/null; then
+  if assert_readiness_not_called "${case81_name}" "${case81_dir}/readiness.log" \
+     && assert_no_decoy_executed "${case81_name}" "${case81_dir}/fake_claw.log"; then
+    pass_case "${case81_name}"
+  fi
+fi
+
+case82_name="plan_run_with_a_foreign_wrapper_override_refuses_before_exec"
+case82_dir="$(stage_layout "${case82_name}")"
+install_canonical "${case82_dir}" current
+if run_case "${case82_name}" "${case82_dir}" 9 -- \
+     plan run ./plan.yaml --wrapper /usr/bin/claw >/dev/null; then
+  if assert_stderr_contains "${case82_name}" "${case82_dir}/wrapper.stderr" \
+       'not proven to pass the readiness gate' \
+     && assert_fake_not_called "${case82_name}" "${case82_dir}/fake_claw.log"; then
+    pass_case "${case82_name}"
+  fi
+fi
+
+case83_name="plan_run_with_the_equals_form_wrapper_override_also_refuses"
+case83_dir="$(stage_layout "${case83_name}")"
+install_canonical "${case83_dir}" current
+if run_case "${case83_name}" "${case83_dir}" 9 -- \
+     plan run ./plan.yaml --wrapper=/usr/bin/claw >/dev/null; then
+  if assert_fake_not_called "${case83_name}" "${case83_dir}/fake_claw.log"; then
+    pass_case "${case83_name}"
+  fi
+fi
+
+# Pointing --wrapper at THIS wrapper preserves the child-gating proof, so it
+# is allowed rather than refused.
+case84_name="plan_run_pointing_the_wrapper_override_at_this_wrapper_is_allowed"
+case84_dir="$(stage_layout "${case84_name}")"
+install_canonical "${case84_dir}" current
+if run_case "${case84_name}" "${case84_dir}" 0 -- \
+     plan run ./plan.yaml --wrapper "${case84_dir}/root/scripts/claw-sidestack-local" >/dev/null; then
+  if assert_readiness_not_called "${case84_name}" "${case84_dir}/readiness.log" \
+     && assert_no_decoy_executed "${case84_name}" "${case84_dir}/fake_claw.log"; then
+    pass_case "${case84_name}"
+  fi
+fi
+
+# A `--wrapper` on a NON-run plan subcommand is not a child-spawning path.
+case85_name="plan_status_is_local_even_with_a_wrapper_looking_argument"
+case85_dir="$(stage_layout "${case85_name}")"
+install_canonical "${case85_dir}" current
+if run_case "${case85_name}" "${case85_dir}" 0 -- plan status . >/dev/null; then
+  if assert_readiness_not_called "${case85_name}" "${case85_dir}/readiness.log"; then
+    pass_case "${case85_name}"
+  fi
+fi
+
+# ---------- help-shaped prompts stay gated ---------------------------------
+case86_name="prompt_whose_text_is_skills_dash_dash_help_is_still_gated"
+case86_dir="$(stage_layout "${case86_name}")"
+install_canonical "${case86_dir}" current
+if run_case "${case86_name}" "${case86_dir}" 0 -- --model fast prompt "skills --help" >/dev/null; then
+  if assert_readiness_called_for "${case86_name}" "${case86_dir}/readiness.log" 'qwen3%3A14b'; then
+    pass_case "${case86_name}"
+  fi
+fi
+
+# A single shorthand argument that merely CONTAINS "skills" is a prompt.
+case87_name="shorthand_prompt_containing_the_word_skills_is_gated"
+case87_dir="$(stage_layout "${case87_name}")"
+install_canonical "${case87_dir}" current
+if run_case "${case87_name}" "${case87_dir}" 0 -- --model fast "skills --help" >/dev/null; then
+  if assert_readiness_called_for "${case87_name}" "${case87_dir}/readiness.log" 'qwen3%3A14b'; then
+    pass_case "${case87_name}"
+  fi
+fi
+
+# ---------- global flags on either side of the subcommand ------------------
+# The CLI consumes its global flags wherever they appear, so a flag AFTER the
+# subcommand must still be stripped before the positional scan -- otherwise a
+# flag value could be mistaken for the subcommand.
+case88_name="global_model_flag_after_the_subcommand_is_still_resolved"
+case88_dir="$(stage_layout "${case88_name}")"
+install_canonical "${case88_dir}" current
+if run_case "${case88_name}" "${case88_dir}" 0 -- prompt "hi" --model fast >/dev/null; then
+  if assert_readiness_called_for "${case88_name}" "${case88_dir}/readiness.log" 'qwen3%3A14b'; then
+    pass_case "${case88_name}"
+  fi
+fi
+
+# A flag VALUE that reads like a local subcommand must never be scanned as one.
+case89_name="a_flag_value_that_looks_like_a_local_subcommand_is_not_a_subcommand"
+case89_dir="$(stage_layout "${case89_name}")"
+install_canonical "${case89_dir}" current
+if run_case "${case89_name}" "${case89_dir}" 0 -- \
+     --model fast --allowed-tools doctor prompt "hi" >/dev/null; then
+  if assert_readiness_called_for "${case89_name}" "${case89_dir}/readiness.log" 'qwen3%3A14b' \
+     && assert_no_decoy_executed "${case89_name}" "${case89_dir}/fake_claw.log"; then
+    pass_case "${case89_name}"
+  fi
+fi
+
+# ---------- the readiness GET stays bounded and unhijackable ---------------
+# Verified against real curl 8.5.0 in this lane: `--max-filesize 65536` aborts
+# with exit 63 for both a Content-Length body and a chunked one, which the
+# wrapper turns into a transport failure and therefore a fail-closed exit 9.
+# `--disable` (first argument, where curl requires it) suppresses ~/.curlrc,
+# and `--noproxy '*'` was shown to be load-bearing: without it curl sends this
+# GET to a proxy named by HTTP_PROXY/ALL_PROXY.
+case90_name="readiness_get_is_bounded_direct_and_ignores_curlrc"
+case90_dir="$(stage_layout "${case90_name}")"
+install_canonical "${case90_dir}" current
+if run_case "${case90_name}" "${case90_dir}" 0 -- --model fast prompt "hi" >/dev/null; then
+  c90_log="${case90_dir}/readiness.log"
+  if ! grep -Fq 'ARG=--max-filesize' "${c90_log}"; then
+    fail_case "${case90_name}" "the readiness GET is not size-bounded" /dev/null /dev/null "${c90_log}"
+  elif [[ "$(grep -m1 -n 'ARG=' "${c90_log}" | cut -d: -f2-)" != "ARG=--disable" ]]; then
+    fail_case "${case90_name}" "--disable is not curl's first argument, so ~/.curlrc is still read" \
+      /dev/null /dev/null "${c90_log}"
+  elif ! grep -Fq 'ARG=--noproxy' "${c90_log}"; then
+    fail_case "${case90_name}" "the readiness GET can be redirected by a proxy env var" \
+      /dev/null /dev/null "${c90_log}"
+  elif grep -Eq 'ARG=(--location|-L|--netrc|-n|--netrc-file|-X|--request|-d|--data.*)$' "${c90_log}"; then
+    fail_case "${case90_name}" "the readiness GET follows redirects, reads .netrc, or is not a plain GET" \
+      /dev/null /dev/null "${c90_log}"
+  else
+    pass_case "${case90_name}"
+  fi
+fi
+
+# ---------- cases 91-96: the curl capability floor ACCEPTS >= 8.4.0 --------
+# `--max-filesize` is only guaranteed to abort an in-progress transfer of
+# unknown length from curl 8.4.0 onward, so the wrapper requires that version
+# before it will issue the readiness GET. Every version at or above the floor
+# must still work exactly as before.
+#
+# 8.10.0 and 9.0.0 are the lexicographic traps: compared as STRINGS, "8.10.0"
+# and "8.4.0" order the wrong way round, so a string compare would reject a
+# curl that satisfies the floor. They must be accepted.
+curl_floor_accept_case() {
+  local label="$1" version_line="$2"
+  local name="curl_floor_accepts_${label}"
+  local dir
+  dir="$(stage_layout "${name}")"
+  install_canonical "${dir}" current
+  write_fake_readiness_client "${dir}" 0 200 "${READY_QWEN3_14B}" "${version_line}"
+  if run_case "${name}" "${dir}" 0 -- --model fast prompt "hi" >/dev/null; then
+    if assert_readiness_called_for "${name}" "${dir}/readiness.log" 'qwen3%3A14b' \
+       && assert_log_contains "${name}" "${dir}/fake_claw.log" "IDENTITY=CANONICAL" \
+       && assert_no_decoy_executed "${name}" "${dir}/fake_claw.log"; then
+      pass_case "${name}"
+    fi
+  fi
+}
+
+curl_floor_accept_case "8_4_0"  'curl 8.4.0 (x86_64-pc-linux-gnu) libcurl/8.4.0 OpenSSL/3.0.13'
+curl_floor_accept_case "8_4_1"  'curl 8.4.1 (x86_64-pc-linux-gnu) libcurl/8.4.1 OpenSSL/3.0.13'
+curl_floor_accept_case "8_5_0"  'curl 8.5.0 (x86_64-pc-linux-gnu) libcurl/8.5.0 OpenSSL/3.0.13'
+curl_floor_accept_case "8_10_0" 'curl 8.10.0 (x86_64-pc-linux-gnu) libcurl/8.10.0 OpenSSL/3.0.13'
+curl_floor_accept_case "8_10_1" 'curl 8.10.1 (x86_64-pc-linux-gnu) libcurl/8.10.1 OpenSSL/3.0.13'
+curl_floor_accept_case "9_0_0"  'curl 9.0.0 (x86_64-pc-linux-gnu) libcurl/9.0.0 OpenSSL/3.0.13'
+
+# ---------- cases 97-103: the curl capability floor REFUSES otherwise ------
+# Every rejected shape must fail closed identically: exit 9, ZERO readiness
+# requests, and no canonical exec. On an old curl the contract is "refuse
+# before transfer", never "transfer with an unreliable bound".
+curl_floor_reject_case() {
+  local label="$1" version_line="$2" version_exit="${3-0}"
+  local name="curl_floor_refuses_${label}"
+  local dir
+  dir="$(stage_layout "${name}")"
+  install_canonical "${dir}" current
+  write_fake_readiness_client "${dir}" 0 200 "${READY_QWEN3_14B}" "${version_line}" "${version_exit}"
+  if run_case "${name}" "${dir}" 9 -- --model fast prompt "hi" >/dev/null; then
+    if assert_curl_floor_refusal "${name}" "${dir}"; then
+      if ! grep -Fq 'curl 8.4.0 or newer is required' "${dir}/wrapper.stderr"; then
+        fail_case "${name}" "the refusal does not name the required curl version" \
+          /dev/null "${dir}/wrapper.stderr" /dev/null
+      else
+        pass_case "${name}"
+      fi
+    fi
+  fi
+}
+
+curl_floor_reject_case "8_3_999" 'curl 8.3.999 (x86_64-pc-linux-gnu) libcurl/8.3.999'
+curl_floor_reject_case "8_3_0"   'curl 8.3.0 (x86_64-pc-linux-gnu) libcurl/8.3.0'
+curl_floor_reject_case "7_88_1"  'curl 7.88.1 (x86_64-pc-linux-gnu) libcurl/7.88.1'
+curl_floor_reject_case "7_68_0"  'curl 7.68.0 (x86_64-pc-linux-gnu) libcurl/7.68.0'
+curl_floor_reject_case "malformed_banner" 'curl banana (x86_64-pc-linux-gnu) libcurl/banana'
+curl_floor_reject_case "empty_banner" ''
+curl_floor_reject_case "version_command_failure" 'curl 8.5.0 (x86_64-pc-linux-gnu) libcurl/8.5.0' 1
+
+# ---------- cases 104-106: partial and decorated versions are UNKNOWN ------
+# A two-component (`8.4`) or suffixed (`8.6.0-DEV`) banner cannot be ordered
+# against the floor without guessing, so it is treated as unknown and refuses.
+# Unknown == fail closed; the bound is never weakened on a maybe.
+curl_floor_reject_case "partial_version" 'curl 8.4 (x86_64-pc-linux-gnu) libcurl/8.4'
+curl_floor_reject_case "dev_suffix" 'curl 8.6.0-DEV (x86_64-pc-linux-gnu) libcurl/8.6.0-DEV'
+curl_floor_reject_case "not_curl_banner" 'wget 1.21.4 (linux-gnu)'
+
+# ---------- case 107: the 8.3.999 / 8.4.0 boundary is exact ----------------
+# The discriminating proof: the highest rejected version and the lowest
+# accepted version differ by the smallest step the floor recognises, and they
+# land on opposite sides of it.
+case107_name="curl_floor_boundary_8_3_999_rejects_and_8_4_0_accepts"
+c107_low_dir="$(stage_layout "${case107_name}_low")"
+install_canonical "${c107_low_dir}" current
+write_fake_readiness_client "${c107_low_dir}" 0 200 "${READY_QWEN3_14B}" \
+  'curl 8.3.999 (x86_64-pc-linux-gnu) libcurl/8.3.999'
+c107_high_dir="$(stage_layout "${case107_name}_high")"
+install_canonical "${c107_high_dir}" current
+write_fake_readiness_client "${c107_high_dir}" 0 200 "${READY_QWEN3_14B}" \
+  'curl 8.4.0 (x86_64-pc-linux-gnu) libcurl/8.4.0'
+if run_case "${case107_name}_low" "${c107_low_dir}" 9 -- --model fast prompt "hi" >/dev/null \
+   && run_case "${case107_name}_high" "${c107_high_dir}" 0 -- --model fast prompt "hi" >/dev/null; then
+  if assert_curl_floor_refusal "${case107_name}" "${c107_low_dir}" \
+     && assert_readiness_called_for "${case107_name}" "${c107_high_dir}/readiness.log" 'qwen3%3A14b'; then
+    pass_case "${case107_name}"
+  fi
+fi
+
+# ---------- case 108: an old curl is refused BEFORE any transfer -----------
+# The portability contract, stated positively: even when the endpoint would
+# have answered with an oversized unknown-length body, a pre-8.4 curl never
+# reaches the request at all. The unreliable-bound path is not merely
+# mitigated on old curl — it is unreachable.
+case108_name="pre_84_curl_never_reaches_an_oversized_unknown_length_body"
+case108_dir="$(stage_layout "${case108_name}")"
+install_canonical "${case108_dir}" current
+# A body far past the 64 KiB bound, served by a curl that predates enforcement.
+write_fake_readiness_client "${case108_dir}" 0 200 "$(head -c 200000 /dev/zero | tr '\0' 'x')" \
+  'curl 8.3.0 (x86_64-pc-linux-gnu) libcurl/8.3.0'
+if run_case "${case108_name}" "${case108_dir}" 9 -- --model fast prompt "hi" >/dev/null; then
+  if assert_curl_floor_refusal "${case108_name}" "${case108_dir}"; then
+    pass_case "${case108_name}"
+  fi
+fi
+
+# ---------- case 109: one resolved command path is probed and used ---------
+# The capability check is worthless if the wrapper checks one command and then
+# re-resolves another from PATH for the GET. A second, PRE-8.4 curl is planted
+# later on PATH: it must never be consulted, and the SELF recorded by the
+# version probe must equal the SELF recorded by the request. This is a claim
+# about PATH selection only, not about executable identity.
+case109_name="curl_command_path_binding_probe_and_get_use_one_path"
+case109_dir="$(stage_layout "${case109_name}")"
+install_canonical "${case109_dir}" current
+# A (first on PATH): satisfies the floor and serves the readiness answer.
+write_fake_readiness_client "${case109_dir}" 0 200 "${READY_QWEN3_14B}" \
+  'curl 8.5.0 (x86_64-pc-linux-gnu) libcurl/8.5.0'
+# B (later on PATH): reports a pre-8.4 version and records ANY invocation.
+mkdir -p "${case109_dir}/decoybin2"
+cat > "${case109_dir}/decoybin2/curl" <<CURLB
+#!/usr/bin/env bash
+printf 'SECOND_CURL_INVOKED=1 args=%s\n' "\$*" >> '${case109_dir}/second_curl.log'
+if [[ "\${1:-}" == "--version" ]]; then
+  printf 'curl 8.3.0 (x86_64-pc-linux-gnu) libcurl/8.3.0\n'
+  exit 0
+fi
+printf '%s' '${READY_QWEN3_14B}'
+printf '\n%s' '200'
+CURLB
+chmod 0755 "${case109_dir}/decoybin2/curl"
+: > "${case109_dir}/second_curl.log"
+if run_case "${case109_name}" "${case109_dir}" 0 \
+     "PATH=${case109_dir}/decoybin:${case109_dir}/decoybin2:${case109_dir}/home/.cargo/bin:/usr/bin:/bin" \
+     -- --model fast prompt "hi" >/dev/null; then
+  if assert_same_curl_command_path "${case109_name}" "${case109_dir}" \
+     && assert_readiness_called_for "${case109_name}" "${case109_dir}/readiness.log" 'qwen3%3A14b'; then
+    if [[ -s "${case109_dir}/second_curl.log" ]]; then
+      fail_case "${case109_name}" "a second curl on PATH was invoked" \
+        /dev/null /dev/null "${case109_dir}/second_curl.log"
+    else
+      pass_case "${case109_name}"
+    fi
+  fi
+fi
+
+# ---------- case 110: a failing floor is not escaped by a newer curl -------
+# The mirror image of case 109. The FIRST curl on PATH is pre-8.4 and a newer
+# one sits behind it. The wrapper must refuse on the command path it resolved,
+# never walk PATH looking for a curl that passes.
+case110_name="curl_command_path_binding_refuses_on_resolved_path_not_a_newer_one"
+case110_dir="$(stage_layout "${case110_name}")"
+install_canonical "${case110_dir}" current
+write_fake_readiness_client "${case110_dir}" 0 200 "${READY_QWEN3_14B}" \
+  'curl 8.3.0 (x86_64-pc-linux-gnu) libcurl/8.3.0'
+mkdir -p "${case110_dir}/decoybin2"
+cat > "${case110_dir}/decoybin2/curl" <<CURLC
+#!/usr/bin/env bash
+printf 'SECOND_CURL_INVOKED=1 args=%s\n' "\$*" >> '${case110_dir}/second_curl.log'
+if [[ "\${1:-}" == "--version" ]]; then
+  printf 'curl 9.9.9 (x86_64-pc-linux-gnu) libcurl/9.9.9\n'
+  exit 0
+fi
+printf '%s' '${READY_QWEN3_14B}'
+printf '\n%s' '200'
+CURLC
+chmod 0755 "${case110_dir}/decoybin2/curl"
+: > "${case110_dir}/second_curl.log"
+if run_case "${case110_name}" "${case110_dir}" 9 \
+     "PATH=${case110_dir}/decoybin:${case110_dir}/decoybin2:${case110_dir}/home/.cargo/bin:/usr/bin:/bin" \
+     -- --model fast prompt "hi" >/dev/null; then
+  if assert_curl_floor_refusal "${case110_name}" "${case110_dir}"; then
+    if [[ -s "${case110_dir}/second_curl.log" ]]; then
+      fail_case "${case110_name}" "the wrapper walked PATH for a curl that passes the floor" \
+        /dev/null /dev/null "${case110_dir}/second_curl.log"
+    else
+      pass_case "${case110_name}"
+    fi
+  fi
+fi
+
+# ---------- case 111: the capability probe carries no credential -----------
+# `curl --version` takes no arguments beyond the flag, and the API key must
+# not reach the probe's argument list or the refusal text.
+case111_name="curl_capability_probe_never_carries_the_api_key"
+case111_dir="$(stage_layout "${case111_name}" 'export OPENAI_BASE_URL="http://127.0.0.1:11435/v1"
+export OPENAI_API_KEY="sk-n6-floor-sentinel-must-not-leak"
+export RUSTY_CLAUDE_MODEL_ALIAS__FAST="qwen3:14b"')"
+install_canonical "${case111_dir}" current
+write_fake_readiness_client "${case111_dir}" 0 200 "${READY_QWEN3_14B}" \
+  'curl 8.3.0 (x86_64-pc-linux-gnu) libcurl/8.3.0'
+if run_case "${case111_name}" "${case111_dir}" 9 -- --model fast prompt "hi" >/dev/null; then
+  if grep -Fq 'sk-n6-floor-sentinel-must-not-leak' "${case111_dir}/curlversion.log"; then
+    fail_case "${case111_name}" "the API key reached the capability probe's arguments" \
+      /dev/null /dev/null "${case111_dir}/curlversion.log"
+  elif grep -Fq 'sk-n6-floor-sentinel-must-not-leak' "${case111_dir}/wrapper.stderr"; then
+    fail_case "${case111_name}" "the API key was printed in the floor refusal" \
+      /dev/null "${case111_dir}/wrapper.stderr" /dev/null
+  else
+    pass_case "${case111_name}"
+  fi
+fi
+
+# ---------- case 112: a hostile banner cannot flood or escape the terminal -
+# The refusal echoes a version string derived from curl's own output, so it is
+# bounded and stripped to printable ASCII before it reaches stderr.
+case112_name="curl_floor_refusal_bounds_and_sanitizes_a_hostile_banner"
+case112_dir="$(stage_layout "${case112_name}")"
+install_canonical "${case112_dir}" current
+c112_flood="curl $(head -c 4000 /dev/zero | tr '\0' 'A')"
+write_fake_readiness_client "${case112_dir}" 0 200 "${READY_QWEN3_14B}" "${c112_flood}"
+if run_case "${case112_name}" "${case112_dir}" 9 -- --model fast prompt "hi" >/dev/null; then
+  if assert_curl_floor_refusal "${case112_name}" "${case112_dir}"; then
+    c112_longest="$(awk '{ if (length > max) max = length } END { print max + 0 }' \
+      "${case112_dir}/wrapper.stderr")"
+    if (( c112_longest > 400 )); then
+      fail_case "${case112_name}" "the refusal echoed an unbounded banner (${c112_longest} chars)" \
+        /dev/null "${case112_dir}/wrapper.stderr" /dev/null
+    else
+      pass_case "${case112_name}"
+    fi
+  fi
+fi
+
+# ---------- cases 113-118: non-inference commands gain NO curl requirement -
+# The floor is a property of the readiness GET, and only the inference path
+# performs one. A locally dispatched invocation must still run under a curl
+# that could never satisfy the floor, and must not probe curl at all.
+# assert_canonical_ran <name> <case_dir> <first_arg>
+#
+# `write_fake_claw` answers `--version` from a banner arm that deliberately
+# does NOT append to the exec log, so for that one invocation the proof that
+# canonical ran is the banner on stdout. Every other form logs its identity.
+assert_canonical_ran() {
+  local name="$1" dir="$2" first_arg="$3"
+  if [[ "${first_arg}" == "--version" ]]; then
+    if ! grep -Fq 'Claw Code' "${dir}/wrapper.stdout"; then
+      fail_case "${name}" "canonical did not emit its version banner" \
+        "${dir}/wrapper.stdout" "${dir}/wrapper.stderr" "${dir}/fake_claw.log"
+      return 1
+    fi
+    return 0
+  fi
+  assert_log_contains "${name}" "${dir}/fake_claw.log" "IDENTITY=CANONICAL"
+}
+
+curl_floor_local_case() {
+  local label="$1"
+  shift
+  local name="curl_floor_does_not_apply_to_local_${label}"
+  local dir
+  dir="$(stage_layout "${name}")"
+  install_canonical "${dir}" current
+  write_fake_readiness_client "${dir}" 0 200 "${READY_QWEN3_14B}" \
+    'curl 7.68.0 (x86_64-pc-linux-gnu) libcurl/7.68.0'
+  if run_case "${name}" "${dir}" 0 -- "$@" >/dev/null; then
+    if assert_canonical_ran "${name}" "${dir}" "$1" \
+       && assert_readiness_not_called "${name}" "${dir}/readiness.log" \
+       && assert_no_decoy_executed "${name}" "${dir}/fake_claw.log"; then
+      if [[ -s "${dir}/curlversion.log" ]]; then
+        fail_case "${name}" "a local invocation probed curl for its version" \
+          /dev/null /dev/null "${dir}/curlversion.log"
+      else
+        pass_case "${name}"
+      fi
+    fi
+  fi
+}
+
+curl_floor_local_case "help_flag" --help
+curl_floor_local_case "version_flag" --version
+curl_floor_local_case "version_subcommand" version
+curl_floor_local_case "status_subcommand" status
+curl_floor_local_case "doctor_subcommand" doctor
+curl_floor_local_case "plan_run" plan run ./plan.yaml
+
+# ---------- cases 119-121: local commands run with NO curl on PATH ---------
+# Stronger than the version floor: a local invocation must succeed on a host
+# where curl is absent entirely. PATH is rebuilt from the tools the wrapper
+# and the status helper actually need, with curl deliberately excluded.
+make_curlless_bin() {
+  local dir="$1" tool src
+  mkdir -p -- "${dir}"
+  for tool in bash sh git stat python3 sed tr grep sort cut dirname basename awk \
+              head cat env id uname mkdir chmod ln rm ls date expr; do
+    src="$(command -v "${tool}" 2>/dev/null || true)"
+    [[ -n "${src}" ]] && ln -sf "${src}" "${dir}/${tool}"
+  done
+  if [[ -n "$(command -v curl 2>/dev/null || true)" && -e "${dir}/curl" ]]; then
+    fail_case "make_curlless_bin" "curl leaked into the curl-free PATH" /dev/null /dev/null /dev/null
+  fi
+}
+
+curl_absent_local_case() {
+  local label="$1"
+  shift
+  local name="local_dispatch_survives_with_no_curl_on_path_${label}"
+  local dir
+  dir="$(stage_layout "${name}")"
+  install_canonical "${dir}" current
+  make_curlless_bin "${dir}/nocurlbin"
+  # The decoy claw stays reachable so a PATH fallback would still be caught.
+  if run_case "${name}" "${dir}" 0 \
+       "PATH=${dir}/nocurlbin:${dir}/home/.cargo/bin" \
+       -- "$@" >/dev/null; then
+    if assert_canonical_ran "${name}" "${dir}" "$1" \
+       && assert_readiness_not_called "${name}" "${dir}/readiness.log" \
+       && assert_no_decoy_executed "${name}" "${dir}/fake_claw.log"; then
+      pass_case "${name}"
+    fi
+  fi
+}
+
+curl_absent_local_case "help_flag" --help
+curl_absent_local_case "status_subcommand" status
+curl_absent_local_case "doctor_subcommand" doctor
+
+# ---------- case 122: inference with NO curl still refuses ----------------
+# The pre-existing missing-curl refusal must survive the new floor: absent
+# curl is still exit 9, and now there is no version probe to reach either.
+case122_name="inference_with_no_curl_on_path_still_refuses"
+case122_dir="$(stage_layout "${case122_name}")"
+install_canonical "${case122_dir}" current
+make_curlless_bin "${case122_dir}/nocurlbin"
+if run_case "${case122_name}" "${case122_dir}" 9 \
+     "PATH=${case122_dir}/nocurlbin:${case122_dir}/home/.cargo/bin" \
+     -- --model fast prompt "hi" >/dev/null; then
+  if assert_readiness_not_called "${case122_name}" "${case122_dir}/readiness.log" \
+     && assert_no_decoy_executed "${case122_name}" "${case122_dir}/fake_claw.log"; then
+    if grep -Fq 'FAKE_CLAW_CALLED=1' "${case122_dir}/fake_claw.log"; then
+      fail_case "${case122_name}" "canonical executed without a curl to prove readiness" \
+        /dev/null /dev/null "${case122_dir}/fake_claw.log"
+    else
+      pass_case "${case122_name}"
+    fi
+  fi
+fi
+
+# ---------- case 123: USAGE.md states the curl trust contract truthfully ----
+# The wrapper's curl handling is a THREE-layer claim and the docs must keep the
+# layers distinct: a compatibility guarantee (>= 8.4.0), a path-selection
+# guarantee (resolved once, reused), and a trust ASSUMPTION (the local curl is
+# trusted; its executable identity is not pinned). This case fails if the docs
+# drift back toward claiming executable identity.
+#
+# Emphasis markers are stripped before matching so the assertions stay semantic
+# rather than coupled to Markdown formatting.
+case123_name="usage_docs_state_curl_trusted_dependency_contract"
+case123_norm="${WORK_DIR}/usage-normalized.txt"
+tr -d '*_`' < "${REPO_ROOT}/USAGE.md" > "${case123_norm}"
+case123_ok=1
+case123_missing=""
+while IFS= read -r phrase; do
+  [[ -n "${phrase}" ]] || continue
+  if ! grep -iqF -- "${phrase}" "${case123_norm}"; then
+    case123_ok=0
+    case123_missing="${case123_missing}${case123_missing:+; }${phrase}"
+  fi
+done <<'PHRASES'
+curl 8.4.0
+trusted dependency
+resolved command path
+not executable pinning
+same-user
+outside its threat model
+PHRASES
+# The overclaims the independent review rejected must not reappear.
+case123_bad=""
+while IFS= read -r phrase; do
+  [[ -n "${phrase}" ]] || continue
+  if grep -iqF -- "${phrase}" "${case123_norm}"; then
+    case123_ok=0
+    case123_bad="${case123_bad}${case123_bad:+; }${phrase}"
+  fi
+done <<'BADPHRASES'
+same curl executable
+binary identity
+pinned executable
+identity proof
+BADPHRASES
+if (( case123_ok == 1 )); then
+  pass_case "${case123_name}"
+else
+  fail_case "${case123_name}" \
+    "USAGE.md curl trust contract drifted (missing: ${case123_missing:-none}) (overclaims present: ${case123_bad:-none})" \
+    /dev/null /dev/null /dev/null
+fi
+
+# ---------- case 124: the wrapper source documents the same boundary -------
+# Source comments are the other half of the contract. They must describe the
+# trusted-dependency assumption and must not re-assert that the probed bytes
+# are necessarily the bytes that serve the request.
+case124_name="wrapper_source_documents_curl_trust_boundary"
+case124_ok=1
+case124_missing=""
+while IFS= read -r phrase; do
+  [[ -n "${phrase}" ]] || continue
+  if ! grep -iqF -- "${phrase}" "${REAL_WRAPPER}"; then
+    case124_ok=0
+    case124_missing="${case124_missing}${case124_missing:+; }${phrase}"
+  fi
+done <<'PHRASES'
+Trusted local dependencies
+threat model
+does not pin
+retarget
+PHRASES
+case124_bad=""
+while IFS= read -r phrase; do
+  [[ -n "${phrase}" ]] || continue
+  if grep -iqF -- "${phrase}" "${REAL_WRAPPER}"; then
+    case124_ok=0
+    case124_bad="${case124_bad}${case124_bad:+; }${phrase}"
+  fi
+done <<'BADPHRASES'
+EXACT executable
+necessarily the binary
+same binary
+binary identity
+BADPHRASES
+if (( case124_ok == 1 )); then
+  pass_case "${case124_name}"
+else
+  fail_case "${case124_name}" \
+    "wrapper trust-boundary comments drifted (missing: ${case124_missing:-none}) (overclaims present: ${case124_bad:-none})" \
+    /dev/null /dev/null /dev/null
+fi
+
+# ---------- case 125: RESIDUAL — symlink retarget between probe and GET ----
+# TRUST_BOUNDARY_RESIDUAL_CONFIRMED, not a promised refusal.
+#
+# The resolved curl path is a SYMLINK. The program it points at answers
+# `--version` with a compliant 8.5.0 banner and, as a side effect, retargets
+# the symlink at a different program, which then serves the readiness GET.
+#
+# The wrapper does NOT refuse this, and is not claimed to: resolving the
+# command path once binds PATH SELECTION, never executable identity. This case
+# asserts the residual is exactly as documented. If it ever stops holding, the
+# wrapper gained a guarantee it does not currently claim and USAGE.md plus the
+# source comments must be updated to match — that is a docs bug, not a
+# security regression.
+case125_name="TRUST_BOUNDARY_RESIDUAL_symlink_retarget_between_probe_and_get"
+case125_dir="$(stage_layout "${case125_name}")"
+install_canonical "${case125_dir}" current
+: > "${case125_dir}/symlink.log"
+cat > "${case125_dir}/decoybin/good-curl" <<GOODCURL
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "--version" ]]; then
+  printf 'GOOD_VERSION_PROBE=1\n' >> '${case125_dir}/symlink.log'
+  ln -sfn '${case125_dir}/decoybin/bad-curl' '${case125_dir}/decoybin/curl'
+  printf 'curl 8.5.0 (x86_64-pc-linux-gnu) libcurl/8.5.0\n'
+  exit 0
+fi
+printf 'GOOD_GET=1\n' >> '${case125_dir}/symlink.log'
+printf '%s' '{"ready": true, "reason_code": "READY_GOOD", "requested_model": "qwen3:14b"}'
+printf '\n200'
+GOODCURL
+cat > "${case125_dir}/decoybin/bad-curl" <<BADCURL
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "--version" ]]; then
+  printf 'BAD_VERSION_PROBE=1\n' >> '${case125_dir}/symlink.log'
+  printf 'curl 8.3.0 (x86_64-pc-linux-gnu) libcurl/8.3.0\n'
+  exit 0
+fi
+printf 'BAD_GET=1\n' >> '${case125_dir}/symlink.log'
+printf '%s' '{"ready": true, "reason_code": "READY_FROM_RETARGETED_PATH", "requested_model": "qwen3:14b"}'
+printf '\n200'
+BADCURL
+chmod 0755 "${case125_dir}/decoybin/good-curl" "${case125_dir}/decoybin/bad-curl"
+ln -sfn "${case125_dir}/decoybin/good-curl" "${case125_dir}/decoybin/curl"
+if run_case "${case125_name}" "${case125_dir}" 0 -- --model fast prompt "hi" >/dev/null; then
+  # The probe ran the original target; the GET was served by the retargeted one.
+  if grep -Fq 'GOOD_VERSION_PROBE=1' "${case125_dir}/symlink.log" \
+     && grep -Fq 'BAD_GET=1' "${case125_dir}/symlink.log" \
+     && grep -Fq 'READY_FROM_RETARGETED_PATH' "${case125_dir}/wrapper.stderr"; then
+    printf '  TRUST_BOUNDARY_RESIDUAL_CONFIRMED: %s\n' "${case125_name}"
+    pass_case "${case125_name}"
+  else
+    fail_case "${case125_name}" \
+      "documented symlink-retarget residual did not reproduce; docs and source comments must be re-checked against actual behaviour" \
+      /dev/null "${case125_dir}/wrapper.stderr" "${case125_dir}/symlink.log"
+  fi
+fi
+
+# ---------- case 126: RESIDUAL — a stateful, lying curl executable ---------
+# TRUST_BOUNDARY_RESIDUAL_CONFIRMED, not a promised refusal.
+#
+# ONE executable reports a compliant `curl 8.5.0` for `--version`, then ignores
+# `--max-filesize` on the GET and returns a body far past the 64 KiB bound.
+# No path changes and no second curl is involved, so nothing about path
+# resolution could detect it: the version banner is a CLAIM made by the program
+# under test, and the size bound is enforced by curl itself, not by the
+# wrapper.
+#
+# The wrapper trusts the local curl and therefore accepts this. Same contract
+# as case 125: if this stops holding, the docs must be updated to match.
+case126_name="TRUST_BOUNDARY_RESIDUAL_stateful_lying_curl_executable"
+case126_dir="$(stage_layout "${case126_name}")"
+install_canonical "${case126_dir}" current
+: > "${case126_dir}/lying.log"
+cat > "${case126_dir}/decoybin/curl" <<LYINGCURL
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "--version" ]]; then
+  printf 'LYING_VERSION_PROBE=1\n' >> '${case126_dir}/lying.log'
+  printf 'curl 8.5.0 (x86_64-pc-linux-gnu) libcurl/8.5.0\n'
+  exit 0
+fi
+printf 'LYING_GET_IGNORED_MAX_FILESIZE=1\n' >> '${case126_dir}/lying.log'
+python3 - <<'PYBODY'
+import json
+print(json.dumps({
+    "ready": True,
+    "reason_code": "READY_LYING_EXECUTABLE",
+    "requested_model": "qwen3:14b",
+    "padding": "x" * 200000,
+}), end="")
+PYBODY
+printf '\n200'
+LYINGCURL
+chmod 0755 "${case126_dir}/decoybin/curl"
+if run_case "${case126_name}" "${case126_dir}" 0 -- --model fast prompt "hi" >/dev/null; then
+  if grep -Fq 'LYING_VERSION_PROBE=1' "${case126_dir}/lying.log" \
+     && grep -Fq 'LYING_GET_IGNORED_MAX_FILESIZE=1' "${case126_dir}/lying.log" \
+     && grep -Fq 'READY_LYING_EXECUTABLE' "${case126_dir}/wrapper.stderr"; then
+    printf '  TRUST_BOUNDARY_RESIDUAL_CONFIRMED: %s\n' "${case126_name}"
+    pass_case "${case126_name}"
+  else
+    fail_case "${case126_name}" \
+      "documented lying-executable residual did not reproduce; docs and source comments must be re-checked against actual behaviour" \
+      /dev/null "${case126_dir}/wrapper.stderr" "${case126_dir}/lying.log"
   fi
 fi
 
