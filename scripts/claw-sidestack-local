@@ -444,9 +444,24 @@ n6_urlencode() {
 
 # Last `--model` wins, matching the CLI parser, which reassigns on every
 # occurrence. Both `--model VALUE` and `--model=VALUE` are supported.
+#
+# The scan STOPS at the `-p` terminal. `parse_args_with_terminal` returns
+# `CliAction::Prompt` the moment it reaches `-p`, carrying whatever `model` had
+# been assigned by THEN, and joins every later token into the prompt text. So
+# `--model fast -p hello --model deep` dispatches on `fast`, and a scanner that
+# ran on to the end of argv would gate on `deep`: readiness approved for one
+# model, inference performed on another. Only assignments before the terminal
+# are model metadata.
 n6_model_flag_value() {
-  local found=1 value="" index=0 arg
+  local found=1 value="" index=0 arg terminal
   local -a argv=( "$@" )
+  if terminal="$(n6_prompt_terminal_index "$@")"; then
+    if (( terminal > 0 )); then
+      argv=( "${argv[@]:0:terminal}" )
+    else
+      argv=()
+    fi
+  fi
   while (( index < ${#argv[@]} )); do
     arg="${argv[index]}"
     if [[ "${arg}" == "--model" ]]; then
@@ -490,6 +505,113 @@ n6_is_global_inline_flag() {
     --model=*|--permission-mode=*|--output-format=*|--allowedTools=*|--allowed-tools=*|--reasoning-effort=*|--base-commit=*) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+# Index of the `-p` that TERMINATES the CLI's argument loop, or nothing.
+#
+# `parse_args_with_terminal` puts no `rest.is_empty()` guard on its `-p` arm, so
+# `-p` is recognized wherever it appears, and that arm RETURNS
+# `CliAction::Prompt` immediately: `args[index + 1..]` is joined into the prompt
+# text and nothing after it is ever parsed as an option again. Two consequences
+# that both the classifier and the model scanner depend on:
+#
+#   * options BEFORE the terminal are real options and still count;
+#   * every token AFTER it is prompt DATA -- not a model flag, not a local verb,
+#     not a wrapper override, not a help or version flag.
+#
+# Value-taking global flags consume their following token first, so a `-p`
+# sitting in a flag VALUE slot is a value, never the terminal.
+#
+# Prints the index and returns 0 when a terminal exists; returns 1 otherwise.
+n6_prompt_terminal_index() {
+  local -a argv=( "$@" )
+  local index=0
+  while (( index < ${#argv[@]} )); do
+    if n6_flag_takes_value "${argv[index]}"; then
+      index=$(( index + 2 ))
+      continue
+    fi
+    if [[ "${argv[index]}" == "-p" ]]; then
+      printf '%s' "${index}"
+      return 0
+    fi
+    index=$(( index + 1 ))
+  done
+  return 1
+}
+
+# True when the CLI's post-loop `wants_help` / `wants_version` checks would
+# fire. Both return a local printer (`CliAction::Help` / `CliAction::Version`)
+# that constructs no `LiveCli` and reaches no provider.
+#
+# The guards are mirrored exactly, and neither is "a help flag appears in
+# argv":
+#
+#   `--help` / `-h`     set wants_help only while the positional vector is
+#                       still EMPTY, or when its first entry is one of the four
+#                       subcommands the CLI intercepts (`prompt`, `commit`,
+#                       `pr`, `issue`). Anywhere else the flag is PUSHED into
+#                       the positional vector and becomes prompt text, which is
+#                       why `explain this --help` is a prompt, not a help
+#                       request.
+#   `--version` / `-V`  set wants_version wherever they appear.
+#
+# `--resume`, `--resume=...`, `--acp` and `-acp` are tracked because the CLI
+# pushes a positional for each of them. That makes the vector non-empty, which
+# changes what a LATER `--help` means -- `--resume --help` is a resumed session,
+# not help.
+#
+# Callers MUST rule out a `-p` terminal first: `-p` returns from inside the
+# argument loop, before either check is reached.
+n6_wants_help_or_version() {
+  local -a argv=( "$@" )
+  local index=0 arg first_positional="" rest_empty=1
+  while (( index < ${#argv[@]} )); do
+    arg="${argv[index]}"
+    if n6_flag_takes_value "${arg}"; then
+      index=$(( index + 2 ))
+      continue
+    fi
+    case "${arg}" in
+      --version|-V)
+        return 0
+        ;;
+      --help|-h)
+        if (( rest_empty == 1 )); then
+          return 0
+        fi
+        case "${first_positional}" in
+          prompt|commit|pr|issue) return 0 ;;
+        esac
+        index=$(( index + 1 ))
+        continue
+        ;;
+      --resume|--resume=*|--acp|-acp)
+        if (( rest_empty == 1 )); then
+          first_positional="${arg}"
+          rest_empty=0
+        fi
+        index=$(( index + 1 ))
+        continue
+        ;;
+    esac
+    if n6_is_global_inline_flag "${arg}"; then
+      index=$(( index + 1 ))
+      continue
+    fi
+    if (( rest_empty == 1 )) && [[ "${arg}" == -* ]]; then
+      # The CLI ERRORS on an unrecognized option while the positional vector is
+      # empty, so dropping it here can never produce a local verdict by itself.
+      index=$(( index + 1 ))
+      continue
+    fi
+    if (( rest_empty == 1 )); then
+      first_positional="${arg}"
+      rest_empty=0
+    fi
+    index=$(( index + 1 ))
+  done
+  return 1
 }
 
 # Two flags make the CLI dispatch to a model-backed action regardless of what
@@ -571,27 +693,60 @@ n6_skills_is_local() {
   esac
 }
 
-# `--wrapper` for `claw plan run`: prints the operator-supplied value (empty
-# when the flag was given without one) and returns 0, or returns 1 when the
-# flag is absent. Scanned over the plan tail, where the CLI parses it.
+# Plan-tail flags that consume the following token, mirroring the value-taking
+# arms of `parse_plan_subcommand_args`. Needed so a `--wrapper` occupying
+# another flag's VALUE slot is read as that value, not as an override.
+n6_plan_flag_takes_value() {
+  case "$1" in
+    --report-format|--substrate-url|--fast-model|--wrapper|--step-timeout|--workspace-root) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# `--wrapper` for `claw plan run`: prints the EFFECTIVE operator-supplied value
+# (empty when the flag was given without one) and returns 0, or returns 1 when
+# the flag is absent. Scanned over the plan tail, where the CLI parses it.
+#
+# LAST assignment wins. `parse_plan_subcommand_args` reassigns `wrapper` on
+# every occurrence and never breaks out of its loop, so
+# `--wrapper <this-wrapper> --wrapper /usr/bin/claw` runs the plan's
+# model-bearing steps through `/usr/bin/claw`. A first-match reader would call
+# that plan safely self-wrapped and wave through exactly the case that escapes
+# the readiness gate. The converse ordering matters too: with
+# `--wrapper /usr/bin/claw --wrapper <this-wrapper>` the runner really does use
+# this wrapper, so refusing it would be a false refusal.
+#
+# `--wrapper` given as the LAST token is an error in the CLI ("missing value
+# for --wrapper"); it is recorded here as an empty assignment so the caller
+# fails closed rather than falling back to an earlier value.
 n6_plan_wrapper_override() {
   local -a rest=( "$@" )
-  local index=0 arg
+  local index=0 arg found=1 value=""
   while (( index < ${#rest[@]} )); do
     arg="${rest[index]}"
     if [[ "${arg}" == "--wrapper" ]]; then
+      value=""
       if (( index + 1 < ${#rest[@]} )); then
-        printf '%s' "${rest[index + 1]}"
+        value="${rest[index + 1]}"
       fi
-      return 0
+      found=0
+      index=$(( index + 2 ))
+      continue
     fi
     if [[ "${arg}" == --wrapper=* ]]; then
-      printf '%s' "${arg#--wrapper=}"
-      return 0
+      value="${arg#--wrapper=}"
+      found=0
+      index=$(( index + 1 ))
+      continue
+    fi
+    if n6_plan_flag_takes_value "${arg}"; then
+      index=$(( index + 2 ))
+      continue
     fi
     index=$(( index + 1 ))
   done
-  return 1
+  (( found == 0 )) || return 1
+  printf '%s' "${value}"
 }
 
 # Absolute form of a path with its directory resolved, without requiring
@@ -617,9 +772,29 @@ n6_classify_invocation() {
   local -a rest=()
   local token subcommand wrapper_override resolved_wrapper self_wrapper
 
-  case "${1-}" in
-    --help|-h|--version|-V) printf 'local'; return 0 ;;
-  esac
+  # Mirror the CLI's own precedence, which is NOT the order the tokens appear
+  # in argv:
+  #
+  #   1. `-p` returns `CliAction::Prompt` from INSIDE the argument loop, so it
+  #      short-circuits the post-loop `wants_help` / `wants_version` checks
+  #      entirely. In `--help --model fast -p status` the leading `--help`
+  #      never gets to decide anything: the invocation is a prompt, and gating
+  #      it on that flag is a readiness BYPASS, not a help request.
+  #   2. `wants_help` / `wants_version` are evaluated after the loop and before
+  #      any positional dispatch, including before the `--resume` branch.
+  #   3. `--resume` forces a session dispatch only when nothing above fired.
+  #
+  # Testing the FIRST token for a help flag, as this classifier used to, gets
+  # step 1 backwards.
+  if n6_prompt_terminal_index "$@" >/dev/null; then
+    printf 'inference'
+    return 0
+  fi
+
+  if n6_wants_help_or_version "$@"; then
+    printf 'local'
+    return 0
+  fi
 
   if n6_forces_inference "$@"; then
     printf 'inference'
@@ -635,6 +810,20 @@ n6_classify_invocation() {
     '')
       # No positional at all: the interactive REPL, or a piped one-shot prompt.
       printf 'inference'
+      return 0
+      ;;
+    help)
+      # `claw help` alone is `CliAction::Help`, a local printer, but the verb
+      # is NOT unconditionally local: `parse_local_help_action` has no `help`
+      # topic and `parse_single_word_command_alias` declines the two-token
+      # help-flag form, so `help --help` and `help -h` fall through to the
+      # prompt catch-all. Every other `help ...` shape is a CLI usage error,
+      # which is gated here rather than bypassed.
+      if (( ${#rest[@]} == 1 )); then
+        printf 'local'
+      else
+        printf 'inference'
+      fi
       return 0
       ;;
     skills)

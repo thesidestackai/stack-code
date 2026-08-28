@@ -1866,6 +1866,358 @@ if run_case "${case126_name}" "${case126_dir}" 0 -- --model fast prompt "hi" >/d
   fi
 fi
 
+# ============================================================================
+# PR #180 review findings: argument-order semantics of parse_args_with_terminal
+# ============================================================================
+#
+# Four parser-order defects were reported against this wrapper. Each is a
+# mismatch between the wrapper's classifier and the ACTUAL Rust dispatch in
+# rust/crates/rusty-claude-cli/src/main.rs, and three of the four could let an
+# inference-capable invocation reach the canonical client without a readiness
+# proof, or with a proof for the WRONG model. The cases below pin the real
+# parser's behaviour, not the wrapper's convenience.
+
+assert_readiness_not_called_for() {
+  local name="$1" readiness_log="$2" encoded_model="$3"
+  if grep -Fq "requested_model=${encoded_model}" "${readiness_log}"; then
+    fail_case "${name}" "readiness was queried for ${encoded_model}, which is NOT the model this invocation dispatches on" \
+      /dev/null /dev/null "${readiness_log}"
+    return 1
+  fi
+}
+
+# ---------- P1: a leading help/version flag must not outrank `-p` -----------
+# `parse_args_with_terminal` returns CliAction::Prompt from INSIDE its argument
+# loop the moment it reaches `-p`. `wants_help` / `wants_version` are only
+# consulted AFTER that loop, so they never run for such an invocation:
+# `--help --model fast -p status` is a prompt whose text reads "status".
+# Classifying it local on the leading flag skipped the readiness request
+# entirely and let canonical execute against a broker that would have refused.
+for pr180_lead_flag in --help -h --version -V; do
+  pr180_a_name="pr180_leading_${pr180_lead_flag#-}_flag_does_not_outrank_dash_p"
+  pr180_a_name="${pr180_a_name//-/_}"
+  pr180_a_dir="$(stage_layout "${pr180_a_name}")"
+  install_canonical "${pr180_a_dir}" current
+  write_fake_readiness_client "${pr180_a_dir}" 0 200 "$(refusal_body HYPERLIQUID_ACTIVE)"
+  if run_case "${pr180_a_name}" "${pr180_a_dir}" 8 -- \
+       "${pr180_lead_flag}" --model fast -p status >/dev/null; then
+    if assert_readiness_called_for "${pr180_a_name}" "${pr180_a_dir}/readiness.log" 'qwen3%3A14b' \
+       && assert_stderr_contains "${pr180_a_name}" "${pr180_a_dir}/wrapper.stderr" \
+            'local coding readiness refused' \
+       && assert_fake_not_called "${pr180_a_name}" "${pr180_a_dir}/fake_claw.log" \
+       && assert_no_decoy_executed "${pr180_a_name}" "${pr180_a_dir}/fake_claw.log"; then
+      pass_case "${pr180_a_name}"
+    fi
+  fi
+done
+
+# The same shape with a READY broker still runs -- the gate must admit it, not
+# merely refuse everything -- and canonical must execute exactly once.
+pr180_a_ready_name="pr180_leading_help_flag_before_dash_p_runs_once_when_ready"
+pr180_a_ready_dir="$(stage_layout "${pr180_a_ready_name}")"
+install_canonical "${pr180_a_ready_dir}" current
+if run_case "${pr180_a_ready_name}" "${pr180_a_ready_dir}" 0 -- \
+     --help --model fast -p status >/dev/null; then
+  pr180_a_ready_execs="$(grep -c 'FAKE_CLAW_CALLED=1' "${pr180_a_ready_dir}/fake_claw.log" || true)"
+  if assert_readiness_called_for "${pr180_a_ready_name}" "${pr180_a_ready_dir}/readiness.log" 'qwen3%3A14b' \
+     && assert_log_contains "${pr180_a_ready_name}" "${pr180_a_ready_dir}/fake_claw.log" 'IDENTITY=CANONICAL' \
+     && assert_no_decoy_executed "${pr180_a_ready_name}" "${pr180_a_ready_dir}/fake_claw.log"; then
+    if [[ "${pr180_a_ready_execs}" == "1" ]]; then
+      pass_case "${pr180_a_ready_name}"
+    else
+      fail_case "${pr180_a_ready_name}" "canonical executed ${pr180_a_ready_execs} times, expected exactly 1" \
+        /dev/null /dev/null "${pr180_a_ready_dir}/fake_claw.log"
+    fi
+  fi
+fi
+
+# ---------- P1: `-p` consumes the tail for MODEL scanning too ---------------
+# The readiness model must equal the model inference will actually use. `-p`
+# joins every later token into the prompt TEXT, so a `--model` after it is
+# prompt data, never model metadata.
+pr180_b1_name="pr180_model_flag_after_the_dash_p_terminal_is_prompt_text"
+pr180_b1_dir="$(stage_layout "${pr180_b1_name}")"
+install_canonical "${pr180_b1_dir}" current
+if run_case "${pr180_b1_name}" "${pr180_b1_dir}" 0 -- \
+     --model fast -p hello --model deep >/dev/null; then
+  if assert_readiness_called_for "${pr180_b1_name}" "${pr180_b1_dir}/readiness.log" 'qwen3%3A14b' \
+     && assert_readiness_not_called_for "${pr180_b1_name}" "${pr180_b1_dir}/readiness.log" 'qwen3.5%3A27b' \
+     && assert_no_decoy_executed "${pr180_b1_name}" "${pr180_b1_dir}/fake_claw.log"; then
+    pass_case "${pr180_b1_name}"
+  fi
+fi
+
+# The decisive direction: repeated `--model` BEFORE the terminal still follows
+# last-assignment-wins, and a `--model` after it must not pull the verdict back
+# to the earlier alias. Approving `fast` and then loading `deep` is exactly the
+# wrong-model admission this gate exists to prevent.
+pr180_b2_name="pr180_last_model_before_the_terminal_wins_over_the_tail"
+pr180_b2_dir="$(stage_layout "${pr180_b2_name}")"
+install_canonical "${pr180_b2_dir}" current
+write_fake_readiness_client "${pr180_b2_dir}" 0 200 \
+  '{"ready": true, "reason_code": "READY_AFTER_SAFE_EVICTION", "requested_model": "qwen3.5:27b", "requires_hyperliquid_pause": false}'
+if run_case "${pr180_b2_name}" "${pr180_b2_dir}" 0 -- \
+     --model fast --model deep -p hello --model fast >/dev/null; then
+  if assert_readiness_called_for "${pr180_b2_name}" "${pr180_b2_dir}/readiness.log" 'qwen3.5%3A27b' \
+     && assert_readiness_not_called_for "${pr180_b2_name}" "${pr180_b2_dir}/readiness.log" 'qwen3%3A14b' \
+     && assert_no_decoy_executed "${pr180_b2_name}" "${pr180_b2_dir}/fake_claw.log"; then
+    pass_case "${pr180_b2_name}"
+  fi
+fi
+
+# The `--model=VALUE` form obeys the same terminal.
+pr180_b3_name="pr180_model_equals_form_respects_the_dash_p_terminal"
+pr180_b3_dir="$(stage_layout "${pr180_b3_name}")"
+install_canonical "${pr180_b3_dir}" current
+write_fake_readiness_client "${pr180_b3_dir}" 0 200 \
+  '{"ready": true, "reason_code": "READY_AFTER_SAFE_EVICTION", "requested_model": "qwen3.5:27b", "requires_hyperliquid_pause": false}'
+if run_case "${pr180_b3_name}" "${pr180_b3_dir}" 0 -- \
+     --model=deep -p hello --model=fast >/dev/null; then
+  if assert_readiness_called_for "${pr180_b3_name}" "${pr180_b3_dir}/readiness.log" 'qwen3.5%3A27b' \
+     && assert_readiness_not_called_for "${pr180_b3_name}" "${pr180_b3_dir}/readiness.log" 'qwen3%3A14b'; then
+    pass_case "${pr180_b3_name}"
+  fi
+fi
+
+# Tokens in the prompt tail are not top-level options of ANY kind: a `--model`,
+# a local verb and a `--wrapper` all sit in the text here.
+pr180_b4_name="pr180_prompt_tail_tokens_are_never_top_level_options"
+pr180_b4_dir="$(stage_layout "${pr180_b4_name}")"
+install_canonical "${pr180_b4_dir}" current
+if run_case "${pr180_b4_name}" "${pr180_b4_dir}" 0 -- \
+     --model fast -p run --model deep --wrapper /usr/bin/claw >/dev/null; then
+  if assert_readiness_called_for "${pr180_b4_name}" "${pr180_b4_dir}/readiness.log" 'qwen3%3A14b' \
+     && assert_readiness_not_called_for "${pr180_b4_name}" "${pr180_b4_dir}/readiness.log" 'qwen3.5%3A27b' \
+     && assert_log_contains "${pr180_b4_name}" "${pr180_b4_dir}/fake_claw.log" 'IDENTITY=CANONICAL'; then
+    pass_case "${pr180_b4_name}"
+  fi
+fi
+
+# ---------- P1: repeated plan `--wrapper` is LAST-assignment-wins ----------
+# `parse_plan_subcommand_args` reassigns `wrapper` on every occurrence and
+# never breaks, so the last one is what `build_claw_command` spawns the plan's
+# model-bearing steps through. A first-match reader called
+# `--wrapper <self> --wrapper /usr/bin/claw` safely self-wrapped while the
+# runner really used /usr/bin/claw -- a foreign-wrapper escape.
+
+# pr180_plan_wrapper_case <label> <expected_exit> <argv...>
+# The literal string __SELF__ in argv is replaced with this case's own wrapper.
+pr180_plan_wrapper_case() {
+  local label="$1" expected_exit="$2"
+  shift 2
+  local name="pr180_plan_wrapper_${label}"
+  local dir arg
+  local -a argv=()
+  dir="$(stage_layout "${name}")"
+  install_canonical "${dir}" current
+  for arg in "$@"; do
+    if [[ "${arg}" == "__SELF__" ]]; then
+      argv+=( "${dir}/root/scripts/claw-sidestack-local" )
+    elif [[ "${arg}" == "--wrapper=__SELF__" ]]; then
+      argv+=( "--wrapper=${dir}/root/scripts/claw-sidestack-local" )
+    else
+      argv+=( "${arg}" )
+    fi
+  done
+  if run_case "${name}" "${dir}" "${expected_exit}" -- "${argv[@]}" >/dev/null; then
+    if assert_readiness_not_called "${name}" "${dir}/readiness.log" \
+       && assert_no_decoy_executed "${name}" "${dir}/fake_claw.log"; then
+      if [[ "${expected_exit}" == "9" ]]; then
+        if assert_stderr_contains "${name}" "${dir}/wrapper.stderr" \
+             'not proven to pass the readiness gate' \
+           && assert_fake_not_called "${name}" "${dir}/fake_claw.log"; then
+          pass_case "${name}"
+        fi
+      else
+        if assert_log_contains "${name}" "${dir}/fake_claw.log" 'IDENTITY=CANONICAL'; then
+          pass_case "${name}"
+        fi
+      fi
+    fi
+  fi
+}
+
+# self then foreign: the runner uses the FOREIGN wrapper -> must refuse.
+pr180_plan_wrapper_case self_then_foreign_refuses 9 \
+  plan run ./plan.yaml --wrapper __SELF__ --wrapper /usr/bin/claw
+# foreign then self: the runner really does use THIS wrapper -> refusing would
+# be a false refusal.
+pr180_plan_wrapper_case foreign_then_self_is_allowed 0 \
+  plan run ./plan.yaml --wrapper /usr/bin/claw --wrapper __SELF__
+pr180_plan_wrapper_case self_then_self_is_allowed 0 \
+  plan run ./plan.yaml --wrapper __SELF__ --wrapper __SELF__
+pr180_plan_wrapper_case foreign_then_foreign_refuses 9 \
+  plan run ./plan.yaml --wrapper /usr/bin/claw --wrapper /bin/claw
+# Mixed `--wrapper VALUE` / `--wrapper=VALUE` syntax obeys the same rule.
+pr180_plan_wrapper_case equals_self_then_space_foreign_refuses 9 \
+  plan run ./plan.yaml --wrapper=__SELF__ --wrapper /usr/bin/claw
+pr180_plan_wrapper_case space_foreign_then_equals_self_is_allowed 0 \
+  plan run ./plan.yaml --wrapper /usr/bin/claw --wrapper=__SELF__
+# A trailing valueless `--wrapper` is the LAST assignment. The CLI errors on
+# it, and the wrapper must fail closed rather than fall back to the earlier
+# self-wrapper value.
+pr180_plan_wrapper_case self_then_valueless_fails_closed 9 \
+  plan run ./plan.yaml --wrapper __SELF__ --wrapper
+
+# The refusal must name the EFFECTIVE wrapper, so the operator is told which
+# executable the runner would actually have used.
+pr180_c_msg_name="pr180_plan_wrapper_refusal_names_the_effective_wrapper"
+pr180_c_msg_dir="$(stage_layout "${pr180_c_msg_name}")"
+install_canonical "${pr180_c_msg_dir}" current
+if run_case "${pr180_c_msg_name}" "${pr180_c_msg_dir}" 9 -- \
+     plan run ./plan.yaml \
+     --wrapper "${pr180_c_msg_dir}/root/scripts/claw-sidestack-local" \
+     --wrapper /usr/bin/claw >/dev/null; then
+  if assert_stderr_contains "${pr180_c_msg_name}" "${pr180_c_msg_dir}/wrapper.stderr" \
+       'claw plan run --wrapper /usr/bin/claw' \
+     && assert_fake_not_called "${pr180_c_msg_name}" "${pr180_c_msg_dir}/fake_claw.log"; then
+    pass_case "${pr180_c_msg_name}"
+  fi
+fi
+
+# Plan-tail flags consume their value token, so a `--wrapper` sitting in
+# another flag's VALUE slot is that value, not an override. Here the CLI binds
+# fast_model="--wrapper" and the plan file "/usr/bin/claw", leaving `wrapper`
+# unset -- so the runner uses its DEFAULT (this wrapper) and the children stay
+# gated. Refusing would be a false refusal built on a naive substring scan.
+pr180_c_slot_name="pr180_plan_wrapper_in_another_flags_value_slot_is_not_an_override"
+pr180_c_slot_dir="$(stage_layout "${pr180_c_slot_name}")"
+install_canonical "${pr180_c_slot_dir}" current
+if run_case "${pr180_c_slot_name}" "${pr180_c_slot_dir}" 0 -- \
+     plan run --fast-model --wrapper /usr/bin/claw >/dev/null; then
+  if assert_readiness_not_called "${pr180_c_slot_name}" "${pr180_c_slot_dir}/readiness.log" \
+     && assert_log_contains "${pr180_c_slot_name}" "${pr180_c_slot_dir}/fake_claw.log" 'IDENTITY=CANONICAL' \
+     && assert_no_decoy_executed "${pr180_c_slot_name}" "${pr180_c_slot_dir}/fake_claw.log"; then
+    pass_case "${pr180_c_slot_name}"
+  fi
+fi
+
+# ---------- P2: the bare `help` subcommand is local ------------------------
+# `parse_single_word_command_alias` maps the single word `help` to
+# CliAction::Help, a local printer that cannot issue a provider request. It
+# must not demand `--model` or a readiness proof.
+pr180_d1_name="pr180_bare_help_subcommand_is_local"
+pr180_d1_dir="$(stage_layout "${pr180_d1_name}")"
+install_canonical "${pr180_d1_dir}" current
+if run_case "${pr180_d1_name}" "${pr180_d1_dir}" 0 -- help >/dev/null; then
+  if assert_readiness_not_called "${pr180_d1_name}" "${pr180_d1_dir}/readiness.log" \
+     && assert_log_contains "${pr180_d1_name}" "${pr180_d1_dir}/fake_claw.log" 'IDENTITY=CANONICAL' \
+     && assert_no_decoy_executed "${pr180_d1_name}" "${pr180_d1_dir}/fake_claw.log"; then
+    if [[ -s "${pr180_d1_dir}/curlversion.log" ]]; then
+      fail_case "${pr180_d1_name}" "a local help invocation probed curl for its version" \
+        /dev/null /dev/null "${pr180_d1_dir}/curlversion.log"
+    else
+      pass_case "${pr180_d1_name}"
+    fi
+  fi
+fi
+
+# `help` is local only as the WHOLE positional vector. `help --help` and
+# `help -h` have no local-help topic and are declined by the diagnostic-verb
+# alias, so both fall through to the prompt catch-all and stay gated.
+for pr180_help_tail in --help -h; do
+  pr180_d2_name="pr180_help_with_a_${pr180_help_tail#-}_tail_is_still_inference"
+  pr180_d2_name="${pr180_d2_name//-/_}"
+  pr180_d2_dir="$(stage_layout "${pr180_d2_name}")"
+  install_canonical "${pr180_d2_dir}" current
+  if run_case "${pr180_d2_name}" "${pr180_d2_dir}" 9 -- help "${pr180_help_tail}" >/dev/null; then
+    if assert_stderr_contains "${pr180_d2_name}" "${pr180_d2_dir}/wrapper.stderr" \
+         'readiness requires an explicit --model for this invocation' \
+       && assert_fake_not_called "${pr180_d2_name}" "${pr180_d2_dir}/fake_claw.log"; then
+      pass_case "${pr180_d2_name}"
+    fi
+  fi
+done
+
+# `-p help` is a PROMPT whose text reads "help", and `prompt help` is the
+# prompt subcommand. Both must still be gated on a live readiness answer.
+pr180_d3_name="pr180_dash_p_help_is_gated_not_local_help"
+pr180_d3_dir="$(stage_layout "${pr180_d3_name}")"
+install_canonical "${pr180_d3_dir}" current
+write_fake_readiness_client "${pr180_d3_dir}" 0 200 "$(refusal_body HYPERLIQUID_ACTIVE)"
+if run_case "${pr180_d3_name}" "${pr180_d3_dir}" 8 -- --model fast -p help >/dev/null; then
+  if assert_readiness_called_for "${pr180_d3_name}" "${pr180_d3_dir}/readiness.log" 'qwen3%3A14b' \
+     && assert_fake_not_called "${pr180_d3_name}" "${pr180_d3_dir}/fake_claw.log"; then
+    pass_case "${pr180_d3_name}"
+  fi
+fi
+
+pr180_d4_name="pr180_prompt_help_subcommand_is_gated"
+pr180_d4_dir="$(stage_layout "${pr180_d4_name}")"
+install_canonical "${pr180_d4_dir}" current
+write_fake_readiness_client "${pr180_d4_dir}" 0 200 "$(refusal_body HYPERLIQUID_ACTIVE)"
+if run_case "${pr180_d4_name}" "${pr180_d4_dir}" 8 -- --model fast prompt help >/dev/null; then
+  if assert_readiness_called_for "${pr180_d4_name}" "${pr180_d4_dir}/readiness.log" 'qwen3%3A14b' \
+     && assert_fake_not_called "${pr180_d4_name}" "${pr180_d4_dir}/fake_claw.log"; then
+    pass_case "${pr180_d4_name}"
+  fi
+fi
+
+pr180_d5_name="pr180_shorthand_prompt_whose_text_contains_help_is_gated"
+pr180_d5_dir="$(stage_layout "${pr180_d5_name}")"
+install_canonical "${pr180_d5_dir}" current
+write_fake_readiness_client "${pr180_d5_dir}" 0 200 "$(refusal_body HYPERLIQUID_ACTIVE)"
+if run_case "${pr180_d5_name}" "${pr180_d5_dir}" 8 -- --model fast "explain help to me" >/dev/null; then
+  if assert_readiness_called_for "${pr180_d5_name}" "${pr180_d5_dir}/readiness.log" 'qwen3%3A14b' \
+     && assert_fake_not_called "${pr180_d5_name}" "${pr180_d5_dir}/fake_claw.log"; then
+    pass_case "${pr180_d5_name}"
+  fi
+fi
+
+# ---------- adjacent parser-order audit ------------------------------------
+# `wants_help` / `wants_version` are set wherever the CLI's own guards say so,
+# not only on the FIRST token. `--model fast --help` is CliAction::Help: the
+# flag arrives while the positional vector is still empty.
+pr180_e1_name="pr180_help_flag_after_a_global_flag_is_still_local_help"
+pr180_e1_dir="$(stage_layout "${pr180_e1_name}")"
+install_canonical "${pr180_e1_dir}" current
+if run_case "${pr180_e1_name}" "${pr180_e1_dir}" 0 -- --model fast --help >/dev/null; then
+  if assert_readiness_not_called "${pr180_e1_name}" "${pr180_e1_dir}/readiness.log" \
+     && assert_log_contains "${pr180_e1_name}" "${pr180_e1_dir}/fake_claw.log" 'IDENTITY=CANONICAL'; then
+    pass_case "${pr180_e1_name}"
+  fi
+fi
+
+# The CLI intercepts `--help` after exactly four API-forwarding subcommands
+# (prompt, commit, pr, issue) and shows top-level help instead of sending the
+# flag to a provider.
+pr180_e2_name="pr180_help_flag_after_the_prompt_subcommand_is_local_help"
+pr180_e2_dir="$(stage_layout "${pr180_e2_name}")"
+install_canonical "${pr180_e2_dir}" current
+if run_case "${pr180_e2_name}" "${pr180_e2_dir}" 0 -- prompt hi --help >/dev/null; then
+  if assert_readiness_not_called "${pr180_e2_name}" "${pr180_e2_dir}/readiness.log" \
+     && assert_log_contains "${pr180_e2_name}" "${pr180_e2_dir}/fake_claw.log" 'IDENTITY=CANONICAL'; then
+    pass_case "${pr180_e2_name}"
+  fi
+fi
+
+# ...but a `--help` after ANY other positional is prompt text, not a help
+# request. This is the boundary case for the rule above and must stay gated.
+pr180_e3_name="pr180_help_flag_after_an_ordinary_positional_stays_gated"
+pr180_e3_dir="$(stage_layout "${pr180_e3_name}")"
+install_canonical "${pr180_e3_dir}" current
+write_fake_readiness_client "${pr180_e3_dir}" 0 200 "$(refusal_body HYPERLIQUID_ACTIVE)"
+if run_case "${pr180_e3_name}" "${pr180_e3_dir}" 8 -- --model fast explain this --help >/dev/null; then
+  if assert_readiness_called_for "${pr180_e3_name}" "${pr180_e3_dir}/readiness.log" 'qwen3%3A14b' \
+     && assert_fake_not_called "${pr180_e3_name}" "${pr180_e3_dir}/fake_claw.log"; then
+    pass_case "${pr180_e3_name}"
+  fi
+fi
+
+# `--resume` pushes a positional, so a `--help` AFTER it is a resumed-session
+# argument, not top-level help: the invocation continues a real session and
+# stays gated.
+pr180_e4_name="pr180_help_flag_after_resume_is_not_local_help"
+pr180_e4_dir="$(stage_layout "${pr180_e4_name}")"
+install_canonical "${pr180_e4_dir}" current
+write_fake_readiness_client "${pr180_e4_dir}" 0 200 "$(refusal_body HYPERLIQUID_ACTIVE)"
+if run_case "${pr180_e4_name}" "${pr180_e4_dir}" 8 -- --model fast --resume --help >/dev/null; then
+  if assert_readiness_called_for "${pr180_e4_name}" "${pr180_e4_dir}/readiness.log" 'qwen3%3A14b' \
+     && assert_fake_not_called "${pr180_e4_name}" "${pr180_e4_dir}/fake_claw.log"; then
+    pass_case "${pr180_e4_name}"
+  fi
+fi
+
 # ---------- summary ----------
 if [[ "${FAIL_COUNT}" -gt 0 ]]; then
   printf '\nFAIL: %d cases failed, %d passed\n' "${FAIL_COUNT}" "${PASS_COUNT}" >&2
