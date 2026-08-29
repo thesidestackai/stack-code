@@ -413,6 +413,20 @@ n6_resolve_upstream_model() {
         "${requested}" "${resolved}"
       return 1
     fi
+    # The env alias is not the last hop. `parse_args_with_terminal` resolves
+    # the `--model` value once when it parses the flag, and the `-p` arm then
+    # calls `resolve_model_alias_with_config` AGAIN on the already-resolved
+    # string before it builds `CliAction::Prompt`. That second pass misses the
+    # env table (the resolved value is no longer a bare name) but still
+    # consults the CONFIG aliases, which can rename any string. With
+    # `RUSTY_CLAUDE_MODEL_ALIAS__FAST=qwen3:14b` and a config alias mapping
+    # `qwen3:14b` to `openai/other`, `--model fast -p hello` preflighted as
+    # `qwen3:14b` here would have inference load `other`.
+    if n6_config_alias_defined "${resolved}"; then
+      printf "ERR|alias '%s' resolves to '%s', which a claw config alias redefines again; the effective upstream model is not determinable here" \
+        "${requested}" "${resolved}"
+      return 1
+    fi
   else
     if n6_config_alias_defined "${requested}"; then
       printf "ERR|'%s' is redefined by a claw config alias; the effective upstream model is not determinable here" \
@@ -475,6 +489,16 @@ n6_model_flag_value() {
       index=$(( index + 2 ))
       continue
     fi
+    # Any OTHER value-taking global flag CONSUMES the token after it, so a
+    # `--model` standing in that slot is that flag's VALUE and never reaches
+    # the CLI's `--model` arm. `--model fast --base-commit --model deep -p
+    # hello` dispatches on `fast`: the second `--model` is the `--base-commit`
+    # value. A scan that walked one token at a time would read `deep` and gate
+    # readiness on a model the invocation never loads.
+    if n6_flag_takes_value "${arg}"; then
+      index=$(( index + 2 ))
+      continue
+    fi
     if [[ "${arg}" == --model=* ]]; then
       value="${arg#--model=}"
       found=0
@@ -485,13 +509,29 @@ n6_model_flag_value() {
   printf '%s' "${value}"
 }
 
-# Global flags that consume the following token, so the positional scan does
-# not mistake a flag VALUE for a subcommand. Mirrors the `--flag value` arms
-# of `parse_args_with_terminal`. Over-inclusion is safe: it can only drop a
-# positional, and a missing positional is gated, never bypassed.
+# Global flags that consume the following token, so no argv walk mistakes a
+# flag VALUE for a subcommand, a `-p` terminal, or a `--model` option. This is
+# the EXACT set of `--flag value` arms in `parse_args_with_terminal`, and it
+# must stay exact in BOTH directions:
+#
+#   under-inclusion  a real value slot is walked as if it were an option, so a
+#                    `--model` sitting in one is read as a model flag that the
+#                    CLI never saw (readiness gates a model inference will not
+#                    use);
+#   over-inclusion   a token the CLI treats as an ordinary positional is
+#                    skipped ALONG WITH the one after it, so a real `-p`
+#                    terminal or a real `--model` can be swallowed. That is not
+#                    a safe direction either: `dump-manifests --manifests-dir
+#                    -p foo` is `CliAction::Prompt` in the CLI, and swallowing
+#                    its `-p` classifies the invocation on the `dump-manifests`
+#                    positional instead -- a readiness BYPASS.
+#
+# `--manifests-dir` is deliberately ABSENT: it is parsed by the
+# `dump-manifests` subcommand parser, never by the global loop, so the global
+# loop pushes it onto the positional vector like any other token.
 n6_flag_takes_value() {
   case "$1" in
-    --model|--permission-mode|--output-format|--allowed-tools|--allowedTools|--reasoning-effort|--base-commit|--manifests-dir) return 0 ;;
+    --model|--permission-mode|--output-format|--allowed-tools|--allowedTools|--reasoning-effort|--base-commit) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -749,6 +789,46 @@ n6_plan_wrapper_override() {
   printf '%s' "${value}"
 }
 
+# `--workspace-root` for `claw plan run`: prints the EFFECTIVE value and
+# returns 0, or returns 1 when the flag is absent. LAST assignment wins, for
+# the same reason as `--wrapper` -- `parse_plan_subcommand_args` reassigns
+# `workspace_root` on every occurrence and never breaks out of its loop.
+#
+# This value is load-bearing for the DEFAULT-wrapper proof: the step executor
+# applies it as `Command::current_dir`, and a relative program path is resolved
+# by the child AFTER that chdir. So the executable a defaulted `plan run`
+# actually spawns is `<workspace-root>/scripts/claw-sidestack-local`, not
+# `<cwd>/scripts/claw-sidestack-local`.
+n6_plan_workspace_root_override() {
+  local -a rest=( "$@" )
+  local index=0 arg found=1 value=""
+  while (( index < ${#rest[@]} )); do
+    arg="${rest[index]}"
+    if [[ "${arg}" == "--workspace-root" ]]; then
+      value=""
+      if (( index + 1 < ${#rest[@]} )); then
+        value="${rest[index + 1]}"
+      fi
+      found=0
+      index=$(( index + 2 ))
+      continue
+    fi
+    if [[ "${arg}" == --workspace-root=* ]]; then
+      value="${arg#--workspace-root=}"
+      found=0
+      index=$(( index + 1 ))
+      continue
+    fi
+    if n6_plan_flag_takes_value "${arg}"; then
+      index=$(( index + 2 ))
+      continue
+    fi
+    index=$(( index + 1 ))
+  done
+  (( found == 0 )) || return 1
+  printf '%s' "${value}"
+}
+
 # Absolute form of a path with its directory resolved, without requiring
 # `realpath` (absent by default on macOS).
 n6_resolve_path() {
@@ -771,6 +851,7 @@ n6_resolve_path() {
 n6_classify_invocation() {
   local -a rest=()
   local token subcommand wrapper_override resolved_wrapper self_wrapper
+  local plan_cwd_wrapper plan_spawn_wrapper plan_workspace_root
 
   # Mirror the CLI's own precedence, which is NOT the order the tokens appear
   # in argv:
@@ -851,15 +932,54 @@ n6_classify_invocation() {
       # spawned back through THIS wrapper as `--model fast … prompt …`, where
       # it is gated on its own — but ONLY while the runner uses its default
       # wrapper. An operator-supplied `--wrapper` breaks that proof.
-      if [[ "${rest[1]-}" == "run" ]] && wrapper_override="$(n6_plan_wrapper_override "${rest[@]}")"; then
+      if [[ "${rest[1]-}" == "run" ]]; then
         self_wrapper="$(n6_resolve_path "${BASH_SOURCE[0]}" || true)"
-        resolved_wrapper="$(n6_resolve_path "${wrapper_override}" || true)"
-        if [[ -z "${self_wrapper}" || -z "${resolved_wrapper}" \
-              || "${resolved_wrapper}" != "${self_wrapper}" ]]; then
-          # shellcheck disable=SC2016  # backticks in the user-facing message are literal
-          printf 'refuse|`claw plan run --wrapper %s` would spawn every model-bearing step through an executable other than this wrapper, so those steps are not proven to pass the readiness gate. Omit --wrapper (the runner already defaults to scripts/claw-sidestack-local) or point it at this wrapper.' \
-            "${wrapper_override}"
-          return 0
+        if wrapper_override="$(n6_plan_wrapper_override "${rest[@]}")"; then
+          resolved_wrapper="$(n6_resolve_path "${wrapper_override}" || true)"
+          if [[ -z "${self_wrapper}" || -z "${resolved_wrapper}" \
+                || "${resolved_wrapper}" != "${self_wrapper}" ]]; then
+            # shellcheck disable=SC2016  # backticks in the user-facing message are literal
+            printf 'refuse|`claw plan run --wrapper %s` would spawn every model-bearing step through an executable other than this wrapper, so those steps are not proven to pass the readiness gate. Omit --wrapper only when the runner default resolves back to this wrapper, or point --wrapper at this wrapper.' \
+              "${wrapper_override}"
+            return 0
+          fi
+        else
+          # NO override. That is not the same as "safe": the runner default is
+          # the RELATIVE path `scripts/claw-sidestack-local`, and nothing binds
+          # it to the tree this wrapper lives in. Two different bases resolve
+          # it, and both are checked:
+          #
+          #   existence precheck  `wrapper_path.exists()` runs in the plan
+          #                       process, so it resolves against its CWD. When
+          #                       that path is absent the CLI reports
+          #                       substrate-unavailable and spawns NOTHING --
+          #                       no model-bearing child can run, so there is
+          #                       nothing to gate.
+          #   actual spawn        the step executor sets
+          #                       `Command::current_dir(<workspace-root>)`, and
+          #                       the child resolves the relative program AFTER
+          #                       that chdir. `--workspace-root` therefore moves
+          #                       the executable that really runs.
+          #
+          # Invoked by absolute path from another tree, `plan run` would hand
+          # every model-bearing step to THAT tree's
+          # scripts/claw-sidestack-local, which need not carry this gate.
+          plan_cwd_wrapper="$(n6_resolve_path "scripts/claw-sidestack-local" || true)"
+          if [[ -n "${plan_cwd_wrapper}" && -e "${plan_cwd_wrapper}" ]]; then
+            if ! plan_workspace_root="$(n6_plan_workspace_root_override "${rest[@]}")" \
+               || [[ -z "${plan_workspace_root}" ]]; then
+              plan_workspace_root="."
+            fi
+            plan_spawn_wrapper="$(n6_resolve_path "${plan_workspace_root%/}/scripts/claw-sidestack-local" || true)"
+            if [[ -z "${self_wrapper}" || -z "${plan_spawn_wrapper}" \
+                  || "${plan_cwd_wrapper}" != "${self_wrapper}" \
+                  || "${plan_spawn_wrapper}" != "${self_wrapper}" ]]; then
+              # shellcheck disable=SC2016  # backticks in the user-facing message are literal
+              printf 'refuse|`claw plan run` without --wrapper spawns its model-bearing steps through the runner default `scripts/claw-sidestack-local`, which resolves to %s, not to this wrapper (%s). Those steps are not proven to pass the readiness gate. Run the plan from the tree this wrapper lives in, or pass --wrapper pointing at this wrapper.' \
+                "${plan_spawn_wrapper:-${plan_cwd_wrapper}}" "${self_wrapper:-<unresolvable>}"
+              return 0
+            fi
+          fi
         fi
       fi
       printf 'local'

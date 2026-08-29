@@ -356,7 +356,12 @@ run_case() {
 
   set +e
   (
-    cd "${case_dir}/cwd" || exit 127
+    # RUN_CASE_CWD lets a case choose the directory the wrapper is invoked
+    # FROM, which the `plan run` default-wrapper proof depends on: the runner
+    # resolves its default `scripts/claw-sidestack-local` relative to that
+    # directory. Unset (the default) keeps every pre-existing case on the
+    # neutral `${case_dir}/cwd`, which holds no `scripts/` tree.
+    cd "${RUN_CASE_CWD:-${case_dir}/cwd}" || exit 127
     env -i \
       HOME="${case_dir}/home" \
       PATH="${case_dir}/decoybin:${case_dir}/home/.cargo/bin:/usr/bin:/bin" \
@@ -2215,6 +2220,290 @@ if run_case "${pr180_e4_name}" "${pr180_e4_dir}" 8 -- --model fast --resume --he
   if assert_readiness_called_for "${pr180_e4_name}" "${pr180_e4_dir}/readiness.log" 'qwen3%3A14b' \
      && assert_fake_not_called "${pr180_e4_name}" "${pr180_e4_dir}/fake_claw.log"; then
     pass_case "${pr180_e4_name}"
+  fi
+fi
+
+# =====================================================================
+# PR #180 fresh Codex review (review 5052994850) — three P1 findings.
+# =====================================================================
+
+# ---------- P1-A: a value slot must never become a model flag --------------
+#
+# Every value-taking GLOBAL flag consumes the token after it, so a `--model`
+# standing in that slot is that flag's VALUE and never reaches the CLI's
+# `--model` arm. `--model fast --base-commit --model deep -p hello` dispatches
+# on `fast`; a scanner walking one token at a time reads `deep` and gates
+# readiness on a model the invocation never loads.
+#
+# One case per value-taking global arm of `parse_args_with_terminal`, because
+# `--base-commit` is only the example the review happened to pick.
+pr180_value_slot_case() {
+  local flag="$1"
+  local name="pr180_model_in_the_${flag//-/_}_value_slot_is_not_a_model_flag"
+  local dir
+  dir="$(stage_layout "${name}")"
+  install_canonical "${dir}" current
+  # The fixture answers only for qwen3:14b. A wrapper that gated on `deep`
+  # would query qwen3.5:27b, fail the requested_model echo check, and exit 9
+  # instead of 8 — so this case discriminates on the exit code as well as on
+  # the recorded URL.
+  write_fake_readiness_client "${dir}" 0 200 "$(refusal_body HYPERLIQUID_ACTIVE)"
+  if run_case "${name}" "${dir}" 8 -- \
+       --model fast "${flag}" --model deep -p hello >/dev/null; then
+    if assert_readiness_called_for "${name}" "${dir}/readiness.log" 'qwen3%3A14b' \
+       && assert_fake_not_called "${name}" "${dir}/fake_claw.log"; then
+      pass_case "${name}"
+    fi
+  fi
+}
+
+pr180_value_slot_case --base-commit
+pr180_value_slot_case --permission-mode
+pr180_value_slot_case --output-format
+pr180_value_slot_case --reasoning-effort
+pr180_value_slot_case --allowedTools
+pr180_value_slot_case --allowed-tools
+
+# The converse must still hold: once the value slot is FILLED, a later
+# `--model` is a real option and the LAST one wins. Without this case a fix
+# that simply ignored every `--model` after the first would also pass.
+pr180_a7_name="pr180_a_model_flag_after_a_filled_value_slot_still_wins"
+pr180_a7_dir="$(stage_layout "${pr180_a7_name}")"
+install_canonical "${pr180_a7_dir}" current
+write_fake_readiness_client "${pr180_a7_dir}" 0 200 "$(refusal_body HYPERLIQUID_ACTIVE qwen3.5:27b)"
+if run_case "${pr180_a7_name}" "${pr180_a7_dir}" 8 -- \
+     --model fast --base-commit HEAD~1 --model deep -p hello >/dev/null; then
+  if assert_readiness_called_for "${pr180_a7_name}" "${pr180_a7_dir}/readiness.log" 'qwen3.5%3A27b' \
+     && assert_fake_not_called "${pr180_a7_name}" "${pr180_a7_dir}/fake_claw.log"; then
+    pass_case "${pr180_a7_name}"
+  fi
+fi
+
+# `--manifests-dir` belongs to the `dump-manifests` SUBCOMMAND parser, never to
+# the global loop, so the global loop pushes it onto the positional vector like
+# any other token. Treating it as value-taking swallows the token after it —
+# and when that token is the `-p` terminal, the invocation is classified on the
+# `dump-manifests` positional instead of as the prompt the CLI actually
+# dispatches. That is a readiness BYPASS, so it is pinned here.
+pr180_a8_name="pr180_manifests_dir_does_not_swallow_the_prompt_terminal"
+pr180_a8_dir="$(stage_layout "${pr180_a8_name}")"
+install_canonical "${pr180_a8_dir}" current
+write_fake_readiness_client "${pr180_a8_dir}" 0 200 "$(refusal_body HYPERLIQUID_ACTIVE)"
+if run_case "${pr180_a8_name}" "${pr180_a8_dir}" 8 -- \
+     --model fast dump-manifests --manifests-dir -p foo >/dev/null; then
+  if assert_readiness_called_for "${pr180_a8_name}" "${pr180_a8_dir}/readiness.log" 'qwen3%3A14b' \
+     && assert_fake_not_called "${pr180_a8_name}" "${pr180_a8_dir}/fake_claw.log"; then
+    pass_case "${pr180_a8_name}"
+  fi
+fi
+
+# ...and it must not swallow a real `--model` either: with `--manifests-dir`
+# treated as value-taking, this invocation would gate on `fast` while the CLI
+# dispatches `deep`.
+pr180_a9_name="pr180_manifests_dir_does_not_swallow_a_later_model_flag"
+pr180_a9_dir="$(stage_layout "${pr180_a9_name}")"
+install_canonical "${pr180_a9_dir}" current
+write_fake_readiness_client "${pr180_a9_dir}" 0 200 "$(refusal_body HYPERLIQUID_ACTIVE qwen3.5:27b)"
+if run_case "${pr180_a9_name}" "${pr180_a9_dir}" 8 -- \
+     --model fast status --manifests-dir --model deep -p hi >/dev/null; then
+  if assert_readiness_called_for "${pr180_a9_name}" "${pr180_a9_dir}/readiness.log" 'qwen3.5%3A27b' \
+     && assert_fake_not_called "${pr180_a9_name}" "${pr180_a9_dir}/fake_claw.log"; then
+    pass_case "${pr180_a9_name}"
+  fi
+fi
+
+# ---------- P1-B: the env alias is not the last resolution hop -------------
+#
+# The `-p` arm calls `resolve_model_alias_with_config` a SECOND time on the
+# already-resolved string. That pass misses the env table but still consults
+# the config aliases, which can rename any string. Preflighting the
+# intermediate value would admit one model and load another.
+pr180_b1_name="pr180_config_alias_on_the_env_alias_result_fails_closed"
+pr180_b1_dir="$(stage_layout "${pr180_b1_name}")"
+install_canonical "${pr180_b1_dir}" current
+printf '{"aliases": {"qwen3:14b": "openai/other"}}\n' > "${pr180_b1_dir}/cwd/.claw.json"
+if run_case "${pr180_b1_name}" "${pr180_b1_dir}" 9 -- --model fast -p hello >/dev/null; then
+  if assert_stderr_contains "${pr180_b1_name}" "${pr180_b1_dir}/wrapper.stderr" \
+       'which a claw config alias redefines again' \
+     && assert_readiness_not_called "${pr180_b1_name}" "${pr180_b1_dir}/readiness.log" \
+     && assert_fake_not_called "${pr180_b1_name}" "${pr180_b1_dir}/fake_claw.log"; then
+    pass_case "${pr180_b1_name}"
+  fi
+fi
+
+# The refusal is specific to a config alias standing on the RESOLVED value. An
+# unrelated alias in the same config must not refuse anything.
+pr180_b2_name="pr180_an_unrelated_config_alias_does_not_refuse_the_env_alias"
+pr180_b2_dir="$(stage_layout "${pr180_b2_name}")"
+install_canonical "${pr180_b2_dir}" current
+printf '{"aliases": {"something-else": "openai/other"}}\n' > "${pr180_b2_dir}/cwd/.claw.json"
+write_fake_readiness_client "${pr180_b2_dir}" 0 200 "$(refusal_body HYPERLIQUID_ACTIVE)"
+if run_case "${pr180_b2_name}" "${pr180_b2_dir}" 8 -- --model fast -p hello >/dev/null; then
+  if assert_readiness_called_for "${pr180_b2_name}" "${pr180_b2_dir}/readiness.log" 'qwen3%3A14b' \
+     && assert_fake_not_called "${pr180_b2_name}" "${pr180_b2_dir}/fake_claw.log"; then
+    pass_case "${pr180_b2_name}"
+  fi
+fi
+
+# The same second hop applies to the `--model=VALUE` form.
+pr180_b3_name="pr180_config_alias_on_the_env_alias_result_fails_closed_equals_form"
+pr180_b3_dir="$(stage_layout "${pr180_b3_name}")"
+install_canonical "${pr180_b3_dir}" current
+printf '{"aliases": {"qwen3:14b": "openai/other"}}\n' > "${pr180_b3_dir}/cwd/.claw.json"
+if run_case "${pr180_b3_name}" "${pr180_b3_dir}" 9 -- --model=fast -p hello >/dev/null; then
+  if assert_readiness_not_called "${pr180_b3_name}" "${pr180_b3_dir}/readiness.log" \
+     && assert_fake_not_called "${pr180_b3_name}" "${pr180_b3_dir}/fake_claw.log"; then
+    pass_case "${pr180_b3_name}"
+  fi
+fi
+
+# ---------- P1-C: bind the DEFAULT plan wrapper to this executable ---------
+#
+# `plan run` without `--wrapper` uses the relative default
+# `scripts/claw-sidestack-local`. Nothing binds that to the tree this wrapper
+# lives in: invoked by absolute path from another tree, the runner hands every
+# model-bearing step to THAT tree's wrapper.
+pr180_c1_name="pr180_plan_run_default_wrapper_in_a_foreign_cwd_refuses"
+pr180_c1_dir="$(stage_layout "${pr180_c1_name}")"
+install_canonical "${pr180_c1_dir}" current
+mkdir -p "${pr180_c1_dir}/foreign/scripts"
+printf '#!/usr/bin/env bash\nexit 0\n' > "${pr180_c1_dir}/foreign/scripts/claw-sidestack-local"
+chmod 0755 "${pr180_c1_dir}/foreign/scripts/claw-sidestack-local"
+if RUN_CASE_CWD="${pr180_c1_dir}/foreign" \
+   run_case "${pr180_c1_name}" "${pr180_c1_dir}" 9 -- plan run ./plan.yaml >/dev/null; then
+  if assert_stderr_contains "${pr180_c1_name}" "${pr180_c1_dir}/wrapper.stderr" \
+       'not proven to pass the readiness gate' \
+     && assert_readiness_not_called "${pr180_c1_name}" "${pr180_c1_dir}/readiness.log" \
+     && assert_fake_not_called "${pr180_c1_name}" "${pr180_c1_dir}/fake_claw.log"; then
+    pass_case "${pr180_c1_name}"
+  fi
+fi
+
+# Positive control: run the plan from the tree this wrapper lives in and the
+# runner default resolves back to this very file, so the child-gating proof
+# holds and the invocation stays local.
+pr180_c2_name="pr180_plan_run_default_wrapper_in_its_own_tree_is_local"
+pr180_c2_dir="$(stage_layout "${pr180_c2_name}")"
+install_canonical "${pr180_c2_dir}" current
+if RUN_CASE_CWD="${pr180_c2_dir}/root" \
+   run_case "${pr180_c2_name}" "${pr180_c2_dir}" 0 -- plan run ./plan.yaml >/dev/null; then
+  if assert_readiness_not_called "${pr180_c2_name}" "${pr180_c2_dir}/readiness.log" \
+     && assert_log_contains "${pr180_c2_name}" "${pr180_c2_dir}/fake_claw.log" 'IDENTITY=CANONICAL' \
+     && assert_no_decoy_executed "${pr180_c2_name}" "${pr180_c2_dir}/fake_claw.log"; then
+    pass_case "${pr180_c2_name}"
+  fi
+fi
+
+# `--workspace-root` moves the directory the child resolves the relative
+# program against, so it moves the executable that actually runs even when the
+# CWD copy is this wrapper.
+pr180_c3_name="pr180_plan_run_workspace_root_moving_the_default_wrapper_refuses"
+pr180_c3_dir="$(stage_layout "${pr180_c3_name}")"
+install_canonical "${pr180_c3_dir}" current
+mkdir -p "${pr180_c3_dir}/elsewhere/scripts"
+printf '#!/usr/bin/env bash\nexit 0\n' > "${pr180_c3_dir}/elsewhere/scripts/claw-sidestack-local"
+chmod 0755 "${pr180_c3_dir}/elsewhere/scripts/claw-sidestack-local"
+if RUN_CASE_CWD="${pr180_c3_dir}/root" \
+   run_case "${pr180_c3_name}" "${pr180_c3_dir}" 9 -- \
+     plan run ./plan.yaml --workspace-root "${pr180_c3_dir}/elsewhere" >/dev/null; then
+  if assert_readiness_not_called "${pr180_c3_name}" "${pr180_c3_dir}/readiness.log" \
+     && assert_fake_not_called "${pr180_c3_name}" "${pr180_c3_dir}/fake_claw.log"; then
+    pass_case "${pr180_c3_name}"
+  fi
+fi
+
+# ...including the `=` form, and LAST assignment wins.
+pr180_c4_name="pr180_plan_run_workspace_root_equals_form_last_wins"
+pr180_c4_dir="$(stage_layout "${pr180_c4_name}")"
+install_canonical "${pr180_c4_dir}" current
+mkdir -p "${pr180_c4_dir}/elsewhere/scripts"
+printf '#!/usr/bin/env bash\nexit 0\n' > "${pr180_c4_dir}/elsewhere/scripts/claw-sidestack-local"
+chmod 0755 "${pr180_c4_dir}/elsewhere/scripts/claw-sidestack-local"
+if RUN_CASE_CWD="${pr180_c4_dir}/root" \
+   run_case "${pr180_c4_name}" "${pr180_c4_dir}" 9 -- \
+     plan run ./plan.yaml "--workspace-root=${pr180_c4_dir}/root" \
+     "--workspace-root=${pr180_c4_dir}/elsewhere" >/dev/null; then
+  if assert_readiness_not_called "${pr180_c4_name}" "${pr180_c4_dir}/readiness.log" \
+     && assert_fake_not_called "${pr180_c4_name}" "${pr180_c4_dir}/fake_claw.log"; then
+    pass_case "${pr180_c4_name}"
+  fi
+fi
+
+# ...and the converse: a `--workspace-root` pointing BACK at this wrapper's own
+# tree keeps the proof intact and must not be refused.
+pr180_c5_name="pr180_plan_run_workspace_root_pointing_at_this_tree_is_local"
+pr180_c5_dir="$(stage_layout "${pr180_c5_name}")"
+install_canonical "${pr180_c5_dir}" current
+if RUN_CASE_CWD="${pr180_c5_dir}/root" \
+   run_case "${pr180_c5_name}" "${pr180_c5_dir}" 0 -- \
+     plan run ./plan.yaml --workspace-root "${pr180_c5_dir}/root" >/dev/null; then
+  if assert_readiness_not_called "${pr180_c5_name}" "${pr180_c5_dir}/readiness.log" \
+     && assert_log_contains "${pr180_c5_name}" "${pr180_c5_dir}/fake_claw.log" 'IDENTITY=CANONICAL'; then
+    pass_case "${pr180_c5_name}"
+  fi
+fi
+
+# A `--workspace-root` occupying another plan flag's VALUE slot is that value,
+# not an override — the same tokenization rule the plan tail already applies to
+# `--wrapper`.
+pr180_c6_name="pr180_plan_run_workspace_root_in_a_value_slot_is_not_an_override"
+pr180_c6_dir="$(stage_layout "${pr180_c6_name}")"
+install_canonical "${pr180_c6_dir}" current
+if RUN_CASE_CWD="${pr180_c6_dir}/root" \
+   run_case "${pr180_c6_name}" "${pr180_c6_dir}" 0 -- \
+     plan run ./plan.yaml --fast-model --workspace-root >/dev/null; then
+  if assert_readiness_not_called "${pr180_c6_name}" "${pr180_c6_dir}/readiness.log" \
+     && assert_log_contains "${pr180_c6_name}" "${pr180_c6_dir}/fake_claw.log" 'IDENTITY=CANONICAL'; then
+    pass_case "${pr180_c6_name}"
+  fi
+fi
+
+# When the runner default does not EXIST under the plan process CWD, the CLI's
+# own `wrapper_path.exists()` precheck reports substrate-unavailable and spawns
+# nothing at all, so there is no model-bearing child to gate. That stays local
+# — the refusal above is about a default that resolves to a DIFFERENT
+# executable, not about the flag being absent.
+pr180_c7_name="pr180_plan_run_with_no_default_wrapper_under_cwd_stays_local"
+pr180_c7_dir="$(stage_layout "${pr180_c7_name}")"
+install_canonical "${pr180_c7_dir}" current
+if run_case "${pr180_c7_name}" "${pr180_c7_dir}" 0 -- plan run ./plan.yaml >/dev/null; then
+  if assert_readiness_not_called "${pr180_c7_name}" "${pr180_c7_dir}/readiness.log" \
+     && assert_log_contains "${pr180_c7_name}" "${pr180_c7_dir}/fake_claw.log" 'IDENTITY=CANONICAL'; then
+    pass_case "${pr180_c7_name}"
+  fi
+fi
+
+# An explicit `--wrapper` pointing at this wrapper still wins even when the
+# CWD default would resolve somewhere else: the override is what the runner
+# uses, so the default is irrelevant.
+pr180_c8_name="pr180_explicit_wrapper_override_wins_over_a_foreign_cwd_default"
+pr180_c8_dir="$(stage_layout "${pr180_c8_name}")"
+install_canonical "${pr180_c8_dir}" current
+mkdir -p "${pr180_c8_dir}/foreign/scripts"
+printf '#!/usr/bin/env bash\nexit 0\n' > "${pr180_c8_dir}/foreign/scripts/claw-sidestack-local"
+chmod 0755 "${pr180_c8_dir}/foreign/scripts/claw-sidestack-local"
+if RUN_CASE_CWD="${pr180_c8_dir}/foreign" \
+   run_case "${pr180_c8_name}" "${pr180_c8_dir}" 0 -- \
+     plan run ./plan.yaml --wrapper "${pr180_c8_dir}/root/scripts/claw-sidestack-local" >/dev/null; then
+  if assert_readiness_not_called "${pr180_c8_name}" "${pr180_c8_dir}/readiness.log" \
+     && assert_log_contains "${pr180_c8_name}" "${pr180_c8_dir}/fake_claw.log" 'IDENTITY=CANONICAL'; then
+    pass_case "${pr180_c8_name}"
+  fi
+fi
+
+# A non-`run` plan subcommand spawns no children, so the default-wrapper proof
+# does not apply to it even from a foreign tree.
+pr180_c9_name="pr180_plan_status_from_a_foreign_cwd_is_still_local"
+pr180_c9_dir="$(stage_layout "${pr180_c9_name}")"
+install_canonical "${pr180_c9_dir}" current
+mkdir -p "${pr180_c9_dir}/foreign/scripts"
+printf '#!/usr/bin/env bash\nexit 0\n' > "${pr180_c9_dir}/foreign/scripts/claw-sidestack-local"
+chmod 0755 "${pr180_c9_dir}/foreign/scripts/claw-sidestack-local"
+if RUN_CASE_CWD="${pr180_c9_dir}/foreign" \
+   run_case "${pr180_c9_name}" "${pr180_c9_dir}" 0 -- plan status . >/dev/null; then
+  if assert_readiness_not_called "${pr180_c9_name}" "${pr180_c9_dir}/readiness.log" \
+     && assert_log_contains "${pr180_c9_name}" "${pr180_c9_dir}/fake_claw.log" 'IDENTITY=CANONICAL'; then
+    pass_case "${pr180_c9_name}"
   fi
 fi
 
