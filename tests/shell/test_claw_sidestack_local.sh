@@ -1613,6 +1613,12 @@ curl_floor_local_case "version_subcommand" version
 curl_floor_local_case "status_subcommand" status
 curl_floor_local_case "doctor_subcommand" doctor
 curl_floor_local_case "plan_run" plan run ./plan.yaml
+# An effective dry run is local for the SAME reason: it cannot spawn a
+# model-bearing child, so it performs no readiness GET and therefore needs no
+# curl at all -- not even the version probe -- even though its `--wrapper`
+# names a foreign executable the dry-run branch will never use.
+curl_floor_local_case "plan_run_dry_run_with_a_foreign_wrapper" \
+  plan run ./plan.yaml --dry-run --wrapper /usr/bin/claw
 
 # ---------- cases 119-121: local commands run with NO curl on PATH ---------
 # Stronger than the version floor: a local invocation must succeed on a host
@@ -2504,6 +2510,554 @@ if RUN_CASE_CWD="${pr180_c9_dir}/foreign" \
   if assert_readiness_not_called "${pr180_c9_name}" "${pr180_c9_dir}/readiness.log" \
      && assert_log_contains "${pr180_c9_name}" "${pr180_c9_dir}/fake_claw.log" 'IDENTITY=CANONICAL'; then
     pass_case "${pr180_c9_name}"
+  fi
+fi
+
+# ---------- P1-D: preview mode must prove the wrapper it will spawn --------
+#
+# `--workspace-write-preview` takes a DIFFERENT branch of
+# `run_plan_subcommand` than a normal `plan run`, and that branch has no
+# `wrapper_path.exists()` precheck. `run_plan_with_write_preview` still spawns
+# every read-only step BEFORE the lone workspace-write step, through
+# `<workspace-root>/scripts/claw-sidestack-local`. So "the CWD default is
+# missing" -- which really does stop a NORMAL run before it spawns -- proves
+# nothing at all here, and the workspace-root wrapper must be judged on its own.
+
+# The exact reported shape: invoked by absolute path from a CWD with no
+# `scripts/`, previewing into a foreign tree that HAS its own wrapper.
+pr180_d1_name="pr180_preview_with_no_cwd_default_and_a_foreign_workspace_root_refuses"
+pr180_d1_dir="$(stage_layout "${pr180_d1_name}")"
+install_canonical "${pr180_d1_dir}" current
+mkdir -p "${pr180_d1_dir}/foreign/scripts"
+printf '#!/usr/bin/env bash\nexit 0\n' > "${pr180_d1_dir}/foreign/scripts/claw-sidestack-local"
+chmod 0755 "${pr180_d1_dir}/foreign/scripts/claw-sidestack-local"
+if run_case "${pr180_d1_name}" "${pr180_d1_dir}" 9 -- \
+     plan run ./plan.yaml --workspace-write-preview \
+     --workspace-root "${pr180_d1_dir}/foreign" >/dev/null; then
+  if assert_stderr_contains "${pr180_d1_name}" "${pr180_d1_dir}/wrapper.stderr" \
+       'not proven to pass the readiness gate' \
+     && assert_readiness_not_called "${pr180_d1_name}" "${pr180_d1_dir}/readiness.log" \
+     && assert_fake_not_called "${pr180_d1_name}" "${pr180_d1_dir}/fake_claw.log"; then
+    pass_case "${pr180_d1_name}"
+  fi
+fi
+
+# Positive control: same missing-CWD-default shape, but the workspace root IS
+# this wrapper's tree, so the executable preview would spawn is this wrapper.
+pr180_d2_name="pr180_preview_with_no_cwd_default_but_a_self_workspace_root_is_local"
+pr180_d2_dir="$(stage_layout "${pr180_d2_name}")"
+install_canonical "${pr180_d2_dir}" current
+if run_case "${pr180_d2_name}" "${pr180_d2_dir}" 0 -- \
+     plan run ./plan.yaml --workspace-write-preview \
+     --workspace-root "${pr180_d2_dir}/root" >/dev/null; then
+  if assert_readiness_not_called "${pr180_d2_name}" "${pr180_d2_dir}/readiness.log" \
+     && assert_log_contains "${pr180_d2_name}" "${pr180_d2_dir}/fake_claw.log" 'IDENTITY=CANONICAL' \
+     && assert_no_decoy_executed "${pr180_d2_name}" "${pr180_d2_dir}/fake_claw.log"; then
+    pass_case "${pr180_d2_name}"
+  fi
+fi
+
+# A protected CWD default does not launder a foreign workspace root either:
+# the spawn base is the workspace root, not the CWD.
+pr180_d3_name="pr180_preview_from_this_tree_into_a_foreign_workspace_root_refuses"
+pr180_d3_dir="$(stage_layout "${pr180_d3_name}")"
+install_canonical "${pr180_d3_dir}" current
+mkdir -p "${pr180_d3_dir}/foreign/scripts"
+printf '#!/usr/bin/env bash\nexit 0\n' > "${pr180_d3_dir}/foreign/scripts/claw-sidestack-local"
+chmod 0755 "${pr180_d3_dir}/foreign/scripts/claw-sidestack-local"
+if RUN_CASE_CWD="${pr180_d3_dir}/root" \
+   run_case "${pr180_d3_name}" "${pr180_d3_dir}" 9 -- \
+     plan run ./plan.yaml --workspace-write-preview \
+     --workspace-root "${pr180_d3_dir}/foreign" >/dev/null; then
+  if assert_readiness_not_called "${pr180_d3_name}" "${pr180_d3_dir}/readiness.log" \
+     && assert_fake_not_called "${pr180_d3_name}" "${pr180_d3_dir}/fake_claw.log"; then
+    pass_case "${pr180_d3_name}"
+  fi
+fi
+
+# An explicit foreign `--wrapper` is refused in preview mode for the same
+# reason it is refused in a normal run: it is the executable that spawns.
+pr180_d4_name="pr180_preview_with_an_explicit_foreign_wrapper_refuses"
+pr180_d4_dir="$(stage_layout "${pr180_d4_name}")"
+install_canonical "${pr180_d4_dir}" current
+if RUN_CASE_CWD="${pr180_d4_dir}/root" \
+   run_case "${pr180_d4_name}" "${pr180_d4_dir}" 9 -- \
+     plan run ./plan.yaml --workspace-write-preview --wrapper /usr/bin/claw \
+     --workspace-root "${pr180_d4_dir}/root" >/dev/null; then
+  if assert_readiness_not_called "${pr180_d4_name}" "${pr180_d4_dir}/readiness.log" \
+     && assert_fake_not_called "${pr180_d4_name}" "${pr180_d4_dir}/fake_claw.log"; then
+    pass_case "${pr180_d4_name}"
+  fi
+fi
+
+# ...and the documented escape hatch: an explicit `--wrapper` pointing at this
+# wrapper is ABSOLUTE, so the child's chdir to a foreign workspace root cannot
+# move it. Previewing into another tree stays available.
+pr180_d5_name="pr180_preview_into_a_foreign_root_with_an_explicit_self_wrapper_is_local"
+pr180_d5_dir="$(stage_layout "${pr180_d5_name}")"
+install_canonical "${pr180_d5_dir}" current
+mkdir -p "${pr180_d5_dir}/foreign/scripts"
+printf '#!/usr/bin/env bash\nexit 0\n' > "${pr180_d5_dir}/foreign/scripts/claw-sidestack-local"
+chmod 0755 "${pr180_d5_dir}/foreign/scripts/claw-sidestack-local"
+if run_case "${pr180_d5_name}" "${pr180_d5_dir}" 0 -- \
+     plan run ./plan.yaml --workspace-write-preview \
+     --wrapper "${pr180_d5_dir}/root/scripts/claw-sidestack-local" \
+     --workspace-root "${pr180_d5_dir}/foreign" >/dev/null; then
+  if assert_readiness_not_called "${pr180_d5_name}" "${pr180_d5_dir}/readiness.log" \
+     && assert_log_contains "${pr180_d5_name}" "${pr180_d5_dir}/fake_claw.log" 'IDENTITY=CANONICAL'; then
+    pass_case "${pr180_d5_name}"
+  fi
+fi
+
+# The effective child wrapper does not resolve at all (the workspace root has
+# no `scripts/` tree). Preview has no precheck that would stop this, so an
+# unprovable spawn target fails CLOSED rather than being waved through.
+pr180_d6_name="pr180_preview_with_an_unresolvable_workspace_root_wrapper_refuses"
+pr180_d6_dir="$(stage_layout "${pr180_d6_name}")"
+install_canonical "${pr180_d6_dir}" current
+mkdir -p "${pr180_d6_dir}/bare"
+if run_case "${pr180_d6_name}" "${pr180_d6_dir}" 9 -- \
+     plan run ./plan.yaml --workspace-write-preview \
+     --workspace-root "${pr180_d6_dir}/bare" >/dev/null; then
+  if assert_readiness_not_called "${pr180_d6_name}" "${pr180_d6_dir}/readiness.log" \
+     && assert_fake_not_called "${pr180_d6_name}" "${pr180_d6_dir}/fake_claw.log"; then
+    pass_case "${pr180_d6_name}"
+  fi
+fi
+
+# ---------- P2-E: dry run cannot spawn a wrapper, so it must not be gated ---
+#
+# The dry-run arm of `run_plan_subcommand` builds its report from
+# `validate_plan` + `preflight::precheck` only. It never binds a wrapper path,
+# never probes the substrate and never spawns a subprocess -- so a foreign
+# `--wrapper` names an executable that CANNOT run, and refusing on it blocks a
+# purely local plan-validation workflow for no safety gain.
+
+pr180_e1_name="pr180_dry_run_with_an_explicit_foreign_wrapper_is_local"
+pr180_e1_dir="$(stage_layout "${pr180_e1_name}")"
+install_canonical "${pr180_e1_dir}" current
+if RUN_CASE_CWD="${pr180_e1_dir}/root" \
+   run_case "${pr180_e1_name}" "${pr180_e1_dir}" 0 -- \
+     plan run ./plan.yaml --dry-run --wrapper /usr/bin/claw >/dev/null; then
+  if assert_readiness_not_called "${pr180_e1_name}" "${pr180_e1_dir}/readiness.log" \
+     && assert_log_contains "${pr180_e1_name}" "${pr180_e1_dir}/fake_claw.log" 'IDENTITY=CANONICAL' \
+     && assert_no_decoy_executed "${pr180_e1_name}" "${pr180_e1_dir}/fake_claw.log"; then
+    pass_case "${pr180_e1_name}"
+  fi
+fi
+
+# Same, with the wrapper OMITTED from a CWD whose default would be foreign.
+pr180_e2_name="pr180_dry_run_with_a_foreign_cwd_default_wrapper_is_local"
+pr180_e2_dir="$(stage_layout "${pr180_e2_name}")"
+install_canonical "${pr180_e2_dir}" current
+mkdir -p "${pr180_e2_dir}/foreign/scripts"
+printf '#!/usr/bin/env bash\nexit 0\n' > "${pr180_e2_dir}/foreign/scripts/claw-sidestack-local"
+chmod 0755 "${pr180_e2_dir}/foreign/scripts/claw-sidestack-local"
+if RUN_CASE_CWD="${pr180_e2_dir}/foreign" \
+   run_case "${pr180_e2_name}" "${pr180_e2_dir}" 0 -- \
+     plan run ./plan.yaml --dry-run >/dev/null; then
+  if assert_readiness_not_called "${pr180_e2_name}" "${pr180_e2_dir}/readiness.log" \
+     && assert_log_contains "${pr180_e2_name}" "${pr180_e2_dir}/fake_claw.log" 'IDENTITY=CANONICAL' \
+     && assert_no_decoy_executed "${pr180_e2_name}" "${pr180_e2_dir}/fake_claw.log"; then
+    pass_case "${pr180_e2_name}"
+  fi
+fi
+
+# `--workspace-root` without `--workspace-write-preview` is a CLI parse error,
+# so it cannot move a spawn under `--dry-run` either.
+pr180_e3_name="pr180_dry_run_with_a_foreign_workspace_root_is_local"
+pr180_e3_dir="$(stage_layout "${pr180_e3_name}")"
+install_canonical "${pr180_e3_dir}" current
+mkdir -p "${pr180_e3_dir}/elsewhere/scripts"
+printf '#!/usr/bin/env bash\nexit 0\n' > "${pr180_e3_dir}/elsewhere/scripts/claw-sidestack-local"
+chmod 0755 "${pr180_e3_dir}/elsewhere/scripts/claw-sidestack-local"
+if RUN_CASE_CWD="${pr180_e3_dir}/root" \
+   run_case "${pr180_e3_name}" "${pr180_e3_dir}" 0 -- \
+     plan run ./plan.yaml --dry-run --workspace-root "${pr180_e3_dir}/elsewhere" >/dev/null; then
+  if assert_readiness_not_called "${pr180_e3_name}" "${pr180_e3_dir}/readiness.log" \
+     && assert_log_contains "${pr180_e3_name}" "${pr180_e3_dir}/fake_claw.log" 'IDENTITY=CANONICAL'; then
+    pass_case "${pr180_e3_name}"
+  fi
+fi
+
+# A plain protected dry run keeps its existing local behavior.
+pr180_e4_name="pr180_dry_run_from_this_tree_is_unchanged_local"
+pr180_e4_dir="$(stage_layout "${pr180_e4_name}")"
+install_canonical "${pr180_e4_dir}" current
+if RUN_CASE_CWD="${pr180_e4_dir}/root" \
+   run_case "${pr180_e4_name}" "${pr180_e4_dir}" 0 -- \
+     plan run ./plan.yaml --dry-run >/dev/null; then
+  if assert_readiness_not_called "${pr180_e4_name}" "${pr180_e4_dir}/readiness.log" \
+     && assert_log_contains "${pr180_e4_name}" "${pr180_e4_dir}/fake_claw.log" 'IDENTITY=CANONICAL'; then
+    pass_case "${pr180_e4_name}"
+  fi
+fi
+
+# ---------- P1/P2-F: mixed and value-slot mode flags -----------------------
+#
+# `--dry-run` and `--workspace-write-preview` together are refused by
+# `parse_plan_subcommand_args` BEFORE dispatch, and again by the preview branch
+# itself. Both flags are order-independent booleans tested after the parse
+# loop, so neither order can produce a spawn.
+
+pr180_f1_name="pr180_dry_run_then_preview_cannot_spawn_and_is_local"
+pr180_f1_dir="$(stage_layout "${pr180_f1_name}")"
+install_canonical "${pr180_f1_dir}" current
+mkdir -p "${pr180_f1_dir}/foreign/scripts"
+printf '#!/usr/bin/env bash\nexit 0\n' > "${pr180_f1_dir}/foreign/scripts/claw-sidestack-local"
+chmod 0755 "${pr180_f1_dir}/foreign/scripts/claw-sidestack-local"
+if RUN_CASE_CWD="${pr180_f1_dir}/root" \
+   run_case "${pr180_f1_name}" "${pr180_f1_dir}" 0 -- \
+     plan run ./plan.yaml --dry-run --workspace-write-preview \
+     --workspace-root "${pr180_f1_dir}/foreign" >/dev/null; then
+  if assert_readiness_not_called "${pr180_f1_name}" "${pr180_f1_dir}/readiness.log" \
+     && assert_log_contains "${pr180_f1_name}" "${pr180_f1_dir}/fake_claw.log" 'IDENTITY=CANONICAL'; then
+    pass_case "${pr180_f1_name}"
+  fi
+fi
+
+# ...and the reverse order is the same invocation.
+pr180_f2_name="pr180_preview_then_dry_run_cannot_spawn_and_is_local"
+pr180_f2_dir="$(stage_layout "${pr180_f2_name}")"
+install_canonical "${pr180_f2_dir}" current
+mkdir -p "${pr180_f2_dir}/foreign/scripts"
+printf '#!/usr/bin/env bash\nexit 0\n' > "${pr180_f2_dir}/foreign/scripts/claw-sidestack-local"
+chmod 0755 "${pr180_f2_dir}/foreign/scripts/claw-sidestack-local"
+if RUN_CASE_CWD="${pr180_f2_dir}/root" \
+   run_case "${pr180_f2_name}" "${pr180_f2_dir}" 0 -- \
+     plan run ./plan.yaml --workspace-write-preview --dry-run \
+     --workspace-root "${pr180_f2_dir}/foreign" >/dev/null; then
+  if assert_readiness_not_called "${pr180_f2_name}" "${pr180_f2_dir}/readiness.log" \
+     && assert_log_contains "${pr180_f2_name}" "${pr180_f2_dir}/fake_claw.log" 'IDENTITY=CANONICAL'; then
+    pass_case "${pr180_f2_name}"
+  fi
+fi
+
+# THE anti-shortcut guard. A `--dry-run` sitting in another plan flag's VALUE
+# slot is that flag's value: the CLI parses `--fast-model --dry-run` as
+# fast_model="--dry-run" and leaves dry_run FALSE, so this is a LIVE normal run
+# and the foreign CWD default must still refuse. A classifier that merely tests
+# whether argv contains `--dry-run` hands this invocation a bypass.
+pr180_f3_name="pr180_dry_run_in_a_value_slot_is_not_a_dry_run"
+pr180_f3_dir="$(stage_layout "${pr180_f3_name}")"
+install_canonical "${pr180_f3_dir}" current
+mkdir -p "${pr180_f3_dir}/foreign/scripts"
+printf '#!/usr/bin/env bash\nexit 0\n' > "${pr180_f3_dir}/foreign/scripts/claw-sidestack-local"
+chmod 0755 "${pr180_f3_dir}/foreign/scripts/claw-sidestack-local"
+if RUN_CASE_CWD="${pr180_f3_dir}/foreign" \
+   run_case "${pr180_f3_name}" "${pr180_f3_dir}" 9 -- \
+     plan run ./plan.yaml --fast-model --dry-run >/dev/null; then
+  if assert_stderr_contains "${pr180_f3_name}" "${pr180_f3_dir}/wrapper.stderr" \
+       'not proven to pass the readiness gate' \
+     && assert_readiness_not_called "${pr180_f3_name}" "${pr180_f3_dir}/readiness.log" \
+     && assert_fake_not_called "${pr180_f3_name}" "${pr180_f3_dir}/fake_claw.log"; then
+    pass_case "${pr180_f3_name}"
+  fi
+fi
+
+# The same value-slot rule under preview: `--fast-model --dry-run` leaves this
+# a LIVE preview, whose foreign workspace-root wrapper must still be proven.
+pr180_f4_name="pr180_value_slot_dry_run_under_preview_still_gates_the_spawn_wrapper"
+pr180_f4_dir="$(stage_layout "${pr180_f4_name}")"
+install_canonical "${pr180_f4_dir}" current
+mkdir -p "${pr180_f4_dir}/foreign/scripts"
+printf '#!/usr/bin/env bash\nexit 0\n' > "${pr180_f4_dir}/foreign/scripts/claw-sidestack-local"
+chmod 0755 "${pr180_f4_dir}/foreign/scripts/claw-sidestack-local"
+if RUN_CASE_CWD="${pr180_f4_dir}/root" \
+   run_case "${pr180_f4_name}" "${pr180_f4_dir}" 9 -- \
+     plan run ./plan.yaml --workspace-write-preview --fast-model --dry-run \
+     --workspace-root "${pr180_f4_dir}/foreign" >/dev/null; then
+  if assert_readiness_not_called "${pr180_f4_name}" "${pr180_f4_dir}/readiness.log" \
+     && assert_fake_not_called "${pr180_f4_name}" "${pr180_f4_dir}/fake_claw.log"; then
+    pass_case "${pr180_f4_name}"
+  fi
+fi
+
+# ---------- P1-R: an explicit RELATIVE --wrapper is resolved by the CHILD ----
+#
+# `build_claw_command` stores the operator's `--wrapper` value VERBATIM as
+# `ClawCommand.program` and sets `cwd` to the effective workspace root
+# (`runner.rs:130-162`), and `execute_with_timeout` spawns it as
+# `Command::new(&cmd.program).current_dir(&cmd.cwd)` (`runner.rs:433-435`).
+# `current_dir` is applied BEFORE the exec, so which executable actually runs
+# depends on the PATH CLASS of the value:
+#
+#   absolute            the child's chdir cannot move it -- it is the literal
+#                       program, and remains the documented escape hatch.
+#   relative WITH slash execvp resolves it AFTER the chdir, so the real
+#                       program is `<execution-base>/<value>`. Proving the
+#                       caller's CWD holds an identically named path proves
+#                       NOTHING about it.
+#   bare name NO slash  execvp searches PATH, never the CWD. Nothing in the
+#                       wrapper's contract can prove which PATH entry the
+#                       child would pick, and this wrapper does not fall back
+#                       to PATH, so it fails CLOSED.
+#
+# The execution base differs by mode: preview relocates via `--workspace-root`,
+# while a normal run cannot (`--workspace-root` without
+# `--workspace-write-preview` is a parse error at `main.rs:4661-4668`), so its
+# base stays the CWD.
+
+# assert_foreign_child_not_called <name> <log_file>
+assert_foreign_child_not_called() {
+  local name="$1"
+  local log_file="$2"
+  if [[ -s "${log_file}" ]]; then
+    fail_case "${name}" "the foreign workspace-root wrapper was executed" \
+      /dev/null /dev/null "${log_file}"
+    return 1
+  fi
+}
+
+# write_logging_foreign_wrapper <path> <log_file>
+write_logging_foreign_wrapper() {
+  local path="$1" log_file="$2"
+  mkdir -p -- "$(dirname -- "${path}")"
+  cat > "${path}" <<EOF
+#!/usr/bin/env bash
+printf 'FOREIGN_CHILD_CALLED=1\n' >> '${log_file}'
+exit 0
+EOF
+  chmod 0755 "${path}"
+}
+
+# --- A: the exact residual P1 ----------------------------------------------
+# Protected CWD holds the real wrapper, so a CWD-based identity check reads
+# "this is me". But preview spawns with `current_dir(/foreign)`, so the
+# executable that really runs is `/foreign/scripts/claw-sidestack-local`.
+pr180_r1_name="pr180_preview_with_relative_explicit_self_wrapper_and_foreign_root_refuses"
+pr180_r1_dir="$(stage_layout "${pr180_r1_name}")"
+install_canonical "${pr180_r1_dir}" current
+write_logging_foreign_wrapper \
+  "${pr180_r1_dir}/foreign/scripts/claw-sidestack-local" \
+  "${pr180_r1_dir}/foreign_child.log"
+if RUN_CASE_CWD="${pr180_r1_dir}/root" \
+   run_case "${pr180_r1_name}" "${pr180_r1_dir}" 9 -- \
+     plan run ./plan.yaml --workspace-write-preview \
+     --wrapper scripts/claw-sidestack-local \
+     --workspace-root "${pr180_r1_dir}/foreign" >/dev/null; then
+  if assert_stderr_contains "${pr180_r1_name}" "${pr180_r1_dir}/wrapper.stderr" \
+       'not proven to pass the readiness gate' \
+     && assert_readiness_not_called "${pr180_r1_name}" "${pr180_r1_dir}/readiness.log" \
+     && assert_foreign_child_not_called "${pr180_r1_name}" "${pr180_r1_dir}/foreign_child.log" \
+     && assert_fake_not_called "${pr180_r1_name}" "${pr180_r1_dir}/fake_claw.log"; then
+    pass_case "${pr180_r1_name}"
+  fi
+fi
+
+# --- B: relative preview converse -------------------------------------------
+# Mirror image: the CWD has no `scripts/` tree at all, but the EFFECTIVE
+# workspace root is this wrapper's tree, so the relative value resolves to
+# this wrapper and the run is permitted. Resolving against the caller's CWD
+# would wrongly refuse this.
+pr180_r2_name="pr180_preview_relative_explicit_wrapper_resolving_to_self_under_the_root_is_local"
+pr180_r2_dir="$(stage_layout "${pr180_r2_name}")"
+install_canonical "${pr180_r2_dir}" current
+mkdir -p "${pr180_r2_dir}/bare"
+if RUN_CASE_CWD="${pr180_r2_dir}/bare" \
+   run_case "${pr180_r2_name}" "${pr180_r2_dir}" 0 -- \
+     plan run ./plan.yaml --workspace-write-preview \
+     --wrapper scripts/claw-sidestack-local \
+     --workspace-root "${pr180_r2_dir}/root" >/dev/null; then
+  if assert_readiness_not_called "${pr180_r2_name}" "${pr180_r2_dir}/readiness.log" \
+     && assert_log_contains "${pr180_r2_name}" "${pr180_r2_dir}/fake_claw.log" 'IDENTITY=CANONICAL' \
+     && assert_no_decoy_executed "${pr180_r2_name}" "${pr180_r2_dir}/fake_claw.log"; then
+    pass_case "${pr180_r2_name}"
+  fi
+fi
+
+# --- C: the ABSOLUTE escape hatch still works -------------------------------
+# Same foreign root as case A -- and the foreign tree really does hold its own
+# `scripts/claw-sidestack-local` -- but an ABSOLUTE program path ignores the
+# child's chdir, so this stays the documented remedy.
+pr180_r3_name="pr180_preview_absolute_self_wrapper_into_a_foreign_root_holding_a_decoy_is_local"
+pr180_r3_dir="$(stage_layout "${pr180_r3_name}")"
+install_canonical "${pr180_r3_dir}" current
+write_logging_foreign_wrapper \
+  "${pr180_r3_dir}/foreign/scripts/claw-sidestack-local" \
+  "${pr180_r3_dir}/foreign_child.log"
+if RUN_CASE_CWD="${pr180_r3_dir}/root" \
+   run_case "${pr180_r3_name}" "${pr180_r3_dir}" 0 -- \
+     plan run ./plan.yaml --workspace-write-preview \
+     --wrapper "${pr180_r3_dir}/root/scripts/claw-sidestack-local" \
+     --workspace-root "${pr180_r3_dir}/foreign" >/dev/null; then
+  if assert_readiness_not_called "${pr180_r3_name}" "${pr180_r3_dir}/readiness.log" \
+     && assert_foreign_child_not_called "${pr180_r3_name}" "${pr180_r3_dir}/foreign_child.log" \
+     && assert_log_contains "${pr180_r3_name}" "${pr180_r3_dir}/fake_claw.log" 'IDENTITY=CANONICAL'; then
+    pass_case "${pr180_r3_name}"
+  fi
+fi
+
+# --- D: an ABSOLUTE foreign wrapper is still refused -------------------------
+pr180_r4_name="pr180_preview_absolute_foreign_wrapper_refuses"
+pr180_r4_dir="$(stage_layout "${pr180_r4_name}")"
+install_canonical "${pr180_r4_dir}" current
+write_logging_foreign_wrapper \
+  "${pr180_r4_dir}/foreign/scripts/claw-sidestack-local" \
+  "${pr180_r4_dir}/foreign_child.log"
+if RUN_CASE_CWD="${pr180_r4_dir}/root" \
+   run_case "${pr180_r4_name}" "${pr180_r4_dir}" 9 -- \
+     plan run ./plan.yaml --workspace-write-preview \
+     --wrapper "${pr180_r4_dir}/foreign/scripts/claw-sidestack-local" \
+     --workspace-root "${pr180_r4_dir}/root" >/dev/null; then
+  if assert_readiness_not_called "${pr180_r4_name}" "${pr180_r4_dir}/readiness.log" \
+     && assert_foreign_child_not_called "${pr180_r4_name}" "${pr180_r4_dir}/foreign_child.log" \
+     && assert_fake_not_called "${pr180_r4_name}" "${pr180_r4_dir}/fake_claw.log"; then
+    pass_case "${pr180_r4_name}"
+  fi
+fi
+
+# --- E: last-wins, self-ABSOLUTE then relative-foreign ----------------------
+# The EFFECTIVE value is the trailing relative one, and it is judged against
+# the preview execution base. A leading safe absolute cannot launder it.
+pr180_r5_name="pr180_preview_last_wins_absolute_self_then_relative_foreign_refuses"
+pr180_r5_dir="$(stage_layout "${pr180_r5_name}")"
+install_canonical "${pr180_r5_dir}" current
+write_logging_foreign_wrapper \
+  "${pr180_r5_dir}/foreign/scripts/claw-sidestack-local" \
+  "${pr180_r5_dir}/foreign_child.log"
+if RUN_CASE_CWD="${pr180_r5_dir}/root" \
+   run_case "${pr180_r5_name}" "${pr180_r5_dir}" 9 -- \
+     plan run ./plan.yaml --workspace-write-preview \
+     --wrapper "${pr180_r5_dir}/root/scripts/claw-sidestack-local" \
+     --wrapper scripts/claw-sidestack-local \
+     --workspace-root "${pr180_r5_dir}/foreign" >/dev/null; then
+  if assert_readiness_not_called "${pr180_r5_name}" "${pr180_r5_dir}/readiness.log" \
+     && assert_foreign_child_not_called "${pr180_r5_name}" "${pr180_r5_dir}/foreign_child.log" \
+     && assert_fake_not_called "${pr180_r5_name}" "${pr180_r5_dir}/fake_claw.log"; then
+    pass_case "${pr180_r5_name}"
+  fi
+fi
+
+# --- F: last-wins, relative-foreign then self-ABSOLUTE ----------------------
+# Converse of E: the trailing absolute self value wins, so this is permitted
+# and must not be refused on the strength of the earlier relative token.
+pr180_r6_name="pr180_preview_last_wins_relative_foreign_then_absolute_self_is_local"
+pr180_r6_dir="$(stage_layout "${pr180_r6_name}")"
+install_canonical "${pr180_r6_dir}" current
+write_logging_foreign_wrapper \
+  "${pr180_r6_dir}/foreign/scripts/claw-sidestack-local" \
+  "${pr180_r6_dir}/foreign_child.log"
+if RUN_CASE_CWD="${pr180_r6_dir}/root" \
+   run_case "${pr180_r6_name}" "${pr180_r6_dir}" 0 -- \
+     plan run ./plan.yaml --workspace-write-preview \
+     --wrapper scripts/claw-sidestack-local \
+     --wrapper "${pr180_r6_dir}/root/scripts/claw-sidestack-local" \
+     --workspace-root "${pr180_r6_dir}/foreign" >/dev/null; then
+  if assert_readiness_not_called "${pr180_r6_name}" "${pr180_r6_dir}/readiness.log" \
+     && assert_foreign_child_not_called "${pr180_r6_name}" "${pr180_r6_dir}/foreign_child.log" \
+     && assert_log_contains "${pr180_r6_name}" "${pr180_r6_dir}/fake_claw.log" 'IDENTITY=CANONICAL'; then
+    pass_case "${pr180_r6_name}"
+  fi
+fi
+
+# --- G: dry run keeps bypassing wrapper identity entirely -------------------
+# No child wrapper can exist under `--dry-run`, so a foreign-looking relative
+# value is not a reason to refuse. This is the P2 fix; it must not regress.
+pr180_r7_name="pr180_dry_run_with_a_relative_foreign_wrapper_is_local"
+pr180_r7_dir="$(stage_layout "${pr180_r7_name}")"
+install_canonical "${pr180_r7_dir}" current
+write_logging_foreign_wrapper \
+  "${pr180_r7_dir}/foreign/scripts/claw-sidestack-local" \
+  "${pr180_r7_dir}/foreign_child.log"
+if RUN_CASE_CWD="${pr180_r7_dir}/foreign" \
+   run_case "${pr180_r7_name}" "${pr180_r7_dir}" 0 -- \
+     plan run ./plan.yaml --dry-run \
+     --wrapper scripts/claw-sidestack-local >/dev/null; then
+  if assert_readiness_not_called "${pr180_r7_name}" "${pr180_r7_dir}/readiness.log" \
+     && assert_foreign_child_not_called "${pr180_r7_name}" "${pr180_r7_dir}/foreign_child.log" \
+     && assert_log_contains "${pr180_r7_name}" "${pr180_r7_dir}/fake_claw.log" 'IDENTITY=CANONICAL'; then
+    pass_case "${pr180_r7_name}"
+  fi
+fi
+
+# --- equals form obeys the same base ----------------------------------------
+pr180_r8_name="pr180_preview_equals_form_relative_self_wrapper_and_foreign_root_refuses"
+pr180_r8_dir="$(stage_layout "${pr180_r8_name}")"
+install_canonical "${pr180_r8_dir}" current
+write_logging_foreign_wrapper \
+  "${pr180_r8_dir}/foreign/scripts/claw-sidestack-local" \
+  "${pr180_r8_dir}/foreign_child.log"
+if RUN_CASE_CWD="${pr180_r8_dir}/root" \
+   run_case "${pr180_r8_name}" "${pr180_r8_dir}" 9 -- \
+     plan run ./plan.yaml --workspace-write-preview \
+     --wrapper=scripts/claw-sidestack-local \
+     --workspace-root "${pr180_r8_dir}/foreign" >/dev/null; then
+  if assert_readiness_not_called "${pr180_r8_name}" "${pr180_r8_dir}/readiness.log" \
+     && assert_foreign_child_not_called "${pr180_r8_name}" "${pr180_r8_dir}/foreign_child.log" \
+     && assert_fake_not_called "${pr180_r8_name}" "${pr180_r8_dir}/fake_claw.log"; then
+    pass_case "${pr180_r8_name}"
+  fi
+fi
+
+# --- a `..` relative value is resolved from the same base -------------------
+# `foreign/../root/scripts/claw-sidestack-local` IS this wrapper, so the run is
+# permitted -- the base is what matters, not the shape of the value.
+pr180_r9_name="pr180_preview_dotdot_relative_wrapper_resolving_to_self_is_local"
+pr180_r9_dir="$(stage_layout "${pr180_r9_name}")"
+install_canonical "${pr180_r9_dir}" current
+mkdir -p "${pr180_r9_dir}/foreign"
+if RUN_CASE_CWD="${pr180_r9_dir}/root" \
+   run_case "${pr180_r9_name}" "${pr180_r9_dir}" 0 -- \
+     plan run ./plan.yaml --workspace-write-preview \
+     --wrapper ../root/scripts/claw-sidestack-local \
+     --workspace-root "${pr180_r9_dir}/foreign" >/dev/null; then
+  if assert_readiness_not_called "${pr180_r9_name}" "${pr180_r9_dir}/readiness.log" \
+     && assert_log_contains "${pr180_r9_name}" "${pr180_r9_dir}/fake_claw.log" 'IDENTITY=CANONICAL'; then
+    pass_case "${pr180_r9_name}"
+  fi
+fi
+
+# --- a BARE name is PATH-searched and therefore unprovable ------------------
+# execvp never consults the CWD for a slash-less program, and this wrapper has
+# no PATH fallback to lean on, so the only safe answer is to refuse -- even
+# when the workspace root IS this wrapper's own tree.
+pr180_r10_name="pr180_preview_bare_name_wrapper_is_unprovable_and_refuses"
+pr180_r10_dir="$(stage_layout "${pr180_r10_name}")"
+install_canonical "${pr180_r10_dir}" current
+if RUN_CASE_CWD="${pr180_r10_dir}/root" \
+   run_case "${pr180_r10_name}" "${pr180_r10_dir}" 9 -- \
+     plan run ./plan.yaml --workspace-write-preview \
+     --wrapper claw-sidestack-local \
+     --workspace-root "${pr180_r10_dir}/root" >/dev/null; then
+  if assert_readiness_not_called "${pr180_r10_name}" "${pr180_r10_dir}/readiness.log" \
+     && assert_fake_not_called "${pr180_r10_name}" "${pr180_r10_dir}/fake_claw.log"; then
+    pass_case "${pr180_r10_name}"
+  fi
+fi
+
+# --- NORMAL mode keeps its own base -----------------------------------------
+# A normal run cannot be relocated by `--workspace-root`, so its relative
+# explicit wrapper is judged against the CWD. Running from this tree with the
+# runner's own relative default is permitted.
+pr180_r11_name="pr180_normal_relative_explicit_self_wrapper_from_this_tree_is_local"
+pr180_r11_dir="$(stage_layout "${pr180_r11_name}")"
+install_canonical "${pr180_r11_dir}" current
+if RUN_CASE_CWD="${pr180_r11_dir}/root" \
+   run_case "${pr180_r11_name}" "${pr180_r11_dir}" 0 -- \
+     plan run ./plan.yaml --wrapper scripts/claw-sidestack-local >/dev/null; then
+  if assert_readiness_not_called "${pr180_r11_name}" "${pr180_r11_dir}/readiness.log" \
+     && assert_log_contains "${pr180_r11_name}" "${pr180_r11_dir}/fake_claw.log" 'IDENTITY=CANONICAL' \
+     && assert_no_decoy_executed "${pr180_r11_name}" "${pr180_r11_dir}/fake_claw.log"; then
+    pass_case "${pr180_r11_name}"
+  fi
+fi
+
+# ...and the same shape from a FOREIGN tree is refused, because the CWD-based
+# base is exactly what a normal run would spawn.
+pr180_r12_name="pr180_normal_relative_explicit_wrapper_from_a_foreign_tree_refuses"
+pr180_r12_dir="$(stage_layout "${pr180_r12_name}")"
+install_canonical "${pr180_r12_dir}" current
+write_logging_foreign_wrapper \
+  "${pr180_r12_dir}/foreign/scripts/claw-sidestack-local" \
+  "${pr180_r12_dir}/foreign_child.log"
+if RUN_CASE_CWD="${pr180_r12_dir}/foreign" \
+   run_case "${pr180_r12_name}" "${pr180_r12_dir}" 9 -- \
+     plan run ./plan.yaml --wrapper scripts/claw-sidestack-local >/dev/null; then
+  if assert_readiness_not_called "${pr180_r12_name}" "${pr180_r12_dir}/readiness.log" \
+     && assert_foreign_child_not_called "${pr180_r12_name}" "${pr180_r12_dir}/foreign_child.log" \
+     && assert_fake_not_called "${pr180_r12_name}" "${pr180_r12_dir}/fake_claw.log"; then
+    pass_case "${pr180_r12_name}"
   fi
 fi
 

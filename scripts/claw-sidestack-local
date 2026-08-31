@@ -829,6 +829,37 @@ n6_plan_workspace_root_override() {
   printf '%s' "${value}"
 }
 
+# Presence of a BOOLEAN plan-tail flag, mirroring the boolean arms of
+# `parse_plan_subcommand_args`.
+#
+# VALUE-SLOT AWARE, and that is the whole point. The parser consumes the token
+# after every value-taking flag, so in `--fast-model --dry-run` the `--dry-run`
+# is fast_model's VALUE and `dry_run` stays FALSE. A naive "argv contains
+# --dry-run" test would read that as a dry run and hand a spawn-capable
+# invocation a bypass -- exactly the mistake this helper exists to prevent.
+#
+# Over-reporting a flag the CLI would not set is the SAFE direction only for
+# spawn-capable modes; for the non-spawning `--dry-run` classification the
+# mirror must be exact, so the value-slot skip is mandatory here.
+n6_plan_has_flag() {
+  local wanted="$1"
+  shift
+  local -a rest=( "$@" )
+  local index=0 arg
+  while (( index < ${#rest[@]} )); do
+    arg="${rest[index]}"
+    if [[ "${arg}" == "${wanted}" ]]; then
+      return 0
+    fi
+    if n6_plan_flag_takes_value "${arg}"; then
+      index=$(( index + 2 ))
+      continue
+    fi
+    index=$(( index + 1 ))
+  done
+  return 1
+}
+
 # Absolute form of a path with its directory resolved, without requiring
 # `realpath` (absent by default on macOS).
 n6_resolve_path() {
@@ -851,7 +882,7 @@ n6_resolve_path() {
 n6_classify_invocation() {
   local -a rest=()
   local token subcommand wrapper_override resolved_wrapper self_wrapper
-  local plan_cwd_wrapper plan_spawn_wrapper plan_workspace_root
+  local plan_cwd_wrapper plan_spawn_wrapper plan_workspace_root plan_wrapper_base
 
   # Mirror the CLI's own precedence, which is NOT the order the tokens appear
   # in argv:
@@ -933,9 +964,81 @@ n6_classify_invocation() {
       # it is gated on its own — but ONLY while the runner uses its default
       # wrapper. An operator-supplied `--wrapper` breaks that proof.
       if [[ "${rest[1]-}" == "run" ]]; then
+        # -- Effective mode: DRY RUN. `--dry-run` reaches a NON-SPAWNING
+        #    outcome under BOTH branches of `run_plan_subcommand`, so no child
+        #    wrapper can run and its identity is irrelevant here:
+        #
+        #      with --workspace-write-preview  the preview branch is entered
+        #        first and returns EXIT_PARSE_ERROR before resolving a wrapper
+        #        or a workspace root. The parser rejects the pair outright too
+        #        ("--workspace-write-preview cannot be combined with
+        #        --dry-run"). ORDER CANNOT CHANGE THIS: both flags are
+        #        order-independent booleans tested AFTER the parse loop, so
+        #        `--dry-run --workspace-write-preview` and
+        #        `--workspace-write-preview --dry-run` are the same refusal.
+        #      without it  the dry-run arm builds its report from
+        #        `validate_plan` + `preflight::precheck` ONLY. It never binds a
+        #        wrapper path at all (`let wrapper_path = ...` lives in the
+        #        live `else` arm), never probes the substrate, and never spawns
+        #        a subprocess.
+        #
+        #    `--workspace-root` is likewise a parse error without
+        #    `--workspace-write-preview`, so it cannot move a spawn here either.
+        #
+        #    Canonical `claw` still execs locally to PERFORM the dry run. That
+        #    is the local validator, not a model-bearing child, and it is the
+        #    same local dispatch every other non-inference verb gets.
+        if n6_plan_has_flag --dry-run "${rest[@]}"; then
+          printf 'local'
+          return 0
+        fi
         self_wrapper="$(n6_resolve_path "${BASH_SOURCE[0]}" || true)"
         if wrapper_override="$(n6_plan_wrapper_override "${rest[@]}")"; then
-          resolved_wrapper="$(n6_resolve_path "${wrapper_override}" || true)"
+          # An explicit `--wrapper` is stored VERBATIM as `ClawCommand.program`
+          # and spawned as `Command::new(program).current_dir(<workspace-root>)`
+          # (`runner.rs:130-162`, `runner.rs:433-435`). The chdir happens BEFORE
+          # the exec, so which executable really runs depends on the PATH CLASS
+          # of the operator's value -- checking it against the CALLER's CWD
+          # proves the wrong file for two of the three classes:
+          #
+          #   absolute            base-independent. The child's chdir cannot
+          #                       move it, which is why an absolute path to
+          #                       this wrapper is the documented escape hatch
+          #                       for previewing into another tree.
+          #   relative with slash resolved by execvp AFTER the chdir, so the
+          #                       real program is `<execution-base>/<value>`.
+          #                       An identically named path under the caller's
+          #                       CWD proves NOTHING about it.
+          #   bare name, no slash execvp searches PATH and never the CWD. This
+          #                       wrapper has no PATH fallback and cannot prove
+          #                       which entry the child would pick, so it fails
+          #                       CLOSED.
+          #
+          # The execution base for a relative value is mode-specific:
+          #   preview  `--workspace-root` (else the CWD) -- the preview branch
+          #            passes it straight through as the step executor CWD.
+          #   normal   the CWD only. `--workspace-root` without
+          #            `--workspace-write-preview` is rejected by
+          #            `parse_plan_subcommand_args` (`main.rs:4661-4668`), so a
+          #            normal run cannot be relocated.
+          if [[ "${wrapper_override}" == /* ]]; then
+            resolved_wrapper="$(n6_resolve_path "${wrapper_override}" || true)"
+          elif [[ "${wrapper_override}" == */* ]]; then
+            plan_wrapper_base="."
+            if n6_plan_has_flag --workspace-write-preview "${rest[@]}"; then
+              if ! plan_workspace_root="$(n6_plan_workspace_root_override "${rest[@]}")" \
+                 || [[ -z "${plan_workspace_root}" ]]; then
+                plan_workspace_root="."
+              fi
+              plan_wrapper_base="${plan_workspace_root}"
+            fi
+            resolved_wrapper="$(n6_resolve_path \
+              "${plan_wrapper_base%/}/${wrapper_override}" || true)"
+          else
+            # PATH-searched: unprovable by construction. Left empty so the
+            # shared refusal below fires.
+            resolved_wrapper=""
+          fi
           if [[ -z "${self_wrapper}" || -z "${resolved_wrapper}" \
                 || "${resolved_wrapper}" != "${self_wrapper}" ]]; then
             # shellcheck disable=SC2016  # backticks in the user-facing message are literal
@@ -946,38 +1049,56 @@ n6_classify_invocation() {
         else
           # NO override. That is not the same as "safe": the runner default is
           # the RELATIVE path `scripts/claw-sidestack-local`, and nothing binds
-          # it to the tree this wrapper lives in. Two different bases resolve
-          # it, and both are checked:
+          # it to the tree this wrapper lives in. The step executor sets
+          # `Command::current_dir(<workspace-root>)` and the child resolves the
+          # relative program AFTER that chdir, so the executable that really
+          # runs is `<workspace-root>/scripts/claw-sidestack-local`.
           #
-          #   existence precheck  `wrapper_path.exists()` runs in the plan
-          #                       process, so it resolves against its CWD. When
-          #                       that path is absent the CLI reports
-          #                       substrate-unavailable and spawns NOTHING --
-          #                       no model-bearing child can run, so there is
-          #                       nothing to gate.
-          #   actual spawn        the step executor sets
-          #                       `Command::current_dir(<workspace-root>)`, and
-          #                       the child resolves the relative program AFTER
-          #                       that chdir. `--workspace-root` therefore moves
-          #                       the executable that really runs.
+          # WHICH bases must be proven depends on the EXECUTION MODE, because
+          # the two spawn-capable branches do not share a precheck:
           #
-          # Invoked by absolute path from another tree, `plan run` would hand
-          # every model-bearing step to THAT tree's
-          # scripts/claw-sidestack-local, which need not carry this gate.
-          plan_cwd_wrapper="$(n6_resolve_path "scripts/claw-sidestack-local" || true)"
-          if [[ -n "${plan_cwd_wrapper}" && -e "${plan_cwd_wrapper}" ]]; then
-            if ! plan_workspace_root="$(n6_plan_workspace_root_override "${rest[@]}")" \
-               || [[ -z "${plan_workspace_root}" ]]; then
-              plan_workspace_root="."
-            fi
-            plan_spawn_wrapper="$(n6_resolve_path "${plan_workspace_root%/}/scripts/claw-sidestack-local" || true)"
+          #   normal   the live arm runs `wrapper_path.exists()` in the plan
+          #            process (resolved against its CWD) BEFORE any spawn and
+          #            reports substrate-unavailable when it fails, so an
+          #            absent CWD default really does mean nothing spawns.
+          #            `--workspace-root` is a parse error without
+          #            `--workspace-write-preview`, so the CWD is the only base
+          #            that can carry a spawn.
+          #   preview  the `--workspace-write-preview` branch has NO
+          #            wrapper-existence precheck AT ALL, and
+          #            `run_plan_with_write_preview` still spawns every
+          #            read-only step preceding the lone workspace-write step
+          #            through `<workspace-root>/scripts/claw-sidestack-local`.
+          #            An absent CWD default proves NOTHING about that spawn,
+          #            so the effective workspace-root wrapper is validated on
+          #            its own and an unresolvable one fails CLOSED. The
+          #            escape hatch for a foreign workspace root is an explicit
+          #            `--wrapper` pointing at this wrapper: an ABSOLUTE
+          #            program path ignores the child's chdir.
+          if ! plan_workspace_root="$(n6_plan_workspace_root_override "${rest[@]}")" \
+             || [[ -z "${plan_workspace_root}" ]]; then
+            plan_workspace_root="."
+          fi
+          plan_spawn_wrapper="$(n6_resolve_path "${plan_workspace_root%/}/scripts/claw-sidestack-local" || true)"
+          if n6_plan_has_flag --workspace-write-preview "${rest[@]}"; then
             if [[ -z "${self_wrapper}" || -z "${plan_spawn_wrapper}" \
-                  || "${plan_cwd_wrapper}" != "${self_wrapper}" \
                   || "${plan_spawn_wrapper}" != "${self_wrapper}" ]]; then
               # shellcheck disable=SC2016  # backticks in the user-facing message are literal
-              printf 'refuse|`claw plan run` without --wrapper spawns its model-bearing steps through the runner default `scripts/claw-sidestack-local`, which resolves to %s, not to this wrapper (%s). Those steps are not proven to pass the readiness gate. Run the plan from the tree this wrapper lives in, or pass --wrapper pointing at this wrapper.' \
-                "${plan_spawn_wrapper:-${plan_cwd_wrapper}}" "${self_wrapper:-<unresolvable>}"
+              printf 'refuse|`claw plan run --workspace-write-preview` spawns the read-only steps before its workspace-write step through `<workspace-root>/scripts/claw-sidestack-local`, which resolves to %s, not to this wrapper (%s), and this branch has no wrapper-existence precheck to stop it. Those steps are not proven to pass the readiness gate. Point --workspace-root at the tree this wrapper lives in, or pass --wrapper pointing at this wrapper.' \
+                "${plan_spawn_wrapper:-<unresolvable>}" "${self_wrapper:-<unresolvable>}"
               return 0
+            fi
+          else
+            plan_cwd_wrapper="$(n6_resolve_path "scripts/claw-sidestack-local" || true)"
+            if [[ -n "${plan_cwd_wrapper}" && -e "${plan_cwd_wrapper}" ]]; then
+              if [[ -z "${self_wrapper}" || -z "${plan_spawn_wrapper}" \
+                    || "${plan_cwd_wrapper}" != "${self_wrapper}" \
+                    || "${plan_spawn_wrapper}" != "${self_wrapper}" ]]; then
+                # shellcheck disable=SC2016  # backticks in the user-facing message are literal
+                printf 'refuse|`claw plan run` without --wrapper spawns its model-bearing steps through the runner default `scripts/claw-sidestack-local`, which resolves to %s, not to this wrapper (%s). Those steps are not proven to pass the readiness gate. Run the plan from the tree this wrapper lives in, or pass --wrapper pointing at this wrapper.' \
+                  "${plan_spawn_wrapper:-${plan_cwd_wrapper}}" "${self_wrapper:-<unresolvable>}"
+                return 0
+              fi
             fi
           fi
         fi
