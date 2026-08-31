@@ -334,6 +334,23 @@ The wrapper:
 
 A committed `.vscode/tasks.json` exposes the broker-routed wrapper through VS Code's Command Palette (`Tasks: Run Task`). Tasks are read-only by default and delegate every invocation to `scripts/claw-sidestack-local`, so LAW 1 stays centralized in one place. See [`docs/editor-vscode.md`](docs/editor-vscode.md) for the task list, offline validation, and the live-broker validation gate.
 
+###### Manual smoke helper: `claw-sidestack-smoke`
+
+A separate, manual-only helper lives at [`scripts/claw-sidestack-smoke`](scripts/claw-sidestack-smoke) for the cases where you want to verify the wrapper end-to-end without typing the prompt yourself. It is **not** part of CI and has no default live behaviour.
+
+```bash
+# Print usage. No broker calls.
+./scripts/claw-sidestack-smoke
+
+# Print the checks that --live would run. Still no broker calls.
+./scripts/claw-sidestack-smoke --dry-run
+
+# Actually run the smoke. Manual-only — only invoke when broker/model state is acceptable.
+./scripts/claw-sidestack-smoke --live
+```
+
+`--live` performs, in order: a `curl` PATH check, an executable check on `scripts/claw-sidestack-local`, a LAW 1 / allowlist check on the `OPENAI_BASE_URL` from [`examples/sidestack-local.env`](examples/sidestack-local.env) (refusing raw `:11434` and any non-broker URL), a `GET <base>/models` reachability probe, and finally one trivial `--model fast prompt "reply with the word ready"` invocation through the wrapper. It sends exactly one prompt — no loops, no retries — and is intended to be run by hand. It is **not** wired into CI.
+
 ### Anthropic-compatible endpoint
 
 ```bash

@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# claw-sidestack-smoke — manual-only smoke helper for the SideStackAI local
+# wrapper at scripts/claw-sidestack-local.
+#
+# Default (no args) prints usage and exits 0. No broker calls. No `claw`
+# invocation.
+#
+# --dry-run: prints the checks that --live would run. Still no broker calls.
+#
+# --live: explicit, manual-only. Performs:
+#   1. require `curl` on PATH
+#   2. require scripts/claw-sidestack-local is executable
+#   3. inspect examples/sidestack-local.env for OPENAI_BASE_URL
+#   4. refuse if the URL contains :11434 (LAW 1)
+#   5. require URL matches http://(127.0.0.1|localhost):11435(/.*)?
+#   6. GET <base>/models — refuse to prompt if it fails
+#   7. exec exactly one trivial prompt via scripts/claw-sidestack-local
+#
+# Manual-only. Not wired into CI. Run only when broker/model state is
+# acceptable.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+WRAPPER="${REPO_ROOT}/scripts/claw-sidestack-local"
+ENV_FILE="${REPO_ROOT}/examples/sidestack-local.env"
+
+usage() {
+  cat <<'USAGE'
+Usage: scripts/claw-sidestack-smoke [--dry-run | --live | -h | --help]
+
+Manual smoke helper for the SideStackAI local wrapper.
+
+Default (no args) prints this usage. No broker calls are made.
+
+  --dry-run   Print the checks that --live would run. No broker calls.
+  --live      Run the smoke. Sources examples/sidestack-local.env, validates
+              the broker URL (LAW 1: refuses :11434, enforces :11435 allowlist),
+              checks GET <base>/models, then execs ONE trivial prompt through
+              scripts/claw-sidestack-local. Manual-only; not wired into CI.
+  -h, --help  Show this message.
+USAGE
+}
+
+if (($# == 0)); then
+  usage
+  exit 0
+fi
+
+if (($# > 1)); then
+  printf 'claw-sidestack-smoke: too many arguments\n' >&2
+  usage >&2
+  exit 64
+fi
+
+mode="$1"
+
+case "${mode}" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  --dry-run)
+    cat <<EOF
+claw-sidestack-smoke (dry-run): --live would perform the following checks before any prompt.
+  1. require 'curl' on PATH
+  2. require executable wrapper at ${WRAPPER}
+  3. read OPENAI_BASE_URL from ${ENV_FILE}
+  4. refuse if OPENAI_BASE_URL contains ':11434' (LAW 1)
+  5. require OPENAI_BASE_URL matches http://(127.0.0.1|localhost):11435(/.*)?
+  6. GET <base>/models against the broker
+  7. exec exactly one prompt: scripts/claw-sidestack-local --model fast prompt "reply with the word ready"
+No broker calls were made.
+EOF
+    exit 0
+    ;;
+  --live)
+    : # fall through to --live path below
+    ;;
+  *)
+    printf 'claw-sidestack-smoke: unknown argument: %s\n' "${mode}" >&2
+    usage >&2
+    exit 64
+    ;;
+esac
+
+# ----- --live path -----
+
+if ! command -v curl >/dev/null 2>&1; then
+  printf 'claw-sidestack-smoke: curl not found on PATH (required for --live).\n' >&2
+  exit 5
+fi
+
+if [[ ! -x "${WRAPPER}" ]]; then
+  printf 'claw-sidestack-smoke: wrapper missing or not executable: %s\n' "${WRAPPER}" >&2
+  exit 6
+fi
+
+if [[ ! -f "${ENV_FILE}" ]]; then
+  printf 'claw-sidestack-smoke: env file not found: %s\n' "${ENV_FILE}" >&2
+  exit 6
+fi
+
+# Extract OPENAI_BASE_URL from the env file via a clean subshell. We only
+# need the URL; we do not want the env file's exports to leak into the
+# wrapper exec below (the wrapper sources the file itself).
+# shellcheck disable=SC1090
+BROKER_URL="$(set -euo pipefail; source "${ENV_FILE}"; printf '%s' "${OPENAI_BASE_URL:-}")"
+
+if [[ -z "${BROKER_URL}" ]]; then
+  printf 'claw-sidestack-smoke: OPENAI_BASE_URL was empty after sourcing %s\n' "${ENV_FILE}" >&2
+  exit 7
+fi
+
+if [[ "${BROKER_URL}" == *11434* ]]; then
+  printf 'claw-sidestack-smoke: LAW 1 refusal — OPENAI_BASE_URL must not point at :11434.\n' >&2
+  printf '  offending value: %s\n' "${BROKER_URL}" >&2
+  exit 7
+fi
+
+BROKER_ALLOWLIST_REGEX='^http://(127\.0\.0\.1|localhost):11435(/.*)?$'
+if [[ ! "${BROKER_URL}" =~ ${BROKER_ALLOWLIST_REGEX} ]]; then
+  printf 'claw-sidestack-smoke: OPENAI_BASE_URL is not an allowed SideStackAI broker URL.\n' >&2
+  printf '  offending value: %s\n' "${BROKER_URL}" >&2
+  printf '  allowlist regex: %s\n' "${BROKER_ALLOWLIST_REGEX}" >&2
+  exit 7
+fi
+
+MODELS_URL="${BROKER_URL%/v1}/v1/models"
+
+printf 'claw-sidestack-smoke: checking models endpoint %s\n' "${MODELS_URL}" >&2
+if ! curl -fsS -o /dev/null --max-time 10 "${MODELS_URL}"; then
+  printf 'claw-sidestack-smoke: broker models endpoint check failed — refusing to prompt.\n' >&2
+  exit 8
+fi
+
+printf 'claw-sidestack-smoke: models endpoint OK; sending one trivial prompt via wrapper.\n' >&2
+exec "${WRAPPER}" --model fast prompt "reply with the word ready"
