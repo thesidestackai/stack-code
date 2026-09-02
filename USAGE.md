@@ -399,6 +399,54 @@ This is the same kind of boundary as the readiness-GET-to-inference-POST race de
 
 This is a prerequisite of the SideStackAI inference wrapper only, not of the repository as a whole. Locally dispatched invocations — `--help`, `--version`, `version`, `status`, `doctor`, `plan run`, and the other non-inference subcommands — never perform a readiness GET, are never version-checked, and keep working on an older `curl` or on a host with no `curl` at all.
 
+###### Two-part enforcement: the startup gate and the in-process gate
+
+Everything above describes the **startup shell gate**, and it can only judge what exists before `exec`:
+
+- it resolves the model from the command line and the profile, refusing (exit 9) rather than guessing when the resolution is not provably terminal;
+- it validates the effective `OPENAI_BASE_URL` against the local broker allowlist and refuses `:11434` outright;
+- it performs one bounded readiness GET for that resolved model and refuses (exit 8) if the broker declines;
+- it applies the same wrapper contract to the subprocesses a `plan run` spawns.
+
+Once the canonical binary is running, none of that is consulted again. A REPL `/model` switch, an Agent primary or fallback selection, a config-supplied primary, and every provider retry all pick a model *after* the wrapper is gone. A startup-only gate says nothing about any of them.
+
+So the wrapper exports one marker immediately before `exec`:
+
+```
+CLAW_SIDESTACK_N6_ENFORCE=1
+```
+
+It is set by the wrapper and nowhere else, carries no secret, and is deliberately not a reuse of `RUSTY_CLAUDE_LLM_CALLER` — that variable carries broker telemetry semantics and comes from a user-editable env file, so enforcement keyed off it could drift and fail open.
+
+That marker turns on the **in-process gate** inside `claw` itself:
+
+- **Every outbound broker inference HTTP attempt performs its own fresh readiness check**, for the exact model string the request payload will carry. This sits inside the provider retry loop, so retry number four is gated exactly as tightly as the first attempt, however long the backoff was.
+- **There is no admission cache.** Not per process, not per model, not time-based. A readiness answer admits exactly the one attempt that follows it; the next attempt asks again. Caching would turn a momentary yes into a standing permission, and the broker issues no lease, epoch, or residency token that a client could legitimately hold.
+- The model the broker is asked to admit and the model the payload carries come from a single shared resolver, so a `fast` alias or an `openai/` routing prefix cannot cause the guard to vet one model while another is sent.
+- A refusal is **non-retryable and non-fallbackable**. It does not trigger a provider retry, and it does not cause the Agent to try the next model in its fallback chain — each fallback entry that does run gets its own readiness decision immediately before its own attempt.
+
+**LAW 1, in process.** While the marker is active, off-broker model-bearing traffic is refused *before any network call*:
+
+- direct Anthropic inference is refused;
+- ordinary cloud OpenAI-compatible endpoints (OpenAI, DashScope, xAI, and anything else reached over a non-broker base URL) are refused;
+- **raw `:11434` application inference is refused**, matching the wrapper's startup LAW 1.
+
+Only an OpenAI-compatible provider whose base URL validates as the local broker — plain `http`, host exactly `127.0.0.1` or `localhost`, port explicitly `11435`, no userinfo, query, or fragment, and one of the canonical `/`, `/v1`, `/v1/chat/completions` path shapes — may carry inference at all, and it is then subject to the per-attempt readiness check above.
+
+When the marker is absent, the in-process routing gate is inert and ordinary upstream provider behaviour is unchanged, with no readiness traffic generated. The per-attempt readiness check does **not** depend on the marker, so a canonical `claw` pointed directly at `:11435` without the wrapper is still admission-gated.
+
+**Transport of an admitted request.** Validating the destination and refreshing readiness would both be worth less if the transport could then move the request somewhere else on its own, so the HTTP client that carries an admitted broker inference `POST` bypasses proxies and follows no redirects:
+
+- **Proxies are bypassed.** `HTTP_PROXY` / `HTTPS_PROXY` (either spelling) and a programmatic `proxy_url` are all ignored for this request, and reqwest's own system-proxy detection stays off. You do not have to set `NO_PROXY` for the broker, and setting it is not what provides this.
+- **Redirects are not followed.** A `301`, `302`, `303`, `307`, or `308` from the broker origin is surfaced as an ordinary provider error rather than followed. `307` and `308` matter most because they would otherwise re-send the method and the whole model-bearing body to the redirect target. No second destination is contacted, and because the resulting error is not retryable it also cannot fall back to another model.
+
+Together these mean an admitted request is one direct, non-proxied, non-redirecting send to the origin Layer A validated and Layer B admitted — the client cannot voluntarily route it to another HTTP origin after approval.
+
+This applies **only** to a destination that validates as the local broker. Ordinary upstream OpenAI-compatible providers keep their existing proxy and redirect behaviour; see [HTTP proxy support](#http-proxy-support).
+
+**Residual race, restated.** The in-process gate narrows the time-of-check/time-of-use window; it does not close it. Client readiness is still not a broker admission reservation: the readiness `GET` and the inference `POST` remain two separate requests, and the broker's state can change between them. This is the same residual described above, now measured per attempt rather than once per process. Nothing here pins a provider or an executable beyond the trust model already stated, and `http_request` is not affected — it is a general-purpose HTTP tool, not a model-bearing inference path.
+
+
 ###### Editor integration: VS Code task wrapper
 
 A committed `.vscode/tasks.json` exposes the broker-routed wrapper through VS Code's Command Palette (`Tasks: Run Task`). Tasks are read-only by default and delegate every invocation to `scripts/claw-sidestack-local`, so LAW 1 stays centralized in one place. See [`docs/editor-vscode.md`](docs/editor-vscode.md) for the task list, offline validation, and the live-broker validation gate.
@@ -569,6 +617,7 @@ let client = build_http_client_with(&config).expect("proxy client");
 - `NO_PROXY` accepts a comma-separated list of host suffixes (for example `.corp.example`) and IP literals.
 - Empty values are treated as unset, so leaving `HTTPS_PROXY=""` in your shell will not enable a proxy.
 - If a proxy URL cannot be parsed, `claw` falls back to a direct (no-proxy) client so existing workflows keep working; double-check the URL if you expected the request to be tunnelled.
+- **Exception — local broker inference.** An inference request whose destination validates as the local SideStack broker never traverses a proxy and never follows a redirect, whatever these variables say. This is a deliberate containment property of the readiness gate, not a bug; see [the in-process gate](#two-part-enforcement-the-startup-gate-and-the-in-process-gate). Every other outbound request, including inference to any non-broker provider, is unaffected.
 
 ## Common operational commands
 

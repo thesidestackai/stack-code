@@ -1,4 +1,5 @@
 use crate::error::ApiError;
+use crate::n6_admission::{self, BrokerOrigin};
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 use crate::providers::anthropic::{self, AnthropicClient, AuthSource};
 use crate::providers::openai_compat::{self, OpenAiCompatClient, OpenAiCompatConfig};
@@ -79,10 +80,51 @@ impl ProviderClient {
         }
     }
 
+    /// Layer A: LAW-1 routing containment.
+    ///
+    /// When the dedicated `SideStack` process marker is active, this process was
+    /// launched by the protected wrapper for local coding, and the only
+    /// destination that may carry model-bearing inference is a validated
+    /// loopback broker origin. Every other route — Anthropic, cloud
+    /// OpenAI-compatible endpoints, `DashScope`, raw `:11434` — is refused here,
+    /// before any network call and before any readiness query.
+    ///
+    /// The match over provider variants is exhaustive on purpose: a future
+    /// provider must be classified deliberately rather than silently admitted
+    /// by a wildcard arm.
+    ///
+    /// When the marker is absent this is inert and ordinary upstream behaviour
+    /// is unchanged.
+    fn enforce_sidestack_routing(&self, request: &MessageRequest) -> Result<(), ApiError> {
+        if !n6_admission::marker_active() {
+            return Ok(());
+        }
+        match self {
+            Self::Xai(client) | Self::OpenAi(client) => {
+                if BrokerOrigin::from_base_url(client.base_url()).is_some() {
+                    Ok(())
+                } else {
+                    Err(ApiError::n6_routing_refused(
+                        &request.model,
+                        format!(
+                            "the SideStack process marker is set, so inference may only go to the local broker on port 11435; this request targets {}",
+                            client.base_url()
+                        ),
+                    ))
+                }
+            }
+            Self::Anthropic(_) => Err(ApiError::n6_routing_refused(
+                &request.model,
+                "the SideStack process marker is set, so direct Anthropic inference is not an allowed route",
+            )),
+        }
+    }
+
     pub async fn send_message(
         &self,
         request: &MessageRequest,
     ) -> Result<MessageResponse, ApiError> {
+        self.enforce_sidestack_routing(request)?;
         match self {
             Self::Anthropic(client) => client.send_message(request).await,
             Self::Xai(client) | Self::OpenAi(client) => client.send_message(request).await,
@@ -93,6 +135,7 @@ impl ProviderClient {
         &self,
         request: &MessageRequest,
     ) -> Result<MessageStream, ApiError> {
+        self.enforce_sidestack_routing(request)?;
         match self {
             Self::Anthropic(client) => client
                 .stream_message(request)

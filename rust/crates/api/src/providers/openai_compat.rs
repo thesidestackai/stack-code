@@ -1,12 +1,14 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::error::ApiError;
+use crate::error::{ApiError, N6RefusalKind};
 use crate::http_client::build_http_client_or_default;
+use crate::n6_admission::{BrokerOrigin, HttpReadinessAuthority, N6ReadinessAuthority};
 use crate::types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
     InputContentBlock, InputMessage, MessageDelta, MessageDeltaEvent, MessageRequest,
@@ -110,6 +112,25 @@ pub struct OpenAiCompatClient {
     max_retries: u32,
     initial_backoff: Duration,
     max_backoff: Duration,
+    /// Layer B authority consulted once per outbound inference HTTP attempt
+    /// whenever `base_url` validates as a `SideStack` broker origin. Installed by
+    /// `new` so no construction path can accidentally skip admission.
+    n6_authority: Arc<dyn N6ReadinessAuthority>,
+    /// Optional additional origin that forces Layer B admission on this client.
+    /// It is OR-ed with the `base_url`-derived origin, so it can only ever
+    /// widen admission, never disable it. No production path sets it.
+    n6_origin_override: Option<BrokerOrigin>,
+    /// Transport used for the inference POST once Layer B has admitted it.
+    ///
+    /// Proxies are disabled and redirects are refused, so an admitted
+    /// model-bearing request cannot leave the validated broker origin: a proxy
+    /// hop or a `Location` header would both carry it to a destination Layer A
+    /// never validated and Layer B never admitted, and a followed redirect
+    /// would additionally be a second outbound inference attempt with no
+    /// readiness decision of its own. `None` when the client could not be
+    /// built, which refuses rather than falling back to a proxy-honouring
+    /// default -- the same fail-closed shape the readiness client uses.
+    broker_http: Option<reqwest::Client>,
 }
 
 impl OpenAiCompatClient {
@@ -131,7 +152,35 @@ impl OpenAiCompatClient {
             max_retries: DEFAULT_MAX_RETRIES,
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
             max_backoff: DEFAULT_MAX_BACKOFF,
+            n6_authority: Arc::new(HttpReadinessAuthority::new()),
+            n6_origin_override: None,
+            broker_http: build_broker_inference_client(),
         }
+    }
+
+    /// Replace the N6 readiness authority.
+    ///
+    /// Production callers never need this — [`OpenAiCompatClient::new`] already
+    /// installs the real HTTP authority. It exists so tests can script
+    /// readiness decisions without contacting a broker.
+    #[must_use]
+    pub fn with_n6_authority(mut self, authority: Arc<dyn N6ReadinessAuthority>) -> Self {
+        self.n6_authority = authority;
+        self
+    }
+
+    /// Force N6 admission on this client using an explicit broker origin.
+    ///
+    /// The override is OR-ed with the origin derived from `base_url`, so it can
+    /// only ever *add* admission to a client that would otherwise be ungated —
+    /// it cannot switch admission off, and it cannot move readiness anywhere a
+    /// [`BrokerOrigin`] could not already point. No production path calls this;
+    /// it exists so the admission path can be exercised against a loopback
+    /// fixture server instead of the real broker port.
+    #[must_use]
+    pub fn with_n6_broker_origin(mut self, origin: BrokerOrigin) -> Self {
+        self.n6_origin_override = Some(origin);
+        self
     }
 
     pub fn from_env(config: OpenAiCompatConfig) -> Result<Self, ApiError> {
@@ -274,9 +323,42 @@ impl OpenAiCompatClient {
         // Pre-flight check: verify request body size against provider limits
         check_request_body_size(request, self.config())?;
 
+        // Layer B: N6 admission. This sits inside the retry loop, immediately
+        // before the outbound POST, so every attempt — including retry 8 after
+        // a long backoff — carries its own fresh readiness decision. There is
+        // deliberately no cache: a readiness answer admits exactly the one
+        // attempt that follows it. Non-broker destinations are untouched and
+        // generate no readiness traffic at all.
+        let gated_origin = self
+            .n6_origin_override
+            .clone()
+            .or_else(|| BrokerOrigin::from_base_url(&self.base_url));
+        //
+        // The transport is chosen from the very same `gated_origin` value, so
+        // the hardened client and the admission decision can never disagree
+        // about what counts as the broker; there is no second parser and no
+        // second notion of "is this SideStack".
+        let http = if let Some(origin) = gated_origin {
+            let wire_model = wire_model_for_request(request);
+            self.n6_authority.check(&origin, &wire_model).await?;
+            let Some(broker_http) = self.broker_http.as_ref() else {
+                return Err(ApiError::N6AdmissionRefused {
+                    model: wire_model,
+                    kind: N6RefusalKind::Transport(
+                        "broker inference http client could not be built with proxies \
+                         disabled and redirects refused"
+                            .to_string(),
+                    ),
+                });
+            };
+            broker_http
+        } else {
+            // Ordinary upstream: unchanged proxy and redirect behaviour.
+            &self.http
+        };
+
         let request_url = chat_completions_endpoint(&self.base_url);
-        let mut builder = self
-            .http
+        let mut builder = http
             .post(&request_url)
             .header("content-type", "application/json")
             .bearer_auth(&self.api_key);
@@ -824,6 +906,40 @@ fn strip_routing_prefix(model: &str) -> &str {
     }
 }
 
+/// The model strings one request resolves to.
+struct ResolvedModels {
+    /// After opt-in env alias resolution, before routing-prefix stripping.
+    /// Reasoning detection and the max-tokens table key off this.
+    effective: String,
+    /// What the outbound `"model"` payload field will carry, and therefore the
+    /// exact identity the broker must admit.
+    wire: String,
+}
+
+/// The single source of truth for request model resolution.
+///
+/// Opt-in env alias resolution first (`fast` → `qwen3:14b`), then
+/// routing-prefix stripping (`openai/gpt-4` → `gpt-4`). Both the payload
+/// builder and [`wire_model_for_request`] go through here, so the model the
+/// broker is asked to admit cannot drift from the model it is then asked to
+/// run.
+fn resolve_request_models(request: &MessageRequest) -> ResolvedModels {
+    let aliased_model = resolve_model_alias(&request.model);
+    let effective = aliased_model.unwrap_or_else(|| request.model.clone());
+    let wire = strip_routing_prefix(&effective).to_string();
+    ResolvedModels { effective, wire }
+}
+
+/// The exact model string that will appear in the outbound `"model"` payload
+/// field for `request`.
+///
+/// The N6 admission guard calls this so its readiness query names the identical
+/// model the subsequent inference request will carry.
+#[must_use]
+pub fn wire_model_for_request(request: &MessageRequest) -> String {
+    resolve_request_models(request).wire
+}
+
 /// Estimate the serialized JSON size of a request payload in bytes.
 /// This is a pre-flight check to avoid hitting provider-specific size limits.
 pub fn estimate_request_body_size(request: &MessageRequest, config: OpenAiCompatConfig) -> usize {
@@ -866,13 +982,15 @@ pub fn build_chat_completion_request(
             "content": system,
         }));
     }
-    // Resolve opt-in local model alias (e.g. `fast` → `qwen3:14b`) before
-    // any wire-model decisions so reasoning detection, max-tokens key, and
-    // the payload `model` field all see the same effective string.
-    let aliased_model = resolve_model_alias(&request.model);
-    let effective_model = aliased_model.as_deref().unwrap_or(&request.model);
-    // Strip routing prefix (e.g., "openai/gpt-4" → "gpt-4") for the wire.
-    let wire_model = strip_routing_prefix(effective_model);
+    // Resolve opt-in local model alias (e.g. `fast` → `qwen3:14b`) before any
+    // wire-model decisions so reasoning detection, max-tokens key, and the
+    // payload `model` field all see the same effective string, then strip the
+    // routing prefix (e.g. "openai/gpt-4" → "gpt-4") for the wire. This goes
+    // through the shared resolver so the N6 admission guard asks about exactly
+    // the model this payload will carry.
+    let resolved_models = resolve_request_models(request);
+    let effective_model = resolved_models.effective.as_str();
+    let wire_model = resolved_models.wire.as_str();
     for message in &request.messages {
         messages.extend(translate_message(message, wire_model));
     }
@@ -1435,6 +1553,43 @@ pub fn has_api_key(key: &str) -> bool {
 #[must_use]
 pub fn read_base_url(config: OpenAiCompatConfig) -> String {
     std::env::var(config.base_url_env).unwrap_or_else(|_| config.default_base_url.to_string())
+}
+
+/// Build the transport used for an inference POST to a validated `SideStack`
+/// broker origin.
+///
+/// Layer A validates the logical destination and Layer B refreshes readiness
+/// immediately before the POST. Neither is worth anything if the transport can
+/// then move the request somewhere else on its own, so this client is built to
+/// have no such freedom:
+///
+/// * `no_proxy()` — the ordinary client installs `HTTP_PROXY` / `HTTPS_PROXY`
+///   (and a config-supplied unified proxy) via
+///   [`crate::http_client::build_http_client_with`]. A proxied broker request
+///   would hand the model-bearing body to a host the guard never validated,
+///   and `NO_PROXY` cannot be relied on because the operator may not have set
+///   it. This also leaves reqwest's own system-proxy auto-detection off.
+/// * `redirect(Policy::none())` — reqwest follows redirects by default. A
+///   301/302/303 would re-issue the request against an unvalidated origin, and
+///   a 307/308 would carry the method and the whole body there. Either way it
+///   is an outbound inference attempt below Layer B with no readiness decision
+///   of its own. The 3xx is surfaced to the existing provider error path
+///   instead, and no second destination is contacted.
+///
+/// Nothing else is configured, so every other property of the client matches
+/// the ordinary one — which differs from reqwest's defaults only in its proxy
+/// installation. Same-origin redirect following is deliberately not
+/// implemented here; zero redirects is the simplest safe behaviour.
+///
+/// Returns `None` if the client cannot be built, which the caller turns into a
+/// refusal. Falling back to a default client would silently restore both
+/// escapes.
+fn build_broker_inference_client() -> Option<reqwest::Client> {
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .ok()
 }
 
 fn chat_completions_endpoint(base_url: &str) -> String {

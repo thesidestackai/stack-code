@@ -65,6 +65,7 @@ log="\${FAKE_CLAW_LOG:?FAKE_CLAW_LOG must be set}"
   printf 'OPENAI_BASE_URL=%s\n' "\${OPENAI_BASE_URL:-}"
   printf 'RUSTY_CLAUDE_LLM_CALLER=%s\n' "\${RUSTY_CLAUDE_LLM_CALLER:-}"
   printf 'RUSTY_CLAUDE_TASK_TYPE=%s\n' "\${RUSTY_CLAUDE_TASK_TYPE:-}"
+  printf 'CLAW_SIDESTACK_N6_ENFORCE=%s\n' "\${CLAW_SIDESTACK_N6_ENFORCE:-}"
   printf 'ARGC=%d\n' "\$#"
   for arg in "\$@"; do
     printf 'ARG=%s\n' "\${arg}"
@@ -3059,6 +3060,173 @@ if RUN_CASE_CWD="${pr180_r12_dir}/foreign" \
      && assert_fake_not_called "${pr180_r12_name}" "${pr180_r12_dir}/fake_claw.log"; then
     pass_case "${pr180_r12_name}"
   fi
+fi
+
+# ---------- cases pr180_r13-r17: the ACP compatibility flags stay local -----
+# `parse_args_with_terminal` rewrites BOTH `--acp` and `-acp` into the bare
+# positional `acp`, which dispatches `print_acp_status` -- a local printer that
+# constructs no LiveCli and issues no provider request. `claw acp` is already
+# covered by the non-inference loop above; these cases pin the two dash forms
+# to the same verdict, and pin the two terminals that must still outrank them.
+
+# ---------- case pr180_r13: `--acp` is local -------------------------------
+pr180_r13_name="pr180_acp_long_compatibility_flag_is_local"
+pr180_r13_dir="$(stage_layout "${pr180_r13_name}")"
+install_canonical "${pr180_r13_dir}" current
+if run_case "${pr180_r13_name}" "${pr180_r13_dir}" 0 -- --acp >/dev/null; then
+  if assert_canonical_ran "${pr180_r13_name}" "${pr180_r13_dir}" --acp \
+     && assert_readiness_not_called "${pr180_r13_name}" "${pr180_r13_dir}/readiness.log" \
+     && assert_no_decoy_executed "${pr180_r13_name}" "${pr180_r13_dir}/fake_claw.log"; then
+    pass_case "${pr180_r13_name}"
+  fi
+fi
+
+# ---------- case pr180_r14: `-acp` is local --------------------------------
+# The single-dash spelling is a real CLI arm, not a typo the parser tolerates,
+# so it must not be swept up by the leading-unknown-dash drop either.
+pr180_r14_name="pr180_acp_short_compatibility_flag_is_local"
+pr180_r14_dir="$(stage_layout "${pr180_r14_name}")"
+install_canonical "${pr180_r14_dir}" current
+if run_case "${pr180_r14_name}" "${pr180_r14_dir}" 0 -- -acp >/dev/null; then
+  if assert_canonical_ran "${pr180_r14_name}" "${pr180_r14_dir}" -acp \
+     && assert_readiness_not_called "${pr180_r14_name}" "${pr180_r14_dir}/readiness.log" \
+     && assert_no_decoy_executed "${pr180_r14_name}" "${pr180_r14_dir}/fake_claw.log"; then
+    pass_case "${pr180_r14_name}"
+  fi
+fi
+
+# ---------- case pr180_r15: the ACP tail rides along with the rewrite ------
+# The rewrite must PUSH a positional, not swallow the flag: `--acp serve` has
+# to reconstruct as `acp serve`, the same two-token vector `acp serve` builds,
+# so the tail keeps deciding what the invocation is. A rewrite that dropped
+# the tail would classify on `acp` alone and call every `--acp …` shape local
+# no matter what followed.
+pr180_r15_name="pr180_acp_compatibility_flag_keeps_its_tail"
+pr180_r15_dir="$(stage_layout "${pr180_r15_name}")"
+install_canonical "${pr180_r15_dir}" current
+if run_case "${pr180_r15_name}" "${pr180_r15_dir}" 0 -- --acp serve >/dev/null; then
+  if assert_canonical_ran "${pr180_r15_name}" "${pr180_r15_dir}" --acp \
+     && assert_readiness_not_called "${pr180_r15_name}" "${pr180_r15_dir}/readiness.log" \
+     && assert_no_decoy_executed "${pr180_r15_name}" "${pr180_r15_dir}/fake_claw.log"; then
+    pass_case "${pr180_r15_name}"
+  fi
+fi
+
+# ---------- case pr180_r16: `-p` still outranks the ACP flag ---------------
+# `-p` RETURNS `CliAction::Prompt` from inside the CLI's argument loop, so a
+# leading `--acp` never gets to make the invocation local. The classifier
+# settles the `-p` terminal before it reads the reconstructed vector at all;
+# this pins that ordering so the ACP rewrite can never become an inference
+# bypass. Readiness is queried, refuses, and the canonical claw never runs.
+pr180_r16_name="pr180_acp_compatibility_flag_does_not_mask_a_prompt_terminal"
+pr180_r16_dir="$(stage_layout "${pr180_r16_name}")"
+install_canonical "${pr180_r16_dir}" current
+write_fake_readiness_client "${pr180_r16_dir}" 0 200 "$(refusal_body BROKER_BUSY)"
+if run_case "${pr180_r16_name}" "${pr180_r16_dir}" 8 -- \
+     --acp --model fast -p hello >/dev/null; then
+  if assert_readiness_called_for "${pr180_r16_name}" "${pr180_r16_dir}/readiness.log" \
+       'qwen3%3A14b' \
+     && assert_stderr_contains "${pr180_r16_name}" "${pr180_r16_dir}/wrapper.stderr" \
+          'local coding readiness refused' \
+     && assert_fake_not_called "${pr180_r16_name}" "${pr180_r16_dir}/fake_claw.log" \
+     && assert_no_decoy_executed "${pr180_r16_name}" "${pr180_r16_dir}/fake_claw.log"; then
+    pass_case "${pr180_r16_name}"
+  fi
+fi
+
+# ---------- case pr180_r17: `--resume` still outranks the ACP flag ---------
+# `--acp --resume` is a CLI USAGE ERROR, not a resumed session: `--acp` fills
+# the positional vector first, so the `--resume` arm's `rest.is_empty()` guard
+# fails and `--resume` is pushed as a plain positional, leaving
+# `parse_acp_args(["--resume"])` to reject the pair. This wrapper does not
+# model that distinction -- `n6_forces_inference` settles `--resume` before the
+# vector is read -- so the invocation stays GATED. That is the deliberate
+# fail-closed direction, and it is pinned here: the ACP rewrite must not
+# relax it into a local dispatch.
+pr180_r17_name="pr180_acp_compatibility_flag_does_not_mask_resume"
+pr180_r17_dir="$(stage_layout "${pr180_r17_name}")"
+install_canonical "${pr180_r17_dir}" current
+if run_case "${pr180_r17_name}" "${pr180_r17_dir}" 9 -- --acp --resume >/dev/null; then
+  if assert_stderr_contains "${pr180_r17_name}" "${pr180_r17_dir}/wrapper.stderr" \
+       'readiness requires an explicit --model for this invocation' \
+     && assert_readiness_not_called "${pr180_r17_name}" "${pr180_r17_dir}/readiness.log" \
+     && assert_fake_not_called "${pr180_r17_name}" "${pr180_r17_dir}/fake_claw.log" \
+     && assert_no_decoy_executed "${pr180_r17_name}" "${pr180_r17_dir}/fake_claw.log"; then
+    pass_case "${pr180_r17_name}"
+  fi
+fi
+
+# ---------- P1: in-process enforcement marker -------------------------------
+#
+# The wrapper can only gate what it sees before `exec`. These cases prove it
+# hands the canonical runtime the marker that turns on the in-process guard, so
+# a post-exec `/model` switch, an Agent fallback, or a provider retry is still
+# admission-gated. The Rust side of the contract is covered by
+# `rust/crates/api/tests/n6_admission_integration.rs`.
+
+# ---------- case pr180_p1_1: marker reaches canonical on an inference run ----
+pr180_p1_1_name="pr180_p1_marker_is_exported_on_an_inference_dispatch"
+pr180_p1_1_dir="$(stage_layout "${pr180_p1_1_name}")"
+install_canonical "${pr180_p1_1_dir}" current
+if run_case "${pr180_p1_1_name}" "${pr180_p1_1_dir}" 0 -- --model fast prompt "say hi" >/dev/null; then
+  if assert_log_contains "${pr180_p1_1_name}" "${pr180_p1_1_dir}/fake_claw.log" \
+       'CLAW_SIDESTACK_N6_ENFORCE=1' \
+     && assert_readiness_called_for "${pr180_p1_1_name}" "${pr180_p1_1_dir}/readiness.log" \
+          'qwen3%3A14b' \
+     && assert_no_decoy_executed "${pr180_p1_1_name}" "${pr180_p1_1_dir}/fake_claw.log"; then
+    pass_case "${pr180_p1_1_name}"
+  fi
+fi
+
+# ---------- case pr180_p1_2: marker reaches canonical on a local dispatch ----
+# `--acp` never queries readiness, but the process it starts can still change
+# models later, so it must carry the marker too.
+pr180_p1_2_name="pr180_p1_marker_is_exported_on_a_local_dispatch"
+pr180_p1_2_dir="$(stage_layout "${pr180_p1_2_name}")"
+install_canonical "${pr180_p1_2_dir}" current
+if run_case "${pr180_p1_2_name}" "${pr180_p1_2_dir}" 0 -- --acp >/dev/null; then
+  if assert_log_contains "${pr180_p1_2_name}" "${pr180_p1_2_dir}/fake_claw.log" \
+       'CLAW_SIDESTACK_N6_ENFORCE=1' \
+     && assert_readiness_not_called "${pr180_p1_2_name}" "${pr180_p1_2_dir}/readiness.log" \
+     && assert_no_decoy_executed "${pr180_p1_2_name}" "${pr180_p1_2_dir}/fake_claw.log"; then
+    pass_case "${pr180_p1_2_name}"
+  fi
+fi
+
+# ---------- case pr180_p1_3: a refused run starts nothing to mark ------------
+# When readiness refuses, the wrapper exits 8 and never execs, so no marked
+# process exists at all.
+pr180_p1_3_name="pr180_p1_marker_never_reaches_a_refused_dispatch"
+pr180_p1_3_dir="$(stage_layout "${pr180_p1_3_name}")"
+install_canonical "${pr180_p1_3_dir}" current
+write_fake_readiness_client "${pr180_p1_3_dir}" 0 200 "$(refusal_body VRAM_CONTENDED qwen3:14b)"
+if run_case "${pr180_p1_3_name}" "${pr180_p1_3_dir}" 8 -- --model fast prompt "say hi" >/dev/null; then
+  if assert_fake_not_called "${pr180_p1_3_name}" "${pr180_p1_3_dir}/fake_claw.log" \
+     && assert_no_decoy_executed "${pr180_p1_3_name}" "${pr180_p1_3_dir}/fake_claw.log"; then
+    pass_case "${pr180_p1_3_name}"
+  fi
+fi
+
+# ---------- case pr180_p1_4: the marker is a bare literal, not a secret ------
+# Enforcement state must be set by this script and nothing else, and it must
+# never carry a value derived from the environment or a credential.
+pr180_p1_4_name="pr180_p1_marker_is_a_bare_literal_set_only_before_exec"
+pr180_p1_4_marker_lines="$(grep -c 'CLAW_SIDESTACK_N6_ENFORCE' "${REAL_WRAPPER}" || true)"
+pr180_p1_4_literal="$(grep -c '^export CLAW_SIDESTACK_N6_ENFORCE=1$' "${REAL_WRAPPER}" || true)"
+# The line after the marker must be the exec, so nothing can run between the
+# two and no later line can unset or overwrite it.
+pr180_p1_4_next="$( { grep -A2 '^export CLAW_SIDESTACK_N6_ENFORCE=1$' "${REAL_WRAPPER}" || true; } | tail -1)"
+# shellcheck disable=SC2016  # deliberate literal: this is the exact source line
+# the wrapper must carry, so it must NOT expand here.
+pr180_p1_4_expected_exec='exec "${CANONICAL_CLAW}" "$@"'
+if [[ "${pr180_p1_4_literal}" == "1" ]] \
+   && [[ "${pr180_p1_4_marker_lines}" == "1" ]] \
+   && [[ "${pr180_p1_4_next}" == "${pr180_p1_4_expected_exec}" ]]; then
+  pass_case "${pr180_p1_4_name}"
+else
+  fail_case "${pr180_p1_4_name}" \
+    'the marker must appear exactly once, as a bare literal, immediately before exec' \
+    /dev/null /dev/null "${REAL_WRAPPER}"
 fi
 
 # ---------- summary ----------

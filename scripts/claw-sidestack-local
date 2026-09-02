@@ -686,6 +686,25 @@ n6_forces_inference() {
 # emitted NUL-separated so an argument containing a newline cannot split. An
 # unrecognized `-…` token is dropped only while `rest` is still empty, matching
 # the CLI, which errors on it there and pushes it everywhere else.
+#
+# `--acp` / `-acp` are the one dash-prefixed pair the CLI REWRITES into a bare
+# positional rather than consuming or rejecting: its arm pushes the literal
+# `acp`, so `claw --acp` dispatches the same local `print_acp_status` printer
+# that `claw acp` does. Reconstructing that here is what keeps both documented
+# compatibility forms out of the leading-unknown-dash drop below — left there
+# they would empty the vector, classify as `inference`, and demand a model for
+# an invocation that only prints ACP status.
+#
+# The rewrite is deliberately UNCONDITIONAL, matching the CLI arm, which
+# carries no `rest.is_empty()` guard. It is placed after the two flag
+# predicates so an `--acp` sitting in another flag's VALUE slot (`--model
+# --acp`) is still consumed as that value, exactly as the CLI consumes it.
+#
+# This normalization decides no verdict by itself. `-p` and `--resume` are
+# both settled by `n6_prompt_terminal_index` and `n6_forces_inference` BEFORE
+# this reconstruction is ever read, so rewriting the alias cannot turn a
+# provider-bearing invocation local, and the tail survives into `rest` so
+# `--acp <tail>` is classified on the same evidence as `acp <tail>`.
 n6_cli_rest() {
   local -a argv=( "$@" ) rest=()
   local index=0 arg
@@ -696,6 +715,11 @@ n6_cli_rest() {
       continue
     fi
     if n6_is_global_inline_flag "${arg}"; then
+      index=$(( index + 1 ))
+      continue
+    fi
+    if [[ "${arg}" == "--acp" || "${arg}" == "-acp" ]]; then
+      rest+=( "acp" )
       index=$(( index + 1 ))
       continue
     fi
@@ -1377,5 +1401,25 @@ if [[ ! -f "${CANONICAL_CLAW}" || ! -x "${CANONICAL_CLAW}" ]]; then
   printf 'claw-sidestack-local: canonical claw is not a regular executable file: %s\n' "${CANONICAL_CLAW}" >&2
   exit 5
 fi
+
+# --- in-process enforcement marker ------------------------------------------
+#
+# Everything above gates the model this wrapper can see *before* exec. Once the
+# canonical binary is running it can change models on its own — the REPL
+# `/model` command, an Agent primary or fallback selection, a provider retry —
+# and none of that passes back through this script.
+#
+# This marker tells the canonical runtime that it was launched as a dedicated
+# SideStack local-coding process, which turns on the in-process guard: only the
+# validated local broker may carry inference, and every outbound broker attempt
+# re-checks readiness for the exact model it is about to send. See the
+# "Two-part enforcement" section of USAGE.md.
+#
+# It is deliberately its own variable rather than a reuse of
+# RUSTY_CLAUDE_LLM_CALLER: that one carries broker telemetry/header semantics
+# and is populated from a user-editable env file, so enforcement keyed off it
+# could drift and fail open. This one is set here, immediately before exec, and
+# nowhere else. It carries no secret.
+export CLAW_SIDESTACK_N6_ENFORCE=1
 
 exec "${CANONICAL_CLAW}" "$@"
