@@ -31,6 +31,9 @@
 #      OR the resolved `curl` does not report a version that enforces the
 #      response-size bound (see the curl capability floor below), in which
 #      case no request is made
+#  10  the canonical claw does not prove it implements the in-process N6
+#      enforcement contract (see the canonical capability floor below); no
+#      readiness request is made and canonical is never exec'd
 #
 # Residual race
 # -------------
@@ -248,6 +251,66 @@ esac
 # `skills` as unconditionally local is exactly the defect this list used to
 # carry: `claw skills help overview` is a PROMPT, not a local report.
 N6_NON_INFERENCE_SUBCOMMANDS=" version status sandbox doctor acp state init config diff export system-prompt dump-manifests bootstrap-plan agents mcp plugins "
+
+# --- canonical capability floor ----------------------------------------------
+#
+# Exporting the in-process enforcement marker below proves nothing on its own:
+# a canonical binary built before that contract existed accepts the variable and
+# ignores it. The startup gate would still pass, and then every model chosen
+# AFTER exec — a REPL `/model` switch, an Agent primary or fallback, a provider
+# retry — would run through an ungated API. The marker is a request; it is not
+# evidence that anything is listening.
+#
+# Freshness is not that evidence either. `claw-canonical-status` calls an
+# install CURRENT when its Git SHA equals the locally known origin/main. That is
+# provenance, not capability: a worktree legitimately ahead of origin/main is
+# not CURRENT, an explicit `CLAW_SIDESTACK_ALLOW_STALE=1` admits a binary of
+# unknown vintage, and UNKNOWN_BASE admits one with no comparison at all. Under
+# each of those the freshness verdict says nothing about whether the guard is
+# compiled in.
+#
+# So the requirement is positive and independent: the canonical binary must
+# ADVERTISE the exact versioned capability, and the wrapper reads that claim
+# only from the status helper's report — the one call that fences the version
+# banner between two topology probes and a file-identity comparison. Re-running
+# `"${CANONICAL_CLAW}" --version` here would be a second, weaker, unfenced read
+# of a file this wrapper has already been told about.
+N6_REQUIRED_CAPABILITY="supported"
+
+# n6_capability_state — what the identity-protected status report attributed to
+# the canonical binary. Prints exactly one word:
+#
+#   supported    the report carries one capability field naming the contract
+#   unsupported  the report carries one field, and it does not
+#   absent       no capability field at all (a status helper predating this
+#                contract, or a report that never reached the banner)
+#   ambiguous    more than one capability field — the report is not trustworthy
+#   malformed    one field carrying a value this wrapper does not define
+#
+# Only "supported" admits a protected invocation. The other four are distinct so
+# the refusal can say WHY, but they are equally fatal: nothing here guesses at
+# text it does not recognise.
+#
+# The comparison is whole-value equality against the exact field name and the
+# exact state word. A substring test would let `unsupported` satisfy a search
+# for `supported`.
+n6_capability_state() {
+  printf '%s\n' "${status_report}" | awk '
+    /^n6 capability:[[:space:]]/ {
+      seen++
+      value = $0
+      sub(/^n6 capability:[[:space:]]*/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+    }
+    END {
+      if (seen == 0) { print "absent"; exit }
+      if (seen > 1) { print "ambiguous"; exit }
+      if (value == "supported") { print "supported"; exit }
+      if (value == "unsupported") { print "unsupported"; exit }
+      print "malformed"
+    }
+  '
+}
 
 # Deliberately strict, fail-closed reader for the two fields this wrapper
 # depends on. Duplicate keys, a non-boolean `ready`, a blank `reason_code`, or
@@ -1297,6 +1360,48 @@ if [[ "${n6_class%%|*}" == "refuse" ]]; then
 fi
 
 if [[ "${n6_class}" == "inference" ]]; then
+  # FIRST, before the broker origin is even derived and long before any byte
+  # reaches the network. A binary that cannot enforce in process must not
+  # consume broker admission work on its way to running ungated, so this
+  # refusal precedes the readiness GET rather than following it.
+  #
+  # Deliberately scoped to inference-capable invocations. A proven local-only
+  # command (`--help`, `--version`, `status`, `doctor`, ...) never reaches a
+  # provider, so there is nothing for the in-process guard to protect and no
+  # reason to make an older binary unable to print its own help. The existing
+  # freshness rules continue to apply to those unchanged.
+  n6_capability="$(n6_capability_state)"
+  if [[ "${n6_capability}" != "${N6_REQUIRED_CAPABILITY}" ]]; then
+    printf 'claw-sidestack-local: refusing to run an inference-capable session on a canonical claw\n' >&2
+    printf '  that does not prove it implements the in-process N6 enforcement contract.\n' >&2
+    printf '  canonical claw: %s\n' "${CANONICAL_CLAW}" >&2
+    case "${n6_capability}" in
+      unsupported)
+        printf '  the canonical binary does not advertise the enforcement capability, so it\n' >&2
+        printf '  predates the contract (or could not be proven to be the file that answered).\n' >&2
+        ;;
+      absent)
+        printf '  the canonical status report carries no capability field at all, so the\n' >&2
+        printf '  status helper predates this contract and cannot answer the question.\n' >&2
+        ;;
+      ambiguous)
+        printf '  the canonical status report carried more than one capability field, so no\n' >&2
+        printf '  single answer can be trusted.\n' >&2
+        ;;
+      *)
+        printf '  the canonical status report carried an unrecognised capability value.\n' >&2
+        ;;
+    esac
+    printf '  the enforcement marker this wrapper exports only turns the in-process guard\n' >&2
+    printf '  ON in a build that HAS one; an older binary accepts it and ignores it, and\n' >&2
+    printf '  every model picked after exec (REPL /model, Agent fallback, provider retry)\n' >&2
+    printf '  would then run ungated. Refusing before the readiness request rather than\n' >&2
+    printf '  admitting a session this wrapper cannot protect.\n' >&2
+    printf '  refresh the canonical binary with: %s/claw-canonical-refresh\n' "${SCRIPT_DIR}" >&2
+    printf '  note: this is NOT the staleness check — CLAW_SIDESTACK_ALLOW_STALE does not\n' >&2
+    printf '  override it, because freshness is not a proof of capability.\n' >&2
+    exit 10
+  fi
   if ! n6_broker_origin="$(n6_readiness_origin)"; then
     printf 'claw-sidestack-local: local coding readiness could not be established\n' >&2
     printf '  could not derive a broker origin from the validated OPENAI_BASE_URL: %s\n' "${EFFECTIVE_BASE_URL}" >&2
@@ -1414,6 +1519,12 @@ fi
 # validated local broker may carry inference, and every outbound broker attempt
 # re-checks readiness for the exact model it is about to send. See the
 # "Two-part enforcement" section of USAGE.md.
+#
+# It is a request, not a proof. A binary that predates the guard accepts this
+# variable and ignores it, so for an inference-capable invocation the canonical
+# capability floor above has already REFUSED unless the binary positively
+# advertised the contract. By the time this line runs on a protected session,
+# the receiver is known to implement what the marker turns on.
 #
 # It is deliberately its own variable rather than a reuse of
 # RUSTY_CLAUDE_LLM_CALLER: that one carries broker telemetry/header semantics

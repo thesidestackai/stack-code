@@ -51,6 +51,14 @@ The SideStackAI operator entrypoint is `~/.local/bin/claw`, and it is a **regula
 
 `claw-canonical-status` exits `0` CURRENT, `10` STALE, `11` MISSING, `12` INVALID_TOPOLOGY, `13` UNKNOWN_BASE (no locally known `origin/main`), and reports the canonical path, its topology, the installed Git SHA, and the `origin/main` SHA it compared against.
 
+It also reports one field that is **not** a freshness verdict:
+
+```
+n6 capability:       supported
+```
+
+This says whether the canonical binary advertises `sidestack-n6-enforce-v1` in its `claw --version` banner — that is, whether it actually implements the in-process enforcement contract described under [Two-part enforcement](#two-part-enforcement-the-startup-gate-and-the-in-process-gate). It is deliberately orthogonal to the exit code, because freshness is not capability: a worktree ahead of `origin/main` is not CURRENT but may well implement the contract, while `CLAW_SIDESTACK_ALLOW_STALE=1` and UNKNOWN_BASE both admit binaries whose vintage is unknown. The capability is read from the same `--version` call the SHA comes from, fenced between two topology probes and a file-identity comparison, and it fails closed to `unsupported` wherever that fence fails.
+
 `claw-canonical-refresh` runs only from a clean worktree whose `HEAD` equals the locally known `origin/main` — it never fetches, so you decide when the base moves. It refuses a dirty source, refuses a symlinked canonical path rather than writing through it, forces `CARGO_TARGET_DIR` inside the worktree so a repo-local `.cargo/config.toml` cannot redirect the build, backs up the existing executable before building, requires the built binary to report the source Git SHA, activates by same-directory atomic rename, and restores the previous executable if post-activation verification fails.
 
 ## Quick start
@@ -329,6 +337,7 @@ The wrapper:
 - does not probe the broker for liveness. Use `claw doctor` or a separate runtime check (for example a small `curl` against the broker's health endpoint) when you need that signal;
 - executes the canonical `~/.local/bin/claw` directly (override with `CLAW_CANONICAL_PATH`) instead of resolving `claw` from PATH, so it can never silently fall through to `~/.cargo/bin/claw` or a Cargo target artifact;
 - delegates topology and freshness to [`scripts/claw-canonical-status`](scripts/claw-canonical-status) — offline, read-only, no provider call — and refuses to launch when the canonical executable is missing (exit 4), is a symlink or otherwise not a regular executable (exit 5), or is stale relative to the locally known `origin/main` (exit 6). Set `CLAW_SIDESTACK_ALLOW_STALE=1` to override the stale refusal deliberately; when `origin/main` is not locally known the wrapper warns loudly and continues. LAW 1 is evaluated before any of these checks.
+- refuses an **inference-capable** invocation (exit 10) unless that same status report proves the canonical binary implements the in-process enforcement contract — see [the canonical capability floor](#the-canonical-capability-floor-exit-10). Locally dispatched commands are unaffected.
 - asks the broker whether starting a local coding session is safe, and refuses if it is not — see the next section.
 
 ###### Automatic broker readiness preflight (N6)
@@ -398,6 +407,36 @@ These three layers are worth keeping distinct, because the last one is a trust a
 This is the same kind of boundary as the readiness-GET-to-inference-POST race described above: both are *client-side* residuals, not gaps in a broker-side reservation. An attacker who can replace your `curl` can equally POST straight to the broker and bypass this wrapper entirely. The broker does not inherit either weakness when callers use ordinary trusted system dependencies.
 
 This is a prerequisite of the SideStackAI inference wrapper only, not of the repository as a whole. Locally dispatched invocations — `--help`, `--version`, `version`, `status`, `doctor`, `plan run`, and the other non-inference subcommands — never perform a readiness GET, are never version-checked, and keep working on an older `curl` or on a host with no `curl` at all.
+
+###### The canonical capability floor (exit 10)
+
+The marker in the next section turns the in-process gate **on**, but only in a build that has one. A canonical `claw` compiled before that contract existed accepts `CLAW_SIDESTACK_N6_ENFORCE=1`, ignores it, and runs an entirely ungated API — while the startup gate reports success. Setting an environment variable is a request; it is not evidence that anything is listening.
+
+So for every inference-capable invocation the wrapper requires **positive proof** that the exact binary it is about to `exec` implements the contract:
+
+- the binary advertises the versioned token `sidestack-n6-enforce-v1` in its `claw --version` banner (`Capabilities` line);
+- [`scripts/claw-canonical-status`](scripts/claw-canonical-status) reads that token out of the **same** identity-protected `--version` call it already makes for the Git SHA, and reports `n6 capability: supported` or `unsupported`;
+- the wrapper requires exactly `supported`, matching the whole field value. A missing field (an older status helper), more than one field, or any value it does not define all fail closed.
+
+**This is not the staleness check, and `CLAW_SIDESTACK_ALLOW_STALE=1` does not override it.** The two answer different questions, and collapsing them would reintroduce the hole:
+
+| canonical status | capability | inference-capable invocation |
+| --- | --- | --- |
+| CURRENT | supported | proceeds to the readiness gate |
+| CURRENT | unsupported | **refused, exit 10** |
+| STALE + `CLAW_SIDESTACK_ALLOW_STALE=1` | supported | proceeds to the readiness gate |
+| STALE + `CLAW_SIDESTACK_ALLOW_STALE=1` | unsupported | **refused, exit 10** |
+| UNKNOWN_BASE | supported | proceeds to the readiness gate |
+| UNKNOWN_BASE | unsupported | **refused, exit 10** |
+| STALE without the override | either | refused, exit 6 (unchanged) |
+
+The CURRENT-but-unsupported row is the point of the whole mechanism: an install can match `origin/main` exactly and still be a build that cannot enforce anything, and a worktree that is legitimately *ahead* of `origin/main` is never CURRENT yet may implement the contract perfectly. Freshness is provenance, not capability.
+
+**The refusal comes before the network.** The capability check is the first thing an inference-capable invocation does — ahead of deriving the broker origin, ahead of the `curl` floor, ahead of the readiness GET. A binary that cannot enforce in process does not get to consume broker admission work on its way to running ungated, so a refused session issues **zero** readiness requests and never execs the canonical binary.
+
+**Locally dispatched commands are unaffected.** `--help`, `--version`, `status`, `doctor`, and the other proven non-inference subcommands never reach a provider, so there is nothing for the in-process guard to protect; they keep working on an older canonical binary exactly as before, under the existing freshness rules.
+
+The token is versioned on purpose. `-v1` names the whole protocol — marker recognised, routing contained, per-attempt admission — so if any of that changes shape a new binary advertises `-v2` and an old wrapper stops matching, rather than a vague "N6 supported" boolean silently spanning two incompatible contracts. Consumers match whole tokens, never prefixes: `sidestack-n6-enforce-v10` is a different contract, not this one.
 
 ###### Two-part enforcement: the startup gate and the in-process gate
 

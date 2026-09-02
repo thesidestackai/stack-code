@@ -19,6 +19,7 @@ pub use n6_admission::{
     evaluate_readiness_body, marker_active, BrokerOrigin, HttpReadinessAuthority,
     N6ReadinessAuthority, N6ReadinessFuture, ReadinessReport, BROKER_PORT,
     MAX_READINESS_BODY_BYTES, READINESS_PATH, SIDESTACK_MARKER_ENV,
+    SIDESTACK_N6_ENFORCE_CAPABILITY,
 };
 pub use prompt_cache::{
     CacheBreakEvent, PromptCache, PromptCacheConfig, PromptCachePaths, PromptCacheRecord,

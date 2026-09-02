@@ -44,18 +44,30 @@ trap cleanup EXIT INT TERM
 PASS_COUNT=0
 FAIL_COUNT=0
 
-# write_fake_claw <path> <identity> <reported_sha>
+# write_fake_claw <path> <identity> <reported_sha> [capabilities]
 #
 # A stand-in for a claw executable. It answers `--version` with a Git SHA
 # banner in the real binary's format, and otherwise records that this specific
 # instance was executed, so the suite can tell canonical from decoy.
+#
+# [capabilities] is the literal text of the banner's `Capabilities` line. The
+# default is the token a build implementing the in-process N6 enforcement
+# contract advertises, which is what every pre-existing case wants: they are
+# testing the startup gate, not the capability floor. The literal "__NONE__"
+# omits the line entirely — a binary predating the contract.
 write_fake_claw() {
   local path="$1" identity="$2" sha="$3"
+  local capabilities="${4-sidestack-n6-enforce-v1}"
+  local capability_line=""
+  if [[ "${capabilities}" != "__NONE__" ]]; then
+    capability_line="  printf '  Capabilities     %s\n' '${capabilities}'"
+  fi
   mkdir -p -- "$(dirname -- "${path}")"
   cat > "${path}" <<FAKE
 #!/usr/bin/env bash
 if [[ "\${1:-}" == "--version" ]]; then
   printf 'Claw Code\n  Version          0.1.0\n  Git SHA          %s\n' '${sha}'
+${capability_line}
   exit 0
 fi
 log="\${FAKE_CLAW_LOG:?FAKE_CLAW_LOG must be set}"
@@ -291,33 +303,40 @@ fixture_head_short() { git -C "$1/root" rev-parse --short HEAD; }
 # SHAs, so a "current" fixture must report the whole thing.
 fixture_head_full() { git -C "$1/root" rev-parse HEAD; }
 
-# install_canonical <case_dir> <mode>
+# install_canonical <case_dir> <mode> [capabilities]
 #   current | stale | stale_prefix | symlink | nonexec | missing
+#
+# [capabilities] is forwarded to write_fake_claw. Omitted, the canonical fixture
+# advertises the N6 enforcement capability, so cases exercising the startup gate
+# are unaffected by the capability floor. Pass "__NONE__" for a binary that
+# predates the contract.
 install_canonical() {
-  local case_dir="$1" mode="$2"
+  local case_dir="$1" mode="$2" capabilities="${3-sidestack-n6-enforce-v1}"
   local canonical="${case_dir}/home/.local/bin/claw"
   mkdir -p "${case_dir}/home/.local/bin"
   case "${mode}" in
     current)
-      write_fake_claw "${canonical}" "CANONICAL" "$(fixture_head_full "${case_dir}")"
+      write_fake_claw "${canonical}" "CANONICAL" "$(fixture_head_full "${case_dir}")" \
+        "${capabilities}"
       ;;
     stale)
       write_fake_claw "${canonical}" "CANONICAL_STALE" \
-        "5ta1e005ta1e005ta1e005ta1e005ta1e005ta1e"
+        "5ta1e005ta1e005ta1e005ta1e005ta1e005ta1e" "${capabilities}"
       ;;
     stale_prefix)
       # A legacy build whose banner is a 7-character PREFIX of the real HEAD.
       # Under the repaired exact-match contract this is unproven, not current.
       write_fake_claw "${canonical}" "CANONICAL_STALE_PREFIX" \
-        "$(fixture_head_short "${case_dir}")"
+        "$(fixture_head_short "${case_dir}")" "${capabilities}"
       ;;
     symlink)
       write_fake_claw "${case_dir}/fake-cargo-target/release/claw" "SYMLINK_TARGET" \
-        "$(fixture_head_full "${case_dir}")"
+        "$(fixture_head_full "${case_dir}")" "${capabilities}"
       ln -s "${case_dir}/fake-cargo-target/release/claw" "${canonical}"
       ;;
     nonexec)
-      write_fake_claw "${canonical}" "CANONICAL" "$(fixture_head_full "${case_dir}")"
+      write_fake_claw "${canonical}" "CANONICAL" "$(fixture_head_full "${case_dir}")" \
+        "${capabilities}"
       chmod 0644 "${canonical}"
       ;;
     missing)
@@ -710,8 +729,12 @@ canonical16="${case16_dir}/home/.local/bin/claw"
 write_fake_claw "${case16_dir}/swapped-target/claw" "SWAPPED_TARGET" "0000000"
 cat > "${case16_dir}/root/scripts/claw-canonical-status" <<STUB
 #!/usr/bin/env bash
-# Reports CURRENT, then races the canonical path into a symlink.
+# Reports CURRENT *and* a supported capability — a maximally permissive status
+# answer — then races the canonical path into a symlink. Every earlier gate is
+# deliberately satisfied so the final topology revalidation is the only thing
+# left that can catch the swap, which is exactly what this case measures.
 printf 'canonical topology:  regular-executable\n'
+printf 'n6 capability:       supported\n'
 printf 'state:               CURRENT\n'
 rm -f -- '${canonical16}'
 ln -s '${case16_dir}/swapped-target/claw' '${canonical16}'
@@ -741,6 +764,8 @@ install_canonical "${case17_dir}" current
 canonical17="${case17_dir}/home/.local/bin/claw"
 cat > "${case17_dir}/root/scripts/claw-canonical-status" <<STUB
 #!/usr/bin/env bash
+# CURRENT and capable, so nothing before the final existence recheck can refuse.
+printf 'n6 capability:       supported\n'
 printf 'state:               CURRENT\n'
 rm -f -- '${canonical17}'
 exit 0
@@ -3226,6 +3251,324 @@ if [[ "${pr180_p1_4_literal}" == "1" ]] \
 else
   fail_case "${pr180_p1_4_name}" \
     'the marker must appear exactly once, as a bare literal, immediately before exec' \
+    /dev/null /dev/null "${REAL_WRAPPER}"
+fi
+
+# ===========================================================================
+# PR180 P1: the canonical capability floor
+#
+# Exporting the enforcement marker is a REQUEST. A canonical binary built
+# before the in-process contract existed accepts it and ignores it, and every
+# model chosen after exec — a REPL /model switch, an Agent fallback, a provider
+# retry — then runs through an ungated API while the startup gate reports
+# success.
+#
+# Freshness cannot stand in for that proof. CURRENT means "this build's Git SHA
+# equals the locally known origin/main": a worktree legitimately AHEAD of
+# origin/main is never CURRENT yet may implement the contract, and an install
+# that matches origin/main exactly may well not. `CLAW_SIDESTACK_ALLOW_STALE=1`
+# and UNKNOWN_BASE admit binaries of unknown vintage outright.
+#
+# So these cases hold freshness and capability apart in both directions, and
+# require the refusal to land BEFORE any readiness request or exec.
+# ===========================================================================
+
+# assert_capability_refusal <name> <case_dir>
+#
+# The shape every capability refusal must have: nothing was asked of the
+# broker, the curl probe never even ran (the refusal precedes it), canonical
+# never executed, and no decoy was reached instead.
+assert_capability_refusal() {
+  local name="$1" case_dir="$2"
+  local log="${case_dir}/fake_claw.log"
+  if [[ -s "${case_dir}/readiness.log" ]]; then
+    fail_case "${name}" "a readiness request was issued for a binary that cannot enforce" \
+      /dev/null /dev/null "${case_dir}/readiness.log"
+    return 1
+  fi
+  if [[ -s "${case_dir}/curlversion.log" ]]; then
+    fail_case "${name}" "the curl probe ran, so the capability refusal did not precede it" \
+      /dev/null /dev/null "${case_dir}/curlversion.log"
+    return 1
+  fi
+  assert_fake_not_called "${name}" "${log}" || return 1
+  assert_no_decoy_executed "${name}" "${log}" || return 1
+  assert_stderr_contains "${name}" "${case_dir}/wrapper.stderr" \
+    'does not prove it implements the in-process N6 enforcement contract' || return 1
+}
+
+# stage_status_capability_report <case_dir> <shape>
+#
+# Replaces the status helper with a stub that reports CURRENT and a capability
+# field of the given shape. Models what the wrapper must do with a report it
+# cannot read cleanly — including one produced by a status helper that predates
+# this contract entirely.
+stage_status_capability_report() {
+  local case_dir="$1" shape="$2"
+  local stub="${case_dir}/root/scripts/claw-canonical-status"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf "printf 'canonical topology:  regular-executable\\\\n'\n"
+    case "${shape}" in
+      absent) : ;;
+      ambiguous)
+        printf "printf 'n6 capability:       supported\\\\n'\n"
+        printf "printf 'n6 capability:       unsupported\\\\n'\n"
+        ;;
+      malformed) printf "printf 'n6 capability:       probably\\\\n'\n" ;;
+      blank) printf "printf 'n6 capability:       \\\\n'\n" ;;
+      *) printf 'test setup: unknown capability report shape %s\n' "${shape}" >&2; exit 2 ;;
+    esac
+    printf "printf 'state:               CURRENT\\\\n'\n"
+    printf 'exit 0\n'
+  } > "${stub}"
+  chmod 0755 "${stub}"
+}
+
+# ---------- capability 1: CURRENT is not capability ----------
+#
+# THE case. The install matches origin/main exactly — freshness is perfect —
+# and the binary still cannot enforce anything. Against the pre-repair wrapper
+# this invocation queried the broker and exec'd.
+cap1_name="capability_current_but_unsupported_binary_refuses_inference"
+cap1_dir="$(stage_layout "${cap1_name}")"
+install_canonical "${cap1_dir}" current "__NONE__"
+if run_case "${cap1_name}" "${cap1_dir}" 10 -- --model fast prompt "should refuse" >/dev/null; then
+  if assert_capability_refusal "${cap1_name}" "${cap1_dir}" \
+     && assert_stderr_contains "${cap1_name}" "${cap1_dir}/wrapper.stderr" \
+          'does not advertise the enforcement capability'; then
+    pass_case "${cap1_name}"
+  fi
+fi
+
+# ---------- capability 2: CURRENT and capable proceeds unchanged ----------
+cap2_name="capability_current_and_supported_binary_runs_inference"
+cap2_dir="$(stage_layout "${cap2_name}")"
+install_canonical "${cap2_dir}" current
+if run_case "${cap2_name}" "${cap2_dir}" 0 -- --model fast prompt "should run" >/dev/null; then
+  log="${cap2_dir}/fake_claw.log"
+  if assert_readiness_called_for "${cap2_name}" "${cap2_dir}/readiness.log" 'qwen3%3A14b' \
+     && assert_readiness_url_is_broker_only "${cap2_name}" "${cap2_dir}/readiness.log" \
+     && assert_log_contains "${cap2_name}" "${log}" 'IDENTITY=CANONICAL' \
+     && assert_log_contains "${cap2_name}" "${log}" 'CLAW_SIDESTACK_N6_ENFORCE=1' \
+     && assert_no_decoy_executed "${cap2_name}" "${log}"; then
+    pass_case "${cap2_name}"
+  fi
+fi
+
+# ---------- capability 3: the stale override does not buy capability --------
+#
+# CLAW_SIDESTACK_ALLOW_STALE=1 is an explicit operator decision about
+# FRESHNESS. It says nothing about whether the binary can enforce, so it must
+# not admit one that cannot.
+cap3_name="capability_stale_override_with_unsupported_binary_refuses"
+cap3_dir="$(stage_layout "${cap3_name}")"
+install_canonical "${cap3_dir}" stale "__NONE__"
+if run_case "${cap3_name}" "${cap3_dir}" 10 CLAW_SIDESTACK_ALLOW_STALE=1 \
+     -- --model fast prompt "should refuse" >/dev/null; then
+  if assert_capability_refusal "${cap3_name}" "${cap3_dir}" \
+     && assert_stderr_contains "${cap3_name}" "${cap3_dir}/wrapper.stderr" \
+          'this is NOT the staleness check'; then
+    pass_case "${cap3_name}"
+  fi
+fi
+
+# ---------- capability 4: the stale override still works when capable -------
+#
+# The operator's deliberate stale override is preserved: a stale build that DOES
+# implement the contract runs exactly as it did before this repair.
+cap4_name="capability_stale_override_with_supported_binary_still_runs"
+cap4_dir="$(stage_layout "${cap4_name}")"
+install_canonical "${cap4_dir}" stale
+if run_case "${cap4_name}" "${cap4_dir}" 0 CLAW_SIDESTACK_ALLOW_STALE=1 \
+     -- --model fast prompt "should run" >/dev/null; then
+  log="${cap4_dir}/fake_claw.log"
+  if assert_stderr_contains "${cap4_name}" "${cap4_dir}/wrapper.stderr" \
+          'CLAW_SIDESTACK_ALLOW_STALE=1 was set' \
+     && assert_readiness_called_for "${cap4_name}" "${cap4_dir}/readiness.log" 'qwen3%3A14b' \
+     && assert_log_contains "${cap4_name}" "${log}" 'IDENTITY=CANONICAL_STALE' \
+     && assert_log_contains "${cap4_name}" "${log}" 'CLAW_SIDESTACK_N6_ENFORCE=1' \
+     && assert_no_decoy_executed "${cap4_name}" "${log}"; then
+    pass_case "${cap4_name}"
+  fi
+fi
+
+# ---------- capability 5: UNKNOWN_BASE does not buy capability --------------
+#
+# With no locally known origin/main there is no freshness answer at all, which
+# is precisely when inferring capability from freshness would be worst.
+cap5_name="capability_unknown_base_with_unsupported_binary_refuses"
+cap5_dir="$(stage_layout "${cap5_name}")"
+install_canonical "${cap5_dir}" current "__NONE__"
+git -C "${cap5_dir}/root" update-ref -d refs/remotes/origin/main
+if run_case "${cap5_name}" "${cap5_dir}" 10 -- --model fast prompt "should refuse" >/dev/null; then
+  if assert_capability_refusal "${cap5_name}" "${cap5_dir}"; then
+    pass_case "${cap5_name}"
+  fi
+fi
+
+# ---------- capability 6: UNKNOWN_BASE still runs when capable --------------
+cap6_name="capability_unknown_base_with_supported_binary_still_runs"
+cap6_dir="$(stage_layout "${cap6_name}")"
+install_canonical "${cap6_dir}" current
+git -C "${cap6_dir}/root" update-ref -d refs/remotes/origin/main
+if run_case "${cap6_name}" "${cap6_dir}" 0 -- --model fast prompt "should run" >/dev/null; then
+  log="${cap6_dir}/fake_claw.log"
+  if assert_stderr_contains "${cap6_name}" "${cap6_dir}/wrapper.stderr" \
+          'freshness could not be determined' \
+     && assert_readiness_called_for "${cap6_name}" "${cap6_dir}/readiness.log" 'qwen3%3A14b' \
+     && assert_log_contains "${cap6_name}" "${log}" 'IDENTITY=CANONICAL' \
+     && assert_no_decoy_executed "${cap6_name}" "${log}"; then
+    pass_case "${cap6_name}"
+  fi
+fi
+
+# ---------- capability 7: near-miss tokens are not the capability -----------
+#
+# A substring or prefix matcher would accept every one of these. `-v1` is a
+# version, and a token that merely contains the contract name is not it.
+for cap_near_miss in \
+  "sidestack-n6-enforce-v10" \
+  "not-sidestack-n6-enforce-v1" \
+  "sidestack-n6-enforce" ; do
+  cap7_name="capability_near_miss_token_refuses__${cap_near_miss}"
+  cap7_dir="$(stage_layout "${cap7_name}")"
+  install_canonical "${cap7_dir}" current "${cap_near_miss}"
+  if run_case "${cap7_name}" "${cap7_dir}" 10 -- --model fast prompt "should refuse" >/dev/null; then
+    if assert_capability_refusal "${cap7_name}" "${cap7_dir}"; then
+      pass_case "${cap7_name}"
+    fi
+  fi
+done
+
+# ---------- capability 8: an unreadable report is not a permissive one ------
+#
+# A status helper predating this contract emits no capability field; a report
+# carrying two fields, a value this wrapper does not define, or a blank one
+# cannot be resolved. None of them may be read as permission.
+for cap_shape in absent ambiguous malformed blank; do
+  cap8_name="capability_unreadable_status_report_refuses__${cap_shape}"
+  cap8_dir="$(stage_layout "${cap8_name}")"
+  install_canonical "${cap8_dir}" current
+  stage_status_capability_report "${cap8_dir}" "${cap_shape}"
+  if run_case "${cap8_name}" "${cap8_dir}" 10 -- --model fast prompt "should refuse" >/dev/null; then
+    if assert_capability_refusal "${cap8_name}" "${cap8_dir}"; then
+      pass_case "${cap8_name}"
+    fi
+  fi
+done
+
+# ---------- capability 9: the refusal precedes the curl floor ---------------
+#
+# Ordering proof. The curl version floor would itself refuse this invocation
+# (exit 9), so seeing exit 10 with an empty curl-probe log proves the
+# capability check ran first — a binary that cannot enforce does not get to
+# consume any preflight work on its way to running ungated.
+cap9_name="capability_refusal_precedes_the_curl_version_probe"
+cap9_dir="$(stage_layout "${cap9_name}")"
+install_canonical "${cap9_dir}" current "__NONE__"
+write_fake_readiness_client "${cap9_dir}" 0 200 "${READY_QWEN3_14B}" \
+  'curl 7.81.0 (x86_64-pc-linux-gnu) libcurl/7.81.0'
+if run_case "${cap9_name}" "${cap9_dir}" 10 -- --model fast prompt "should refuse" >/dev/null; then
+  if assert_capability_refusal "${cap9_name}" "${cap9_dir}"; then
+    pass_case "${cap9_name}"
+  fi
+fi
+
+# ---------- capability 10: the refusal precedes model resolution ------------
+#
+# An inference-capable invocation with no --model would refuse with exit 9. The
+# capability floor must come first, so the operator is told the real problem.
+cap10_name="capability_refusal_precedes_the_model_resolution_refusal"
+cap10_dir="$(stage_layout "${cap10_name}")"
+install_canonical "${cap10_dir}" current "__NONE__"
+if run_case "${cap10_name}" "${cap10_dir}" 10 -- prompt "should refuse" >/dev/null; then
+  if assert_capability_refusal "${cap10_name}" "${cap10_dir}"; then
+    pass_case "${cap10_name}"
+  fi
+fi
+
+# ---------- capability 11: staleness still outranks it without an override --
+#
+# Precedence is unchanged for the existing rules: a STALE binary with no
+# override refuses as STALE (exit 6), whether or not it is capable.
+cap11_name="capability_does_not_displace_the_stale_refusal"
+cap11_dir="$(stage_layout "${cap11_name}")"
+install_canonical "${cap11_dir}" stale
+if run_case "${cap11_name}" "${cap11_dir}" 6 -- --model fast prompt "should refuse" >/dev/null; then
+  log="${cap11_dir}/fake_claw.log"
+  if assert_readiness_not_called "${cap11_name}" "${cap11_dir}/readiness.log" \
+     && assert_stderr_contains "${cap11_name}" "${cap11_dir}/wrapper.stderr" \
+          'refusing to run a STALE canonical claw' \
+     && assert_fake_not_called "${cap11_name}" "${log}"; then
+    pass_case "${cap11_name}"
+  fi
+fi
+
+# ---------- capability 12: local-only commands are NOT gated ----------------
+#
+# The capability requirement protects model-bearing invocations. A command
+# proven unable to reach a provider has nothing for the in-process guard to
+# protect, so an older canonical binary must still print its own help, report
+# its own status, and speak ACP — under the existing freshness rules, unchanged.
+capability_local_case() {
+  local label="$1"
+  shift
+  local name="capability_does_not_gate_local_${label}"
+  local dir
+  dir="$(stage_layout "${name}")"
+  install_canonical "${dir}" current "__NONE__"
+  if run_case "${name}" "${dir}" 0 -- "$@" >/dev/null; then
+    if assert_readiness_not_called "${name}" "${dir}/readiness.log" \
+       && assert_canonical_ran "${name}" "${dir}" "$1" \
+       && assert_no_decoy_executed "${name}" "${dir}/fake_claw.log"; then
+      pass_case "${name}"
+    fi
+  fi
+}
+
+capability_local_case help_flag --help
+capability_local_case version_flag --version
+capability_local_case version_subcommand version
+capability_local_case status_subcommand status
+capability_local_case doctor_subcommand doctor
+capability_local_case acp_subcommand acp
+capability_local_case acp_long_flag --acp
+capability_local_case acp_short_flag -acp
+
+# ---------- capability 13: the wrapper reads only the fenced status report --
+#
+# The capability claim must come from the status helper — the one call that
+# fences the version banner between two topology probes and a file-identity
+# comparison. A second, unfenced `"${CANONICAL_CLAW}" --version` in the wrapper
+# would be a weaker read of the same question, and would show up as the
+# canonical binary being invoked before the exec.
+cap13_name="capability_is_not_read_by_a_second_unfenced_version_call"
+cap13_dir="$(stage_layout "${cap13_name}")"
+install_canonical "${cap13_dir}" current "__NONE__"
+if run_case "${cap13_name}" "${cap13_dir}" 10 -- --model fast prompt "should refuse" >/dev/null; then
+  if assert_capability_refusal "${cap13_name}" "${cap13_dir}"; then
+    pass_case "${cap13_name}"
+  fi
+fi
+
+# ---------- capability 14: the source carries no weaker duplicate probe -----
+#
+# Belt and braces for the above: the wrapper must not contain its own
+# `--version` invocation of the canonical binary at all.
+cap14_name="wrapper_source_has_no_direct_canonical_version_probe"
+# Comment lines are excluded deliberately: the header documents WHY this probe
+# is absent, and naming the thing you must not do is not doing it. Any
+# executable occurrence still fails here.
+# shellcheck disable=SC2016  # deliberate literal: this is the exact source
+# text being searched for, so it must NOT expand here.
+cap14_probes="$( { grep -v '^[[:space:]]*#' "${REAL_WRAPPER}" \
+  | grep -c '\${CANONICAL_CLAW}" --version'; } || true)"
+if [[ "${cap14_probes}" == "0" ]]; then
+  pass_case "${cap14_name}"
+else
+  fail_case "${cap14_name}" \
+    'the wrapper probes the canonical binary directly, bypassing the identity-protected status call' \
     /dev/null /dev/null "${REAL_WRAPPER}"
 fi
 

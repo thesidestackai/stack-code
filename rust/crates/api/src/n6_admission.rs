@@ -55,6 +55,35 @@ use crate::error::{ApiError, N6RefusalKind};
 /// Enforcement state needs its own name that only the protected wrapper sets.
 pub const SIDESTACK_MARKER_ENV: &str = "CLAW_SIDESTACK_N6_ENFORCE";
 
+/// Stable, versioned identifier for the in-process enforcement contract this
+/// module implements: [`marker_active`] routing containment (Layer A) plus a
+/// per-broker-attempt readiness admission (Layer B).
+///
+/// The wrapper exports [`SIDESTACK_MARKER_ENV`] immediately before `exec`, but
+/// setting an environment variable proves nothing about the binary that
+/// receives it: a build that predates this contract simply ignores the marker
+/// and runs an ungated API. So the binary advertises this token in its
+/// `--version` banner, and `scripts/claw-canonical-status` reports whether the
+/// canonical executable carries it. A binary that cannot enforce in process is
+/// then refused *before* any readiness query or `exec`.
+///
+/// Freshness is deliberately not the proof. `claw-canonical-status` calls an
+/// install CURRENT when its Git SHA equals the locally known `origin/main`,
+/// which is useful provenance but says nothing about a wrapper or worktree that
+/// is ahead of `origin/main`, and nothing at all under `STALE` overrides or
+/// `UNKNOWN_BASE`. Capability is reported orthogonally to freshness for exactly
+/// that reason.
+///
+/// # Versioning
+///
+/// The trailing `-v1` is load-bearing. The protocol being asserted is
+/// "recognises the marker, contains routing, and admits per attempt". If any of
+/// that changes shape, a new binary advertises `-v2` and an old wrapper stops
+/// matching, rather than a boolean "N6 supported" silently spanning two
+/// incompatible contracts. Never widen the match to a prefix or substring:
+/// `sidestack-n6-enforce-v10` is a different contract, not this one.
+pub const SIDESTACK_N6_ENFORCE_CAPABILITY: &str = "sidestack-n6-enforce-v1";
+
 /// Readiness endpoint path on the broker. Mirrors the shell wrapper contract.
 pub const READINESS_PATH: &str = "/status/n6_planner_ready";
 
