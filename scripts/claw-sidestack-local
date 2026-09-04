@@ -116,7 +116,21 @@ if [[ "${EFFECTIVE_BASE_URL}" == *11434* ]]; then
   exit 3
 fi
 
-BROKER_ALLOWLIST_REGEX='^http://(127\.0\.0\.1|localhost):11435(/.*)?$'
+# The path classes `BrokerOrigin::from_base_url`
+# (rust/crates/api/src/n6_admission.rs) accepts, and no others. That guard runs
+# INSIDE the canonical binary and rejects every inference request whose base URL
+# path is not, after trailing-slash trimming, one of `` / `/v1` / `/v1/chat/
+# completions`. An allowlist broader than the guard is not permissive, it is
+# BROKEN: a custom path such as `http://127.0.0.1:11435/gateway/v1` would clear
+# LAW 1 here, pass startup readiness, exec canonical, and then fail on every
+# request. Refusing it here makes the wrapper's answer and the runtime's answer
+# the same answer.
+#
+# Deliberately NARROWER than the Rust guard in two spots, never broader: this is
+# a literal-form allowlist with no URL normalization, so it rejects dot-segment
+# (`/../v1`) and repeated-slash (`//`) spellings that `Url::parse` would fold
+# into an accepted path. Fail-closed is the safe direction for a refusal gate.
+BROKER_ALLOWLIST_REGEX='^http://(127\.0\.0\.1|localhost):11435(/|/v1/?|/v1/chat/completions/?)?$'
 if [[ ! "${EFFECTIVE_BASE_URL}" =~ ${BROKER_ALLOWLIST_REGEX} ]]; then
   printf 'claw-sidestack-local: LAW 1 refusal — OPENAI_BASE_URL is not an allowed SideStackAI broker URL.\n' >&2
   printf '  offending value: %s\n' "${EFFECTIVE_BASE_URL}" >&2
@@ -820,6 +834,414 @@ n6_skills_is_local() {
   esac
 }
 
+# `/skills` and `/skill` do NOT share the positional `skills` contract, so
+# `n6_skills_is_local` must not be reused for them. The slash route runs
+# `parse_skills_args` (rust/crates/commands/src/lib.rs) BEFORE
+# `classify_skills_slash_command`, and that extra stage changes two verdicts:
+#
+#   /skills install     `parse_skills_args` returns Err("Usage: /skills install
+#                       <path>") and canonical never reaches a local CliAction,
+#                       so this is NOT local here -- while the positional
+#                       `claw skills install` IS local.
+#   /skills installer   `parse_skills_args` strips the literal `install`, finds
+#                       a non-empty `er`, and REWRITES the args to `install er`.
+#                       `classify_skills_slash_command` then keeps that Local,
+#                       so this IS local here -- while the positional
+#                       `claw skills installer` is a `CliAction::Prompt`.
+#
+# Takes the already-trimmed tail (the `/skills` token removed).
+n6_slash_skills_is_local() {
+  case "$1" in
+    ''|list|help|-h|--help) return 0 ;;
+    install) return 1 ;;
+    install*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Direct-slash normalization: ONE canonical-shaped pipeline, not per-family
+# Unicode patches.
+#
+# `parse_direct_slash_cli_action` does not look at argv tokens at all. It joins
+# the WHOLE argv vector with single spaces and hands that one string to
+# `SlashCommand::parse` -> `validate_slash_command_input`, which then does, in
+# order:
+#
+#   let trimmed = input.trim();                      // Unicode White_Space
+#   trimmed.starts_with('/')                         // else Ok(None)
+#   let mut parts = trimmed.trim_start_matches('/')  // ALL leading slashes
+#                          .split_whitespace();      // Unicode White_Space
+#   let command = parts.next().unwrap_or_default();  // "" => Err
+#   let args = parts.collect::<Vec<_>>();
+#   let remainder = remainder_after_command(trimmed, command);
+#
+# Every one of those steps is Unicode-whitespace-aware, and the two consumers
+# disagree about which of them they read: `parse_mcp_command` matches on the
+# `args` SLICE, while `parse_list_or_help_args` and `parse_skills_args` test
+# the `remainder` STRING. A mirror therefore has to reproduce the pipeline
+# itself, not each family's happy path, or it drifts in both directions at
+# once.
+#
+# The previous mirror read the verb on an argv-token boundary and trimmed the
+# tail with `n6_trim`, whose `sed [[:space:]]` is BOTH ASCII-narrow and
+# locale-sensitive. Measured against canonical on this tree, that cost
+# correctness in both directions:
+#
+#   COMPLETENESS  `claw /mcp $' '`, `/help`, `/agents`, `/agents list `,
+#                 `/skills`, `/skill` and every other family whose tail is
+#                 exclusively non-ASCII Rust whitespace canonicalize to the
+#                 bare local form, but were gated as inference.
+#   SOUNDNESS     `claw /skills $'install '` canonicalizes to `install`,
+#                 which `parse_skills_args` REFUSES ("Usage: /skills install
+#                 <path>") -- yet the ASCII trim left the NBSP attached, the
+#                 `install*` arm matched, and the wrapper called it local. A
+#                 usage error was bypassing readiness.
+#   LOCALE        `[[:space:]]` under `en_US.UTF-8` strips U+3000 but not
+#                 U+00A0, and under `LC_ALL=C` strips neither, so the verdict
+#                 for the same argv depended on the caller's environment.
+#
+# The replacement below runs the canonical pipeline once, under `LC_ALL=C`,
+# over a string in which every non-ASCII Rust whitespace scalar has been folded
+# to an ASCII space. After that fold the ASCII-only trim and splitter ARE
+# `str::trim` and `str::split_whitespace`, so each family arm can be a literal
+# transcription of its Rust parser.
+#
+# `parse_mcp_command` puts NO charset restriction on `target`, so `/mcp show
+# cafe<U+00E9>`, `/mcp show <CJK>` and `/mcp show <emoji>` are all
+# `Ok(CliAction::Mcp { .. })`. Only the SEPARATOR set is mirrored; the target
+# charset is left unconstrained.
+
+# The 19 non-ASCII characters for which Rust's `char::is_whitespace()` is true,
+# as their UTF-8 byte sequences. `str::trim` and `str::split_whitespace` both
+# key off that one predicate, so together with TAB/LF/VT/FF/CR/SPACE this IS
+# the canonical separator set.
+#
+# DERIVED, not remembered: a scratch probe enumerated `char::from_u32(cp)
+# .is_whitespace()` over `0..=0x10FFFF` on the toolchain that builds this repo
+# and returned exactly these 25 scalars. `char::is_whitespace()` reads a
+# Unicode property table compiled into the binary and never consults the
+# locale; `LC_ALL=C` below pins this mirror to the same locale-independent
+# byte comparisons. Note what is NOT here: U+200B ZERO WIDTH SPACE and U+180E
+# are not `White_Space`, so they are ordinary target bytes to canonical and
+# must stay ordinary target bytes here.
+N6_RUST_WS_NON_ASCII=(
+  $'\xc2\x85'      # U+0085  NEXT LINE
+  $'\xc2\xa0'      # U+00A0  NO-BREAK SPACE
+  $'\xe1\x9a\x80'  # U+1680  OGHAM SPACE MARK
+  $'\xe2\x80\x80'  # U+2000  EN QUAD
+  $'\xe2\x80\x81'  # U+2001  EM QUAD
+  $'\xe2\x80\x82'  # U+2002  EN SPACE
+  $'\xe2\x80\x83'  # U+2003  EM SPACE
+  $'\xe2\x80\x84'  # U+2004  THREE-PER-EM SPACE
+  $'\xe2\x80\x85'  # U+2005  FOUR-PER-EM SPACE
+  $'\xe2\x80\x86'  # U+2006  SIX-PER-EM SPACE
+  $'\xe2\x80\x87'  # U+2007  FIGURE SPACE
+  $'\xe2\x80\x88'  # U+2008  PUNCTUATION SPACE
+  $'\xe2\x80\x89'  # U+2009  THIN SPACE
+  $'\xe2\x80\x8a'  # U+200A  HAIR SPACE
+  $'\xe2\x80\xa8'  # U+2028  LINE SEPARATOR
+  $'\xe2\x80\xa9'  # U+2029  PARAGRAPH SEPARATOR
+  $'\xe2\x80\xaf'  # U+202F  NARROW NO-BREAK SPACE
+  $'\xe2\x81\x9f'  # U+205F  MEDIUM MATHEMATICAL SPACE
+  $'\xe3\x80\x80'  # U+3000  IDEOGRAPHIC SPACE
+)
+
+# UTF-8 byte classes, spelled out as literal sets so that membership is a
+# plain substring test. No bracket RANGES and no `[[:space:]]`: a range
+# endpoint is collation-dependent, a literal set is not.
+#
+# The four constrained second-byte ranges UTF-8 well-formedness needs are
+# contiguous SLICES of the continuation set:
+#   ${N6_UTF8_CONT:32}     \xA0-\xBF   valid second byte after \xE0
+#   ${N6_UTF8_CONT:0:32}   \x80-\x9F   valid second byte after \xED
+#   ${N6_UTF8_CONT:16}     \x90-\xBF   valid second byte after \xF0
+#   ${N6_UTF8_CONT:0:16}   \x80-\x8F   valid second byte after \xF4
+N6_UTF8_CONT=$'\x80\x81\x82\x83\x84\x85\x86\x87\x88\x89\x8a\x8b\x8c\x8d\x8e\x8f'
+N6_UTF8_CONT+=$'\x90\x91\x92\x93\x94\x95\x96\x97\x98\x99\x9a\x9b\x9c\x9d\x9e\x9f'
+N6_UTF8_CONT+=$'\xa0\xa1\xa2\xa3\xa4\xa5\xa6\xa7\xa8\xa9\xaa\xab\xac\xad\xae\xaf'
+N6_UTF8_CONT+=$'\xb0\xb1\xb2\xb3\xb4\xb5\xb6\xb7\xb8\xb9\xba\xbb\xbc\xbd\xbe\xbf'
+N6_UTF8_LEAD2=$'\xc2\xc3\xc4\xc5\xc6\xc7\xc8\xc9\xca\xcb\xcc\xcd\xce\xcf'
+N6_UTF8_LEAD2+=$'\xd0\xd1\xd2\xd3\xd4\xd5\xd6\xd7\xd8\xd9\xda\xdb\xdc\xdd\xde\xdf'
+N6_UTF8_LEAD3=$'\xe0\xe1\xe2\xe3\xe4\xe5\xe6\xe7\xe8\xe9\xea\xeb\xec\xed\xee\xef'
+N6_UTF8_LEAD4=$'\xf0\xf1\xf2\xf3\xf4'
+# \xC0 \xC1 encode overlongs; \xF5-\xFF are above U+10FFFF. Neither can begin a
+# well-formed sequence, and neither is claimed by any table above.
+N6_UTF8_NEVER_LEAD=$'\xc0\xc1\xf5\xf6\xf7\xf8\xf9\xfa\xfb\xfc\xfd\xfe\xff'
+
+# Well-formed-UTF-8 predicate over the raw bytes of "$1".
+#
+# WHY the mirror needs it: `main` collects argv with `std::env::args()`, which
+# unwraps and PANICS on a non-UTF-8 argument before any parsing happens
+# (verified against this tree's binary: `claw /mcp show $'caf\xe9'` aborts with
+# `called \`Result::unwrap()\` on an \`Err\` value: "caf\xE9"`, rc 101). No
+# invalid-UTF-8 argv can therefore ever reach `Ok(CliAction::Mcp { .. })`, so
+# the mirror must not call one local. Overlongs and surrogate encodings are
+# rejected here for the same reason -- they panic too.
+#
+# It also earns the substring rewrite below: UTF-8 is self-synchronising, so on
+# WELL-FORMED input a lead byte is never a continuation byte and a whitespace
+# character's byte sequence can only occur at a real character boundary. Byte
+# substitution is then exactly character substitution.
+n6_utf8_is_valid() {
+  local s="$1"
+  local LC_ALL=C
+  local length=${#s}
+  local index=0 lead second allowed follow count
+  while (( index < length )); do
+    lead="${s:index:1}"
+    case "${N6_UTF8_NEVER_LEAD}${N6_UTF8_CONT}" in
+      *"${lead}"*) return 1 ;;
+    esac
+    if [[ "${N6_UTF8_LEAD2}" == *"${lead}"* ]]; then
+      count=1
+      allowed="${N6_UTF8_CONT}"
+    elif [[ "${N6_UTF8_LEAD3}" == *"${lead}"* ]]; then
+      count=2
+      case "${lead}" in
+        $'\xe0') allowed="${N6_UTF8_CONT:32}" ;;
+        $'\xed') allowed="${N6_UTF8_CONT:0:32}" ;;
+        *) allowed="${N6_UTF8_CONT}" ;;
+      esac
+    elif [[ "${N6_UTF8_LEAD4}" == *"${lead}"* ]]; then
+      count=3
+      case "${lead}" in
+        $'\xf0') allowed="${N6_UTF8_CONT:16}" ;;
+        $'\xf4') allowed="${N6_UTF8_CONT:0:16}" ;;
+        *) allowed="${N6_UTF8_CONT}" ;;
+      esac
+    else
+      # Not claimed by any multi-byte table and not rejected above: ASCII.
+      index=$((index + 1))
+      continue
+    fi
+    (( index + count < length )) || return 1
+    second="${s:index+1:1}"
+    [[ "${allowed}" == *"${second}"* ]] || return 1
+    follow=2
+    while (( follow <= count )); do
+      [[ "${N6_UTF8_CONT}" == *"${s:index+follow:1}"* ]] || return 1
+      follow=$((follow + 1))
+    done
+    index=$((index + count + 1))
+  done
+  return 0
+}
+
+# The six ASCII characters for which `char::is_whitespace()` is true, as a
+# literal set. No bracket RANGE and no `[[:space:]]`: a range endpoint and a
+# POSIX class are both collation/locale dependent, a literal set is not.
+# Membership is tested as a plain substring match under `LC_ALL=C`.
+N6_ASCII_WS=$' \t\n\v\f\r'
+
+# Fold every non-ASCII canonical separator down to an ASCII space.
+#
+# Fails CLOSED on anything canonical could not receive as a `&str` (see
+# `n6_utf8_is_valid`), so an invalid-UTF-8 argv can never be called local.
+#
+# UTF-8 is self-synchronising, so on WELL-FORMED input a whitespace scalar's
+# byte sequence occurs only at a real character boundary: byte substitution is
+# exactly character substitution. Folding only ever REPLACES one whitespace
+# scalar with another, so it can neither merge two canonical words into one nor
+# split one word into two.
+#
+# Result in N6_WS_FOLDED. Returns non-zero (and leaves the result unset) when
+# the input is not well-formed UTF-8.
+n6_rust_ws_fold() {
+  local value="$1"
+  local LC_ALL=C
+  local separator
+  n6_utf8_is_valid "${value}" || return 1
+  for separator in "${N6_RUST_WS_NON_ASCII[@]}"; do
+    value="${value//"${separator}"/ }"
+  done
+  N6_WS_FOLDED="${value}"
+  return 0
+}
+
+# `str::trim` over an already-folded string. Result in N6_WS_TRIMMED.
+#
+# `n6_trim` above keeps its own `sed`-based implementation and its own callers;
+# this one is used ONLY by the direct-slash mirror. Keeping them separate means
+# the fix cannot silently change model-alias or positional-subcommand parsing.
+n6_ws_trim() {
+  local value="$1"
+  local LC_ALL=C
+  while [[ -n "${value}" && "${N6_ASCII_WS}" == *"${value:0:1}"* ]]; do
+    value="${value:1}"
+  done
+  while [[ -n "${value}" && "${N6_ASCII_WS}" == *"${value: -1}"* ]]; do
+    value="${value:0:${#value} - 1}"
+  done
+  N6_WS_TRIMMED="${value}"
+  return 0
+}
+
+# `str::split_whitespace` over an already-folded string. Tokens in
+# N6_WS_TOKENS.
+#
+# Deliberately a character walk rather than `tokens=( ${value} )`: unquoted
+# expansion would apply pathname expansion to every token, so `/mcp show *`
+# would be rewritten by the wrapper's own CWD. No `eval`, no `set -f` dance.
+n6_ws_split() {
+  local value="$1"
+  local LC_ALL=C
+  local length=${#value}
+  local index=0 character token=''
+  N6_WS_TOKENS=()
+  while (( index < length )); do
+    character="${value:index:1}"
+    if [[ "${N6_ASCII_WS}" == *"${character}"* ]]; then
+      if [[ -n "${token}" ]]; then
+        N6_WS_TOKENS+=( "${token}" )
+        token=''
+      fi
+    else
+      token+="${character}"
+    fi
+    index=$(( index + 1 ))
+  done
+  if [[ -n "${token}" ]]; then
+    N6_WS_TOKENS+=( "${token}" )
+  fi
+  return 0
+}
+
+# `parse_mcp_command` (rust/crates/commands/src/lib.rs), transcribed arm for
+# arm over the canonical `args` slice.
+#
+#   []                       Ok   bare /mcp
+#   ["list"]                 Ok
+#   ["list", ..]             Err  usage_error("mcp list", "")
+#   ["show"]                 Err  usage_error("mcp show", "<server>")
+#   ["show", target]         Ok   EXACTLY one target word
+#   ["show", ..]             Err  "Unexpected arguments for /mcp show."
+#   ["help"|"-h"|"--help"]   Ok   one-element pattern: `help extra` is an Err
+#   [action, ..]             Err
+#
+# Called with the canonical `args` as "$@", so the count IS the word count that
+# `split_whitespace` produced -- never the argv arity.
+n6_slash_mcp_is_local() {
+  case $# in
+    0) return 0 ;;
+    1)
+      case "$1" in
+        list|help|-h|--help) return 0 ;;
+        *) return 1 ;;
+      esac
+      ;;
+    2)
+      [[ "$1" == show ]] || return 1
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# Mirror of `parse_direct_slash_cli_action`
+# (rust/crates/rusty-claude-cli/src/main.rs) and the `SlashCommand::parse` arms
+# it dispatches through (rust/crates/commands/src/lib.rs).
+#
+# That function has exactly four `Ok(CliAction::…)` outcomes, and each one is
+# further constrained by its own argument parser:
+#
+#   /help                      CliAction::Help    `validate_no_args` -- bare only
+#   /agents [list|help|-h|--help]
+#                              CliAction::Agents  `parse_list_or_help_args`
+#   /mcp [list|show <server>|help|-h|--help]
+#                              CliAction::Mcp     `parse_mcp_command`
+#   /skills|/skill [list|help|-h|--help|install<tail>]
+#                              CliAction::Skills  `parse_skills_args` then
+#                                                 `classify_skills_slash_command`
+#
+# Every other direct slash form leaves that function as either
+# `SkillSlashDispatch::Invoke` -- which IS `CliAction::Prompt` and must stay
+# gated -- or an `Err` usage refusal canonical never proves local. Both stay
+# `inference` here: only a PROVEN local form may bypass readiness. Unknown
+# names, interactive-only commands and invalid UTF-8 all land there too.
+#
+# Note which parser reads which value. `/mcp` matches on the WORD SLICE, so
+# `claw /mcp show "alpha beta"` is `["show", "alpha", "beta"]` -- an Err, not a
+# two-argv local dispatch. `/agents`, `/skills` and `/skill` test the
+# REMAINDER STRING that `remainder_after_command` recovers by stripping the
+# literal `/<command>` prefix off the trimmed input, which is why a spelling
+# like `/  mcp  list` yields no remainder at all while still yielding the word
+# `list`.
+#
+# Takes the FULL argv vector, verb included, exactly as canonical receives
+# `rest`.
+n6_direct_slash_is_local() {
+  local IFS=' '
+  local raw="$*"
+  local LC_ALL=C
+  local trimmed nameless command remainder prefix
+  local -a args=()
+
+  # `let raw = rest.join(" ")`, then `validate_slash_command_input(&raw)`.
+  n6_rust_ws_fold "${raw}" || return 1
+  n6_ws_trim "${N6_WS_FOLDED}"
+  trimmed="${N6_WS_TRIMMED}"
+
+  # `if !trimmed.starts_with('/') { return Ok(None) }` -- `Ok(None)` is the
+  # `unknown subcommand` Err arm of `parse_direct_slash_cli_action`.
+  [[ "${trimmed}" == /* ]] || return 1
+
+  # `trimmed.trim_start_matches('/')` strips EVERY leading slash, so `//help`
+  # and `/ help` both reach the `help` arm.
+  nameless="${trimmed}"
+  while [[ "${nameless}" == /* ]]; do
+    nameless="${nameless#/}"
+  done
+
+  # `.split_whitespace()`: `command = parts.next()`, `args = parts.collect()`.
+  n6_ws_split "${nameless}"
+  command="${N6_WS_TOKENS[0]-}"
+  # `if command.is_empty()` -- the "Slash command name is missing." Err.
+  [[ -n "${command}" ]] || return 1
+  # QUOTED array slice: an unquoted `( ${arr[@]:1} )` would apply pathname
+  # expansion to every token, which is exactly the hazard this mirror exists to
+  # avoid.
+  args=( "${N6_WS_TOKENS[@]:1}" )
+
+  # `remainder_after_command(trimmed, command)`: strip the literal
+  # `/<command>` prefix, trim, and treat empty as `None`. `''` stands in for
+  # `None` here because every consumer runs it through
+  # `normalize_optional_args`, which maps `Some("")` to `None` anyway.
+  # Both `${prefix}` expansions are QUOTED inside their pattern positions, so a
+  # command name containing `*`, `?` or `[` is matched literally.
+  prefix="/${command}"
+  remainder=''
+  if [[ "${trimmed}" == "${prefix}"* ]]; then
+    n6_ws_trim "${trimmed#"${prefix}"}"
+    remainder="${N6_WS_TRIMMED}"
+  fi
+
+  case "${command}" in
+    help)
+      # `validate_no_args(command, &args)`: any WORD at all is an Err.
+      (( ${#args[@]} == 0 )) || return 1
+      return 0
+      ;;
+    agents)
+      # `parse_list_or_help_args` tests the WHOLE remainder, so `list extra` is
+      # an Err rather than a local listing.
+      case "${remainder}" in
+        ''|list|help|-h|--help) return 0 ;;
+        *) return 1 ;;
+      esac
+      ;;
+    mcp)
+      n6_slash_mcp_is_local ${args[@]+"${args[@]}"}
+      return
+      ;;
+    skills|skill)
+      n6_slash_skills_is_local "${remainder}"
+      return
+      ;;
+  esac
+  return 1
+}
+
 # Plan-tail flags that consume the following token, mirroring the value-taking
 # arms of `parse_plan_subcommand_args`. Needed so a `--wrapper` occupying
 # another flag's VALUE slot is read as that value, not as an override.
@@ -1009,6 +1431,19 @@ n6_classify_invocation() {
     '')
       # No positional at all: the interactive REPL, or a piped one-shot prompt.
       printf 'inference'
+      return 0
+      ;;
+    /*)
+      # A DIRECT slash invocation (`claw /help`), which canonical routes to
+      # `parse_direct_slash_cli_action` rather than to any positional arm.
+      # Classifying every one of these as inference -- as this classifier used
+      # to -- made `claw /help` demand a `--model` and exit 9 for a printer that
+      # never reaches a provider, while the positional `claw help` ran locally.
+      if n6_direct_slash_is_local "${rest[@]}"; then
+        printf 'local'
+      else
+        printf 'inference'
+      fi
       return 0
       ;;
     help)

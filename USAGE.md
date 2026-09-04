@@ -331,7 +331,7 @@ For local sessions you can skip the `source` step entirely and use the opt-in wr
 The wrapper:
 
 - sources [`examples/sidestack-local.env`](examples/sidestack-local.env) so every invocation starts from the canonical broker profile, even if the surrounding shell had a stale `OPENAI_BASE_URL`;
-- validates the final effective `OPENAI_BASE_URL` against an allowlist of local SideStackAI broker URLs (`http://127.0.0.1:11435` or `http://localhost:11435`, optionally with a path);
+- validates the final effective `OPENAI_BASE_URL` against an allowlist of local SideStackAI broker URLs — plain `http`, host exactly `127.0.0.1` or `localhost`, port explicitly `11435`, no userinfo, query, or fragment, and one of the canonical base paths `` (none), `/v1`, or `/v1/chat/completions`, each with an optional trailing slash. These are the same path shapes the in-process routing gate accepts, so a custom path such as `http://127.0.0.1:11435/gateway/v1` is refused here (exit 3) rather than accepted at startup and then rejected on every inference request by the canonical binary;
 - refuses to launch `claw` if `OPENAI_BASE_URL` contains the raw Ollama port `:11434` — this is the wrapper's LAW 1 and trips even if the profile itself is edited to point there;
 - prints the active non-secret profile (`OPENAI_BASE_URL`, `RUSTY_CLAUDE_LLM_CALLER`, `RUSTY_CLAUDE_TASK_TYPE`, and the names of any `RUSTY_CLAUDE_MODEL_ALIAS__*` exports) to stderr before exec'ing `claw`;
 - does not probe the broker for liveness. Use `claw doctor` or a separate runtime check (for example a small `curl` against the broker's health endpoint) when you need that signal;

@@ -3572,6 +3572,794 @@ else
     /dev/null /dev/null "${REAL_WRAPPER}"
 fi
 
+# ===========================================================================
+# PR #180 current-head P2 #1: direct slash commands are classified like the
+# canonical dispatch, not blanket-gated as inference.
+#
+# `parse_direct_slash_cli_action` (rust/crates/rusty-claude-cli/src/main.rs)
+# maps a DIRECT slash invocation to a local `CliAction` for exactly four
+# command names, each further constrained by its own argument parser. The
+# classifier used to send every `/…` token to the inference fallback, so
+# `claw /help` demanded a `--model` and exited 9 for a printer that never
+# reaches a provider — while the positional `claw help` dispatched locally.
+# ===========================================================================
+
+# ---------- direct slash: PROVEN local forms bypass readiness ---------------
+# Each row is an `Ok(CliAction::{Help,Agents,Mcp,Skills})` outcome of
+# `parse_direct_slash_cli_action`. No `--model` is supplied: a local dispatch
+# must not require one, and must issue ZERO readiness requests.
+slash_local_index=200
+while IFS='|' read -r slash_argv slash_label; do
+  [[ -n "${slash_label}" ]] || continue
+  ds_name="direct_slash_local_${slash_label}"
+  ds_dir="$(stage_layout "case${slash_local_index}_${slash_label}")"
+  install_canonical "${ds_dir}" current
+  # shellcheck disable=SC2086  # deliberate word splitting: these are argv words
+  if run_case "${ds_name}" "${ds_dir}" 0 -- ${slash_argv} >/dev/null; then
+    if assert_readiness_not_called "${ds_name}" "${ds_dir}/readiness.log" \
+       && assert_canonical_ran "${ds_name}" "${ds_dir}" "${slash_argv%% *}" \
+       && assert_no_decoy_executed "${ds_name}" "${ds_dir}/fake_claw.log"; then
+      pass_case "${ds_name}"
+    fi
+  fi
+  slash_local_index=$((slash_local_index + 1))
+done <<'SLASH_LOCAL'
+/help|help
+/agents|agents_bare
+/agents list|agents_list
+/agents help|agents_help
+/agents -h|agents_dash_h
+/agents --help|agents_dash_dash_help
+/mcp|mcp_bare
+/mcp list|mcp_list
+/mcp show someserver|mcp_show_target
+/mcp help|mcp_help
+/mcp -h|mcp_dash_h
+/skills|skills_bare
+/skills list|skills_list
+/skills help|skills_help
+/skills -h|skills_dash_h
+/skills --help|skills_dash_dash_help
+/skills install ./some/path|skills_install_target
+/skills installer|skills_installer_is_rewritten_to_install_er
+/skill list|skill_alias_list
+SLASH_LOCAL
+
+# ---------- direct slash: everything else stays gated ----------------------
+# Two distinct canonical outcomes share this verdict, and neither is a proven
+# local dispatch:
+#   * `SkillSlashDispatch::Invoke` -> `CliAction::Prompt` (a real model call);
+#   * `Err(...)` usage refusals, which canonical never proves local.
+# Each must query readiness for the EXACT resolved model before canonical runs.
+slash_gated_index=230
+while IFS='|' read -r slash_argv slash_label; do
+  [[ -n "${slash_label}" ]] || continue
+  dg_name="direct_slash_gated_${slash_label}"
+  dg_dir="$(stage_layout "case${slash_gated_index}_${slash_label}")"
+  install_canonical "${dg_dir}" current
+  # shellcheck disable=SC2086  # deliberate word splitting: these are argv words
+  if run_case "${dg_name}" "${dg_dir}" 0 -- --model fast ${slash_argv} >/dev/null; then
+    if assert_readiness_called_for "${dg_name}" "${dg_dir}/readiness.log" 'qwen3%3A14b' \
+       && assert_readiness_url_is_broker_only "${dg_name}" "${dg_dir}/readiness.log" \
+       && assert_no_decoy_executed "${dg_name}" "${dg_dir}/fake_claw.log"; then
+      pass_case "${dg_name}"
+    fi
+  fi
+  slash_gated_index=$((slash_gated_index + 1))
+done <<'SLASH_GATED'
+/skills some-skill|skill_invocation
+/skills some-skill arg1 arg2|skill_invocation_with_args
+/skill some-skill|skill_alias_invocation
+/skills install|skills_install_bare_is_a_usage_err_not_local
+/help extra|help_with_args_is_a_usage_err
+/agents list extra|agents_list_extra_is_a_usage_err
+/mcp show|mcp_show_without_target_is_a_usage_err
+/mcp show a b|mcp_show_with_two_targets_is_a_usage_err
+/mcp bogus|mcp_unknown_action_is_a_usage_err
+/status|interactive_only_slash_command
+/definitely-not-a-command|unknown_slash_command
+SLASH_GATED
+
+# ===========================================================================
+# PR #180 independent-review repair: `/mcp show` is mirrored on CANONICAL word
+# boundaries, not on argv arity.
+#
+# `parse_direct_slash_cli_action` joins the whole argv tail with single spaces
+# and hands that ONE string to `SlashCommand::parse`, which re-splits it with
+# `str::split_whitespace` before `parse_mcp_command` matches its slice arms.
+# The table-driven rows above cannot reach this: they are expanded with
+# deliberate word splitting, so they can express neither an argv token that
+# CONTAINS whitespace nor an EMPTY argv token -- the two shapes where argv
+# arity and canonical word count disagree. Each case below therefore passes its
+# argv explicitly.
+#
+# Canonical proves `Ok(CliAction::Mcp { .. })` for `show` at exactly one slice,
+# `["show", target]`. Both of the review's counterexamples land elsewhere:
+#
+#   claw /mcp show "alpha beta"  -> `/mcp show alpha beta` -> `["show", ..]`
+#                                   "Unexpected arguments for /mcp show."
+#   claw /mcp show ""            -> `/mcp show `           -> `["show"]`
+#                                   `usage_error("mcp show", "<server>")`
+#
+# A classifier that reads argv arity calls both of those local and lets them
+# bypass readiness.
+# ===========================================================================
+
+# ---------- `/mcp show`: zero and multi target words stay gated -------------
+mcp_show_gated_index=260
+mcp_show_gated_case() {
+  local label="$1"
+  shift
+  local name="direct_slash_gated_${label}"
+  local dir
+  dir="$(stage_layout "case${mcp_show_gated_index}_${label}")"
+  install_canonical "${dir}" current
+  if run_case "${name}" "${dir}" 0 -- --model fast "$@" >/dev/null; then
+    if assert_readiness_called_for "${name}" "${dir}/readiness.log" 'qwen3%3A14b' \
+       && assert_readiness_url_is_broker_only "${name}" "${dir}/readiness.log" \
+       && assert_no_decoy_executed "${name}" "${dir}/fake_claw.log"; then
+      pass_case "${name}"
+    fi
+  fi
+  mcp_show_gated_index=$((mcp_show_gated_index + 1))
+}
+
+# The two cases named by the independent review.
+mcp_show_gated_case mcp_show_single_argv_token_with_two_words \
+  /mcp show "alpha beta"
+mcp_show_gated_case mcp_show_empty_argv_token_leaves_no_target \
+  /mcp show ""
+
+# The same boundary reached through the rest of the canonical whitespace set:
+# `split_whitespace` breaks on TAB, VT, FF and CR exactly as it does on SPACE,
+# so none of these carries a single target word either.
+mcp_show_gated_case mcp_show_tab_separated_target_is_two_words \
+  /mcp show "$(printf 'alpha\tbeta')"
+mcp_show_gated_case mcp_show_newline_separated_target_is_two_words \
+  /mcp show "$(printf 'alpha\nbeta')"
+mcp_show_gated_case mcp_show_cr_separated_target_is_two_words \
+  /mcp show "$(printf 'alpha\rbeta')"
+
+# Three-plus target words, and the whitespace-only token that leaves none.
+mcp_show_gated_case mcp_show_three_target_words \
+  /mcp show "alpha beta gamma"
+mcp_show_gated_case mcp_show_whitespace_only_target_leaves_no_target \
+  /mcp show "   "
+mcp_show_gated_case mcp_show_two_empty_argv_tokens_leave_no_target \
+  /mcp show "" ""
+
+# A whole `show <target>` pair folded into ONE argv token still has to be
+# counted on canonical word boundaries -- `["show", "alpha", "beta"]` is an Err.
+mcp_show_gated_case mcp_show_folded_argv_token_with_two_targets \
+  /mcp "show alpha beta"
+
+# Unicode `White_Space` is a canonical separator like SPACE is, so
+# `alpha<NBSP>beta` is `["show", "alpha", "beta"]` -- an Err, not a local
+# dispatch. These two were the first non-ASCII separators the mirror had to
+# honour; the exhaustive per-codepoint sweep below covers the rest.
+mcp_show_gated_case mcp_show_nbsp_separated_target_fails_closed \
+  /mcp show "$(printf 'alpha\xc2\xa0beta')"
+mcp_show_gated_case mcp_show_ideographic_space_target_fails_closed \
+  /mcp show "$(printf 'alpha\xe3\x80\x80beta')"
+
+# ---------- `/mcp show`: exactly one target word is still local -------------
+# The repair must not shrink the proven-local surface: a single canonical
+# target word is `Ok(CliAction::Mcp { .. })` and must dispatch with no `--model`
+# and ZERO readiness requests.
+mcp_show_local_index=280
+mcp_show_local_case() {
+  local label="$1"
+  shift
+  local name="direct_slash_local_${label}"
+  local dir
+  dir="$(stage_layout "case${mcp_show_local_index}_${label}")"
+  install_canonical "${dir}" current
+  if run_case "${name}" "${dir}" 0 -- "$@" >/dev/null; then
+    if assert_readiness_not_called "${name}" "${dir}/readiness.log" \
+       && assert_canonical_ran "${name}" "${dir}" "$1" \
+       && assert_no_decoy_executed "${name}" "${dir}/fake_claw.log"; then
+      pass_case "${name}"
+    fi
+  fi
+  mcp_show_local_index=$((mcp_show_local_index + 1))
+}
+
+mcp_show_local_case mcp_show_one_target_word \
+  /mcp show alpha
+# `str::trim` plus `split_whitespace` normalise padding away, so a padded token
+# still carries exactly one target word.
+mcp_show_local_case mcp_show_padded_target_normalises_to_one_word \
+  /mcp show "  alpha  "
+mcp_show_local_case mcp_show_tab_padded_target_normalises_to_one_word \
+  /mcp show "$(printf '\talpha\t')"
+# `rest.join(" ")` erases the argv boundary, so a folded `show alpha` is the
+# same canonical input as the two-token form.
+mcp_show_local_case mcp_show_folded_argv_token_with_one_target \
+  /mcp "show alpha"
+# A target that merely LOOKS like a glob must not be pathname-expanded while
+# the remainder is re-split; canonical keeps it as one literal target word.
+mcp_show_local_case mcp_show_glob_shaped_target_is_one_word \
+  /mcp show "*"
+# Empty argv tokens collapse under `join`+`trim`, leaving the bare `/mcp` form,
+# which is `Ok(CliAction::Mcp { action: None, target: None })`.
+mcp_show_local_case mcp_bare_with_empty_argv_tokens \
+  /mcp "" ""
+# `--help` is a `parse_mcp_command` help alias, local like `-h`.
+mcp_show_local_case mcp_dash_dash_help \
+  /mcp --help
+
+# ===========================================================================
+# PR #180 Unicode source-mirror closure.
+#
+# `parse_mcp_command` constrains the SHAPE of `/mcp show` -- exactly one word
+# after `show` -- and nothing about the target's charset. Every one of these
+# is `Ok(CliAction::Mcp { .. })` in canonical, verified against a binary built
+# from this tree:
+#
+#   claw /mcp show café   ->  MCP / café  disconnected ...   (rc 0)
+#
+# A mirror that refuses every non-ASCII byte is sound but INCOMPLETE: it sends
+# proven-local dispatches through the readiness gate. The separator set is
+# what has to be mirrored exactly, so the wrapper now folds the whole Unicode
+# `White_Space` set and leaves the target charset alone.
+#
+# The whitespace inventory below is not remembered, it is DERIVED: a scratch
+# probe enumerated `char::from_u32(cp).is_whitespace()` over `0..=0x10FFFF` on
+# the toolchain that builds this repo and returned exactly 25 scalars -- the 6
+# ASCII ones and the 19 spelled out here.
+# ===========================================================================
+
+# ---------- `/mcp show`: a non-ASCII target is ONE word, so it is local -----
+mcp_show_local_case mcp_show_latin1_accented_target \
+  /mcp show "$(printf 'caf\xc3\xa9')"
+mcp_show_local_case mcp_show_cjk_target \
+  /mcp show "$(printf '\xe6\x9d\xb1\xe4\xba\xac')"
+mcp_show_local_case mcp_show_cyrillic_target \
+  /mcp show "$(printf '\xd1\x81\xd0\xb5\xd1\x80\xd0\xb2\xd0\xb5\xd1\x80')"
+mcp_show_local_case mcp_show_greek_target \
+  /mcp show "$(printf '\xce\xb1')"
+mcp_show_local_case mcp_show_astral_emoji_target \
+  /mcp show "$(printf '\xf0\x9f\x98\x80')"
+# A ZWJ sequence is several scalars and no whitespace, so it is still one word.
+mcp_show_local_case mcp_show_zwj_sequence_target \
+  /mcp show "$(printf '\xf0\x9f\x91\xa8\xe2\x80\x8d\xf0\x9f\x91\xa9')"
+mcp_show_local_case mcp_show_combining_mark_target \
+  /mcp show "$(printf 'e\xcc\x81')"
+mcp_show_local_case mcp_show_rtl_target \
+  /mcp show "$(printf '\xd8\xb3\xd9\x8a\xd8\xa7\xd9\x82')"
+# U+10FFFF is the last scalar value; its 4-byte form must not be mistaken for
+# an out-of-range lead byte.
+mcp_show_local_case mcp_show_max_scalar_target \
+  /mcp show "$(printf '\xf4\x8f\xbf\xbf')"
+# The mirror must fold `White_Space` and NOTHING else. U+200B ZERO WIDTH SPACE
+# and U+180E MONGOLIAN VOWEL SEPARATOR are NOT `White_Space` in any Unicode
+# version this toolchain ships, so canonical keeps them inside a single word.
+# Folding either one would SHRINK the proven-local surface.
+mcp_show_local_case mcp_show_zero_width_space_is_not_a_separator \
+  /mcp show "$(printf 'al\xe2\x80\x8bpha')"
+mcp_show_local_case mcp_show_mongolian_vowel_separator_is_not_a_separator \
+  /mcp show "$(printf 'al\xe1\xa0\x8epha')"
+# `str::trim` and `split_whitespace` drop non-ASCII padding exactly as they
+# drop ASCII padding, leaving one target word.
+mcp_show_local_case mcp_show_nbsp_padded_target_normalises_to_one_word \
+  /mcp show "$(printf '\xc2\xa0alpha\xc2\xa0')"
+mcp_show_local_case mcp_show_ideographic_space_padded_target_normalises \
+  /mcp show "$(printf '\xe3\x80\x80alpha\xe3\x80\x80')"
+# The separator between `show` and its target may itself be non-ASCII.
+mcp_show_local_case mcp_show_nbsp_separates_verb_from_target \
+  /mcp "$(printf 'show\xc2\xa0alpha')"
+
+# ---------- every Rust separator splits, so none yields one target word -----
+# Driven by the derived inventory: for EVERY codepoint where
+# `char::is_whitespace()` is true, `alpha<W>beta` is `["show", "alpha",
+# "beta"]` -- a usage Err that must stay gated. Under-splitting any one of
+# these would manufacture a readiness bypass.
+mcp_show_separator_case() {
+  local label="$1" separator="$2"
+  mcp_show_gated_case "mcp_show_separator_${label}" \
+    /mcp show "alpha${separator}beta"
+}
+mcp_show_separator_case u0009 $'\x09'
+mcp_show_separator_case u000a $'\x0a'
+mcp_show_separator_case u000b $'\x0b'
+mcp_show_separator_case u000c $'\x0c'
+mcp_show_separator_case u000d $'\x0d'
+mcp_show_separator_case u0020 $'\x20'
+mcp_show_separator_case u0085 $'\xc2\x85'
+mcp_show_separator_case u00a0 $'\xc2\xa0'
+mcp_show_separator_case u1680 $'\xe1\x9a\x80'
+mcp_show_separator_case u2000 $'\xe2\x80\x80'
+mcp_show_separator_case u2001 $'\xe2\x80\x81'
+mcp_show_separator_case u2002 $'\xe2\x80\x82'
+mcp_show_separator_case u2003 $'\xe2\x80\x83'
+mcp_show_separator_case u2004 $'\xe2\x80\x84'
+mcp_show_separator_case u2005 $'\xe2\x80\x85'
+mcp_show_separator_case u2006 $'\xe2\x80\x86'
+mcp_show_separator_case u2007 $'\xe2\x80\x87'
+mcp_show_separator_case u2008 $'\xe2\x80\x88'
+mcp_show_separator_case u2009 $'\xe2\x80\x89'
+mcp_show_separator_case u200a $'\xe2\x80\x8a'
+mcp_show_separator_case u2028 $'\xe2\x80\xa8'
+mcp_show_separator_case u2029 $'\xe2\x80\xa9'
+mcp_show_separator_case u202f $'\xe2\x80\xaf'
+mcp_show_separator_case u205f $'\xe2\x81\x9f'
+mcp_show_separator_case u3000 $'\xe3\x80\x80'
+# A separator that leaves NO target word at all is the same usage Err.
+mcp_show_gated_case mcp_show_non_ascii_whitespace_only_target_leaves_no_target \
+  /mcp show "$(printf '\xc2\xa0\xe3\x80\x80\xe2\x80\xa8')"
+
+# ---------- invalid UTF-8 fails CLOSED --------------------------------------
+# `main` collects argv with `std::env::args()`, which unwraps and PANICS on a
+# non-UTF-8 argument before any parsing runs (verified against a binary built
+# from this tree: rc 101, `called \`Result::unwrap()\` on an \`Err\` value:
+# "caf\xE9"`). No such argv can reach `Ok(CliAction::Mcp { .. })`, so calling
+# one local would be unsound -- and a byte string that is not well-formed has
+# no character boundaries to fold whitespace on either. Both reasons point the
+# same way: refuse.
+mcp_show_gated_case mcp_show_latin1_byte_is_not_valid_utf8 \
+  /mcp show "$(printf 'caf\xe9')"
+mcp_show_gated_case mcp_show_lone_continuation_byte_is_not_valid_utf8 \
+  /mcp show "$(printf 'al\x80pha')"
+mcp_show_gated_case mcp_show_surrogate_encoding_is_not_valid_utf8 \
+  /mcp show "$(printf '\xed\xa0\x80')"
+mcp_show_gated_case mcp_show_two_byte_overlong_is_not_valid_utf8 \
+  /mcp show "$(printf '\xc0\xaf')"
+mcp_show_gated_case mcp_show_three_byte_overlong_is_not_valid_utf8 \
+  /mcp show "$(printf '\xe0\x80\xaf')"
+mcp_show_gated_case mcp_show_four_byte_overlong_is_not_valid_utf8 \
+  /mcp show "$(printf '\xf0\x80\x80\xaf')"
+mcp_show_gated_case mcp_show_above_max_scalar_is_not_valid_utf8 \
+  /mcp show "$(printf '\xf4\x90\x80\x80')"
+mcp_show_gated_case mcp_show_f5_lead_byte_is_not_valid_utf8 \
+  /mcp show "$(printf '\xf5\x80\x80\x80')"
+mcp_show_gated_case mcp_show_truncated_three_byte_sequence_is_not_valid_utf8 \
+  /mcp show "$(printf 'a\xe2\x80')"
+mcp_show_gated_case mcp_show_truncated_four_byte_sequence_is_not_valid_utf8 \
+  /mcp show "$(printf '\xf0\x9f\x98')"
+
+# ---------- the separator table itself is pinned to the derived inventory ---
+# The table is the whole contract: drop an entry and that codepoint stops
+# splitting, which turns a two-target usage Err into a local dispatch. This
+# asserts the wrapper still carries exactly the 19 non-ASCII scalars the Rust
+# probe returned, in order, and nothing else.
+ws_table_name="mcp_show_separator_table_matches_rust_is_whitespace_inventory"
+ws_table_actual="$(sed -n '/^N6_RUST_WS_NON_ASCII=(/,/^)$/p' \
+  "${REPO_ROOT}/scripts/claw-sidestack-local" \
+  | sed -n 's/^ *\$.*# *\(U+[0-9A-F]*\).*/\1/p' | tr '\n' ' ')"
+ws_table_expected="U+0085 U+00A0 U+1680 U+2000 U+2001 U+2002 U+2003 U+2004 \
+U+2005 U+2006 U+2007 U+2008 U+2009 U+200A U+2028 U+2029 U+202F U+205F U+3000 "
+if [[ "${ws_table_actual}" == "${ws_table_expected}" ]]; then
+  pass_case "${ws_table_name}"
+else
+  fail_case "${ws_table_name}" \
+    "separator table drifted from the derived Rust inventory: ${ws_table_actual}" \
+    /dev/null /dev/null /dev/null
+fi
+
+# ===========================================================================
+# PR #180 direct-slash Unicode normalization closure.
+#
+# The previous mirror read the VERB on an argv-token boundary and trimmed the
+# tail with `n6_trim`, whose `sed [[:space:]]` is both ASCII-narrow and
+# LOCALE-sensitive. `parse_direct_slash_cli_action` does neither: it joins the
+# whole argv vector with single spaces and runs the joined string through
+# `str::trim`, `trim_start_matches('/')` and `str::split_whitespace`, all three
+# of which key off `char::is_whitespace()`.
+#
+# Measured against a differential oracle built from this tree's own `commands`
+# crate (`SlashCommand::parse` + `classify_skills_slash_command`) over a
+# 40,077-case corpus, the old mirror diverged from canonical 2,527 times:
+#
+#   2,511 COMPLETENESS  proven-local dispatches gated as inference, across
+#                       ALL FIVE local families -- not just `/mcp show`.
+#      16 SOUNDNESS     `/skills install<W>` and `/skill install<W>` called
+#                       LOCAL for W in U+0085, U+00A0, U+2007, U+202F. Those
+#                       canonicalize to bare `install`, which
+#                       `parse_skills_args` REFUSES; a usage error was
+#                       bypassing the readiness gate.
+#
+# 22 of the 62 rows below also changed verdict on the old mirror purely with
+# `LC_ALL`, because glibc's `[[:space:]]` matches U+3000 under `en_US.UTF-8`
+# and not under `C`. The repaired mirror folds the derived `White_Space`
+# inventory itself under a pinned `LC_ALL=C`, so it is locale-invariant: the
+# corpus returns byte-identical verdicts under both locales, and zero
+# divergences from the oracle under either.
+# ===========================================================================
+
+# ---------- a Unicode-only tail canonicalizes to the BARE local form --------
+# `rest.join(" ")` then `str::trim` erases a tail made only of Rust whitespace,
+# so `claw /mcp $'\xc2\xa0'` IS `Ok(CliAction::Mcp { action: None, target:
+# None })` -- the disclosed residual, reproduced here for every local family.
+unicode_slash_local_index=400
+unicode_slash_local_case() {
+  local label="$1"
+  shift
+  local name="direct_slash_local_${label}"
+  local dir
+  dir="$(stage_layout "case${unicode_slash_local_index}_${label}")"
+  install_canonical "${dir}" current
+  if run_case "${name}" "${dir}" 0 -- "$@" >/dev/null; then
+    if assert_readiness_not_called "${name}" "${dir}/readiness.log" \
+       && assert_canonical_ran "${name}" "${dir}" "$1" \
+       && assert_no_decoy_executed "${name}" "${dir}/fake_claw.log"; then
+      pass_case "${name}"
+    fi
+  fi
+  unicode_slash_local_index=$((unicode_slash_local_index + 1))
+}
+
+unicode_slash_local_case help_nbsp_only_tail \
+  /help "$(printf '\xc2\xa0')"
+unicode_slash_local_case help_ideographic_space_only_tail \
+  /help "$(printf '\xe3\x80\x80')"
+unicode_slash_local_case agents_nbsp_only_tail \
+  /agents "$(printf '\xc2\xa0')"
+unicode_slash_local_case agents_ideographic_space_only_tail \
+  /agents "$(printf '\xe3\x80\x80')"
+unicode_slash_local_case mcp_nbsp_only_tail \
+  /mcp "$(printf '\xc2\xa0')"
+unicode_slash_local_case mcp_ideographic_space_only_tail \
+  /mcp "$(printf '\xe3\x80\x80')"
+unicode_slash_local_case skills_nbsp_only_tail \
+  /skills "$(printf '\xc2\xa0')"
+unicode_slash_local_case skills_ideographic_space_only_tail \
+  /skills "$(printf '\xe3\x80\x80')"
+unicode_slash_local_case skill_alias_nbsp_only_tail \
+  /skill "$(printf '\xc2\xa0')"
+unicode_slash_local_case skill_alias_ideographic_space_only_tail \
+  /skill "$(printf '\xe3\x80\x80')"
+
+# The same erasure for EVERY non-ASCII scalar in the derived inventory. Missing
+# any one of them re-opens the gap for that codepoint alone.
+mcp_bare_separator_case() {
+  local label="$1" separator="$2"
+  unicode_slash_local_case "mcp_bare_ws_only_tail_${label}" \
+    /mcp "${separator}"
+}
+mcp_bare_separator_case u0085 $'\xc2\x85'
+mcp_bare_separator_case u00a0 $'\xc2\xa0'
+mcp_bare_separator_case u1680 $'\xe1\x9a\x80'
+mcp_bare_separator_case u2000 $'\xe2\x80\x80'
+mcp_bare_separator_case u2001 $'\xe2\x80\x81'
+mcp_bare_separator_case u2002 $'\xe2\x80\x82'
+mcp_bare_separator_case u2003 $'\xe2\x80\x83'
+mcp_bare_separator_case u2004 $'\xe2\x80\x84'
+mcp_bare_separator_case u2005 $'\xe2\x80\x85'
+mcp_bare_separator_case u2006 $'\xe2\x80\x86'
+mcp_bare_separator_case u2007 $'\xe2\x80\x87'
+mcp_bare_separator_case u2008 $'\xe2\x80\x88'
+mcp_bare_separator_case u2009 $'\xe2\x80\x89'
+mcp_bare_separator_case u200a $'\xe2\x80\x8a'
+mcp_bare_separator_case u2028 $'\xe2\x80\xa8'
+mcp_bare_separator_case u2029 $'\xe2\x80\xa9'
+mcp_bare_separator_case u202f $'\xe2\x80\xaf'
+mcp_bare_separator_case u205f $'\xe2\x81\x9f'
+mcp_bare_separator_case u3000 $'\xe3\x80\x80'
+
+# ---------- a Unicode separator around a real subcommand still splits -------
+# `split_whitespace` and the `remainder_after_command` trim both drop it, so
+# these are the ordinary `list`/`help` local dispatches.
+unicode_slash_local_case agents_nbsp_before_list \
+  /agents "$(printf '\xc2\xa0list')"
+unicode_slash_local_case agents_nbsp_after_list \
+  /agents "$(printf 'list\xc2\xa0')"
+unicode_slash_local_case mcp_nbsp_before_list \
+  /mcp "$(printf '\xc2\xa0list')"
+unicode_slash_local_case mcp_nbsp_after_list \
+  /mcp "$(printf 'list\xc2\xa0')"
+unicode_slash_local_case skills_nbsp_before_list \
+  /skills "$(printf '\xc2\xa0list')"
+unicode_slash_local_case skill_alias_ideographic_space_before_help \
+  /skill "$(printf '\xe3\x80\x80help')"
+unicode_slash_local_case mcp_nbsp_separated_show_and_target \
+  /mcp "$(printf '\xc2\xa0show\xc2\xa0alpha')"
+# `parse_skills_args` rewrites `installer` to `install er`, which
+# `classify_skills_slash_command` keeps Local -- a leading NBSP must not change
+# that.
+unicode_slash_local_case skills_nbsp_before_installer \
+  /skills "$(printf '\xc2\xa0installer')"
+
+# ---------- the VERB is read on canonical word boundaries too ---------------
+# `rest.join(" ")` erases the argv boundary before parsing, so a whole
+# invocation folded into ONE argv token is the same canonical input as the
+# spread form. The old mirror matched the verb against `$1` and gated all of
+# these.
+unicode_slash_local_case mcp_single_argv_token_with_nbsp_tail \
+  "$(printf '/mcp\xc2\xa0')"
+unicode_slash_local_case agents_single_argv_token_nbsp_before_list \
+  "$(printf '/agents\xc2\xa0list')"
+unicode_slash_local_case mcp_single_argv_token_list \
+  "/mcp list"
+unicode_slash_local_case mcp_single_argv_token_show_target \
+  "/mcp show alpha"
+# `trimmed.trim_start_matches('/')` strips EVERY leading slash, and
+# `split_whitespace` then skips any padding, so both of these reach the `help`
+# arm with an empty `args`.
+unicode_slash_local_case double_slash_help \
+  "//help"
+unicode_slash_local_case bare_slash_then_help \
+  "/" help
+
+# ---------- normalization must NOT manufacture a local dispatch -------------
+# Every row here is an `Err` or a `SkillSlashDispatch::Invoke` in canonical and
+# must still query readiness for the exact resolved model.
+unicode_slash_gated_index=460
+unicode_slash_gated_case() {
+  local label="$1"
+  shift
+  local name="direct_slash_gated_${label}"
+  local dir
+  dir="$(stage_layout "case${unicode_slash_gated_index}_${label}")"
+  install_canonical "${dir}" current
+  if run_case "${name}" "${dir}" 0 -- --model fast "$@" >/dev/null; then
+    if assert_readiness_called_for "${name}" "${dir}/readiness.log" 'qwen3%3A14b' \
+       && assert_readiness_url_is_broker_only "${name}" "${dir}/readiness.log" \
+       && assert_no_decoy_executed "${name}" "${dir}/fake_claw.log"; then
+      pass_case "${name}"
+    fi
+  fi
+  unicode_slash_gated_index=$((unicode_slash_gated_index + 1))
+}
+
+# THE SOUNDNESS ROW. `/skills install<W>` canonicalizes to bare `install`,
+# which `parse_skills_args` refuses with "Usage: /skills install <path>".
+# The old mirror left the separator attached, matched its `install*` arm and
+# bypassed readiness for a usage error.
+skills_install_ws_case() {
+  local label="$1" separator="$2"
+  unicode_slash_gated_case "skills_install_${label}_is_a_usage_err_not_local" \
+    /skills "$(printf 'install')${separator}"
+}
+skills_install_ws_case u0085 $'\xc2\x85'
+skills_install_ws_case u00a0 $'\xc2\xa0'
+skills_install_ws_case u2000 $'\xe2\x80\x80'
+skills_install_ws_case u2007 $'\xe2\x80\x87'
+skills_install_ws_case u202f $'\xe2\x80\xaf'
+skills_install_ws_case u3000 $'\xe3\x80\x80'
+unicode_slash_gated_case skill_alias_install_nbsp_is_a_usage_err_not_local \
+  /skill "$(printf 'install\xc2\xa0')"
+
+# The remaining error/prompt families, reached across a Unicode separator.
+unicode_slash_gated_case help_nbsp_extra_is_a_usage_err \
+  /help "$(printf '\xc2\xa0extra')"
+unicode_slash_gated_case mcp_nbsp_show_without_target_is_a_usage_err \
+  /mcp "$(printf '\xc2\xa0show')"
+unicode_slash_gated_case mcp_nbsp_show_with_two_targets_is_a_usage_err \
+  /mcp "$(printf '\xc2\xa0show\xc2\xa0a\xc2\xa0b')"
+unicode_slash_gated_case mcp_nbsp_unknown_action_is_a_usage_err \
+  /mcp "$(printf '\xc2\xa0unknown')"
+unicode_slash_gated_case mcp_nbsp_list_extra_is_a_usage_err \
+  /mcp "$(printf '\xc2\xa0list\xc2\xa0extra')"
+unicode_slash_gated_case agents_nbsp_list_extra_is_a_usage_err \
+  /agents "$(printf '\xc2\xa0list\xc2\xa0extra')"
+unicode_slash_gated_case skills_nbsp_skill_invocation_is_a_prompt \
+  /skills "$(printf '\xc2\xa0some-skill')"
+unicode_slash_gated_case skills_nbsp_install_bare_is_a_usage_err \
+  /skills "$(printf '\xc2\xa0install')"
+unicode_slash_gated_case interactive_only_slash_with_nbsp_tail \
+  /status "$(printf '\xc2\xa0')"
+unicode_slash_gated_case unknown_slash_with_nbsp_tail \
+  /definitely-not-a-command "$(printf '\xc2\xa0')"
+# Folding must never reach the filesystem: an unquoted `( ${tokens} )` would
+# pathname-expand this into the wrapper's own CWD before classification.
+unicode_slash_gated_case agents_nbsp_glob_shaped_arg_is_a_usage_err \
+  /agents "$(printf '\xc2\xa0*')"
+# U+200B is NOT `White_Space`, so it stays inside the word and `/help` keeps a
+# non-empty `args` -- an Err, exactly as it is for an ordinary letter.
+unicode_slash_gated_case help_zero_width_space_arg_is_a_usage_err \
+  /help "$(printf '\xc2\xa0\xe2\x80\x8b')"
+
+# ---------- direct slash: `-p` still wins over an apparent local slash ------
+# `-p` returns `CliAction::Prompt` from INSIDE the argument loop, so `claw -p
+# /help` is a PROMPT whose text reads "/help", not a help request. Treating the
+# slash token as local here would be a readiness BYPASS.
+ds_p_name="direct_slash_p_flag_overrides_apparent_local_slash"
+ds_p_dir="$(stage_layout "${ds_p_name}")"
+install_canonical "${ds_p_dir}" current
+if run_case "${ds_p_name}" "${ds_p_dir}" 0 -- --model fast -p /help >/dev/null; then
+  if assert_readiness_called_for "${ds_p_name}" "${ds_p_dir}/readiness.log" 'qwen3%3A14b' \
+     && assert_no_decoy_executed "${ds_p_name}" "${ds_p_dir}/fake_claw.log"; then
+    pass_case "${ds_p_name}"
+  fi
+fi
+
+# Without an explicit model the same shape must refuse rather than dispatch.
+ds_p2_name="direct_slash_p_flag_without_model_refuses"
+ds_p2_dir="$(stage_layout "${ds_p2_name}")"
+install_canonical "${ds_p2_dir}" current
+if run_case "${ds_p2_name}" "${ds_p2_dir}" 9 -- -p /help >/dev/null; then
+  if assert_readiness_not_called "${ds_p2_name}" "${ds_p2_dir}/readiness.log" \
+     && assert_fake_not_called "${ds_p2_name}" "${ds_p2_dir}/fake_claw.log"; then
+    pass_case "${ds_p2_name}"
+  fi
+fi
+
+# ---------- direct slash: `--resume` precedence is unchanged ----------------
+# `--resume` routes to `parse_resume_args`, which continues a real session, so
+# it is inference-capable no matter what positional follows it.
+ds_r_name="direct_slash_resume_still_forces_inference"
+ds_r_dir="$(stage_layout "${ds_r_name}")"
+install_canonical "${ds_r_dir}" current
+if run_case "${ds_r_name}" "${ds_r_dir}" 0 -- --model fast --resume session.jsonl /help >/dev/null; then
+  if assert_readiness_called_for "${ds_r_name}" "${ds_r_dir}/readiness.log" 'qwen3%3A14b' \
+     && assert_no_decoy_executed "${ds_r_name}" "${ds_r_dir}/fake_claw.log"; then
+    pass_case "${ds_r_name}"
+  fi
+fi
+
+# ---------- direct slash: a local slash form is refused when the broker is
+# not consulted at all, i.e. it must never become a silent inference path -----
+# The mirror may only ever be NARROWER than canonical. This pins the exact
+# boundary the positional `skills` mirror does NOT share: `/skills install` is
+# an Err (gated above), while `claw skills install` remains local.
+ds_pos_name="positional_skills_install_stays_local_while_slash_form_is_gated"
+ds_pos_dir="$(stage_layout "${ds_pos_name}")"
+install_canonical "${ds_pos_dir}" current
+if run_case "${ds_pos_name}" "${ds_pos_dir}" 0 -- skills install >/dev/null; then
+  if assert_readiness_not_called "${ds_pos_name}" "${ds_pos_dir}/readiness.log" \
+     && assert_no_decoy_executed "${ds_pos_name}" "${ds_pos_dir}/fake_claw.log"; then
+    pass_case "${ds_pos_name}"
+  fi
+fi
+
+# ===========================================================================
+# PR #180 current-head P2 #2: the shell broker allowlist matches the path
+# classes `BrokerOrigin::from_base_url` (rust/crates/api/src/n6_admission.rs)
+# accepts, so an accepted configuration is a usable one.
+#
+# The old allowlist ended in `(/.*)?`, which let `http://127.0.0.1:11435/
+# gateway/v1` clear LAW 1, pass startup readiness, and exec canonical — which
+# then rejected every inference request, because that path is not one of the
+# three shapes the in-process guard recognizes.
+# ===========================================================================
+
+# ---------- broker path: the canonical shapes are accepted ------------------
+# Table-driven over BOTH loopback hosts. A local subcommand is used so the
+# case proves URL ACCEPTANCE without depending on readiness.
+brokerok_index=260
+while IFS='|' read -r broker_url broker_label; do
+  [[ -n "${broker_label}" ]] || continue
+  bo_name="broker_path_accepted_${broker_label}"
+  bo_dir="$(stage_layout "case${brokerok_index}_${broker_label}" "export OPENAI_BASE_URL=\"${broker_url}\"
+export OPENAI_API_KEY=\"local\"")"
+  install_canonical "${bo_dir}" current
+  if run_case "${bo_name}" "${bo_dir}" 0 -- status >/dev/null; then
+    if assert_canonical_ran "${bo_name}" "${bo_dir}" status \
+       && assert_no_decoy_executed "${bo_name}" "${bo_dir}/fake_claw.log"; then
+      if grep -Fq 'LAW 1' "${bo_dir}/wrapper.stderr"; then
+        fail_case "${bo_name}" "a canonical broker base URL was refused by LAW 1" \
+          /dev/null "${bo_dir}/wrapper.stderr" "${bo_dir}/fake_claw.log"
+      else
+        pass_case "${bo_name}"
+      fi
+    fi
+  fi
+  brokerok_index=$((brokerok_index + 1))
+done <<'BROKER_OK'
+http://127.0.0.1:11435|v4_root
+http://127.0.0.1:11435/|v4_root_slash
+http://127.0.0.1:11435/v1|v4_v1
+http://127.0.0.1:11435/v1/|v4_v1_slash
+http://127.0.0.1:11435/v1/chat/completions|v4_chat
+http://127.0.0.1:11435/v1/chat/completions/|v4_chat_slash
+http://localhost:11435|host_root
+http://localhost:11435/|host_root_slash
+http://localhost:11435/v1|host_v1
+http://localhost:11435/v1/|host_v1_slash
+http://localhost:11435/v1/chat/completions|host_chat
+http://localhost:11435/v1/chat/completions/|host_chat_slash
+BROKER_OK
+
+# ---------- broker path: everything the in-process guard rejects is refused -
+# Exit 3, before the readiness client and before canonical claw.
+brokerbad_index=280
+while IFS='|' read -r broker_url broker_label; do
+  [[ -n "${broker_label}" ]] || continue
+  bb_name="broker_path_refused_${broker_label}"
+  bb_dir="$(stage_layout "case${brokerbad_index}_${broker_label}" "export OPENAI_BASE_URL=\"${broker_url}\"
+export OPENAI_API_KEY=\"local\"")"
+  install_canonical "${bb_dir}" current
+  if run_case "${bb_name}" "${bb_dir}" 3 -- --model fast prompt "should refuse" >/dev/null; then
+    if assert_readiness_not_called "${bb_name}" "${bb_dir}/readiness.log" \
+       && assert_stderr_contains "${bb_name}" "${bb_dir}/wrapper.stderr" 'LAW 1' \
+       && assert_fake_not_called "${bb_name}" "${bb_dir}/fake_claw.log" \
+       && assert_no_decoy_executed "${bb_name}" "${bb_dir}/fake_claw.log"; then
+      pass_case "${bb_name}"
+    fi
+  fi
+  brokerbad_index=$((brokerbad_index + 1))
+done <<'BROKER_BAD'
+http://127.0.0.1:11435/gateway/v1|custom_gateway_path
+http://localhost:11435/gateway/v1|custom_gateway_path_localhost
+http://127.0.0.1:11435/foo|custom_foo_path
+http://127.0.0.1:11435/admin|admin_path
+http://127.0.0.1:11435/v1/embeddings|v1_embeddings_path
+http://127.0.0.1:11435/v2|v2_path
+http://127.0.0.1:11435/v1/chat|v1_chat_without_completions
+http://127.0.0.1:11435/v1?x=1|query_string
+http://127.0.0.1:11435/v1#frag|fragment
+http://user@127.0.0.1:11435/v1|userinfo
+http://user:pass@localhost:11435/v1|userinfo_with_password
+https://127.0.0.1:11435/v1|https_scheme
+http://127.0.0.1:11436/v1|wrong_port
+http://127.0.0.1/v1|implicit_default_port
+http://evil.example.com:11435/v1|wrong_host
+http://localhost.evil:11435/v1|host_prefix_lookalike
+BROKER_BAD
+
+# ---------- broker path: :11434 stays refused by its own dedicated check ----
+# The raw app-inference port must keep its specific LAW 1 message, not fall
+# through to the generic allowlist refusal.
+bb11434_name="broker_path_refused_raw_11434_keeps_dedicated_message"
+bb11434_dir="$(stage_layout "${bb11434_name}" 'export OPENAI_BASE_URL="http://127.0.0.1:11434/v1"
+export OPENAI_API_KEY="local"')"
+install_canonical "${bb11434_dir}" current
+if run_case "${bb11434_name}" "${bb11434_dir}" 3 -- --model fast prompt "should refuse" >/dev/null; then
+  if assert_readiness_not_called "${bb11434_name}" "${bb11434_dir}/readiness.log" \
+     && assert_stderr_contains "${bb11434_name}" "${bb11434_dir}/wrapper.stderr" \
+          'must not point at :11434' \
+     && assert_fake_not_called "${bb11434_name}" "${bb11434_dir}/fake_claw.log"; then
+    pass_case "${bb11434_name}"
+  fi
+fi
+
+# ---------- broker path: the refusal precedes the canonical checks ----------
+# Mirrors case 12 for the narrowed allowlist: with canonical MISSING, a custom
+# broker path must still refuse at LAW 1 and never reach the topology probe.
+bbord_name="broker_path_refusal_precedes_canonical_checks"
+bbord_dir="$(stage_layout "${bbord_name}" 'export OPENAI_BASE_URL="http://127.0.0.1:11435/gateway/v1"
+export OPENAI_API_KEY="local"')"
+install_canonical "${bbord_dir}" missing
+if run_case "${bbord_name}" "${bbord_dir}" 3 -- --model fast prompt "should refuse" >/dev/null; then
+  if assert_readiness_not_called "${bbord_name}" "${bbord_dir}/readiness.log" \
+     && assert_stderr_contains "${bbord_name}" "${bbord_dir}/wrapper.stderr" 'LAW 1' \
+     && assert_fake_not_called "${bbord_name}" "${bbord_dir}/fake_claw.log"; then
+    if grep -Fq 'canonical claw is missing' "${bbord_dir}/wrapper.stderr"; then
+      fail_case "${bbord_name}" "canonical checks ran before the LAW 1 refusal" \
+        /dev/null "${bbord_dir}/wrapper.stderr" "${bbord_dir}/fake_claw.log"
+    else
+      pass_case "${bbord_name}"
+    fi
+  fi
+fi
+
+# ---------- broker path: a LOCAL invocation is refused just the same --------
+# LAW 1 is evaluated before the classifier, so a custom path cannot be smuggled
+# in behind a locally dispatched command either.
+bbloc_name="broker_path_refusal_applies_to_local_invocations_too"
+bbloc_dir="$(stage_layout "${bbloc_name}" 'export OPENAI_BASE_URL="http://127.0.0.1:11435/gateway/v1"
+export OPENAI_API_KEY="local"')"
+install_canonical "${bbloc_dir}" current
+if run_case "${bbloc_name}" "${bbloc_dir}" 3 -- /help >/dev/null; then
+  if assert_readiness_not_called "${bbloc_name}" "${bbloc_dir}/readiness.log" \
+     && assert_stderr_contains "${bbloc_name}" "${bbloc_dir}/wrapper.stderr" 'LAW 1' \
+     && assert_fake_not_called "${bbloc_name}" "${bbloc_dir}/fake_claw.log"; then
+    pass_case "${bbloc_name}"
+  fi
+fi
+
+# ---------- docs: USAGE states the narrowed contract, not "any path" --------
+bbdoc_name="usage_docs_state_the_canonical_broker_path_shapes"
+bbdoc_missing=""
+for bbdoc_needle in \
+  '/v1/chat/completions`, each with an optional trailing slash' \
+  'is refused here (exit 3) rather than accepted at startup'; do
+  if ! grep -Fq "${bbdoc_needle}" "${REPO_ROOT}/USAGE.md"; then
+    bbdoc_missing="${bbdoc_needle}"
+    break
+  fi
+done
+# The retired overclaim must be gone: it promised arbitrary broker paths.
+if [[ -z "${bbdoc_missing}" ]] && grep -Fq 'optionally with a path' "${REPO_ROOT}/USAGE.md"; then
+  bbdoc_missing='the retired "optionally with a path" claim is still present'
+fi
+if [[ -z "${bbdoc_missing}" ]]; then
+  pass_case "${bbdoc_name}"
+else
+  fail_case "${bbdoc_name}" "USAGE.md broker allowlist contract: ${bbdoc_missing}" \
+    /dev/null /dev/null /dev/null
+fi
+
 # ---------- summary ----------
 if [[ "${FAIL_COUNT}" -gt 0 ]]; then
   printf '\nFAIL: %d cases failed, %d passed\n' "${FAIL_COUNT}" "${PASS_COUNT}" >&2
