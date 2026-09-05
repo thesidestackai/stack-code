@@ -23,6 +23,17 @@
 #   5  canonical claw has invalid topology (symlink / not a regular executable)
 #   6  canonical claw is stale relative to the locally known origin/main
 #   7  the canonical status check itself could not run
+#   8  broker readiness refused the session (`ready=false`)
+#   9  broker readiness could not be established (endpoint unreachable, timed
+#      out, non-2xx, malformed, or the requested upstream model is unknown),
+#      OR the invocation can reach a provider but its exact upstream model is
+#      not determinable here at all (`task run`, `plan run --wrapper <other>`),
+#      OR the resolved `curl` does not report a version that enforces the
+#      response-size bound (see the curl capability floor below), in which
+#      case no request is made
+#  10  the canonical claw does not prove it implements the in-process N6
+#      enforcement contract (see the canonical capability floor below); no
+#      readiness request is made and canonical is never exec'd
 #
 # Residual race
 # -------------
@@ -33,6 +44,48 @@
 # semantics portably across Linux, macOS, and WSL, so a SAME-USER process
 # racing between that final check and the `exec` remains possible. The window
 # is narrowed, not eliminated.
+#
+# The same is true of the N6 broker readiness gate added below. It is a
+# CLIENT-side refusal, not an atomic broker admission reservation: a
+# time-of-check/time-of-use interval remains between the readiness GET and the
+# first inference POST that the canonical claw issues. The broker's 300-second
+# Hyperliquid quiet window makes that residual race acceptable under the
+# current operating contract, but it is a real window, not a proof. Raw POSTs
+# made directly to the broker bypass this wrapper and therefore this gate
+# entirely.
+#
+# Trusted local dependencies
+# --------------------------
+# This wrapper treats the resolved local `curl` program — and the same-user
+# filesystem and environment that contain it — as TRUSTED for the duration of
+# one invocation. That trust is an assumption, not something the wrapper
+# verifies, and it bounds every claim made below.
+#
+# Within that assumption the wrapper does defend against: accidental PATH
+# re-resolution between the version probe and the request, a genuine but
+# too-old curl whose `--max-filesize` cannot bound an unknown-length transfer,
+# a malformed or unparseable version banner, a hostile `~/.curlrc`, proxy
+# environment variables, redirects, oversized responses under a compliant
+# curl >= 8.4.0, and HTTP or JSON failures.
+#
+# It does NOT defend against a curl executable that is itself hostile. Three
+# residuals follow directly and are accepted, not solved:
+#
+#   * A malicious curl can print any version it likes. The banner is a claim
+#     by the program under test, so the >= 8.4.0 floor binds a cooperative
+#     curl, not an adversarial one.
+#   * A malicious curl can accept `--max-filesize` and ignore it, returning a
+#     body far larger than the 64 KiB bound.
+#   * If the resolved path is a symlink, a same-user process — including the
+#     probed program itself — can retarget it between the `--version` probe
+#     and the readiness GET, so a different executable can serve the request.
+#
+# These are local dependency-integrity attacks, and they sit OUTSIDE this
+# wrapper's threat model. An attacker who can replace this user's curl can
+# equally POST to the broker directly and bypass the wrapper altogether, which
+# is the same client-side boundary the readiness race above already documents.
+# None of these is a weakness the broker inherits when callers use ordinary
+# trusted system dependencies.
 
 set -euo pipefail
 
@@ -63,7 +116,21 @@ if [[ "${EFFECTIVE_BASE_URL}" == *11434* ]]; then
   exit 3
 fi
 
-BROKER_ALLOWLIST_REGEX='^http://(127\.0\.0\.1|localhost):11435(/.*)?$'
+# The path classes `BrokerOrigin::from_base_url`
+# (rust/crates/api/src/n6_admission.rs) accepts, and no others. That guard runs
+# INSIDE the canonical binary and rejects every inference request whose base URL
+# path is not, after trailing-slash trimming, one of `` / `/v1` / `/v1/chat/
+# completions`. An allowlist broader than the guard is not permissive, it is
+# BROKEN: a custom path such as `http://127.0.0.1:11435/gateway/v1` would clear
+# LAW 1 here, pass startup readiness, exec canonical, and then fail on every
+# request. Refusing it here makes the wrapper's answer and the runtime's answer
+# the same answer.
+#
+# Deliberately NARROWER than the Rust guard in two spots, never broader: this is
+# a literal-form allowlist with no URL normalization, so it rejects dot-segment
+# (`/../v1`) and repeated-slash (`//`) spellings that `Url::parse` would fold
+# into an accepted path. Fail-closed is the safe direction for a refusal gate.
+BROKER_ALLOWLIST_REGEX='^http://(127\.0\.0\.1|localhost):11435(/|/v1/?|/v1/chat/completions/?)?$'
 if [[ ! "${EFFECTIVE_BASE_URL}" =~ ${BROKER_ALLOWLIST_REGEX} ]]; then
   printf 'claw-sidestack-local: LAW 1 refusal — OPENAI_BASE_URL is not an allowed SideStackAI broker URL.\n' >&2
   printf '  offending value: %s\n' "${EFFECTIVE_BASE_URL}" >&2
@@ -161,6 +228,1701 @@ case "${status_rc}" in
     ;;
 esac
 
+
+# --- N6 broker readiness preflight ------------------------------------------
+#
+# Policy: a local coding session must not start when the broker's readiness
+# endpoint says starting one would disrupt the Hyperliquid trading lane.
+# Stack-Code and Hyperliquid are both tier 3, so equal priority only prevents
+# preemption while Hyperliquid is ACTIVELY inferring; an idle resident
+# Hyperliquid model can still be evicted. The broker's
+# `GET /status/n6_planner_ready` applies a 300-second Hyperliquid quiet window
+# and is the authority. `/status` is NOT — it reports the slot, not safety.
+#
+# This gate is a CLIENT-side refusal, not a broker admission reservation. See
+# the "Residual race" note in the header.
+#
+# Everything here runs BEFORE the final topology revalidation below, so no
+# network operation ever happens between that check and `exec`.
+#
+# The classifier is TAIL-AWARE, not verb-aware. Several verbs (`skills`,
+# `plan`, `task`) dispatch locally or to a provider depending on what follows
+# them, and two flags (`-p`, `--resume`) force a provider dispatch regardless
+# of any positional. Classifying on the leading verb alone is what let
+# `claw skills help overview` — a `CliAction::Prompt` — run ungated.
+#
+# Where the exact upstream model cannot be proven before `exec`, the wrapper
+# REFUSES (exit 9) rather than gate on a model the invocation will not use.
+
+# Subcommands proven (by reading the CLI dispatch in
+# rust/crates/rusty-claude-cli/src/main.rs) not to issue a provider request:
+# each one dispatches to a local printer/reporter and never constructs a
+# `LiveCli`.
+#
+# `skills`, `plan`, and `task` are deliberately NOT in this list. Their
+# classification depends on the argument TAIL, not on the leading verb, so
+# each one gets a dedicated arm in `n6_classify_invocation` below. Treating
+# `skills` as unconditionally local is exactly the defect this list used to
+# carry: `claw skills help overview` is a PROMPT, not a local report.
+N6_NON_INFERENCE_SUBCOMMANDS=" version status sandbox doctor acp state init config diff export system-prompt dump-manifests bootstrap-plan agents mcp plugins "
+
+# --- canonical capability floor ----------------------------------------------
+#
+# Exporting the in-process enforcement marker below proves nothing on its own:
+# a canonical binary built before that contract existed accepts the variable and
+# ignores it. The startup gate would still pass, and then every model chosen
+# AFTER exec — a REPL `/model` switch, an Agent primary or fallback, a provider
+# retry — would run through an ungated API. The marker is a request; it is not
+# evidence that anything is listening.
+#
+# Freshness is not that evidence either. `claw-canonical-status` calls an
+# install CURRENT when its Git SHA equals the locally known origin/main. That is
+# provenance, not capability: a worktree legitimately ahead of origin/main is
+# not CURRENT, an explicit `CLAW_SIDESTACK_ALLOW_STALE=1` admits a binary of
+# unknown vintage, and UNKNOWN_BASE admits one with no comparison at all. Under
+# each of those the freshness verdict says nothing about whether the guard is
+# compiled in.
+#
+# So the requirement is positive and independent: the canonical binary must
+# ADVERTISE the exact versioned capability, and the wrapper reads that claim
+# only from the status helper's report — the one call that fences the version
+# banner between two topology probes and a file-identity comparison. Re-running
+# `"${CANONICAL_CLAW}" --version` here would be a second, weaker, unfenced read
+# of a file this wrapper has already been told about.
+N6_REQUIRED_CAPABILITY="supported"
+
+# n6_capability_state — what the identity-protected status report attributed to
+# the canonical binary. Prints exactly one word:
+#
+#   supported    the report carries one capability field naming the contract
+#   unsupported  the report carries one field, and it does not
+#   absent       no capability field at all (a status helper predating this
+#                contract, or a report that never reached the banner)
+#   ambiguous    more than one capability field — the report is not trustworthy
+#   malformed    one field carrying a value this wrapper does not define
+#
+# Only "supported" admits a protected invocation. The other four are distinct so
+# the refusal can say WHY, but they are equally fatal: nothing here guesses at
+# text it does not recognise.
+#
+# The comparison is whole-value equality against the exact field name and the
+# exact state word. A substring test would let `unsupported` satisfy a search
+# for `supported`.
+n6_capability_state() {
+  printf '%s\n' "${status_report}" | awk '
+    /^n6 capability:[[:space:]]/ {
+      seen++
+      value = $0
+      sub(/^n6 capability:[[:space:]]*/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+    }
+    END {
+      if (seen == 0) { print "absent"; exit }
+      if (seen > 1) { print "ambiguous"; exit }
+      if (value == "supported") { print "supported"; exit }
+      if (value == "unsupported") { print "unsupported"; exit }
+      print "malformed"
+    }
+  '
+}
+
+# Deliberately strict, fail-closed reader for the two fields this wrapper
+# depends on. Duplicate keys, a non-boolean `ready`, a blank `reason_code`, or
+# a `requested_model` that does not correspond to what was asked are all
+# treated as "readiness could not be established". python3 is already an
+# unconditional dependency of scripts/claw-canonical-refresh, so this adds no
+# new runtime requirement; jq is not used anywhere in this repo and is not
+# introduced here.
+N6_PARSER_PY="$(cat <<'PY'
+import json, os, sys
+
+def no_duplicate_keys(pairs):
+    seen = {}
+    for key, value in pairs:
+        if key in seen:
+            raise ValueError("duplicate key: " + key)
+        seen[key] = value
+    return seen
+
+try:
+    payload = json.loads(sys.stdin.read(), object_pairs_hook=no_duplicate_keys)
+except Exception:
+    sys.exit(1)
+if not isinstance(payload, dict):
+    sys.exit(1)
+
+if "ready" not in payload or not isinstance(payload["ready"], bool):
+    sys.exit(1)
+reason = payload.get("reason_code")
+if not isinstance(reason, str) or not reason.strip():
+    sys.exit(1)
+reason = reason.strip()
+if "|" in reason or "\n" in reason or "\r" in reason:
+    sys.exit(1)
+
+sent = os.environ["N6_SENT_MODEL"]
+echoed = payload.get("requested_model")
+if not isinstance(echoed, str) or not echoed.strip():
+    sys.exit(1)
+if echoed.strip() not in (sent, sent + ":latest"):
+    sys.exit(1)
+
+sys.stdout.write(("READY|" if payload["ready"] else "NOTREADY|") + reason)
+PY
+)"
+
+n6_trim() {
+  # ASCII-whitespace trim, matching the CLI's `str::trim` for the ASCII inputs
+  # this wrapper accepts.
+  printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+# A "bare" name is what the CLI and the provider layer both treat as eligible
+# for `RUSTY_CLAUDE_MODEL_ALIAS__*` lookup: ASCII alphanumerics and `_`.
+n6_is_bare_name() { [[ "$1" =~ ^[A-Za-z0-9_]+$ ]]; }
+
+# Conservative charset for anything we are willing to put on the wire. Real
+# broker model strings (`qwen3:14b`, `qwen3.5:27b`, `openai/qwen3:14b`) fit;
+# anything else fails closed rather than being percent-encoded by guesswork.
+n6_is_wire_safe_model() { [[ "$1" =~ ^[A-Za-z0-9._:/~+-]+$ ]]; }
+
+n6_env_alias_value() {
+  local name="$1" upper key value
+  # ASCII-only uppercasing is deliberate: it mirrors the CLI's
+  # `to_ascii_uppercase`, and callers only reach here with `[A-Za-z0-9_]`.
+  # shellcheck disable=SC2018,SC2019
+  upper="$(printf '%s' "${name}" | tr 'a-z' 'A-Z')"
+  key="RUSTY_CLAUDE_MODEL_ALIAS__${upper}"
+  [[ -n ${!key+x} ]] || return 1
+  value="$(n6_trim "${!key}")"
+  [[ -n "${value}" ]] || return 1
+  printf '%s' "${value}"
+}
+
+# Mirror of `strip_routing_prefix` in
+# rust/crates/api/src/providers/openai_compat.rs — only these prefixes are
+# stripped, and only at the first `/`.
+n6_strip_routing_prefix() {
+  case "$1" in
+    openai/*) printf '%s' "${1#openai/}" ;;
+    xai/*)    printf '%s' "${1#xai/}" ;;
+    grok/*)   printf '%s' "${1#grok/}" ;;
+    qwen/*)   printf '%s' "${1#qwen/}" ;;
+    kimi/*)   printf '%s' "${1#kimi/}" ;;
+    *)        printf '%s' "$1" ;;
+  esac
+}
+
+# True when a claw config alias redefines this exact model string. Config
+# aliases are consulted by the CLI whenever the env-alias lookup misses, and
+# they can rename ANY string, so their presence makes the effective upstream
+# model undeterminable from here. The five candidate paths mirror
+# `ConfigLoader::discover` in rust/crates/runtime/src/config.rs.
+n6_config_alias_defined() {
+  local model="$1" config_home
+  config_home="${CLAW_CONFIG_HOME:-}"
+  if [[ -z "${config_home}" ]]; then
+    if [[ -n "${HOME:-}" ]]; then
+      config_home="${HOME}/.claw"
+    else
+      config_home=".claw"
+    fi
+  fi
+  N6_MODEL="${model}" N6_CONFIG_HOME="${config_home}" "${N6_PYTHON}" - <<'PY'
+import json, os, sys
+
+model = os.environ["N6_MODEL"]
+home = os.path.abspath(os.environ["N6_CONFIG_HOME"])
+cwd = os.getcwd()
+for path in (
+    os.path.join(os.path.dirname(home), ".claw.json"),
+    os.path.join(home, "settings.json"),
+    os.path.join(cwd, ".claw.json"),
+    os.path.join(cwd, ".claw", "settings.json"),
+    os.path.join(cwd, ".claw", "settings.local.json"),
+):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            parsed = json.load(handle)
+    except Exception:
+        continue
+    if isinstance(parsed, dict):
+        aliases = parsed.get("aliases")
+        if isinstance(aliases, dict) and model in aliases:
+            sys.exit(0)
+sys.exit(1)
+PY
+}
+
+# Resolve the EXACT upstream model string the broker will be asked for, or
+# fail closed. Only two shapes are admitted, and both are exact mirrors of the
+# CLI + provider resolution chain:
+#
+#   bare name  -> must hit RUSTY_CLAUDE_MODEL_ALIAS__<UPPER>, and the alias
+#                 value must itself be non-bare (so no further alias hop and no
+#                 built-in cloud-alias substitution can apply);
+#   explicit   -> forwarded verbatim, provided no claw config alias redefines
+#                 it, then the routing prefix is stripped for the wire.
+#
+# Everything else — no `--model`, a bare name with no alias, a chained alias, a
+# config-aliased string — is UNDETERMINABLE and refuses.
+#
+# Prints `OK|<upstream model>` and returns 0, or `ERR|<diagnostic>` and
+# returns 1. The diagnostic travels on stdout because the caller reads this
+# through a command substitution, where a shell variable set here would be
+# discarded with the subshell.
+n6_resolve_upstream_model() {
+  local requested resolved
+  requested="$(n6_trim "$1")"
+  if [[ -z "${requested}" ]]; then
+    printf 'ERR|the --model value is empty'
+    return 1
+  fi
+  if n6_is_bare_name "${requested}"; then
+    if ! resolved="$(n6_env_alias_value "${requested}")"; then
+      # shellcheck disable=SC2018,SC2019  # ASCII-only, mirrors the CLI
+      printf "ERR|'%s' is a bare alias with no RUSTY_CLAUDE_MODEL_ALIAS__%s export" \
+        "${requested}" "$(printf '%s' "${requested}" | tr 'a-z' 'A-Z')"
+      return 1
+    fi
+    if n6_is_bare_name "${resolved}"; then
+      printf "ERR|alias '%s' resolves to another bare name ('%s'); the effective upstream model is not determinable here" \
+        "${requested}" "${resolved}"
+      return 1
+    fi
+    # The env alias is not the last hop. `parse_args_with_terminal` resolves
+    # the `--model` value once when it parses the flag, and the `-p` arm then
+    # calls `resolve_model_alias_with_config` AGAIN on the already-resolved
+    # string before it builds `CliAction::Prompt`. That second pass misses the
+    # env table (the resolved value is no longer a bare name) but still
+    # consults the CONFIG aliases, which can rename any string. With
+    # `RUSTY_CLAUDE_MODEL_ALIAS__FAST=qwen3:14b` and a config alias mapping
+    # `qwen3:14b` to `openai/other`, `--model fast -p hello` preflighted as
+    # `qwen3:14b` here would have inference load `other`.
+    if n6_config_alias_defined "${resolved}"; then
+      printf "ERR|alias '%s' resolves to '%s', which a claw config alias redefines again; the effective upstream model is not determinable here" \
+        "${requested}" "${resolved}"
+      return 1
+    fi
+  else
+    if n6_config_alias_defined "${requested}"; then
+      printf "ERR|'%s' is redefined by a claw config alias; the effective upstream model is not determinable here" \
+        "${requested}"
+      return 1
+    fi
+    resolved="${requested}"
+  fi
+  resolved="$(n6_strip_routing_prefix "${resolved}")"
+  if [[ -z "${resolved}" ]] || ! n6_is_wire_safe_model "${resolved}"; then
+    printf "ERR|resolved upstream model '%s' is empty or contains characters this wrapper will not put on the wire" \
+      "${resolved}"
+    return 1
+  fi
+  printf 'OK|%s' "${resolved}"
+}
+
+n6_urlencode() {
+  local value="$1" out="" index char
+  for (( index = 0; index < ${#value}; index++ )); do
+    char="${value:index:1}"
+    case "${char}" in
+      [A-Za-z0-9._~-]) out="${out}${char}" ;;
+      *) out="${out}$(printf '%%%02X' "'${char}")" ;;
+    esac
+  done
+  printf '%s' "${out}"
+}
+
+# Last `--model` wins, matching the CLI parser, which reassigns on every
+# occurrence. Both `--model VALUE` and `--model=VALUE` are supported.
+#
+# The scan STOPS at the `-p` terminal. `parse_args_with_terminal` returns
+# `CliAction::Prompt` the moment it reaches `-p`, carrying whatever `model` had
+# been assigned by THEN, and joins every later token into the prompt text. So
+# `--model fast -p hello --model deep` dispatches on `fast`, and a scanner that
+# ran on to the end of argv would gate on `deep`: readiness approved for one
+# model, inference performed on another. Only assignments before the terminal
+# are model metadata.
+n6_model_flag_value() {
+  local found=1 value="" index=0 arg terminal
+  local -a argv=( "$@" )
+  if terminal="$(n6_prompt_terminal_index "$@")"; then
+    if (( terminal > 0 )); then
+      argv=( "${argv[@]:0:terminal}" )
+    else
+      argv=()
+    fi
+  fi
+  while (( index < ${#argv[@]} )); do
+    arg="${argv[index]}"
+    if [[ "${arg}" == "--model" ]]; then
+      if (( index + 1 >= ${#argv[@]} )); then
+        # `--model` with no value: the CLI itself errors out, so there is no
+        # inference to gate, but there is also no model to resolve.
+        return 1
+      fi
+      value="${argv[index + 1]}"
+      found=0
+      index=$(( index + 2 ))
+      continue
+    fi
+    # Any OTHER value-taking global flag CONSUMES the token after it, so a
+    # `--model` standing in that slot is that flag's VALUE and never reaches
+    # the CLI's `--model` arm. `--model fast --base-commit --model deep -p
+    # hello` dispatches on `fast`: the second `--model` is the `--base-commit`
+    # value. A scan that walked one token at a time would read `deep` and gate
+    # readiness on a model the invocation never loads.
+    if n6_flag_takes_value "${arg}"; then
+      index=$(( index + 2 ))
+      continue
+    fi
+    if [[ "${arg}" == --model=* ]]; then
+      value="${arg#--model=}"
+      found=0
+    fi
+    index=$(( index + 1 ))
+  done
+  (( found == 0 )) || return 1
+  printf '%s' "${value}"
+}
+
+# Global flags that consume the following token, so no argv walk mistakes a
+# flag VALUE for a subcommand, a `-p` terminal, or a `--model` option. This is
+# the EXACT set of `--flag value` arms in `parse_args_with_terminal`, and it
+# must stay exact in BOTH directions:
+#
+#   under-inclusion  a real value slot is walked as if it were an option, so a
+#                    `--model` sitting in one is read as a model flag that the
+#                    CLI never saw (readiness gates a model inference will not
+#                    use);
+#   over-inclusion   a token the CLI treats as an ordinary positional is
+#                    skipped ALONG WITH the one after it, so a real `-p`
+#                    terminal or a real `--model` can be swallowed. That is not
+#                    a safe direction either: `dump-manifests --manifests-dir
+#                    -p foo` is `CliAction::Prompt` in the CLI, and swallowing
+#                    its `-p` classifies the invocation on the `dump-manifests`
+#                    positional instead -- a readiness BYPASS.
+#
+# `--manifests-dir` is deliberately ABSENT: it is parsed by the
+# `dump-manifests` subcommand parser, never by the global loop, so the global
+# loop pushes it onto the positional vector like any other token.
+n6_flag_takes_value() {
+  case "$1" in
+    --model|--permission-mode|--output-format|--allowed-tools|--allowedTools|--reasoning-effort|--base-commit) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Global flags the CLI consumes wherever they appear WITHOUT taking a separate
+# token, including every `--flag=value` form. None of these ever contributes to
+# the positional `rest` vector the CLI builds.
+n6_is_global_inline_flag() {
+  case "$1" in
+    --dangerously-skip-permissions|--compact|--allow-broad-cwd|--print) return 0 ;;
+    --model=*|--permission-mode=*|--output-format=*|--allowedTools=*|--allowed-tools=*|--reasoning-effort=*|--base-commit=*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Index of the `-p` that TERMINATES the CLI's argument loop, or nothing.
+#
+# `parse_args_with_terminal` puts no `rest.is_empty()` guard on its `-p` arm, so
+# `-p` is recognized wherever it appears, and that arm RETURNS
+# `CliAction::Prompt` immediately: `args[index + 1..]` is joined into the prompt
+# text and nothing after it is ever parsed as an option again. Two consequences
+# that both the classifier and the model scanner depend on:
+#
+#   * options BEFORE the terminal are real options and still count;
+#   * every token AFTER it is prompt DATA -- not a model flag, not a local verb,
+#     not a wrapper override, not a help or version flag.
+#
+# Value-taking global flags consume their following token first, so a `-p`
+# sitting in a flag VALUE slot is a value, never the terminal.
+#
+# Prints the index and returns 0 when a terminal exists; returns 1 otherwise.
+n6_prompt_terminal_index() {
+  local -a argv=( "$@" )
+  local index=0
+  while (( index < ${#argv[@]} )); do
+    if n6_flag_takes_value "${argv[index]}"; then
+      index=$(( index + 2 ))
+      continue
+    fi
+    if [[ "${argv[index]}" == "-p" ]]; then
+      printf '%s' "${index}"
+      return 0
+    fi
+    index=$(( index + 1 ))
+  done
+  return 1
+}
+
+# True when the CLI's post-loop `wants_help` / `wants_version` checks would
+# fire. Both return a local printer (`CliAction::Help` / `CliAction::Version`)
+# that constructs no `LiveCli` and reaches no provider.
+#
+# The guards are mirrored exactly, and neither is "a help flag appears in
+# argv":
+#
+#   `--help` / `-h`     set wants_help only while the positional vector is
+#                       still EMPTY, or when its first entry is one of the four
+#                       subcommands the CLI intercepts (`prompt`, `commit`,
+#                       `pr`, `issue`). Anywhere else the flag is PUSHED into
+#                       the positional vector and becomes prompt text, which is
+#                       why `explain this --help` is a prompt, not a help
+#                       request.
+#   `--version` / `-V`  set wants_version wherever they appear.
+#
+# `--resume`, `--resume=...`, `--acp` and `-acp` are tracked because the CLI
+# pushes a positional for each of them. That makes the vector non-empty, which
+# changes what a LATER `--help` means -- `--resume --help` is a resumed session,
+# not help.
+#
+# Callers MUST rule out a `-p` terminal first: `-p` returns from inside the
+# argument loop, before either check is reached.
+n6_wants_help_or_version() {
+  local -a argv=( "$@" )
+  local index=0 arg first_positional="" rest_empty=1
+  while (( index < ${#argv[@]} )); do
+    arg="${argv[index]}"
+    if n6_flag_takes_value "${arg}"; then
+      index=$(( index + 2 ))
+      continue
+    fi
+    case "${arg}" in
+      --version|-V)
+        return 0
+        ;;
+      --help|-h)
+        if (( rest_empty == 1 )); then
+          return 0
+        fi
+        case "${first_positional}" in
+          prompt|commit|pr|issue) return 0 ;;
+        esac
+        index=$(( index + 1 ))
+        continue
+        ;;
+      --resume|--resume=*|--acp|-acp)
+        if (( rest_empty == 1 )); then
+          first_positional="${arg}"
+          rest_empty=0
+        fi
+        index=$(( index + 1 ))
+        continue
+        ;;
+    esac
+    if n6_is_global_inline_flag "${arg}"; then
+      index=$(( index + 1 ))
+      continue
+    fi
+    if (( rest_empty == 1 )) && [[ "${arg}" == -* ]]; then
+      # The CLI ERRORS on an unrecognized option while the positional vector is
+      # empty, so dropping it here can never produce a local verdict by itself.
+      index=$(( index + 1 ))
+      continue
+    fi
+    if (( rest_empty == 1 )); then
+      first_positional="${arg}"
+      rest_empty=0
+    fi
+    index=$(( index + 1 ))
+  done
+  return 1
+}
+
+# Two flags make the CLI dispatch to a model-backed action regardless of what
+# follows, so no positional scan can classify them:
+#
+#   -p        `parse_args_with_terminal` joins the ENTIRE remaining argv into a
+#             prompt and returns `CliAction::Prompt`. `-p status` is a PROMPT
+#             whose text happens to read "status", not the local status report.
+#   --resume  routes to `parse_resume_args`, producing `ResumeSession` or
+#             `ResumeRepl`; both continue a real session. `--resume status`
+#             resumes a session reference named "status".
+#
+# Both are unconditionally inference-capable.
+n6_forces_inference() {
+  local -a argv=( "$@" )
+  local index=0 arg
+  while (( index < ${#argv[@]} )); do
+    arg="${argv[index]}"
+    if n6_flag_takes_value "${arg}"; then
+      index=$(( index + 2 ))
+      continue
+    fi
+    case "${arg}" in
+      -p|--resume|--resume=*) return 0 ;;
+    esac
+    index=$(( index + 1 ))
+  done
+  return 1
+}
+
+# Reconstruct the positional `rest` vector `parse_args_with_terminal` builds,
+# emitted NUL-separated so an argument containing a newline cannot split. An
+# unrecognized `-…` token is dropped only while `rest` is still empty, matching
+# the CLI, which errors on it there and pushes it everywhere else.
+#
+# `--acp` / `-acp` are the one dash-prefixed pair the CLI REWRITES into a bare
+# positional rather than consuming or rejecting: its arm pushes the literal
+# `acp`, so `claw --acp` dispatches the same local `print_acp_status` printer
+# that `claw acp` does. Reconstructing that here is what keeps both documented
+# compatibility forms out of the leading-unknown-dash drop below — left there
+# they would empty the vector, classify as `inference`, and demand a model for
+# an invocation that only prints ACP status.
+#
+# The rewrite is deliberately UNCONDITIONAL, matching the CLI arm, which
+# carries no `rest.is_empty()` guard. It is placed after the two flag
+# predicates so an `--acp` sitting in another flag's VALUE slot (`--model
+# --acp`) is still consumed as that value, exactly as the CLI consumes it.
+#
+# This normalization decides no verdict by itself. `-p` and `--resume` are
+# both settled by `n6_prompt_terminal_index` and `n6_forces_inference` BEFORE
+# this reconstruction is ever read, so rewriting the alias cannot turn a
+# provider-bearing invocation local, and the tail survives into `rest` so
+# `--acp <tail>` is classified on the same evidence as `acp <tail>`.
+n6_cli_rest() {
+  local -a argv=( "$@" ) rest=()
+  local index=0 arg
+  while (( index < ${#argv[@]} )); do
+    arg="${argv[index]}"
+    if n6_flag_takes_value "${arg}"; then
+      index=$(( index + 2 ))
+      continue
+    fi
+    if n6_is_global_inline_flag "${arg}"; then
+      index=$(( index + 1 ))
+      continue
+    fi
+    if [[ "${arg}" == "--acp" || "${arg}" == "-acp" ]]; then
+      rest+=( "acp" )
+      index=$(( index + 1 ))
+      continue
+    fi
+    if (( ${#rest[@]} == 0 )) && [[ "${arg}" == -* ]]; then
+      index=$(( index + 1 ))
+      continue
+    fi
+    rest+=( "${arg}" )
+    index=$(( index + 1 ))
+  done
+  (( ${#rest[@]} )) && printf '%s\0' "${rest[@]}"
+  return 0
+}
+
+# Exact mirror of `classify_skills_slash_command` in
+# rust/crates/commands/src/lib.rs. The CLI joins EVERY token after `skills`
+# with a single space (`join_optional_args`), trims it, and keeps the
+# invocation local for only these whole-string forms. Anything else becomes
+# `SkillSlashDispatch::Invoke`, i.e. `CliAction::Prompt`.
+#
+# A first-token test is therefore WRONG — the tail decides. `skills help
+# overview`, `skills list extra`, `skills <skill>`, and `skills <skill> <args>`
+# are all prompts.
+#
+# Takes the full `rest` vector; the leading `skills` token is dropped here.
+n6_skills_is_local() {
+  shift || true
+  local IFS=' '
+  local joined
+  joined="$(n6_trim "$*")"
+  case "${joined}" in
+    ''|list|help|-h|--help|install) return 0 ;;
+    'install '*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# `/skills` and `/skill` do NOT share the positional `skills` contract, so
+# `n6_skills_is_local` must not be reused for them. The slash route runs
+# `parse_skills_args` (rust/crates/commands/src/lib.rs) BEFORE
+# `classify_skills_slash_command`, and that extra stage changes two verdicts:
+#
+#   /skills install     `parse_skills_args` returns Err("Usage: /skills install
+#                       <path>") and canonical never reaches a local CliAction,
+#                       so this is NOT local here -- while the positional
+#                       `claw skills install` IS local.
+#   /skills installer   `parse_skills_args` strips the literal `install`, finds
+#                       a non-empty `er`, and REWRITES the args to `install er`.
+#                       `classify_skills_slash_command` then keeps that Local,
+#                       so this IS local here -- while the positional
+#                       `claw skills installer` is a `CliAction::Prompt`.
+#
+# Takes the already-trimmed tail (the `/skills` token removed).
+n6_slash_skills_is_local() {
+  case "$1" in
+    ''|list|help|-h|--help) return 0 ;;
+    install) return 1 ;;
+    install*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Direct-slash normalization: ONE canonical-shaped pipeline, not per-family
+# Unicode patches.
+#
+# `parse_direct_slash_cli_action` does not look at argv tokens at all. It joins
+# the WHOLE argv vector with single spaces and hands that one string to
+# `SlashCommand::parse` -> `validate_slash_command_input`, which then does, in
+# order:
+#
+#   let trimmed = input.trim();                      // Unicode White_Space
+#   trimmed.starts_with('/')                         // else Ok(None)
+#   let mut parts = trimmed.trim_start_matches('/')  // ALL leading slashes
+#                          .split_whitespace();      // Unicode White_Space
+#   let command = parts.next().unwrap_or_default();  // "" => Err
+#   let args = parts.collect::<Vec<_>>();
+#   let remainder = remainder_after_command(trimmed, command);
+#
+# Every one of those steps is Unicode-whitespace-aware, and the two consumers
+# disagree about which of them they read: `parse_mcp_command` matches on the
+# `args` SLICE, while `parse_list_or_help_args` and `parse_skills_args` test
+# the `remainder` STRING. A mirror therefore has to reproduce the pipeline
+# itself, not each family's happy path, or it drifts in both directions at
+# once.
+#
+# The previous mirror read the verb on an argv-token boundary and trimmed the
+# tail with `n6_trim`, whose `sed [[:space:]]` is BOTH ASCII-narrow and
+# locale-sensitive. Measured against canonical on this tree, that cost
+# correctness in both directions:
+#
+#   COMPLETENESS  `claw /mcp $' '`, `/help`, `/agents`, `/agents list `,
+#                 `/skills`, `/skill` and every other family whose tail is
+#                 exclusively non-ASCII Rust whitespace canonicalize to the
+#                 bare local form, but were gated as inference.
+#   SOUNDNESS     `claw /skills $'install '` canonicalizes to `install`,
+#                 which `parse_skills_args` REFUSES ("Usage: /skills install
+#                 <path>") -- yet the ASCII trim left the NBSP attached, the
+#                 `install*` arm matched, and the wrapper called it local. A
+#                 usage error was bypassing readiness.
+#   LOCALE        `[[:space:]]` under `en_US.UTF-8` strips U+3000 but not
+#                 U+00A0, and under `LC_ALL=C` strips neither, so the verdict
+#                 for the same argv depended on the caller's environment.
+#
+# The replacement below runs the canonical pipeline once, under `LC_ALL=C`,
+# over a string in which every non-ASCII Rust whitespace scalar has been folded
+# to an ASCII space. After that fold the ASCII-only trim and splitter ARE
+# `str::trim` and `str::split_whitespace`, so each family arm can be a literal
+# transcription of its Rust parser.
+#
+# `parse_mcp_command` puts NO charset restriction on `target`, so `/mcp show
+# cafe<U+00E9>`, `/mcp show <CJK>` and `/mcp show <emoji>` are all
+# `Ok(CliAction::Mcp { .. })`. Only the SEPARATOR set is mirrored; the target
+# charset is left unconstrained.
+
+# The 19 non-ASCII characters for which Rust's `char::is_whitespace()` is true,
+# as their UTF-8 byte sequences. `str::trim` and `str::split_whitespace` both
+# key off that one predicate, so together with TAB/LF/VT/FF/CR/SPACE this IS
+# the canonical separator set.
+#
+# DERIVED, not remembered: a scratch probe enumerated `char::from_u32(cp)
+# .is_whitespace()` over `0..=0x10FFFF` on the toolchain that builds this repo
+# and returned exactly these 25 scalars. `char::is_whitespace()` reads a
+# Unicode property table compiled into the binary and never consults the
+# locale; `LC_ALL=C` below pins this mirror to the same locale-independent
+# byte comparisons. Note what is NOT here: U+200B ZERO WIDTH SPACE and U+180E
+# are not `White_Space`, so they are ordinary target bytes to canonical and
+# must stay ordinary target bytes here.
+N6_RUST_WS_NON_ASCII=(
+  $'\xc2\x85'      # U+0085  NEXT LINE
+  $'\xc2\xa0'      # U+00A0  NO-BREAK SPACE
+  $'\xe1\x9a\x80'  # U+1680  OGHAM SPACE MARK
+  $'\xe2\x80\x80'  # U+2000  EN QUAD
+  $'\xe2\x80\x81'  # U+2001  EM QUAD
+  $'\xe2\x80\x82'  # U+2002  EN SPACE
+  $'\xe2\x80\x83'  # U+2003  EM SPACE
+  $'\xe2\x80\x84'  # U+2004  THREE-PER-EM SPACE
+  $'\xe2\x80\x85'  # U+2005  FOUR-PER-EM SPACE
+  $'\xe2\x80\x86'  # U+2006  SIX-PER-EM SPACE
+  $'\xe2\x80\x87'  # U+2007  FIGURE SPACE
+  $'\xe2\x80\x88'  # U+2008  PUNCTUATION SPACE
+  $'\xe2\x80\x89'  # U+2009  THIN SPACE
+  $'\xe2\x80\x8a'  # U+200A  HAIR SPACE
+  $'\xe2\x80\xa8'  # U+2028  LINE SEPARATOR
+  $'\xe2\x80\xa9'  # U+2029  PARAGRAPH SEPARATOR
+  $'\xe2\x80\xaf'  # U+202F  NARROW NO-BREAK SPACE
+  $'\xe2\x81\x9f'  # U+205F  MEDIUM MATHEMATICAL SPACE
+  $'\xe3\x80\x80'  # U+3000  IDEOGRAPHIC SPACE
+)
+
+# UTF-8 byte classes, spelled out as literal sets so that membership is a
+# plain substring test. No bracket RANGES and no `[[:space:]]`: a range
+# endpoint is collation-dependent, a literal set is not.
+#
+# The four constrained second-byte ranges UTF-8 well-formedness needs are
+# contiguous SLICES of the continuation set:
+#   ${N6_UTF8_CONT:32}     \xA0-\xBF   valid second byte after \xE0
+#   ${N6_UTF8_CONT:0:32}   \x80-\x9F   valid second byte after \xED
+#   ${N6_UTF8_CONT:16}     \x90-\xBF   valid second byte after \xF0
+#   ${N6_UTF8_CONT:0:16}   \x80-\x8F   valid second byte after \xF4
+N6_UTF8_CONT=$'\x80\x81\x82\x83\x84\x85\x86\x87\x88\x89\x8a\x8b\x8c\x8d\x8e\x8f'
+N6_UTF8_CONT+=$'\x90\x91\x92\x93\x94\x95\x96\x97\x98\x99\x9a\x9b\x9c\x9d\x9e\x9f'
+N6_UTF8_CONT+=$'\xa0\xa1\xa2\xa3\xa4\xa5\xa6\xa7\xa8\xa9\xaa\xab\xac\xad\xae\xaf'
+N6_UTF8_CONT+=$'\xb0\xb1\xb2\xb3\xb4\xb5\xb6\xb7\xb8\xb9\xba\xbb\xbc\xbd\xbe\xbf'
+N6_UTF8_LEAD2=$'\xc2\xc3\xc4\xc5\xc6\xc7\xc8\xc9\xca\xcb\xcc\xcd\xce\xcf'
+N6_UTF8_LEAD2+=$'\xd0\xd1\xd2\xd3\xd4\xd5\xd6\xd7\xd8\xd9\xda\xdb\xdc\xdd\xde\xdf'
+N6_UTF8_LEAD3=$'\xe0\xe1\xe2\xe3\xe4\xe5\xe6\xe7\xe8\xe9\xea\xeb\xec\xed\xee\xef'
+N6_UTF8_LEAD4=$'\xf0\xf1\xf2\xf3\xf4'
+# \xC0 \xC1 encode overlongs; \xF5-\xFF are above U+10FFFF. Neither can begin a
+# well-formed sequence, and neither is claimed by any table above.
+N6_UTF8_NEVER_LEAD=$'\xc0\xc1\xf5\xf6\xf7\xf8\xf9\xfa\xfb\xfc\xfd\xfe\xff'
+
+# Well-formed-UTF-8 predicate over the raw bytes of "$1".
+#
+# WHY the mirror needs it: `main` collects argv with `std::env::args()`, which
+# unwraps and PANICS on a non-UTF-8 argument before any parsing happens
+# (verified against this tree's binary: `claw /mcp show $'caf\xe9'` aborts with
+# `called \`Result::unwrap()\` on an \`Err\` value: "caf\xE9"`, rc 101). No
+# invalid-UTF-8 argv can therefore ever reach `Ok(CliAction::Mcp { .. })`, so
+# the mirror must not call one local. Overlongs and surrogate encodings are
+# rejected here for the same reason -- they panic too.
+#
+# It also earns the substring rewrite below: UTF-8 is self-synchronising, so on
+# WELL-FORMED input a lead byte is never a continuation byte and a whitespace
+# character's byte sequence can only occur at a real character boundary. Byte
+# substitution is then exactly character substitution.
+n6_utf8_is_valid() {
+  local s="$1"
+  local LC_ALL=C
+  local length=${#s}
+  local index=0 lead second allowed follow count
+  while (( index < length )); do
+    lead="${s:index:1}"
+    case "${N6_UTF8_NEVER_LEAD}${N6_UTF8_CONT}" in
+      *"${lead}"*) return 1 ;;
+    esac
+    if [[ "${N6_UTF8_LEAD2}" == *"${lead}"* ]]; then
+      count=1
+      allowed="${N6_UTF8_CONT}"
+    elif [[ "${N6_UTF8_LEAD3}" == *"${lead}"* ]]; then
+      count=2
+      case "${lead}" in
+        $'\xe0') allowed="${N6_UTF8_CONT:32}" ;;
+        $'\xed') allowed="${N6_UTF8_CONT:0:32}" ;;
+        *) allowed="${N6_UTF8_CONT}" ;;
+      esac
+    elif [[ "${N6_UTF8_LEAD4}" == *"${lead}"* ]]; then
+      count=3
+      case "${lead}" in
+        $'\xf0') allowed="${N6_UTF8_CONT:16}" ;;
+        $'\xf4') allowed="${N6_UTF8_CONT:0:16}" ;;
+        *) allowed="${N6_UTF8_CONT}" ;;
+      esac
+    else
+      # Not claimed by any multi-byte table and not rejected above: ASCII.
+      index=$((index + 1))
+      continue
+    fi
+    (( index + count < length )) || return 1
+    second="${s:index+1:1}"
+    [[ "${allowed}" == *"${second}"* ]] || return 1
+    follow=2
+    while (( follow <= count )); do
+      [[ "${N6_UTF8_CONT}" == *"${s:index+follow:1}"* ]] || return 1
+      follow=$((follow + 1))
+    done
+    index=$((index + count + 1))
+  done
+  return 0
+}
+
+# The six ASCII characters for which `char::is_whitespace()` is true, as a
+# literal set. No bracket RANGE and no `[[:space:]]`: a range endpoint and a
+# POSIX class are both collation/locale dependent, a literal set is not.
+# Membership is tested as a plain substring match under `LC_ALL=C`.
+N6_ASCII_WS=$' \t\n\v\f\r'
+
+# Fold every non-ASCII canonical separator down to an ASCII space.
+#
+# Fails CLOSED on anything canonical could not receive as a `&str` (see
+# `n6_utf8_is_valid`), so an invalid-UTF-8 argv can never be called local.
+#
+# UTF-8 is self-synchronising, so on WELL-FORMED input a whitespace scalar's
+# byte sequence occurs only at a real character boundary: byte substitution is
+# exactly character substitution. Folding only ever REPLACES one whitespace
+# scalar with another, so it can neither merge two canonical words into one nor
+# split one word into two.
+#
+# Result in N6_WS_FOLDED. Returns non-zero (and leaves the result unset) when
+# the input is not well-formed UTF-8.
+n6_rust_ws_fold() {
+  local value="$1"
+  local LC_ALL=C
+  local separator
+  n6_utf8_is_valid "${value}" || return 1
+  for separator in "${N6_RUST_WS_NON_ASCII[@]}"; do
+    value="${value//"${separator}"/ }"
+  done
+  N6_WS_FOLDED="${value}"
+  return 0
+}
+
+# `str::trim` over an already-folded string. Result in N6_WS_TRIMMED.
+#
+# `n6_trim` above keeps its own `sed`-based implementation and its own callers;
+# this one is used ONLY by the direct-slash mirror. Keeping them separate means
+# the fix cannot silently change model-alias or positional-subcommand parsing.
+n6_ws_trim() {
+  local value="$1"
+  local LC_ALL=C
+  while [[ -n "${value}" && "${N6_ASCII_WS}" == *"${value:0:1}"* ]]; do
+    value="${value:1}"
+  done
+  while [[ -n "${value}" && "${N6_ASCII_WS}" == *"${value: -1}"* ]]; do
+    value="${value:0:${#value} - 1}"
+  done
+  N6_WS_TRIMMED="${value}"
+  return 0
+}
+
+# `str::split_whitespace` over an already-folded string. Tokens in
+# N6_WS_TOKENS.
+#
+# Deliberately a character walk rather than `tokens=( ${value} )`: unquoted
+# expansion would apply pathname expansion to every token, so `/mcp show *`
+# would be rewritten by the wrapper's own CWD. No `eval`, no `set -f` dance.
+n6_ws_split() {
+  local value="$1"
+  local LC_ALL=C
+  local length=${#value}
+  local index=0 character token=''
+  N6_WS_TOKENS=()
+  while (( index < length )); do
+    character="${value:index:1}"
+    if [[ "${N6_ASCII_WS}" == *"${character}"* ]]; then
+      if [[ -n "${token}" ]]; then
+        N6_WS_TOKENS+=( "${token}" )
+        token=''
+      fi
+    else
+      token+="${character}"
+    fi
+    index=$(( index + 1 ))
+  done
+  if [[ -n "${token}" ]]; then
+    N6_WS_TOKENS+=( "${token}" )
+  fi
+  return 0
+}
+
+# `parse_mcp_command` (rust/crates/commands/src/lib.rs), transcribed arm for
+# arm over the canonical `args` slice.
+#
+#   []                       Ok   bare /mcp
+#   ["list"]                 Ok
+#   ["list", ..]             Err  usage_error("mcp list", "")
+#   ["show"]                 Err  usage_error("mcp show", "<server>")
+#   ["show", target]         Ok   EXACTLY one target word
+#   ["show", ..]             Err  "Unexpected arguments for /mcp show."
+#   ["help"|"-h"|"--help"]   Ok   one-element pattern: `help extra` is an Err
+#   [action, ..]             Err
+#
+# Called with the canonical `args` as "$@", so the count IS the word count that
+# `split_whitespace` produced -- never the argv arity.
+n6_slash_mcp_is_local() {
+  case $# in
+    0) return 0 ;;
+    1)
+      case "$1" in
+        list|help|-h|--help) return 0 ;;
+        *) return 1 ;;
+      esac
+      ;;
+    2)
+      [[ "$1" == show ]] || return 1
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# Mirror of `parse_direct_slash_cli_action`
+# (rust/crates/rusty-claude-cli/src/main.rs) and the `SlashCommand::parse` arms
+# it dispatches through (rust/crates/commands/src/lib.rs).
+#
+# That function has exactly four `Ok(CliAction::…)` outcomes, and each one is
+# further constrained by its own argument parser:
+#
+#   /help                      CliAction::Help    `validate_no_args` -- bare only
+#   /agents [list|help|-h|--help]
+#                              CliAction::Agents  `parse_list_or_help_args`
+#   /mcp [list|show <server>|help|-h|--help]
+#                              CliAction::Mcp     `parse_mcp_command`
+#   /skills|/skill [list|help|-h|--help|install<tail>]
+#                              CliAction::Skills  `parse_skills_args` then
+#                                                 `classify_skills_slash_command`
+#
+# Every other direct slash form leaves that function as either
+# `SkillSlashDispatch::Invoke` -- which IS `CliAction::Prompt` and must stay
+# gated -- or an `Err` usage refusal canonical never proves local. Both stay
+# `inference` here: only a PROVEN local form may bypass readiness. Unknown
+# names, interactive-only commands and invalid UTF-8 all land there too.
+#
+# Note which parser reads which value. `/mcp` matches on the WORD SLICE, so
+# `claw /mcp show "alpha beta"` is `["show", "alpha", "beta"]` -- an Err, not a
+# two-argv local dispatch. `/agents`, `/skills` and `/skill` test the
+# REMAINDER STRING that `remainder_after_command` recovers by stripping the
+# literal `/<command>` prefix off the trimmed input, which is why a spelling
+# like `/  mcp  list` yields no remainder at all while still yielding the word
+# `list`.
+#
+# Takes the FULL argv vector, verb included, exactly as canonical receives
+# `rest`.
+n6_direct_slash_is_local() {
+  local IFS=' '
+  local raw="$*"
+  local LC_ALL=C
+  local trimmed nameless command remainder prefix
+  local -a args=()
+
+  # `let raw = rest.join(" ")`, then `validate_slash_command_input(&raw)`.
+  n6_rust_ws_fold "${raw}" || return 1
+  n6_ws_trim "${N6_WS_FOLDED}"
+  trimmed="${N6_WS_TRIMMED}"
+
+  # `if !trimmed.starts_with('/') { return Ok(None) }` -- `Ok(None)` is the
+  # `unknown subcommand` Err arm of `parse_direct_slash_cli_action`.
+  [[ "${trimmed}" == /* ]] || return 1
+
+  # `trimmed.trim_start_matches('/')` strips EVERY leading slash, so `//help`
+  # and `/ help` both reach the `help` arm.
+  nameless="${trimmed}"
+  while [[ "${nameless}" == /* ]]; do
+    nameless="${nameless#/}"
+  done
+
+  # `.split_whitespace()`: `command = parts.next()`, `args = parts.collect()`.
+  n6_ws_split "${nameless}"
+  command="${N6_WS_TOKENS[0]-}"
+  # `if command.is_empty()` -- the "Slash command name is missing." Err.
+  [[ -n "${command}" ]] || return 1
+  # QUOTED array slice: an unquoted `( ${arr[@]:1} )` would apply pathname
+  # expansion to every token, which is exactly the hazard this mirror exists to
+  # avoid.
+  args=( "${N6_WS_TOKENS[@]:1}" )
+
+  # `remainder_after_command(trimmed, command)`: strip the literal
+  # `/<command>` prefix, trim, and treat empty as `None`. `''` stands in for
+  # `None` here because every consumer runs it through
+  # `normalize_optional_args`, which maps `Some("")` to `None` anyway.
+  # Both `${prefix}` expansions are QUOTED inside their pattern positions, so a
+  # command name containing `*`, `?` or `[` is matched literally.
+  prefix="/${command}"
+  remainder=''
+  if [[ "${trimmed}" == "${prefix}"* ]]; then
+    n6_ws_trim "${trimmed#"${prefix}"}"
+    remainder="${N6_WS_TRIMMED}"
+  fi
+
+  case "${command}" in
+    help)
+      # `validate_no_args(command, &args)`: any WORD at all is an Err.
+      (( ${#args[@]} == 0 )) || return 1
+      return 0
+      ;;
+    agents)
+      # `parse_list_or_help_args` tests the WHOLE remainder, so `list extra` is
+      # an Err rather than a local listing.
+      case "${remainder}" in
+        ''|list|help|-h|--help) return 0 ;;
+        *) return 1 ;;
+      esac
+      ;;
+    mcp)
+      n6_slash_mcp_is_local ${args[@]+"${args[@]}"}
+      return
+      ;;
+    skills|skill)
+      n6_slash_skills_is_local "${remainder}"
+      return
+      ;;
+  esac
+  return 1
+}
+
+# Plan-tail flags that consume the following token, mirroring the value-taking
+# arms of `parse_plan_subcommand_args`. Needed so a `--wrapper` occupying
+# another flag's VALUE slot is read as that value, not as an override.
+n6_plan_flag_takes_value() {
+  case "$1" in
+    --report-format|--substrate-url|--fast-model|--wrapper|--step-timeout|--workspace-root) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# `--wrapper` for `claw plan run`: prints the EFFECTIVE operator-supplied value
+# (empty when the flag was given without one) and returns 0, or returns 1 when
+# the flag is absent. Scanned over the plan tail, where the CLI parses it.
+#
+# LAST assignment wins. `parse_plan_subcommand_args` reassigns `wrapper` on
+# every occurrence and never breaks out of its loop, so
+# `--wrapper <this-wrapper> --wrapper /usr/bin/claw` runs the plan's
+# model-bearing steps through `/usr/bin/claw`. A first-match reader would call
+# that plan safely self-wrapped and wave through exactly the case that escapes
+# the readiness gate. The converse ordering matters too: with
+# `--wrapper /usr/bin/claw --wrapper <this-wrapper>` the runner really does use
+# this wrapper, so refusing it would be a false refusal.
+#
+# `--wrapper` given as the LAST token is an error in the CLI ("missing value
+# for --wrapper"); it is recorded here as an empty assignment so the caller
+# fails closed rather than falling back to an earlier value.
+n6_plan_wrapper_override() {
+  local -a rest=( "$@" )
+  local index=0 arg found=1 value=""
+  while (( index < ${#rest[@]} )); do
+    arg="${rest[index]}"
+    if [[ "${arg}" == "--wrapper" ]]; then
+      value=""
+      if (( index + 1 < ${#rest[@]} )); then
+        value="${rest[index + 1]}"
+      fi
+      found=0
+      index=$(( index + 2 ))
+      continue
+    fi
+    if [[ "${arg}" == --wrapper=* ]]; then
+      value="${arg#--wrapper=}"
+      found=0
+      index=$(( index + 1 ))
+      continue
+    fi
+    if n6_plan_flag_takes_value "${arg}"; then
+      index=$(( index + 2 ))
+      continue
+    fi
+    index=$(( index + 1 ))
+  done
+  (( found == 0 )) || return 1
+  printf '%s' "${value}"
+}
+
+# `--workspace-root` for `claw plan run`: prints the EFFECTIVE value and
+# returns 0, or returns 1 when the flag is absent. LAST assignment wins, for
+# the same reason as `--wrapper` -- `parse_plan_subcommand_args` reassigns
+# `workspace_root` on every occurrence and never breaks out of its loop.
+#
+# This value is load-bearing for the DEFAULT-wrapper proof: the step executor
+# applies it as `Command::current_dir`, and a relative program path is resolved
+# by the child AFTER that chdir. So the executable a defaulted `plan run`
+# actually spawns is `<workspace-root>/scripts/claw-sidestack-local`, not
+# `<cwd>/scripts/claw-sidestack-local`.
+n6_plan_workspace_root_override() {
+  local -a rest=( "$@" )
+  local index=0 arg found=1 value=""
+  while (( index < ${#rest[@]} )); do
+    arg="${rest[index]}"
+    if [[ "${arg}" == "--workspace-root" ]]; then
+      value=""
+      if (( index + 1 < ${#rest[@]} )); then
+        value="${rest[index + 1]}"
+      fi
+      found=0
+      index=$(( index + 2 ))
+      continue
+    fi
+    if [[ "${arg}" == --workspace-root=* ]]; then
+      value="${arg#--workspace-root=}"
+      found=0
+      index=$(( index + 1 ))
+      continue
+    fi
+    if n6_plan_flag_takes_value "${arg}"; then
+      index=$(( index + 2 ))
+      continue
+    fi
+    index=$(( index + 1 ))
+  done
+  (( found == 0 )) || return 1
+  printf '%s' "${value}"
+}
+
+# Presence of a BOOLEAN plan-tail flag, mirroring the boolean arms of
+# `parse_plan_subcommand_args`.
+#
+# VALUE-SLOT AWARE, and that is the whole point. The parser consumes the token
+# after every value-taking flag, so in `--fast-model --dry-run` the `--dry-run`
+# is fast_model's VALUE and `dry_run` stays FALSE. A naive "argv contains
+# --dry-run" test would read that as a dry run and hand a spawn-capable
+# invocation a bypass -- exactly the mistake this helper exists to prevent.
+#
+# Over-reporting a flag the CLI would not set is the SAFE direction only for
+# spawn-capable modes; for the non-spawning `--dry-run` classification the
+# mirror must be exact, so the value-slot skip is mandatory here.
+n6_plan_has_flag() {
+  local wanted="$1"
+  shift
+  local -a rest=( "$@" )
+  local index=0 arg
+  while (( index < ${#rest[@]} )); do
+    arg="${rest[index]}"
+    if [[ "${arg}" == "${wanted}" ]]; then
+      return 0
+    fi
+    if n6_plan_flag_takes_value "${arg}"; then
+      index=$(( index + 2 ))
+      continue
+    fi
+    index=$(( index + 1 ))
+  done
+  return 1
+}
+
+# Absolute form of a path with its directory resolved, without requiring
+# `realpath` (absent by default on macOS).
+n6_resolve_path() {
+  local path="$1" dir base
+  [[ -n "${path}" ]] || return 1
+  dir="$(dirname -- "${path}")"
+  base="$(basename -- "${path}")"
+  ( cd -- "${dir}" 2>/dev/null && printf '%s/%s' "$(pwd -P)" "${base}" ) || return 1
+}
+
+# Three-way classification of THIS invocation:
+#
+#   local            proven to dispatch to a local printer/reporter; the
+#                    readiness gate is bypassed
+#   inference        can reach a provider; the readiness gate must run
+#   refuse|<reason>  can reach a provider, but the EXACT upstream model is not
+#                    determinable here — fail closed before canonical `exec`
+#
+# Anything unrecognized falls through to `inference`, never to `local`.
+n6_classify_invocation() {
+  local -a rest=()
+  local token subcommand wrapper_override resolved_wrapper self_wrapper
+  local plan_cwd_wrapper plan_spawn_wrapper plan_workspace_root plan_wrapper_base
+
+  # Mirror the CLI's own precedence, which is NOT the order the tokens appear
+  # in argv:
+  #
+  #   1. `-p` returns `CliAction::Prompt` from INSIDE the argument loop, so it
+  #      short-circuits the post-loop `wants_help` / `wants_version` checks
+  #      entirely. In `--help --model fast -p status` the leading `--help`
+  #      never gets to decide anything: the invocation is a prompt, and gating
+  #      it on that flag is a readiness BYPASS, not a help request.
+  #   2. `wants_help` / `wants_version` are evaluated after the loop and before
+  #      any positional dispatch, including before the `--resume` branch.
+  #   3. `--resume` forces a session dispatch only when nothing above fired.
+  #
+  # Testing the FIRST token for a help flag, as this classifier used to, gets
+  # step 1 backwards.
+  if n6_prompt_terminal_index "$@" >/dev/null; then
+    printf 'inference'
+    return 0
+  fi
+
+  if n6_wants_help_or_version "$@"; then
+    printf 'local'
+    return 0
+  fi
+
+  if n6_forces_inference "$@"; then
+    printf 'inference'
+    return 0
+  fi
+
+  while IFS= read -r -d '' token; do
+    rest+=( "${token}" )
+  done < <(n6_cli_rest "$@")
+
+  subcommand="${rest[0]-}"
+  case "${subcommand}" in
+    '')
+      # No positional at all: the interactive REPL, or a piped one-shot prompt.
+      printf 'inference'
+      return 0
+      ;;
+    /*)
+      # A DIRECT slash invocation (`claw /help`), which canonical routes to
+      # `parse_direct_slash_cli_action` rather than to any positional arm.
+      # Classifying every one of these as inference -- as this classifier used
+      # to -- made `claw /help` demand a `--model` and exit 9 for a printer that
+      # never reaches a provider, while the positional `claw help` ran locally.
+      if n6_direct_slash_is_local "${rest[@]}"; then
+        printf 'local'
+      else
+        printf 'inference'
+      fi
+      return 0
+      ;;
+    help)
+      # `claw help` alone is `CliAction::Help`, a local printer, but the verb
+      # is NOT unconditionally local: `parse_local_help_action` has no `help`
+      # topic and `parse_single_word_command_alias` declines the two-token
+      # help-flag form, so `help --help` and `help -h` fall through to the
+      # prompt catch-all. Every other `help ...` shape is a CLI usage error,
+      # which is gated here rather than bypassed.
+      if (( ${#rest[@]} == 1 )); then
+        printf 'local'
+      else
+        printf 'inference'
+      fi
+      return 0
+      ;;
+    skills)
+      if n6_skills_is_local "${rest[@]}"; then
+        printf 'local'
+      else
+        printf 'inference'
+      fi
+      return 0
+      ;;
+    task)
+      if [[ "${rest[1]-}" == "run" ]]; then
+        # shellcheck disable=SC2016  # backticks in the user-facing message are literal
+        printf 'refuse|`claw task run` takes its model from the task spec (its `model` field, or the bridge default `fast-default`), never from the CLI --model flag, and the effective upstream model is whatever the broker resolves that request to — a value first observable in the broker response, after inference has already happened. The exact upstream model cannot be proven before execution, so this wrapper refuses rather than gate on a model the task will not use.'
+        return 0
+      fi
+      # Every other `claw task …` form is a CLI usage error, but it is not
+      # proven local, so it is gated rather than bypassed.
+      printf 'inference'
+      return 0
+      ;;
+    plan)
+      # `plan run` itself issues no provider request (its only network op is a
+      # read-only `GET /models` substrate probe). Every model-bearing step is
+      # spawned back through THIS wrapper as `--model fast … prompt …`, where
+      # it is gated on its own — but ONLY while the runner uses its default
+      # wrapper. An operator-supplied `--wrapper` breaks that proof.
+      if [[ "${rest[1]-}" == "run" ]]; then
+        # -- Effective mode: DRY RUN. `--dry-run` reaches a NON-SPAWNING
+        #    outcome under BOTH branches of `run_plan_subcommand`, so no child
+        #    wrapper can run and its identity is irrelevant here:
+        #
+        #      with --workspace-write-preview  the preview branch is entered
+        #        first and returns EXIT_PARSE_ERROR before resolving a wrapper
+        #        or a workspace root. The parser rejects the pair outright too
+        #        ("--workspace-write-preview cannot be combined with
+        #        --dry-run"). ORDER CANNOT CHANGE THIS: both flags are
+        #        order-independent booleans tested AFTER the parse loop, so
+        #        `--dry-run --workspace-write-preview` and
+        #        `--workspace-write-preview --dry-run` are the same refusal.
+        #      without it  the dry-run arm builds its report from
+        #        `validate_plan` + `preflight::precheck` ONLY. It never binds a
+        #        wrapper path at all (`let wrapper_path = ...` lives in the
+        #        live `else` arm), never probes the substrate, and never spawns
+        #        a subprocess.
+        #
+        #    `--workspace-root` is likewise a parse error without
+        #    `--workspace-write-preview`, so it cannot move a spawn here either.
+        #
+        #    Canonical `claw` still execs locally to PERFORM the dry run. That
+        #    is the local validator, not a model-bearing child, and it is the
+        #    same local dispatch every other non-inference verb gets.
+        if n6_plan_has_flag --dry-run "${rest[@]}"; then
+          printf 'local'
+          return 0
+        fi
+        self_wrapper="$(n6_resolve_path "${BASH_SOURCE[0]}" || true)"
+        if wrapper_override="$(n6_plan_wrapper_override "${rest[@]}")"; then
+          # An explicit `--wrapper` is stored VERBATIM as `ClawCommand.program`
+          # and spawned as `Command::new(program).current_dir(<workspace-root>)`
+          # (`runner.rs:130-162`, `runner.rs:433-435`). The chdir happens BEFORE
+          # the exec, so which executable really runs depends on the PATH CLASS
+          # of the operator's value -- checking it against the CALLER's CWD
+          # proves the wrong file for two of the three classes:
+          #
+          #   absolute            base-independent. The child's chdir cannot
+          #                       move it, which is why an absolute path to
+          #                       this wrapper is the documented escape hatch
+          #                       for previewing into another tree.
+          #   relative with slash resolved by execvp AFTER the chdir, so the
+          #                       real program is `<execution-base>/<value>`.
+          #                       An identically named path under the caller's
+          #                       CWD proves NOTHING about it.
+          #   bare name, no slash execvp searches PATH and never the CWD. This
+          #                       wrapper has no PATH fallback and cannot prove
+          #                       which entry the child would pick, so it fails
+          #                       CLOSED.
+          #
+          # The execution base for a relative value is mode-specific:
+          #   preview  `--workspace-root` (else the CWD) -- the preview branch
+          #            passes it straight through as the step executor CWD.
+          #   normal   the CWD only. `--workspace-root` without
+          #            `--workspace-write-preview` is rejected by
+          #            `parse_plan_subcommand_args` (`main.rs:4661-4668`), so a
+          #            normal run cannot be relocated.
+          if [[ "${wrapper_override}" == /* ]]; then
+            resolved_wrapper="$(n6_resolve_path "${wrapper_override}" || true)"
+          elif [[ "${wrapper_override}" == */* ]]; then
+            plan_wrapper_base="."
+            if n6_plan_has_flag --workspace-write-preview "${rest[@]}"; then
+              if ! plan_workspace_root="$(n6_plan_workspace_root_override "${rest[@]}")" \
+                 || [[ -z "${plan_workspace_root}" ]]; then
+                plan_workspace_root="."
+              fi
+              plan_wrapper_base="${plan_workspace_root}"
+            fi
+            resolved_wrapper="$(n6_resolve_path \
+              "${plan_wrapper_base%/}/${wrapper_override}" || true)"
+          else
+            # PATH-searched: unprovable by construction. Left empty so the
+            # shared refusal below fires.
+            resolved_wrapper=""
+          fi
+          if [[ -z "${self_wrapper}" || -z "${resolved_wrapper}" \
+                || "${resolved_wrapper}" != "${self_wrapper}" ]]; then
+            # shellcheck disable=SC2016  # backticks in the user-facing message are literal
+            printf 'refuse|`claw plan run --wrapper %s` would spawn every model-bearing step through an executable other than this wrapper, so those steps are not proven to pass the readiness gate. Omit --wrapper only when the runner default resolves back to this wrapper, or point --wrapper at this wrapper.' \
+              "${wrapper_override}"
+            return 0
+          fi
+        else
+          # NO override. That is not the same as "safe": the runner default is
+          # the RELATIVE path `scripts/claw-sidestack-local`, and nothing binds
+          # it to the tree this wrapper lives in. The step executor sets
+          # `Command::current_dir(<workspace-root>)` and the child resolves the
+          # relative program AFTER that chdir, so the executable that really
+          # runs is `<workspace-root>/scripts/claw-sidestack-local`.
+          #
+          # WHICH bases must be proven depends on the EXECUTION MODE, because
+          # the two spawn-capable branches do not share a precheck:
+          #
+          #   normal   the live arm runs `wrapper_path.exists()` in the plan
+          #            process (resolved against its CWD) BEFORE any spawn and
+          #            reports substrate-unavailable when it fails, so an
+          #            absent CWD default really does mean nothing spawns.
+          #            `--workspace-root` is a parse error without
+          #            `--workspace-write-preview`, so the CWD is the only base
+          #            that can carry a spawn.
+          #   preview  the `--workspace-write-preview` branch has NO
+          #            wrapper-existence precheck AT ALL, and
+          #            `run_plan_with_write_preview` still spawns every
+          #            read-only step preceding the lone workspace-write step
+          #            through `<workspace-root>/scripts/claw-sidestack-local`.
+          #            An absent CWD default proves NOTHING about that spawn,
+          #            so the effective workspace-root wrapper is validated on
+          #            its own and an unresolvable one fails CLOSED. The
+          #            escape hatch for a foreign workspace root is an explicit
+          #            `--wrapper` pointing at this wrapper: an ABSOLUTE
+          #            program path ignores the child's chdir.
+          if ! plan_workspace_root="$(n6_plan_workspace_root_override "${rest[@]}")" \
+             || [[ -z "${plan_workspace_root}" ]]; then
+            plan_workspace_root="."
+          fi
+          plan_spawn_wrapper="$(n6_resolve_path "${plan_workspace_root%/}/scripts/claw-sidestack-local" || true)"
+          if n6_plan_has_flag --workspace-write-preview "${rest[@]}"; then
+            if [[ -z "${self_wrapper}" || -z "${plan_spawn_wrapper}" \
+                  || "${plan_spawn_wrapper}" != "${self_wrapper}" ]]; then
+              # shellcheck disable=SC2016  # backticks in the user-facing message are literal
+              printf 'refuse|`claw plan run --workspace-write-preview` spawns the read-only steps before its workspace-write step through `<workspace-root>/scripts/claw-sidestack-local`, which resolves to %s, not to this wrapper (%s), and this branch has no wrapper-existence precheck to stop it. Those steps are not proven to pass the readiness gate. Point --workspace-root at the tree this wrapper lives in, or pass --wrapper pointing at this wrapper.' \
+                "${plan_spawn_wrapper:-<unresolvable>}" "${self_wrapper:-<unresolvable>}"
+              return 0
+            fi
+          else
+            plan_cwd_wrapper="$(n6_resolve_path "scripts/claw-sidestack-local" || true)"
+            if [[ -n "${plan_cwd_wrapper}" && -e "${plan_cwd_wrapper}" ]]; then
+              if [[ -z "${self_wrapper}" || -z "${plan_spawn_wrapper}" \
+                    || "${plan_cwd_wrapper}" != "${self_wrapper}" \
+                    || "${plan_spawn_wrapper}" != "${self_wrapper}" ]]; then
+                # shellcheck disable=SC2016  # backticks in the user-facing message are literal
+                printf 'refuse|`claw plan run` without --wrapper spawns its model-bearing steps through the runner default `scripts/claw-sidestack-local`, which resolves to %s, not to this wrapper (%s). Those steps are not proven to pass the readiness gate. Run the plan from the tree this wrapper lives in, or pass --wrapper pointing at this wrapper.' \
+                  "${plan_spawn_wrapper:-${plan_cwd_wrapper}}" "${self_wrapper:-<unresolvable>}"
+                return 0
+              fi
+            fi
+          fi
+        fi
+      fi
+      printf 'local'
+      return 0
+      ;;
+  esac
+
+  if [[ "${N6_NON_INFERENCE_SUBCOMMANDS}" == *" ${subcommand} "* ]]; then
+    printf 'local'
+    return 0
+  fi
+  printf 'inference'
+}
+
+# Derive the readiness origin from the ALREADY LAW-1-VALIDATED broker URL.
+# No second host is hard-coded, and nothing outside the allowlisted origin can
+# be reached.
+n6_readiness_origin() {
+  if [[ "${EFFECTIVE_BASE_URL}" =~ ^(http://(127\.0\.0\.1|localhost):11435)(/.*)?$ ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  return 1
+}
+
+# --- curl capability floor ---------------------------------------------------
+#
+# The readiness body is bounded with `--max-filesize 65536`, but that option's
+# guarantee is VERSION-DEPENDENT. curl documents that before 8.4.0
+# `--max-filesize` does not abort a transfer whose size was not known before
+# the download began — precisely the chunked / unknown-length shape that an
+# unbounded response would arrive in. From 8.4.0 the transfer is aborted once
+# the threshold is reached mid-transfer.
+#
+# Older curl still ACCEPTS `--max-filesize`, so probing for the option, or for
+# curl's willingness to parse it, distinguishes nothing. The reported version
+# is the only signal available — and, per the trust boundary above, it is a
+# signal only because a trusted curl is assumed to report itself honestly.
+#
+# Therefore: no adequate reported version, no request. Such a curl refuses
+# with exit 9 BEFORE the readiness GET, so it never puts a byte on the wire.
+# The contract on an old curl is "refuse before transfer", not "transfer with
+# an unreliable bound" — the response-size guarantee is never silently
+# weakened for any curl that reports itself accurately.
+#
+# This floor applies ONLY to the inference path, which is the only path that
+# performs the readiness GET. Locally dispatched invocations never reach here
+# and gain no curl requirement.
+N6_CURL_MIN_VERSION="8.4.0"
+
+N6_CURL_VERSION_PY="$(cat <<'PY'
+import os, re, sys
+
+# A real banner's first line is `curl <version> (<triple>) libcurl/<version> …`.
+# Only a complete, undecorated MAJOR.MINOR.PATCH triple is accepted. A partial
+# (`8.4`) or decorated (`8.6.0-DEV`) version is not something this wrapper can
+# order unambiguously against the floor, so it is treated as unknown and fails
+# closed rather than being guessed at.
+line = os.environ.get("N6_CURL_VERSION_LINE", "")
+match = re.match(r"^curl ([0-9]{1,5})\.([0-9]{1,5})\.([0-9]{1,5})(?:[ \t]|$)", line)
+if not match:
+    sys.exit(1)
+# Integer tuple comparison, never a string compare: lexicographically "8.10.0"
+# sorts BELOW "8.4.0", which would reject a version that satisfies the floor.
+found = tuple(int(part) for part in match.groups())
+sys.stdout.write("%d.%d.%d" % found)
+if found < (8, 4, 0):
+    sys.exit(2)
+PY
+)"
+
+# Bounded, printable-only rendering of anything derived from curl's output, so
+# a malformed banner cannot flood the operator's terminal or smuggle control
+# sequences into it.
+n6_sanitize_version_display() {
+  printf '%s' "$1" | LC_ALL=C tr -cd '[:print:]' | cut -c1-60
+}
+
+# Checks that the curl at the resolved command path N6_CURL reports a version
+# satisfying the floor. The curl command path is resolved once, to an absolute
+# path, and reused for both this capability probe and the readiness request
+# below; the wrapper never walks PATH a second time looking for another curl,
+# so a later PATH change cannot substitute a different command.
+#
+# This binds the PATH SELECTION, not the executable identity. It does not pin
+# a binary, an inode, or a symlink target, and it cannot: a same-user process
+# may replace or retarget that path between this probe and the GET, and a
+# hostile curl may simply misreport its version here and then ignore
+# `--max-filesize` on the request. Those residuals are accepted and are
+# described under "Trusted local dependencies" at the top of this file.
+#
+# Sets n6_curl_version to a bounded, sanitized display string. Returns:
+#   0 proven >= 8.4.0   1 unparseable/unknown banner   2 proven older
+#   3 the `--version` command itself failed
+n6_curl_capability_proven() {
+  local raw rc=0 line parsed prc=0
+  n6_curl_version="(unknown)"
+  # The banner of any real curl is a few hundred bytes. Only its first line,
+  # truncated, is ever retained, parsed, or displayed.
+  raw="$("${N6_CURL}" --version 2>/dev/null)" || rc=$?
+  if (( rc != 0 )); then
+    return 3
+  fi
+  line="${raw%%$'\n'*}"
+  line="${line:0:200}"
+  parsed="$(N6_CURL_VERSION_LINE="${line}" "${N6_PYTHON}" -c "${N6_CURL_VERSION_PY}" 2>/dev/null)" || prc=$?
+  if [[ -n "${parsed}" ]]; then
+    n6_curl_version="$(n6_sanitize_version_display "${parsed}")"
+  else
+    n6_curl_version="$(n6_sanitize_version_display "${line}")"
+    [[ -n "${n6_curl_version}" ]] || n6_curl_version="(empty)"
+  fi
+  case "${prc}" in
+    0) return 0 ;;
+    2) return 2 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Bounded, single-shot GET. No POST, no retries, no waiting loop, no
+# credentials: the readiness endpoint is unauthenticated and the API key must
+# never appear in these arguments. `--disable` ignores ~/.curlrc and
+# `--noproxy '*'` stops a proxy env var from redirecting the request off-host,
+# so the URL built above is the only endpoint that can be contacted.
+#
+# Sets n6_reason on success. Returns:
+#   0 ready=true   1 ready=false   2 transport/timeout   3 non-2xx
+#   4 malformed or contract-violating response
+n6_readiness_query() {
+  local model="$1" origin="$2"
+  local url raw http_code body parsed
+  url="${origin}/status/n6_planner_ready?requested_model=$(n6_urlencode "${model}")"
+  # `--max-filesize` bounds the body this wrapper is willing to buffer. A real
+  # readiness answer is a few hundred bytes; anything approaching 64 KiB is not
+  # this endpoint answering, so curl aborts (exit 63) and the gate fails closed
+  # rather than reading an unbounded body into a shell variable.
+  if ! raw="$("${N6_CURL}" --disable --silent --noproxy '*' --get \
+      --connect-timeout 2 --max-time 5 --max-filesize 65536 \
+      --write-out '\n%{http_code}' "${url}" 2>/dev/null)"; then
+    return 2
+  fi
+  http_code="${raw##*$'\n'}"
+  body="${raw%$'\n'*}"
+  case "${http_code}" in
+    2??) ;;
+    *) n6_reason="http ${http_code}"; return 3 ;;
+  esac
+  if ! parsed="$(printf '%s' "${body}" | N6_SENT_MODEL="${model}" \
+      "${N6_PYTHON}" -c "${N6_PARSER_PY}" 2>/dev/null)"; then
+    return 4
+  fi
+  n6_reason="${parsed#*|}"
+  case "${parsed%%|*}" in
+    READY) return 0 ;;
+    NOTREADY) return 1 ;;
+    *) return 4 ;;
+  esac
+}
+
+n6_reason=""
+N6_CURL="$(command -v curl || true)"
+N6_PYTHON="$(command -v python3 || true)"
+
+n6_class="$(n6_classify_invocation "$@")"
+
+if [[ "${n6_class%%|*}" == "refuse" ]]; then
+  printf 'claw-sidestack-local: local coding readiness could not be established\n' >&2
+  printf '  %s\n' "${n6_class#*|}" >&2
+  exit 9
+fi
+
+if [[ "${n6_class}" == "inference" ]]; then
+  # FIRST, before the broker origin is even derived and long before any byte
+  # reaches the network. A binary that cannot enforce in process must not
+  # consume broker admission work on its way to running ungated, so this
+  # refusal precedes the readiness GET rather than following it.
+  #
+  # Deliberately scoped to inference-capable invocations. A proven local-only
+  # command (`--help`, `--version`, `status`, `doctor`, ...) never reaches a
+  # provider, so there is nothing for the in-process guard to protect and no
+  # reason to make an older binary unable to print its own help. The existing
+  # freshness rules continue to apply to those unchanged.
+  n6_capability="$(n6_capability_state)"
+  if [[ "${n6_capability}" != "${N6_REQUIRED_CAPABILITY}" ]]; then
+    printf 'claw-sidestack-local: refusing to run an inference-capable session on a canonical claw\n' >&2
+    printf '  that does not prove it implements the in-process N6 enforcement contract.\n' >&2
+    printf '  canonical claw: %s\n' "${CANONICAL_CLAW}" >&2
+    case "${n6_capability}" in
+      unsupported)
+        printf '  the canonical binary does not advertise the enforcement capability, so it\n' >&2
+        printf '  predates the contract (or could not be proven to be the file that answered).\n' >&2
+        ;;
+      absent)
+        printf '  the canonical status report carries no capability field at all, so the\n' >&2
+        printf '  status helper predates this contract and cannot answer the question.\n' >&2
+        ;;
+      ambiguous)
+        printf '  the canonical status report carried more than one capability field, so no\n' >&2
+        printf '  single answer can be trusted.\n' >&2
+        ;;
+      *)
+        printf '  the canonical status report carried an unrecognised capability value.\n' >&2
+        ;;
+    esac
+    printf '  the enforcement marker this wrapper exports only turns the in-process guard\n' >&2
+    printf '  ON in a build that HAS one; an older binary accepts it and ignores it, and\n' >&2
+    printf '  every model picked after exec (REPL /model, Agent fallback, provider retry)\n' >&2
+    printf '  would then run ungated. Refusing before the readiness request rather than\n' >&2
+    printf '  admitting a session this wrapper cannot protect.\n' >&2
+    printf '  refresh the canonical binary with: %s/claw-canonical-refresh\n' "${SCRIPT_DIR}" >&2
+    printf '  note: this is NOT the staleness check — CLAW_SIDESTACK_ALLOW_STALE does not\n' >&2
+    printf '  override it, because freshness is not a proof of capability.\n' >&2
+    exit 10
+  fi
+  if ! n6_broker_origin="$(n6_readiness_origin)"; then
+    printf 'claw-sidestack-local: local coding readiness could not be established\n' >&2
+    printf '  could not derive a broker origin from the validated OPENAI_BASE_URL: %s\n' "${EFFECTIVE_BASE_URL}" >&2
+    exit 9
+  fi
+  if [[ -z "${N6_CURL}" ]]; then
+    printf 'claw-sidestack-local: local coding readiness could not be established\n' >&2
+    printf '  curl was not found on PATH; the broker readiness endpoint cannot be queried.\n' >&2
+    exit 9
+  fi
+  if [[ -z "${N6_PYTHON}" ]]; then
+    printf 'claw-sidestack-local: local coding readiness could not be established\n' >&2
+    printf '  python3 was not found on PATH; the readiness response cannot be parsed safely.\n' >&2
+    exit 9
+  fi
+  if ! n6_model_raw="$(n6_model_flag_value "$@")"; then
+    printf 'claw-sidestack-local: local coding readiness requires an explicit --model for this invocation.\n' >&2
+    printf '  Example: --model fast\n' >&2
+    printf '  Without it the effective upstream model is unknown, so the broker cannot be asked\n' >&2
+    printf '  whether starting this session is safe for the Hyperliquid lane.\n' >&2
+    exit 9
+  fi
+  if n6_resolution="$(n6_resolve_upstream_model "${n6_model_raw}")"; then
+    n6_requested_model="${n6_resolution#OK|}"
+  else
+    printf 'claw-sidestack-local: local coding readiness could not resolve the requested model.\n' >&2
+    printf '  %s\n' "${n6_resolution#ERR|}" >&2
+    printf '  Pass an explicit upstream model (for example --model fast, or --model qwen3:14b).\n' >&2
+    exit 9
+  fi
+  # Capability check for the resolved curl, AFTER the exact upstream model is
+  # known and BEFORE any byte reaches the network. A curl that does not report
+  # an adequate version refuses here, so the readiness GET is never issued and
+  # canonical never execs.
+  n6_curl_rc=0
+  n6_curl_capability_proven || n6_curl_rc=$?
+  if (( n6_curl_rc != 0 )); then
+    printf 'claw-sidestack-local: local coding readiness could not be established\n' >&2
+    printf '  curl %s or newer is required for bounded readiness responses\n' "${N6_CURL_MIN_VERSION}" >&2
+    case "${n6_curl_rc}" in
+      2) printf '  detected curl version: %s\n' "${n6_curl_version}" >&2 ;;
+      3) printf '  detected curl version: (the curl --version command failed)\n' >&2 ;;
+      *) printf '  detected curl version: (unrecognized banner: %s)\n' "${n6_curl_version}" >&2 ;;
+    esac
+    printf '  curl executable: %s\n' "${N6_CURL}" >&2
+    printf '  older curl does not enforce --max-filesize once a transfer of unknown\n' >&2
+    printf '  length is already in progress, so the 64 KiB bound on the readiness body\n' >&2
+    printf '  cannot be guaranteed. Refusing before the request rather than reading an\n' >&2
+    printf '  unbounded response.\n' >&2
+    exit 9
+  fi
+  n6_rc=0
+  n6_readiness_query "${n6_requested_model}" "${n6_broker_origin}" || n6_rc=$?
+  case "${n6_rc}" in
+    0)
+      printf '  broker readiness: ready (%s) for %s\n' "${n6_reason}" "${n6_requested_model}" >&2
+      ;;
+    1)
+      printf 'claw-sidestack-local: local coding readiness refused\n' >&2
+      printf 'requested model: %s\n' "${n6_requested_model}" >&2
+      printf 'reason_code: %s\n' "${n6_reason}" >&2
+      printf '  the broker declined this session; it is not queued and no model was loaded.\n' >&2
+      printf '  re-run once the broker reports ready — this wrapper refuses, it never waits.\n' >&2
+      exit 8
+      ;;
+    2)
+      printf 'claw-sidestack-local: local coding readiness could not be established\n' >&2
+      printf 'requested model: %s\n' "${n6_requested_model}" >&2
+      printf '  the broker readiness endpoint was unreachable or timed out.\n' >&2
+      exit 9
+      ;;
+    3)
+      printf 'claw-sidestack-local: local coding readiness could not be established\n' >&2
+      printf 'requested model: %s\n' "${n6_requested_model}" >&2
+      printf '  the broker readiness endpoint returned %s.\n' "${n6_reason}" >&2
+      exit 9
+      ;;
+    *)
+      printf 'claw-sidestack-local: local coding readiness could not be established\n' >&2
+      printf 'requested model: %s\n' "${n6_requested_model}" >&2
+      printf '  the broker readiness response was malformed or did not answer for this model.\n' >&2
+      exit 9
+      ;;
+  esac
+fi
+
 # --- final topology revalidation, immediately before exec -------------------
 #
 # Nothing may run between this block and `exec`. See the Residual race note in
@@ -179,5 +1941,31 @@ if [[ ! -f "${CANONICAL_CLAW}" || ! -x "${CANONICAL_CLAW}" ]]; then
   printf 'claw-sidestack-local: canonical claw is not a regular executable file: %s\n' "${CANONICAL_CLAW}" >&2
   exit 5
 fi
+
+# --- in-process enforcement marker ------------------------------------------
+#
+# Everything above gates the model this wrapper can see *before* exec. Once the
+# canonical binary is running it can change models on its own — the REPL
+# `/model` command, an Agent primary or fallback selection, a provider retry —
+# and none of that passes back through this script.
+#
+# This marker tells the canonical runtime that it was launched as a dedicated
+# SideStack local-coding process, which turns on the in-process guard: only the
+# validated local broker may carry inference, and every outbound broker attempt
+# re-checks readiness for the exact model it is about to send. See the
+# "Two-part enforcement" section of USAGE.md.
+#
+# It is a request, not a proof. A binary that predates the guard accepts this
+# variable and ignores it, so for an inference-capable invocation the canonical
+# capability floor above has already REFUSED unless the binary positively
+# advertised the contract. By the time this line runs on a protected session,
+# the receiver is known to implement what the marker turns on.
+#
+# It is deliberately its own variable rather than a reuse of
+# RUSTY_CLAUDE_LLM_CALLER: that one carries broker telemetry/header semantics
+# and is populated from a user-editable env file, so enforcement keyed off it
+# could drift and fail open. This one is set here, immediately before exec, and
+# nowhere else. It carries no secret.
+export CLAW_SIDESTACK_N6_ENFORCE=1
 
 exec "${CANONICAL_CLAW}" "$@"

@@ -29,6 +29,7 @@ use api::{
     ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
     OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient, ProviderKind,
     StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    SIDESTACK_N6_ENFORCE_CAPABILITY,
 };
 
 use commands::{
@@ -10772,11 +10773,26 @@ fn parse_titled_body(value: &str) -> Option<(String, String)> {
     Some((title.to_string(), body.to_string()))
 }
 
+/// The `--version` banner.
+///
+/// The `Capabilities` line is a machine-readable, whitespace-separated set of
+/// stable tokens naming runtime contracts THIS build actually implements. It
+/// exists so a caller can prove a capability instead of inferring one:
+/// `scripts/claw-canonical-status` reads it out of the same identity-protected
+/// `--version` call it already makes, and `scripts/claw-sidestack-local`
+/// refuses a protected invocation whose canonical binary does not advertise
+/// [`SIDESTACK_N6_ENFORCE_CAPABILITY`] — a build predating that contract would
+/// otherwise accept the enforcement marker and silently ignore it.
+///
+/// Consumers must match a whole token, never a prefix or a substring. Existing
+/// parsers read the `Git SHA` line by field, so appending a line is backward
+/// compatible; an older binary simply has no `Capabilities` line at all, which
+/// is precisely the unsupported signal.
 fn render_version_report() -> String {
     let git_sha = GIT_SHA.unwrap_or("unknown");
     let target = BUILD_TARGET.unwrap_or("unknown");
     format!(
-        "Claw Code\n  Version          {VERSION}\n  Git SHA          {git_sha}\n  Target           {target}\n  Build date       {DEFAULT_DATE}"
+        "Claw Code\n  Version          {VERSION}\n  Git SHA          {git_sha}\n  Target           {target}\n  Build date       {DEFAULT_DATE}\n  Capabilities     {SIDESTACK_N6_ENFORCE_CAPABILITY}"
     )
 }
 
@@ -13330,7 +13346,7 @@ mod tests {
     };
     use api::{
         ApiError, InputContentBlock, MessageResponse, OutputContentBlock, ToolResultContentBlock,
-        Usage,
+        Usage, SIDESTACK_N6_ENFORCE_CAPABILITY,
     };
     use plugins::{
         PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
@@ -13349,6 +13365,85 @@ mod tests {
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tools::GlobalToolRegistry;
+
+    // ---- SideStack N6 enforcement capability advertisement -----------------
+    //
+    // `scripts/claw-canonical-status` reads the capability out of this banner
+    // and `scripts/claw-sidestack-local` refuses a protected invocation whose
+    // canonical binary does not advertise it. These lock the exact shape both
+    // shell consumers parse.
+
+    /// The `Capabilities` line names the exact versioned enforcement token.
+    #[test]
+    fn version_banner_advertises_the_n6_enforcement_capability() {
+        let report = super::render_version_report();
+        let line = report
+            .lines()
+            .find(|line| line.trim_start().starts_with("Capabilities"))
+            .expect("version banner must carry a Capabilities line");
+        let mut fields = line.split_whitespace();
+        assert_eq!(fields.next(), Some("Capabilities"));
+        let tokens: Vec<&str> = fields.collect();
+        assert!(
+            tokens.contains(&"sidestack-n6-enforce-v1"),
+            "banner must advertise the exact capability token, got {tokens:?}"
+        );
+    }
+
+    /// The advertised spelling is the constant the guard module owns, so the
+    /// banner cannot drift away from the contract it claims to implement.
+    #[test]
+    fn advertised_capability_matches_the_guard_module_constant() {
+        assert_eq!(SIDESTACK_N6_ENFORCE_CAPABILITY, "sidestack-n6-enforce-v1");
+        assert!(super::render_version_report()
+            .split_whitespace()
+            .any(|token| token == SIDESTACK_N6_ENFORCE_CAPABILITY));
+    }
+
+    /// The token is versioned, and no near-miss spelling appears in the banner.
+    /// A consumer matching by substring would accept `...-v10`; one matching by
+    /// suffix would accept `not-sidestack-n6-enforce-v1`. Neither is this
+    /// capability, and neither may be present to be matched.
+    #[test]
+    fn capability_token_is_versioned_and_has_no_near_miss_in_the_banner() {
+        assert!(SIDESTACK_N6_ENFORCE_CAPABILITY.ends_with("-v1"));
+        let report = super::render_version_report();
+        let tokens: Vec<&str> = report.split_whitespace().collect();
+        for near_miss in [
+            "sidestack-n6-enforce-v10",
+            "sidestack-n6-enforce-v2",
+            "not-sidestack-n6-enforce-v1",
+            "sidestack-n6-enforce",
+        ] {
+            assert!(
+                !tokens.contains(&near_miss),
+                "banner must not contain the near-miss token {near_miss}"
+            );
+        }
+    }
+
+    /// Appending the line must not disturb the fields existing parsers already
+    /// read: `scripts/claw-canonical-status` and `scripts/claw-canonical-refresh`
+    /// both take field 3 of the `Git SHA` line.
+    #[test]
+    fn version_banner_keeps_the_existing_git_sha_field_layout() {
+        let report = super::render_version_report();
+        let sha_line = report
+            .lines()
+            .find(|line| line.trim_start().starts_with("Git SHA"))
+            .expect("version banner must still carry a Git SHA line");
+        let fields: Vec<&str> = sha_line.split_whitespace().collect();
+        assert_eq!(fields[0], "Git");
+        assert_eq!(fields[1], "SHA");
+        assert_eq!(fields.len(), 3, "Git SHA must stay a three-field line");
+        assert!(report.starts_with("Claw Code\n"));
+        for key in ["Version", "Target", "Build date"] {
+            assert!(
+                report.contains(key),
+                "version banner must still report {key}"
+            );
+        }
+    }
 
     fn registry_with_plugin_tool() -> GlobalToolRegistry {
         GlobalToolRegistry::with_plugin_tools(vec![PluginTool::new(
