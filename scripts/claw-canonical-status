@@ -35,6 +35,19 @@
 #   13  UNKNOWN_BASE      locally known origin/main is unavailable
 #   2   usage error
 #
+# Reported capability (orthogonal to the exit code above):
+#
+#   n6 capability:  supported | unsupported
+#
+# Freshness and capability are DIFFERENT questions and are reported separately.
+# CURRENT means "this build's Git SHA equals the locally known origin/main". It
+# says nothing about a wrapper or worktree that is legitimately ahead of
+# origin/main, and nothing at all under a STALE override or UNKNOWN_BASE. So the
+# exit code is left untouched, and whether the canonical binary implements the
+# in-process SideStack N6 enforcement contract is answered by its own field,
+# read out of the SAME identity-protected version banner. Callers that need the
+# contract (see scripts/claw-sidestack-local) require the field, not the state.
+#
 # Residual race
 # -------------
 # Topology is revalidated immediately before and immediately after the single
@@ -60,12 +73,29 @@ EXIT_USAGE=2
 
 QUIET=0
 
+# The exact versioned capability token a canonical binary advertises when it
+# implements the in-process N6 enforcement contract. Mirrors
+# `SIDESTACK_N6_ENFORCE_CAPABILITY` in rust/crates/api/src/n6_admission.rs, the
+# module that implements it. Matching is whole-token equality below: a prefix or
+# substring test would accept `sidestack-n6-enforce-v10`, which is a different
+# contract, and the `-v1` suffix exists precisely so it can stop matching.
+N6_CAPABILITY_TOKEN="sidestack-n6-enforce-v1"
+
+# Default deny. Every path that cannot positively read the token out of a banner
+# proven to come from the file at the canonical path leaves this untouched.
+N6_CAPABILITY="unsupported"
+
 usage() {
   cat <<'EOF'
 Usage: scripts/claw-canonical-status [--quiet]
 
 Read-only freshness report for the canonical SideStackAI claw executable.
 Performs no build, no network request, and no write.
+
+Also reports, orthogonally to the exit code, whether the canonical binary
+implements the in-process SideStack N6 enforcement contract:
+
+  n6 capability:  supported | unsupported
 
 Options:
   --quiet     suppress the report; communicate only via exit code
@@ -266,6 +296,26 @@ if [[ "${TOPOLOGY}" == "regular-executable" ]]; then
   if version_out="$("${CANONICAL_PATH}" --version 2>/dev/null)"; then
     INSTALLED_SHA="$(printf '%s\n' "${version_out}" \
       | awk '/^[[:space:]]*Git SHA[[:space:]]/ { print $3; exit }')"
+    # Capability comes out of the SAME banner, inside the SAME topology and
+    # identity fence, so it inherits every protection the SHA read has. A
+    # second `--version` call would be a weaker, unfenced read.
+    #
+    # Only the FIRST Capabilities line is considered, matching how the Git SHA
+    # is read, and each whitespace-separated field is compared for WHOLE-token
+    # equality. A binary built before this contract has no such line at all,
+    # which is exactly the unsupported signal.
+    if printf '%s\n' "${version_out}" \
+      | awk -v want="${N6_CAPABILITY_TOKEN}" '
+          /^[[:space:]]*Capabilities[[:space:]]/ {
+            for (i = 2; i <= NF; i++) {
+              if ($i == want) { found = 1 }
+            }
+            exit
+          }
+          END { exit(found ? 0 : 1) }
+        '; then
+      N6_CAPABILITY="supported"
+    fi
     # A FULL 40-character lowercase SHA or nothing. A 7- or 12-character
     # prefix, a 39- or 41-character value, or an uppercase/malformed string
     # is unproven provenance and must not be able to reach CURRENT.
@@ -280,8 +330,12 @@ if [[ "${TOPOLOGY}" == "regular-executable" ]]; then
   # Look again after the call: a verdict must not rest on a banner printed by
   # a file that is no longer the one at the canonical path.
   TOPOLOGY="$(probe_topology "${CANONICAL_PATH}")"
+  # The capability claim is discarded wherever the SHA is: both are read from
+  # one banner, and a banner that cannot be attributed to the file at the
+  # canonical path proves neither provenance nor capability.
   if [[ "${TOPOLOGY}" != "regular-executable" ]]; then
     INSTALLED_SHA=""
+    N6_CAPABILITY="unsupported"
     PROVENANCE_NOTE="canonical topology changed while the version banner was being read"
   else
     identity_after="$(file_identity "${CANONICAL_PATH}")"
@@ -289,9 +343,11 @@ if [[ "${TOPOLOGY}" == "regular-executable" ]]; then
       # Fail closed. An unreadable identity on either side proves nothing, and
       # two unreadable identities must never compare equal to each other.
       INSTALLED_SHA=""
+      N6_CAPABILITY="unsupported"
       PROVENANCE_NOTE="canonical file identity could not be established on this host (${IDENTITY_IMPL}), so the binary cannot be proven unchanged across the version banner"
     elif [[ "${identity_after}" != "${identity_before}" ]]; then
       INSTALLED_SHA=""
+      N6_CAPABILITY="unsupported"
       PROVENANCE_NOTE="canonical file identity changed while the version banner was being read"
     fi
   fi
@@ -301,6 +357,7 @@ report() {
   say "canonical path:      ${CANONICAL_PATH}"
   say "canonical topology:  ${TOPOLOGY}"
   say "installed git sha:   ${INSTALLED_SHA:-<unreadable>}"
+  say "n6 capability:       ${N6_CAPABILITY}"
   say "origin/main sha:     ${ORIGIN_MAIN:-<unavailable>}"
   say "source repo:         ${REPO_ROOT}"
   say "state:               $1"

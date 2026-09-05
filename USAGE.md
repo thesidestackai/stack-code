@@ -51,6 +51,14 @@ The SideStackAI operator entrypoint is `~/.local/bin/claw`, and it is a **regula
 
 `claw-canonical-status` exits `0` CURRENT, `10` STALE, `11` MISSING, `12` INVALID_TOPOLOGY, `13` UNKNOWN_BASE (no locally known `origin/main`), and reports the canonical path, its topology, the installed Git SHA, and the `origin/main` SHA it compared against.
 
+It also reports one field that is **not** a freshness verdict:
+
+```
+n6 capability:       supported
+```
+
+This says whether the canonical binary advertises `sidestack-n6-enforce-v1` in its `claw --version` banner — that is, whether it actually implements the in-process enforcement contract described under [Two-part enforcement](#two-part-enforcement-the-startup-gate-and-the-in-process-gate). It is deliberately orthogonal to the exit code, because freshness is not capability: a worktree ahead of `origin/main` is not CURRENT but may well implement the contract, while `CLAW_SIDESTACK_ALLOW_STALE=1` and UNKNOWN_BASE both admit binaries whose vintage is unknown. The capability is read from the same `--version` call the SHA comes from, fenced between two topology probes and a file-identity comparison, and it fails closed to `unsupported` wherever that fence fails.
+
 `claw-canonical-refresh` runs only from a clean worktree whose `HEAD` equals the locally known `origin/main` — it never fetches, so you decide when the base moves. It refuses a dirty source, refuses a symlinked canonical path rather than writing through it, forces `CARGO_TARGET_DIR` inside the worktree so a repo-local `.cargo/config.toml` cannot redirect the build, backs up the existing executable before building, requires the built binary to report the source Git SHA, activates by same-directory atomic rename, and restores the previous executable if post-activation verification fails.
 
 ## Quick start
@@ -323,12 +331,160 @@ For local sessions you can skip the `source` step entirely and use the opt-in wr
 The wrapper:
 
 - sources [`examples/sidestack-local.env`](examples/sidestack-local.env) so every invocation starts from the canonical broker profile, even if the surrounding shell had a stale `OPENAI_BASE_URL`;
-- validates the final effective `OPENAI_BASE_URL` against an allowlist of local SideStackAI broker URLs (`http://127.0.0.1:11435` or `http://localhost:11435`, optionally with a path);
+- validates the final effective `OPENAI_BASE_URL` against an allowlist of local SideStackAI broker URLs — plain `http`, host exactly `127.0.0.1` or `localhost`, port explicitly `11435`, no userinfo, query, or fragment, and one of the canonical base paths `` (none), `/v1`, or `/v1/chat/completions`, each with an optional trailing slash. These are the same path shapes the in-process routing gate accepts, so a custom path such as `http://127.0.0.1:11435/gateway/v1` is refused here (exit 3) rather than accepted at startup and then rejected on every inference request by the canonical binary;
 - refuses to launch `claw` if `OPENAI_BASE_URL` contains the raw Ollama port `:11434` — this is the wrapper's LAW 1 and trips even if the profile itself is edited to point there;
 - prints the active non-secret profile (`OPENAI_BASE_URL`, `RUSTY_CLAUDE_LLM_CALLER`, `RUSTY_CLAUDE_TASK_TYPE`, and the names of any `RUSTY_CLAUDE_MODEL_ALIAS__*` exports) to stderr before exec'ing `claw`;
 - does not probe the broker for liveness. Use `claw doctor` or a separate runtime check (for example a small `curl` against the broker's health endpoint) when you need that signal;
 - executes the canonical `~/.local/bin/claw` directly (override with `CLAW_CANONICAL_PATH`) instead of resolving `claw` from PATH, so it can never silently fall through to `~/.cargo/bin/claw` or a Cargo target artifact;
 - delegates topology and freshness to [`scripts/claw-canonical-status`](scripts/claw-canonical-status) — offline, read-only, no provider call — and refuses to launch when the canonical executable is missing (exit 4), is a symlink or otherwise not a regular executable (exit 5), or is stale relative to the locally known `origin/main` (exit 6). Set `CLAW_SIDESTACK_ALLOW_STALE=1` to override the stale refusal deliberately; when `origin/main` is not locally known the wrapper warns loudly and continues. LAW 1 is evaluated before any of these checks.
+- refuses an **inference-capable** invocation (exit 10) unless that same status report proves the canonical binary implements the in-process enforcement contract — see [the canonical capability floor](#the-canonical-capability-floor-exit-10). Locally dispatched commands are unaffected.
+- asks the broker whether starting a local coding session is safe, and refuses if it is not — see the next section.
+
+###### Automatic broker readiness preflight (N6)
+
+Stack-Code and the Hyperliquid trading lane are both tier 3 on the broker. Equal priority prevents preemption only while Hyperliquid is *actively inferring*; an idle-but-resident Hyperliquid model can still be evicted by a Stack-Code model swap, and one such swap has already cost a Hyperliquid analyst run. So for every inference-capable invocation the wrapper first calls
+
+```
+GET http://127.0.0.1:11435/status/n6_planner_ready?requested_model=<model>
+```
+
+and only execs `claw` when that endpoint answers `ready: true`.
+
+- **The readiness endpoint is the authority, not `/status`.** `/status` reports which model holds the slot; it says nothing about whether taking the slot is safe. Only `/status/n6_planner_ready` applies the 300-second Hyperliquid quiet window, the holder policy, and the VRAM arithmetic.
+- **`ready: false` means REFUSE, not wait.** The wrapper exits 8 immediately, prints the broker's `reason_code` (for example `HYPERLIQUID_LANE_RECENTLY_ACTIVE`, `HYPERLIQUID_HOLDER_PROTECTED`, `BROKER_BUSY`, `INSUFFICIENT_VRAM`), and never queues, retries, or sleeps. Nothing was loaded and nothing is pending — re-run when the lane is quiet.
+- **Anything unusable fails closed with exit 9**: the endpoint unreachable, a timeout, a non-2xx response, malformed JSON, a missing or non-boolean `ready`, duplicate keys, or an answer that does not correspond to the model that was asked about.
+- **There is no bypass switch.** No environment variable disables this gate; that is the point of it. `CLAW_SIDESTACK_ALLOW_STALE=1` still overrides only the *staleness* refusal and has no effect on readiness.
+- The readiness origin is derived from the already-LAW-1-validated `OPENAI_BASE_URL`, so the query can only ever reach the same allowlisted broker on `:11435`. No credential is sent — the endpoint is unauthenticated and the API key never appears in the request.
+
+**The model must be exact.** The wrapper has to ask about the same upstream model `claw` will actually request, so it resolves the model itself and refuses (exit 9) rather than guessing:
+
+- `--model fast` and `--model=fast` both resolve through `RUSTY_CLAUDE_MODEL_ALIAS__FAST`, so the profile's `qwen3:14b` is what gets queried; `--model deep` likewise queries `qwen3.5:27b`. Alias lookup is case-insensitive, matching the CLI. Resolving the env alias is not on its own enough to admit the result: the wrapper then checks whether a claw config alias redefines that resolved value, and **refuses (exit 9) before any readiness GET** if one does — with `RUSTY_CLAUDE_MODEL_ALIAS__FAST=qwen3:14b` and a config alias mapping `qwen3:14b` to something else, `--model fast` refuses rather than preflight the intermediate `qwen3:14b`. This is fail-closed refusal, not recursive alias emulation: the wrapper never follows the second hop, it declines to guess. A value that survives both checks is proven terminal — non-bare, and not config-aliased — so the CLI's own second alias pass cannot change it.
+- An explicit upstream string is forwarded as-is, with a routing prefix stripped exactly as the provider layer strips it: `--model openai/qwen3:14b` queries `qwen3:14b`.
+- **No `--model` at all refuses.** Without the flag `claw` falls back to its compiled-in cloud default, so there is no local model to ask about. This includes the bare interactive REPL: use `./scripts/claw-sidestack-local --model fast` to start one.
+- A bare name with no `RUSTY_CLAUDE_MODEL_ALIAS__*` export refuses, because it would resolve through a repo config alias or claw's built-in cloud alias table, neither of which is determinable from the wrapper. That covers `--model sonnet` and friends.
+- A model string that a `.claw/settings.json` (or `.claw.json`) `aliases` entry redefines also refuses, for the same reason — whether that string was written on the command line or arrived as the result of a `RUSTY_CLAUDE_MODEL_ALIAS__*` lookup.
+
+**Commands that skip the gate.** Only invocations proven not to issue a provider request bypass it: `--help`, `--version`, and the local subcommands `version`, `status`, `sandbox`, `doctor`, `acp`, `state`, `init`, `config`, `diff`, `export`, `system-prompt`, `dump-manifests`, `bootstrap-plan`, `agents`, `mcp`, and `plugins`. Anything not on that list is treated as inference and gated — including a shorthand prompt that merely happens to contain `--help`.
+
+**The tail decides, not the verb.** Several subcommands dispatch locally *or* to a provider depending on what follows them, so classifying on the leading word alone is wrong:
+
+- `skills` mirrors `classify_skills_slash_command`: only `skills`, `skills list`, `skills help`, `skills -h`, `skills --help`, `skills install`, and `skills install <target>` stay local. Every other form — `skills help overview`, `skills list extra`, `skills <skill>`, `skills <skill> <args>` — is a `CliAction::Prompt` and **is gated**. Note the prefix trap: `skills installer` is a skill invocation, not the `install` subcommand.
+- `-p` makes the CLI join the entire remaining argv into a prompt, so `-p status` is a *prompt reading "status"*, not the local status report. Any `-p` is gated.
+- `--resume` continues a real session, so it is gated regardless of the session reference — `--resume status` resumes a session named `status`.
+
+**Invocations that refuse outright (exit 9).** Two shapes can reach a provider but do not let the wrapper prove *which* upstream model will be used, so it refuses rather than gate on the wrong one:
+
+- **`claw task run <spec>`.** `CliAction::TaskRun` carries only the spec path; the global `--model` is never propagated into it. The bridge reads the spec's `model` field (defaulting to `fast-default`), and the *effective* model is whatever the broker resolves that request to — a value first observable in the broker's response, i.e. after inference has already happened. Gating on `--model` here would query a model the task will never use. Run the task's own lane once the broker is quiet.
+- **`claw plan run` whose model-bearing steps are not proven to come back here.** `plan run` itself issues no provider request (its only network operation is a read-only `GET /models` probe); the gate depends entirely on each model-bearing step being spawned back through *this* wrapper as `--model fast … prompt …`, where it is gated on its own. The wrapper refuses (exit 9) whenever it cannot prove that:
+    - **With an explicit `--wrapper`,** the effective wrapper must resolve to this wrapper. Repeated `--wrapper` assignments follow the CLI's last-assignment-wins semantics, so only the last one is judged; a trailing valueless `--wrapper` is recorded as an empty assignment and refuses rather than falling back to an earlier value. A foreign effective wrapper refuses. **Which file the effective value names depends on its path shape**, because the runner stores it verbatim as the child's program and applies the workspace-root chdir *before* the exec:
+        - **An absolute path** is immune to that chdir, so it is judged as written. This is why an absolute path to this wrapper is the stable escape hatch whenever workspace routing would otherwise be unprovable.
+        - **A relative path containing a slash** is resolved by the child *after* the chdir, so it is judged against the execution base of the effective mode — under `--workspace-write-preview` that is the effective workspace root, not the directory you invoked from. `--wrapper scripts/claw-sidestack-local --workspace-root <other-tree>` therefore refuses even when your own current directory holds this very wrapper at that same relative path: the file that would actually run is `<other-tree>/scripts/claw-sidestack-local`. A normal `plan run` cannot be relocated this way (`--workspace-root` is a parse error without `--workspace-write-preview`), so there the base stays the current directory.
+        - **A bare name with no slash** is searched for on `PATH` and never in the current directory. This wrapper does not fall back to `PATH`, and nothing lets it prove which entry the child would select, so a slash-less `--wrapper` refuses.
+    - **Omitting `--wrapper` is not automatically trusted.** The plan runner's default is the *relative* path `scripts/claw-sidestack-local`, and nothing binds that to the tree this wrapper lives in. The step executor chdirs to the effective workspace root and the spawned child resolves the relative program *after* that chdir, so the executable that actually runs is `<workspace-root>/scripts/claw-sidestack-local`. Running the plan from another tree by absolute path, or pointing `--workspace-root` at a tree with its own `scripts/claw-sidestack-local`, therefore refuses instead of silently handing every step to an ungated executable.
+    - **Which bases must be proven depends on the execution mode**, because the two spawn-capable branches of `plan run` do not share a precheck:
+        - **A normal `plan run`** resolves its default against the current directory and runs an existence precheck there *before* any spawn; when that path is absent the runner reports substrate-unavailable and spawns nothing. `--workspace-root` is a parse error without `--workspace-write-preview`, so the current directory is the only base that can carry a spawn. A missing default is therefore not a bypass **in this mode**: there is no model-bearing child to gate and the invocation stays local.
+        - **`--workspace-write-preview` takes a different branch with no wrapper-existence precheck at all**, and it still spawns every read-only step preceding its lone workspace-write step through `<workspace-root>/scripts/claw-sidestack-local`. A missing current-directory default proves nothing here, so the wrapper judges the effective workspace-root wrapper on its own and refuses when it is foreign *or* unresolvable. To preview into another tree, pass `--wrapper` pointing at this wrapper: an absolute program path is immune to the child's chdir.
+    - **`--dry-run` is not gated on a wrapper at all.** The dry-run branch builds its report from the plan validator and precheck only — it never binds a wrapper path, never probes the substrate and never spawns a subprocess, so a foreign `--wrapper` names an executable that cannot run. Combining `--dry-run` with `--workspace-write-preview` is refused by the CLI in either order (both are order-independent booleans checked after the argument loop), so that pairing cannot spawn either. Canonical `claw` still runs locally to perform the dry run. Note that a `--dry-run` occupying another flag's value slot — as in `--fast-model --dry-run` — is that flag's *value*, leaves the run live, and is gated normally.
+
+    In short: run the plan from the tree this wrapper lives in, or pass `--wrapper` pointing at this wrapper.
+
+**What this does not give you.** This is a client-side refusal, not an atomic broker admission reservation. A time-of-check/time-of-use window remains between the readiness GET and the first inference POST `claw` issues, and the broker does not hold anything on your behalf in between. The 300-second Hyperliquid quiet window makes that residual race acceptable under the current operating contract, but it is a narrowed window, not a closed one. A raw POST sent straight to the broker — by any tool that is not this wrapper — bypasses the gate entirely; the protection is in the wrapper, not in the broker.
+
+The readiness preflight needs `curl` and `python3` on `PATH`. Neither is a new requirement: `python3` is already unconditional for the local model-coding workflow this wrapper serves — the runnable task bridge spawns `python3 scripts/invoke_planner_model_via_broker.py` directly, and the A2/N6 planner and validator scripts are all Python — while [`scripts/claw-canonical-refresh`](scripts/claw-canonical-refresh) and [`scripts/claw-canonical-status`](scripts/claw-canonical-status) fall back to `python3` when GNU `realpath`/`sha256sum` are unavailable. If either tool is missing the wrapper fails closed with exit 9. The readiness GET is size-bounded (`--max-filesize 65536`), ignores `~/.curlrc` (`--disable`), and never uses a proxy (`--noproxy '*'`).
+
+**`curl` 8.4.0 or newer is required for inference-capable wrapper calls.** The readiness response is capped at 64 KiB, but `--max-filesize` only *guarantees* that cap from curl 8.4.0 onward. curl's own manual is explicit: "before curl 8.4.0, when the file size is not known prior to download, for such files this option has no effect even if the file transfer ends up being larger than this given limit", and "starting with curl 8.4.0, this option aborts the transfer if it reaches the threshold during transfer". An unknown-length response is exactly the chunked shape an oversized readiness body would arrive in. Older curl still accepts the option, so its presence distinguishes nothing — only the reported version does.
+
+Before it issues the readiness GET, the wrapper therefore asks `curl` for its version and refuses with exit 9 if that version is below 8.4.0, unparseable, or unobtainable. On such a `curl` the contract is **refuse before transfer**, not *transfer with an unreliable bound* — no request is made and canonical `claw` never executes.
+
+These three layers are worth keeping distinct, because the last one is a trust assumption rather than an enforced guarantee.
+
+**What is guaranteed, for a trusted and compliant `curl`.** Readiness-gated inference requires curl >= 8.4.0; an older or unproven-version curl refuses with exit 9 before anything reaches the wire; the readiness body is capped at 64 KiB via `--max-filesize`; and from 8.4.0 that cap is enforced even for an unknown-length transfer already in progress. A hostile `~/.curlrc` is ignored (`--disable`, which curl documents as taking effect only "if used as the first parameter on the command line", and is passed first here), proxy environment variables are neutralised (`--noproxy '*'`), redirects are not followed, and the request is a single bounded GET carrying no credential.
+
+**What path selection buys you.** The wrapper resolves the `curl` command **once** and reuses that same resolved command path for both the version probe and the readiness GET. It does not walk `PATH` a second time, so a `PATH` change made after resolution cannot substitute a different command. That is a guarantee about *which path is selected*, and nothing more — it is **not** executable pinning, and the wrapper makes no claim to have pinned a binary, an inode, or a symlink target.
+
+**The trust boundary, and what remains outside it.** The local `curl` program, and the same-user filesystem and environment containing it, are a **trusted dependency** of this wrapper. That trust is assumed, not verified. It follows that a malicious `curl` can report any version it likes and then ignore `--max-filesize` and return an unbounded body; and that a same-user process — including the probed program itself, if the resolved path is a symlink — can replace or retarget that path between the version probe and the GET, so a different executable serves the request. Both residuals are real and have been demonstrated under controlled test. This client-side wrapper does not defend against same-user tampering with its own dependencies, and such tampering is outside its threat model.
+
+This is the same kind of boundary as the readiness-GET-to-inference-POST race described above: both are *client-side* residuals, not gaps in a broker-side reservation. An attacker who can replace your `curl` can equally POST straight to the broker and bypass this wrapper entirely. The broker does not inherit either weakness when callers use ordinary trusted system dependencies.
+
+This is a prerequisite of the SideStackAI inference wrapper only, not of the repository as a whole. Locally dispatched invocations — `--help`, `--version`, `version`, `status`, `doctor`, `plan run`, and the other non-inference subcommands — never perform a readiness GET, are never version-checked, and keep working on an older `curl` or on a host with no `curl` at all.
+
+###### The canonical capability floor (exit 10)
+
+The marker in the next section turns the in-process gate **on**, but only in a build that has one. A canonical `claw` compiled before that contract existed accepts `CLAW_SIDESTACK_N6_ENFORCE=1`, ignores it, and runs an entirely ungated API — while the startup gate reports success. Setting an environment variable is a request; it is not evidence that anything is listening.
+
+So for every inference-capable invocation the wrapper requires **positive proof** that the exact binary it is about to `exec` implements the contract:
+
+- the binary advertises the versioned token `sidestack-n6-enforce-v1` in its `claw --version` banner (`Capabilities` line);
+- [`scripts/claw-canonical-status`](scripts/claw-canonical-status) reads that token out of the **same** identity-protected `--version` call it already makes for the Git SHA, and reports `n6 capability: supported` or `unsupported`;
+- the wrapper requires exactly `supported`, matching the whole field value. A missing field (an older status helper), more than one field, or any value it does not define all fail closed.
+
+**This is not the staleness check, and `CLAW_SIDESTACK_ALLOW_STALE=1` does not override it.** The two answer different questions, and collapsing them would reintroduce the hole:
+
+| canonical status | capability | inference-capable invocation |
+| --- | --- | --- |
+| CURRENT | supported | proceeds to the readiness gate |
+| CURRENT | unsupported | **refused, exit 10** |
+| STALE + `CLAW_SIDESTACK_ALLOW_STALE=1` | supported | proceeds to the readiness gate |
+| STALE + `CLAW_SIDESTACK_ALLOW_STALE=1` | unsupported | **refused, exit 10** |
+| UNKNOWN_BASE | supported | proceeds to the readiness gate |
+| UNKNOWN_BASE | unsupported | **refused, exit 10** |
+| STALE without the override | either | refused, exit 6 (unchanged) |
+
+The CURRENT-but-unsupported row is the point of the whole mechanism: an install can match `origin/main` exactly and still be a build that cannot enforce anything, and a worktree that is legitimately *ahead* of `origin/main` is never CURRENT yet may implement the contract perfectly. Freshness is provenance, not capability.
+
+**The refusal comes before the network.** The capability check is the first thing an inference-capable invocation does — ahead of deriving the broker origin, ahead of the `curl` floor, ahead of the readiness GET. A binary that cannot enforce in process does not get to consume broker admission work on its way to running ungated, so a refused session issues **zero** readiness requests and never execs the canonical binary.
+
+**Locally dispatched commands are unaffected.** `--help`, `--version`, `status`, `doctor`, and the other proven non-inference subcommands never reach a provider, so there is nothing for the in-process guard to protect; they keep working on an older canonical binary exactly as before, under the existing freshness rules.
+
+The token is versioned on purpose. `-v1` names the whole protocol — marker recognised, routing contained, per-attempt admission — so if any of that changes shape a new binary advertises `-v2` and an old wrapper stops matching, rather than a vague "N6 supported" boolean silently spanning two incompatible contracts. Consumers match whole tokens, never prefixes: `sidestack-n6-enforce-v10` is a different contract, not this one.
+
+###### Two-part enforcement: the startup gate and the in-process gate
+
+Everything above describes the **startup shell gate**, and it can only judge what exists before `exec`:
+
+- it resolves the model from the command line and the profile, refusing (exit 9) rather than guessing when the resolution is not provably terminal;
+- it validates the effective `OPENAI_BASE_URL` against the local broker allowlist and refuses `:11434` outright;
+- it performs one bounded readiness GET for that resolved model and refuses (exit 8) if the broker declines;
+- it applies the same wrapper contract to the subprocesses a `plan run` spawns.
+
+Once the canonical binary is running, none of that is consulted again. A REPL `/model` switch, an Agent primary or fallback selection, a config-supplied primary, and every provider retry all pick a model *after* the wrapper is gone. A startup-only gate says nothing about any of them.
+
+So the wrapper exports one marker immediately before `exec`:
+
+```
+CLAW_SIDESTACK_N6_ENFORCE=1
+```
+
+It is set by the wrapper and nowhere else, carries no secret, and is deliberately not a reuse of `RUSTY_CLAUDE_LLM_CALLER` — that variable carries broker telemetry semantics and comes from a user-editable env file, so enforcement keyed off it could drift and fail open.
+
+That marker turns on the **in-process gate** inside `claw` itself:
+
+- **Every outbound broker inference HTTP attempt performs its own fresh readiness check**, for the exact model string the request payload will carry. This sits inside the provider retry loop, so retry number four is gated exactly as tightly as the first attempt, however long the backoff was.
+- **There is no admission cache.** Not per process, not per model, not time-based. A readiness answer admits exactly the one attempt that follows it; the next attempt asks again. Caching would turn a momentary yes into a standing permission, and the broker issues no lease, epoch, or residency token that a client could legitimately hold.
+- The model the broker is asked to admit and the model the payload carries come from a single shared resolver, so a `fast` alias or an `openai/` routing prefix cannot cause the guard to vet one model while another is sent.
+- A refusal is **non-retryable and non-fallbackable**. It does not trigger a provider retry, and it does not cause the Agent to try the next model in its fallback chain — each fallback entry that does run gets its own readiness decision immediately before its own attempt.
+
+**LAW 1, in process.** While the marker is active, off-broker model-bearing traffic is refused *before any network call*:
+
+- direct Anthropic inference is refused;
+- ordinary cloud OpenAI-compatible endpoints (OpenAI, DashScope, xAI, and anything else reached over a non-broker base URL) are refused;
+- **raw `:11434` application inference is refused**, matching the wrapper's startup LAW 1.
+
+Only an OpenAI-compatible provider whose base URL validates as the local broker — plain `http`, host exactly `127.0.0.1` or `localhost`, port explicitly `11435`, no userinfo, query, or fragment, and one of the canonical `/`, `/v1`, `/v1/chat/completions` path shapes — may carry inference at all, and it is then subject to the per-attempt readiness check above.
+
+When the marker is absent, the in-process routing gate is inert and ordinary upstream provider behaviour is unchanged, with no readiness traffic generated. The per-attempt readiness check does **not** depend on the marker, so a canonical `claw` pointed directly at `:11435` without the wrapper is still admission-gated.
+
+**Transport of an admitted request.** Validating the destination and refreshing readiness would both be worth less if the transport could then move the request somewhere else on its own, so the HTTP client that carries an admitted broker inference `POST` bypasses proxies and follows no redirects:
+
+- **Proxies are bypassed.** `HTTP_PROXY` / `HTTPS_PROXY` (either spelling) and a programmatic `proxy_url` are all ignored for this request, and reqwest's own system-proxy detection stays off. You do not have to set `NO_PROXY` for the broker, and setting it is not what provides this.
+- **Redirects are not followed.** A `301`, `302`, `303`, `307`, or `308` from the broker origin is surfaced as an ordinary provider error rather than followed. `307` and `308` matter most because they would otherwise re-send the method and the whole model-bearing body to the redirect target. No second destination is contacted, and because the resulting error is not retryable it also cannot fall back to another model.
+
+Together these mean an admitted request is one direct, non-proxied, non-redirecting send to the origin Layer A validated and Layer B admitted — the client cannot voluntarily route it to another HTTP origin after approval.
+
+This applies **only** to a destination that validates as the local broker. Ordinary upstream OpenAI-compatible providers keep their existing proxy and redirect behaviour; see [HTTP proxy support](#http-proxy-support).
+
+**Residual race, restated.** The in-process gate narrows the time-of-check/time-of-use window; it does not close it. Client readiness is still not a broker admission reservation: the readiness `GET` and the inference `POST` remain two separate requests, and the broker's state can change between them. This is the same residual described above, now measured per attempt rather than once per process. Nothing here pins a provider or an executable beyond the trust model already stated, and `http_request` is not affected — it is a general-purpose HTTP tool, not a model-bearing inference path.
+
 
 ###### Editor integration: VS Code task wrapper
 
@@ -500,6 +656,7 @@ let client = build_http_client_with(&config).expect("proxy client");
 - `NO_PROXY` accepts a comma-separated list of host suffixes (for example `.corp.example`) and IP literals.
 - Empty values are treated as unset, so leaving `HTTPS_PROXY=""` in your shell will not enable a proxy.
 - If a proxy URL cannot be parsed, `claw` falls back to a direct (no-proxy) client so existing workflows keep working; double-check the URL if you expected the request to be tunnelled.
+- **Exception — local broker inference.** An inference request whose destination validates as the local SideStack broker never traverses a proxy and never follows a redirect, whatever these variables say. This is a deliberate containment property of the readiness gate, not a bug; see [the in-process gate](#two-part-enforcement-the-startup-gate-and-the-in-process-gate). Every other outbound request, including inference to any non-broker provider, is unaffected.
 
 ## Common operational commands
 

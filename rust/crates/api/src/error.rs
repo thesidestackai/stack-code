@@ -70,6 +70,44 @@ pub enum ApiError {
         max_bytes: usize,
         provider: &'static str,
     },
+    /// The `SideStack` N6 admission guard refused this request before any
+    /// inference traffic left the process.
+    ///
+    /// This is a policy/authority decision, never a transport hiccup: it is
+    /// always non-retryable and must never trigger a provider fallback to a
+    /// different model. See `crate::n6_admission`.
+    N6AdmissionRefused {
+        /// The exact wire model the refusal applies to.
+        model: String,
+        kind: N6RefusalKind,
+    },
+}
+
+/// Why the N6 admission guard refused a request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum N6RefusalKind {
+    /// The broker answered, and the answer was "not ready".
+    NotReady { reason_code: String },
+    /// The readiness query could not be delivered or completed.
+    Transport(String),
+    /// The readiness response violated the response contract.
+    Protocol(String),
+    /// LAW-1: under the `SideStack` process marker, this provider/destination is
+    /// not an allowed inference route at all. Refused before any network call.
+    Routing(String),
+}
+
+impl Display for N6RefusalKind {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotReady { reason_code } => {
+                write!(f, "broker reported not ready (reason_code: {reason_code})")
+            }
+            Self::Transport(detail) => write!(f, "readiness query failed: {detail}"),
+            Self::Protocol(detail) => write!(f, "readiness response was unusable: {detail}"),
+            Self::Routing(detail) => write!(f, "route refused under SideStack policy: {detail}"),
+        }
+    }
 }
 
 impl ApiError {
@@ -122,6 +160,22 @@ impl ApiError {
         }
     }
 
+    /// Build a LAW-1 routing refusal for a destination that the `SideStack`
+    /// process marker forbids. No network call has been made.
+    #[must_use]
+    pub fn n6_routing_refused(model: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self::N6AdmissionRefused {
+            model: model.into(),
+            kind: N6RefusalKind::Routing(detail.into()),
+        }
+    }
+
+    /// True for every N6 admission/routing refusal.
+    #[must_use]
+    pub const fn is_n6_admission_refusal(&self) -> bool {
+        matches!(self, Self::N6AdmissionRefused { .. })
+    }
+
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
@@ -137,7 +191,8 @@ impl ApiError {
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
             | Self::BackoffOverflow { .. }
-            | Self::RequestBodySizeExceeded { .. } => false,
+            | Self::RequestBodySizeExceeded { .. }
+            | Self::N6AdmissionRefused { .. } => false,
         }
     }
 
@@ -156,7 +211,8 @@ impl ApiError {
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
             | Self::BackoffOverflow { .. }
-            | Self::RequestBodySizeExceeded { .. } => None,
+            | Self::RequestBodySizeExceeded { .. }
+            | Self::N6AdmissionRefused { .. } => None,
         }
     }
 
@@ -182,6 +238,7 @@ impl ApiError {
             }
             Self::InvalidApiKeyEnv(_) | Self::Io(_) | Self::Json { .. } => "runtime_io",
             Self::RequestBodySizeExceeded { .. } => "request_size",
+            Self::N6AdmissionRefused { .. } => "n6_admission",
         }
     }
 
@@ -205,7 +262,8 @@ impl ApiError {
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
             | Self::BackoffOverflow { .. }
-            | Self::RequestBodySizeExceeded { .. } => false,
+            | Self::RequestBodySizeExceeded { .. }
+            | Self::N6AdmissionRefused { .. } => false,
         }
     }
 
@@ -235,7 +293,8 @@ impl ApiError {
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
             | Self::BackoffOverflow { .. }
-            | Self::RequestBodySizeExceeded { .. } => false,
+            | Self::RequestBodySizeExceeded { .. }
+            | Self::N6AdmissionRefused { .. } => false,
         }
     }
 }
@@ -344,6 +403,10 @@ impl Display for ApiError {
             } => write!(
                 f,
                 "request body size ({estimated_bytes} bytes) exceeds {provider} limit ({max_bytes} bytes); reduce prompt length or context before retrying"
+            ),
+            Self::N6AdmissionRefused { model, kind } => write!(
+                f,
+                "n6_admission_refused for {model}: {kind}; no inference request was sent and no fallback model was attempted"
             ),
         }
     }

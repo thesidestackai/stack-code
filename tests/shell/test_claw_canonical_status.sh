@@ -57,9 +57,18 @@ make_repo() {
 # set_origin_main <root> <sha>
 set_origin_main() { git -C "$1" update-ref refs/remotes/origin/main "$2"; }
 
-# write_fake_claw <path> <reported_sha>
+# write_fake_claw <path> <reported_sha> [capabilities]
+#
+# [capabilities] is the literal text of the banner's `Capabilities` line. The
+# default is the token a build implementing the in-process N6 enforcement
+# contract advertises. The literal "__NONE__" omits the line entirely, which is
+# what a binary predating that contract looks like.
 write_fake_claw() {
-  local path="$1" sha="$2"
+  local path="$1" sha="$2" capabilities="${3-sidestack-n6-enforce-v1}"
+  local capability_line=""
+  if [[ "${capabilities}" != "__NONE__" ]]; then
+    capability_line="  printf '  Capabilities     %s\n' '${capabilities}'"
+  fi
   mkdir -p -- "$(dirname -- "${path}")"
   cat > "${path}" <<FAKE
 #!/usr/bin/env bash
@@ -69,6 +78,7 @@ if [[ "\${1:-}" == "--version" ]]; then
   printf '  Version          0.1.0\n'
   printf '  Git SHA          %s\n' '${sha}'
   printf '  Target           x86_64-unknown-linux-gnu\n'
+${capability_line}
   exit 0
 fi
 exit 1
@@ -995,6 +1005,249 @@ elif ! grep -Fq "identity could not be established" "${out}"; then
   fail_case "${name}" "report did not explain that the canonical identity was unprovable" "${out}" "${errf}"
 elif [[ "$(snapshot "${home}")" != "${before}" ]]; then
   fail_case "${name}" "status mutated the fixture HOME" "${out}" "${errf}"
+else
+  pass_case "${name}"
+fi
+
+# ---------- capability: a CURRENT build that advertises the contract ----------
+#
+# The capability field is reported ALONGSIDE the freshness verdict, not instead
+# of it, and neither answer disturbs the other.
+name="current_build_advertising_the_capability_reports_supported"
+case_dir="${WORK_DIR}/${name}"; mkdir -p "${case_dir}"
+root="$(make_repo "${case_dir}")"
+home="${case_dir}/home"
+head_sha="$(git -C "${root}" rev-parse HEAD)"
+set_origin_main "${root}" "${head_sha}"
+write_fake_claw "${home}/.local/bin/claw" "${head_sha}" "sidestack-n6-enforce-v1"
+rc="$(run_status "${case_dir}" "${root}" "${home}")"
+out="${case_dir}/stdout"; errf="${case_dir}/stderr"
+if [[ "${rc}" != "0" ]]; then
+  fail_case "${name}" "expected exit 0 (CURRENT), got ${rc}" "${out}" "${errf}"
+elif ! grep -Fqx "n6 capability:       supported" "${out}"; then
+  fail_case "${name}" "report did not declare the capability supported" "${out}" "${errf}"
+elif ! grep -Fq "state:               CURRENT" "${out}"; then
+  fail_case "${name}" "the capability field disturbed the freshness verdict" "${out}" "${errf}"
+else
+  pass_case "${name}"
+fi
+
+# ---------- capability: CURRENT is NOT capability ----------
+#
+# THE case this field exists for. The install matches origin/main exactly, so
+# freshness is perfect — and the binary still cannot enforce anything. If these
+# two answers were ever collapsed, this row would silently read as safe.
+name="current_build_without_the_capability_reports_unsupported"
+case_dir="${WORK_DIR}/${name}"; mkdir -p "${case_dir}"
+root="$(make_repo "${case_dir}")"
+home="${case_dir}/home"
+head_sha="$(git -C "${root}" rev-parse HEAD)"
+set_origin_main "${root}" "${head_sha}"
+write_fake_claw "${home}/.local/bin/claw" "${head_sha}" "__NONE__"
+rc="$(run_status "${case_dir}" "${root}" "${home}")"
+out="${case_dir}/stdout"; errf="${case_dir}/stderr"
+if [[ "${rc}" != "0" ]]; then
+  fail_case "${name}" "expected exit 0 (CURRENT) — capability must not change the exit code, got ${rc}" "${out}" "${errf}"
+elif ! grep -Fq "state:               CURRENT" "${out}"; then
+  fail_case "${name}" "a missing capability changed the freshness verdict" "${out}" "${errf}"
+elif ! grep -Fqx "n6 capability:       unsupported" "${out}"; then
+  fail_case "${name}" "a binary with no Capabilities line was not reported unsupported" "${out}" "${errf}"
+else
+  pass_case "${name}"
+fi
+
+# ---------- capability: a STALE build can still advertise it ----------
+#
+# Capability is orthogonal in BOTH directions: a stale install is not thereby
+# incapable, which is why the wrapper's stale override has to consult this field
+# rather than infer it.
+name="stale_build_advertising_the_capability_reports_supported"
+case_dir="${WORK_DIR}/${name}"; mkdir -p "${case_dir}"
+root="$(make_repo "${case_dir}")"
+home="${case_dir}/home"
+set_origin_main "${root}" "$(git -C "${root}" rev-parse HEAD)"
+write_fake_claw "${home}/.local/bin/claw" \
+  "5ta1e005ta1e005ta1e005ta1e005ta1e005ta1e" "sidestack-n6-enforce-v1"
+rc="$(run_status "${case_dir}" "${root}" "${home}")"
+out="${case_dir}/stdout"; errf="${case_dir}/stderr"
+if [[ "${rc}" != "10" ]]; then
+  fail_case "${name}" "expected exit 10 (STALE), got ${rc}" "${out}" "${errf}"
+elif ! grep -Fqx "n6 capability:       supported" "${out}"; then
+  fail_case "${name}" "a stale but capable binary was not reported supported" "${out}" "${errf}"
+else
+  pass_case "${name}"
+fi
+
+# ---------- capability: whole-token matching ----------
+#
+# A prefix/substring matcher would accept every one of these. `-v1` is a version,
+# not a stem, and a token that merely CONTAINS the contract name is not it.
+for capability_variant in \
+  "sidestack-n6-enforce-v10" \
+  "sidestack-n6-enforce-v2" \
+  "not-sidestack-n6-enforce-v1" \
+  "sidestack-n6-enforce" \
+  "sidestack-n6-enforce-v1x" ; do
+  name="near_miss_capability_token_is_not_accepted__${capability_variant}"
+  case_dir="${WORK_DIR}/${name}"; mkdir -p "${case_dir}"
+  root="$(make_repo "${case_dir}")"
+  home="${case_dir}/home"
+  head_sha="$(git -C "${root}" rev-parse HEAD)"
+  set_origin_main "${root}" "${head_sha}"
+  write_fake_claw "${home}/.local/bin/claw" "${head_sha}" "${capability_variant}"
+  rc="$(run_status "${case_dir}" "${root}" "${home}")"
+  out="${case_dir}/stdout"; errf="${case_dir}/stderr"
+  if ! grep -Fqx "n6 capability:       unsupported" "${out}"; then
+    fail_case "${name}" "near-miss token '${capability_variant}' was accepted as the capability" "${out}" "${errf}"
+  else
+    pass_case "${name}"
+  fi
+done
+
+# ---------- capability: the token may sit among others ----------
+#
+# The line is a SET of tokens, so a future build advertising more than one
+# capability must still be recognised.
+name="capability_is_found_among_other_tokens_on_the_line"
+case_dir="${WORK_DIR}/${name}"; mkdir -p "${case_dir}"
+root="$(make_repo "${case_dir}")"
+home="${case_dir}/home"
+head_sha="$(git -C "${root}" rev-parse HEAD)"
+set_origin_main "${root}" "${head_sha}"
+write_fake_claw "${home}/.local/bin/claw" "${head_sha}" \
+  "some-other-cap-v3 sidestack-n6-enforce-v1 trailing-cap-v9"
+rc="$(run_status "${case_dir}" "${root}" "${home}")"
+out="${case_dir}/stdout"; errf="${case_dir}/stderr"
+if ! grep -Fqx "n6 capability:       supported" "${out}"; then
+  fail_case "${name}" "the capability was not found among other tokens" "${out}" "${errf}"
+else
+  pass_case "${name}"
+fi
+
+# ---------- capability: fails closed when the binary is missing ----------
+name="missing_canonical_reports_unsupported_capability"
+case_dir="${WORK_DIR}/${name}"; mkdir -p "${case_dir}"
+root="$(make_repo "${case_dir}")"
+home="${case_dir}/home"
+mkdir -p "${home}/.local/bin"
+set_origin_main "${root}" "$(git -C "${root}" rev-parse HEAD)"
+rc="$(run_status "${case_dir}" "${root}" "${home}")"
+out="${case_dir}/stdout"; errf="${case_dir}/stderr"
+if [[ "${rc}" != "11" ]]; then
+  fail_case "${name}" "expected exit 11 (MISSING), got ${rc}" "${out}" "${errf}"
+elif ! grep -Fqx "n6 capability:       unsupported" "${out}"; then
+  fail_case "${name}" "a missing binary did not report an unsupported capability" "${out}" "${errf}"
+else
+  pass_case "${name}"
+fi
+
+# ---------- capability: fails closed on invalid topology ----------
+#
+# A symlinked canonical path is never executed, so nothing can have advertised
+# anything. The field must not be silently absent or optimistic.
+name="symlinked_canonical_reports_unsupported_capability"
+case_dir="${WORK_DIR}/${name}"; mkdir -p "${case_dir}"
+root="$(make_repo "${case_dir}")"
+home="${case_dir}/home"
+head_sha="$(git -C "${root}" rev-parse HEAD)"
+set_origin_main "${root}" "${head_sha}"
+write_fake_claw "${case_dir}/target/release/claw" "${head_sha}" "sidestack-n6-enforce-v1"
+mkdir -p "${home}/.local/bin"
+ln -s "${case_dir}/target/release/claw" "${home}/.local/bin/claw"
+rc="$(run_status "${case_dir}" "${root}" "${home}")"
+out="${case_dir}/stdout"; errf="${case_dir}/stderr"
+if [[ "${rc}" != "12" ]]; then
+  fail_case "${name}" "expected exit 12 (INVALID_TOPOLOGY), got ${rc}" "${out}" "${errf}"
+elif ! grep -Fqx "n6 capability:       unsupported" "${out}"; then
+  fail_case "${name}" "a symlinked canonical path did not report an unsupported capability" "${out}" "${errf}"
+else
+  pass_case "${name}"
+fi
+
+# ---------- capability: fails closed when identity cannot be proven ----------
+#
+# Same fence as the Git SHA. A banner that cannot be attributed to the file at
+# the canonical path proves neither provenance NOR capability, so a build that
+# really does advertise the token must still be reported unsupported here.
+name="unprovable_identity_discards_an_advertised_capability"
+case_dir="${WORK_DIR}/${name}"; mkdir -p "${case_dir}"
+root="$(make_repo "${case_dir}")"
+home="${case_dir}/home"
+head_sha="$(git -C "${root}" rev-parse HEAD)"
+set_origin_main "${root}" "${head_sha}"
+write_fake_claw "${home}/.local/bin/claw" "${head_sha}" "sidestack-n6-enforce-v1"
+stage_status_identity_utils "${case_dir}/rcbin" runtime-nonzero
+rc="$(run_status "${case_dir}" "${root}" "${home}" \
+  "PATH=${case_dir}/rcbin:/usr/bin:/bin" \
+  "IDENTITY_PROBE_LOG=${case_dir}/probe.log")"
+out="${case_dir}/stdout"; errf="${case_dir}/stderr"
+if [[ "${rc}" != "10" ]]; then
+  fail_case "${name}" "expected exit 10 (STALE), got ${rc}" "${out}" "${errf}"
+elif ! grep -Fqx "n6 capability:       unsupported" "${out}"; then
+  fail_case "${name}" "an unprovable identity did not discard the advertised capability" "${out}" "${errf}"
+else
+  pass_case "${name}"
+fi
+
+# ---------- capability: exactly one field, always ----------
+#
+# The wrapper refuses an ambiguous report, so the helper must never emit two.
+name="capability_field_is_reported_exactly_once"
+case_dir="${WORK_DIR}/${name}"; mkdir -p "${case_dir}"
+root="$(make_repo "${case_dir}")"
+home="${case_dir}/home"
+head_sha="$(git -C "${root}" rev-parse HEAD)"
+set_origin_main "${root}" "${head_sha}"
+write_fake_claw "${home}/.local/bin/claw" "${head_sha}" "sidestack-n6-enforce-v1"
+rc="$(run_status "${case_dir}" "${root}" "${home}")"
+out="${case_dir}/stdout"; errf="${case_dir}/stderr"
+field_count="$(grep -c '^n6 capability:' "${out}" || true)"
+if [[ "${field_count}" != "1" ]]; then
+  fail_case "${name}" "expected exactly one capability field, found ${field_count}" "${out}" "${errf}"
+else
+  pass_case "${name}"
+fi
+
+# ---------- capability: --quiet still says nothing ----------
+name="quiet_mode_suppresses_the_capability_field_too"
+case_dir="${WORK_DIR}/${name}"; mkdir -p "${case_dir}"
+root="$(make_repo "${case_dir}")"
+home="${case_dir}/home"
+head_sha="$(git -C "${root}" rev-parse HEAD)"
+set_origin_main "${root}" "${head_sha}"
+write_fake_claw "${home}/.local/bin/claw" "${head_sha}" "sidestack-n6-enforce-v1"
+out="${case_dir}/stdout"; errf="${case_dir}/stderr"
+set +e
+env -i HOME="${home}" PATH="/usr/bin:/bin" \
+  bash "${root}/scripts/claw-canonical-status" --quiet >"${out}" 2>"${errf}"
+rc=$?
+set -e
+if [[ "${rc}" != "0" ]]; then
+  fail_case "${name}" "expected exit 0 (CURRENT), got ${rc}" "${out}" "${errf}"
+elif [[ -s "${out}" ]]; then
+  fail_case "${name}" "--quiet printed a report" "${out}" "${errf}"
+else
+  pass_case "${name}"
+fi
+
+# ---------- capability: the status helper still runs --version exactly once ----------
+#
+# Capability must be read out of the SAME fenced banner as the Git SHA. A second
+# invocation would be an unfenced read, and would show up here.
+name="capability_does_not_add_a_second_version_invocation"
+case_dir="${WORK_DIR}/${name}"; mkdir -p "${case_dir}"
+root="$(make_repo "${case_dir}")"
+home="${case_dir}/home"
+head_sha="$(git -C "${root}" rev-parse HEAD)"
+set_origin_main "${root}" "${head_sha}"
+write_fake_claw "${home}/.local/bin/claw" "${head_sha}" "sidestack-n6-enforce-v1"
+rc="$(run_status "${case_dir}" "${root}" "${home}")"
+out="${case_dir}/stdout"; errf="${case_dir}/stderr"
+invocations="$(grep -c '^FAKE_CLAW_ARGV=' "${case_dir}/fake_claw.log" || true)"
+if [[ "${invocations}" != "1" ]]; then
+  fail_case "${name}" "expected exactly one canonical invocation, found ${invocations}" "${out}" "${errf}"
+elif ! grep -Fqx 'FAKE_CLAW_ARGV=--version' "${case_dir}/fake_claw.log"; then
+  fail_case "${name}" "the single invocation was not --version" "${out}" "${errf}"
 else
   pass_case "${name}"
 fi
