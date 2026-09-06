@@ -11927,19 +11927,23 @@ impl AnthropicRuntimeClient {
             return Ok(events);
         }
 
-        let response = self
-            .client
-            .send_message(&MessageRequest {
-                stream: false,
-                ..message_request.clone()
-            })
-            .await
-            .map_err(|error| {
-                RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-            })?;
-        let mut events = response_to_events(response, out)?;
-        push_prompt_cache_record(&self.client, &mut events);
-        Ok(events)
+        // The inference POST for this turn already executed: the provider
+        // accepted the request and answered 2xx, and the stream is only
+        // missing a terminal event. Re-sending the identical request would run
+        // the same non-idempotent inference a second time, take a second N6
+        // admission, and bill a second completion — all for one logical turn.
+        // Fail closed instead. A caller that sees this has an incomplete
+        // stream to diagnose, not a silently duplicated model call.
+        //
+        // A response that arrives complete but unframed is not this case: the
+        // provider layer recovers it into ordinary stream events, so it
+        // terminates normally above and never reaches here.
+        Err(RuntimeError::new(format!(
+            "incomplete stream (session {}): the model call succeeded but its response \
+             ended without a terminal event; it is not re-sent because the inference \
+             has already run",
+            self.session_id
+        )))
     }
 }
 
@@ -20931,5 +20935,298 @@ mod plan_approve_tests {
         assert!(!section.contains("fn parse_apply"));
         assert!(!section.contains("fn match_apply"));
         assert!(!section.contains("fn accept_apply"));
+    }
+}
+
+// =========================================================================
+// Stream fallback — duplicate-inference containment tests
+// =========================================================================
+
+#[cfg(test)]
+mod stream_fallback_tests {
+    use std::collections::BTreeSet;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+    use std::thread;
+
+    use runtime::{
+        ApiClient, ApiRequest, AssistantEvent, ContentBlock, ConversationMessage, MessageRole,
+        RuntimeError,
+    };
+    use tools::GlobalToolRegistry;
+
+    // One logical turn must cost one physical inference POST.
+    //
+    // The SideStackAI broker answers a `stream: true` request on its
+    // Ollama-backed `/v1/chat/completions` path with the complete
+    // `chat.completion` object as a plain JSON body: it hardcodes
+    // `stream: false` toward Ollama and never reads the caller's stream flag.
+    // That body carries no SSE frame separator, so the stream used to end
+    // having produced no events at all, and the CLI re-sent the identical
+    // request non-streaming. The model call had already executed, so the turn
+    // ran inference twice, took two N6 admissions, and was billed twice.
+    //
+    // These tests drive the real `AnthropicRuntimeClient` against a local
+    // counting server. No live model, no broker, no traffic off loopback.
+
+    /// The exact envelope `broker.py` returns for an Ollama-backed completion.
+    const BROKER_UNFRAMED_COMPLETION_BODY: &str = concat!(
+        "{\"id\":\"chatcmpl-ollama-1757000000\",\"object\":\"chat.completion\",",
+        "\"created\":1757000000,\"model\":\"qwen3:14b\",",
+        "\"choices\":[{\"index\":0,",
+        "\"message\":{\"role\":\"assistant\",\"content\":\"PR180_SMOKE_OK\"},",
+        "\"finish_reason\":\"stop\"}],",
+        "\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":5,\"total_tokens\":16}}"
+    );
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Serves `body` to every connection and records each request line, so the
+    /// recorded count is the number of physical inference POSTs the CLI made.
+    /// More connections are accepted than the fixed behaviour needs, so a
+    /// second POST would be answered rather than hanging — the count assertion
+    /// is then a statement about the client, not about a starved fixture.
+    fn spawn_counting_completion_server(
+        body: &'static str,
+        content_type: &'static str,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let address = listener.local_addr().expect("listener addr");
+        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recorder = Arc::clone(&requests);
+        thread::spawn(move || {
+            for stream in listener.incoming().take(4) {
+                let Ok(mut stream) = stream else { break };
+                let mut buffer = Vec::new();
+                let mut headers_end = None;
+                while headers_end.is_none() {
+                    let mut chunk = [0_u8; 1024];
+                    let Ok(read) = stream.read(&mut chunk) else {
+                        break;
+                    };
+                    if read == 0 {
+                        break;
+                    }
+                    buffer.extend_from_slice(&chunk[..read]);
+                    headers_end = buffer
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|position| position + 4);
+                }
+                let Some(headers_end) = headers_end else {
+                    break;
+                };
+                let header_text = String::from_utf8_lossy(&buffer[..headers_end]).into_owned();
+                let mut content_length = 0_usize;
+                for line in header_text.split("\r\n") {
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            content_length = value.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+                // Drain the request body so the client never blocks writing.
+                let mut body_len = buffer.len() - headers_end;
+                while body_len < content_length {
+                    let mut chunk = vec![0_u8; content_length - body_len];
+                    let Ok(read) = stream.read(&mut chunk) else {
+                        break;
+                    };
+                    if read == 0 {
+                        break;
+                    }
+                    body_len += read;
+                }
+                recorder
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(header_text.lines().next().unwrap_or_default().to_string());
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://{address}"), requests)
+    }
+
+    /// Runs one turn against the local server and returns the runtime result
+    /// together with the number of physical POSTs it cost.
+    fn run_one_turn(
+        body: &'static str,
+        content_type: &'static str,
+        allowed_tools: BTreeSet<String>,
+    ) -> (Result<Vec<AssistantEvent>, RuntimeError>, usize) {
+        let _guard = env_lock();
+        let (base_url, requests) = spawn_counting_completion_server(body, content_type);
+        let previous_base = std::env::var_os("OPENAI_BASE_URL");
+        let previous_key = std::env::var_os("OPENAI_API_KEY");
+        std::env::set_var("OPENAI_BASE_URL", &base_url);
+        std::env::set_var("OPENAI_API_KEY", "test-key");
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut client = crate::AnthropicRuntimeClient::new(
+                "stream-fallback-session",
+                "qwen3:14b".to_string(),
+                true,
+                false,
+                // `--allowed-tools ""` resolves to an empty set: tools stay
+                // enabled and zero tool definitions are sent.
+                Some(allowed_tools),
+                GlobalToolRegistry::builtin(),
+                None,
+            )
+            .expect("runtime client should build against the local server");
+            client.stream(ApiRequest {
+                system_prompt: Vec::new(),
+                messages: vec![ConversationMessage {
+                    role: MessageRole::User,
+                    blocks: vec![ContentBlock::Text {
+                        text: "print PR180_SMOKE_OK".to_string(),
+                    }],
+                    usage: None,
+                }],
+            })
+        }));
+
+        match previous_base {
+            Some(value) => std::env::set_var("OPENAI_BASE_URL", value),
+            None => std::env::remove_var("OPENAI_BASE_URL"),
+        }
+        match previous_key {
+            Some(value) => std::env::set_var("OPENAI_API_KEY", value),
+            None => std::env::remove_var("OPENAI_API_KEY"),
+        }
+
+        let count = requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        match result {
+            Ok(value) => (value, count),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    /// The historical fallback-triggering shape: a 2xx answer to a streaming
+    /// request carrying the completed response unframed. The turn must deliver
+    /// that answer, and must cost exactly one inference POST.
+    #[test]
+    fn unframed_completion_answer_costs_one_inference_post() {
+        let (result, requests) = run_one_turn(
+            BROKER_UNFRAMED_COMPLETION_BODY,
+            "application/json",
+            BTreeSet::new(),
+        );
+        let events = result.expect("the completed answer must be delivered, not re-requested");
+
+        assert_eq!(
+            requests, 1,
+            "one logical turn must cost exactly one physical inference POST"
+        );
+        assert!(
+            events.contains(&AssistantEvent::TextDelta("PR180_SMOKE_OK".to_string())),
+            "the assistant text from the first POST must reach the caller, got {events:?}"
+        );
+        assert!(
+            events.contains(&AssistantEvent::MessageStop),
+            "the turn must terminate normally, got {events:?}"
+        );
+    }
+
+    /// A genuinely empty 2xx stream fails closed. The inference already ran, so
+    /// re-sending it is not a safe recovery: the turn reports an incomplete
+    /// stream rather than silently executing the model a second time.
+    ///
+    /// The failure is raised where the evidence is — the provider decides at
+    /// EOF whether the response proved it completed — and reaches the CLI as
+    /// that typed error rather than as a missing terminal event to guess at.
+    #[test]
+    fn empty_successful_stream_fails_closed_without_a_second_inference_post() {
+        let (result, requests) = run_one_turn("", "application/json", BTreeSet::new());
+        let error = result.expect_err("an empty successful stream must not be reported as a turn");
+
+        assert_eq!(
+            requests, 1,
+            "an incomplete stream must not trigger a second inference POST"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("empty body"),
+            "the failure must name the empty body, got {message:?}"
+        );
+    }
+
+    /// A stream cut part-way through a frame is the adversarial case: it
+    /// carries real assistant text, so the turn looks answerable. It is not —
+    /// the rest of the answer never arrived — and it must fail without
+    /// re-running the inference that produced the part that did.
+    #[test]
+    fn truncated_stream_fails_closed_without_a_second_inference_post() {
+        const TRUNCATED_SSE: &str = concat!(
+            "data: {\"id\":\"chatcmpl_stream\",\"model\":\"qwen3:14b\",\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_stream\",\"choices\":[{\"delta\":{\"content\":\"lost"
+        );
+
+        let (result, requests) = run_one_turn(TRUNCATED_SSE, "text/event-stream", BTreeSet::new());
+        let error = result.expect_err("a truncated stream must not be reported as a turn");
+
+        assert_eq!(
+            requests, 1,
+            "a truncated stream must not trigger a second inference POST"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("truncated"),
+            "the failure must name the truncation, got {message:?}"
+        );
+        assert!(
+            !message.contains("post-tool stall"),
+            "an incomplete stream must not be mistaken for a stall and nudged, got {message:?}"
+        );
+    }
+
+    /// A properly framed SSE tool-use stream is unaffected: it terminates on
+    /// its own events, yields the tool call, and costs one POST. Recovery is
+    /// gated on a stream that produced nothing, so it cannot reach this path.
+    #[test]
+    fn framed_tool_use_stream_costs_one_inference_post() {
+        const TOOL_SSE: &str = concat!(
+            "data: {\"id\":\"chatcmpl_stream\",\"model\":\"qwen3:14b\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}]}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_stream\",\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+
+        let (result, requests) = run_one_turn(
+            TOOL_SSE,
+            "text/event-stream",
+            BTreeSet::from(["read_file".to_string()]),
+        );
+        let events = result.expect("a framed tool-use stream must complete");
+
+        assert_eq!(
+            requests, 1,
+            "a framed tool-use stream must not trigger a second inference POST"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AssistantEvent::ToolUse { name, input, .. }
+                    if name == "read_file" && input == "{\"path\":\"a.txt\"}"
+            )),
+            "the tool call must reach the caller intact, got {events:?}"
+        );
+        assert!(
+            events.contains(&AssistantEvent::MessageStop),
+            "the turn must terminate normally, got {events:?}"
+        );
     }
 }
