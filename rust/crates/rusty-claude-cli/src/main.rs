@@ -21194,6 +21194,40 @@ mod stream_fallback_tests {
         );
     }
 
+    /// A stream whose only frame is the terminal sentinel is a completed turn
+    /// that produced nothing. The provider recognises the sentinel, so the
+    /// response is not truncated and there is nothing to diagnose — but before
+    /// the empty turn was opened and closed at the provider layer, the stream
+    /// yielded no events at all and this path reported it as an incomplete
+    /// stream, failing a turn the model had in fact finished.
+    #[test]
+    fn standalone_done_stream_completes_as_an_empty_turn_at_one_post() {
+        let (result, requests) =
+            run_one_turn("data: [DONE]\n\n", "text/event-stream", BTreeSet::new());
+        let events = result.expect("a recognised terminal sentinel must complete the turn");
+
+        assert_eq!(
+            requests, 1,
+            "an empty turn must not trigger a second inference POST"
+        );
+        assert!(
+            events.contains(&AssistantEvent::MessageStop),
+            "the turn must terminate normally, got {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AssistantEvent::TextDelta(text) if !text.is_empty())),
+            "an empty turn must not invent content, got {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AssistantEvent::ToolUse { .. })),
+            "an empty turn must not invent a tool call, got {events:?}"
+        );
+    }
+
     /// A properly framed SSE tool-use stream is unaffected: it terminates on
     /// its own events, yields the tool call, and costs one POST. Recovery is
     /// gated on a stream that produced nothing, so it cannot reach this path.

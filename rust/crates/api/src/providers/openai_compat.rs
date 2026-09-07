@@ -756,28 +756,38 @@ impl StreamState {
         }
     }
 
+    /// Open the assistant message. Every stream does this exactly once,
+    /// before any content and before its terminal event, so the two callers
+    /// that can be first to know a message exists — the first chunk, and the
+    /// end of a stream that never carried one — go through one construction.
+    fn open_message(&mut self, id: String, model: String) -> StreamEvent {
+        self.message_started = true;
+        StreamEvent::MessageStart(MessageStartEvent {
+            message: MessageResponse {
+                id,
+                kind: "message".to_string(),
+                role: "assistant".to_string(),
+                content: Vec::new(),
+                model,
+                stop_reason: None,
+                stop_sequence: None,
+                usage: Usage {
+                    input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                    output_tokens: 0,
+                },
+                request_id: None,
+            },
+        })
+    }
+
     fn ingest_chunk(&mut self, chunk: ChatCompletionChunk) -> Result<Vec<StreamEvent>, ApiError> {
         let mut events = Vec::new();
         if !self.message_started {
-            self.message_started = true;
-            events.push(StreamEvent::MessageStart(MessageStartEvent {
-                message: MessageResponse {
-                    id: chunk.id.clone(),
-                    kind: "message".to_string(),
-                    role: "assistant".to_string(),
-                    content: Vec::new(),
-                    model: chunk.model.clone().unwrap_or_else(|| self.model.clone()),
-                    stop_reason: None,
-                    stop_sequence: None,
-                    usage: Usage {
-                        input_tokens: 0,
-                        cache_creation_input_tokens: 0,
-                        cache_read_input_tokens: 0,
-                        output_tokens: 0,
-                    },
-                    request_id: None,
-                },
-            }));
+            let id = chunk.id.clone();
+            let model = chunk.model.clone().unwrap_or_else(|| self.model.clone());
+            events.push(self.open_message(id, model));
         }
 
         if let Some(usage) = chunk.usage {
@@ -854,6 +864,22 @@ impl StreamState {
         self.finished = true;
 
         let mut events = Vec::new();
+
+        // A stream can prove it finished without ever having started a
+        // message: a body whose only frame is the terminal sentinel says the
+        // response completed and carried nothing. That is the one way to
+        // arrive here unstarted — `finalize_at_eof` has already failed every
+        // body that could not prove completion, and any body that could either
+        // ingested a chunk or was recovered into one — so opening the message
+        // here cannot turn a truncation into a success. It has to be opened:
+        // the terminal events below are what tell a caller the turn ended, and
+        // an empty event list is indistinguishable from a connection that died
+        // before saying anything, which would fail a turn that succeeded.
+        if !self.message_started {
+            let model = self.model.clone();
+            events.push(self.open_message(EMPTY_TURN_MESSAGE_ID.to_string(), model));
+        }
+
         if self.text_started && !self.text_finished {
             self.text_finished = true;
             events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
@@ -965,6 +991,28 @@ impl ToolCallState {
     }
 }
 
+/// The id reported for a turn that terminated without ever sending a chunk.
+/// No chunk arrived, so the provider sent no id to carry; this names the
+/// situation rather than inventing a plausible-looking provider id that a
+/// reader could mistake for one the provider actually assigned.
+const EMPTY_TURN_MESSAGE_ID: &str = "empty-stream";
+
+/// The index of the one choice this client reads a response's content from.
+///
+/// `build_chat_completion_request` never sends `n`, so a response carries
+/// exactly one choice. Every path that reads one resolves it through this
+/// single constant — ordinary normalization, compact-recovery validation, and
+/// the compact-recovery conversion — so no path can select a different choice
+/// than the others and surface content the rest would have ignored.
+const SELECTED_CHOICE_INDEX: usize = 0;
+
+/// The selected choice, taken by value, for the paths that consume a response
+/// rather than inspect it. The borrowing form is
+/// [`ChatCompletionResponse::selected_choice`].
+fn take_selected_choice(choices: Vec<ChatChoice>) -> Option<ChatChoice> {
+    choices.into_iter().nth(SELECTED_CHOICE_INDEX)
+}
+
 /// The discriminator a completed `OpenAI` chat completion carries. A streaming
 /// fragment says `chat.completion.chunk`; only the finished object says this.
 const CHAT_COMPLETION_OBJECT: &str = "chat.completion";
@@ -1022,11 +1070,20 @@ impl ChatCompletionResponse {
     /// and requiring a choice the client never reads to be terminal would
     /// reject responses that are fine.
     fn selected_choice(&self) -> Option<&ChatChoice> {
-        self.choices.first()
+        self.choices.get(SELECTED_CHOICE_INDEX)
     }
 
     /// Reshape a completed response into the one streaming chunk that carries
     /// the same content, so both wire shapes converge on a single decoder.
+    ///
+    /// Only the selected choice is converted, because only the selected choice
+    /// is what this client reads. `StreamState` merges everything a chunk
+    /// carries into one message — text concatenates into a single block, and
+    /// tool calls merge by position — so converting an alternate choice would
+    /// splice content into the answer that `normalize_response` would have
+    /// discarded, and deliver it as the model's. Validation already reads this
+    /// same choice, so recovery accepting a body and recovery delivering it
+    /// cannot disagree about which choice the body was judged on.
     ///
     /// Tool calls are indexed by position: a completed response lists them in
     /// order and has no separate index field, and `ToolCallState` keys on the
@@ -1035,8 +1092,7 @@ impl ChatCompletionResponse {
         ChatCompletionChunk {
             id: self.id,
             model: Some(self.model),
-            choices: self
-                .choices
+            choices: take_selected_choice(self.choices)
                 .into_iter()
                 .map(|choice| ChunkChoice {
                     delta: ChunkDelta {
@@ -1662,13 +1718,9 @@ fn normalize_response(
     model: &str,
     response: ChatCompletionResponse,
 ) -> Result<MessageResponse, ApiError> {
-    let choice = response
-        .choices
-        .into_iter()
-        .next()
-        .ok_or(ApiError::InvalidSseFrame(
-            "chat completion response missing choices",
-        ))?;
+    let choice = take_selected_choice(response.choices).ok_or(ApiError::InvalidSseFrame(
+        "chat completion response missing choices",
+    ))?;
     let mut content = Vec::new();
     if let Some(text) = choice.message.content.filter(|value| !value.is_empty()) {
         content.push(OutputContentBlock::Text { text });

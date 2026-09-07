@@ -854,6 +854,52 @@ impl StreamOutcome {
             .count()
     }
 
+    /// How many `message_start` events reached the caller. A stream may open
+    /// exactly once.
+    fn message_start_count(&self) -> usize {
+        self.events
+            .iter()
+            .filter(|event| matches!(event, StreamEvent::MessageStart(_)))
+            .count()
+    }
+
+    /// How many content blocks were opened. A completed empty turn opens none.
+    fn content_block_start_count(&self) -> usize {
+        self.events
+            .iter()
+            .filter(|event| matches!(event, StreamEvent::ContentBlockStart(_)))
+            .count()
+    }
+
+    /// The names of every tool-use block opened for the caller, in order.
+    fn tool_use_names(&self) -> Vec<String> {
+        self.events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                    content_block: OutputContentBlock::ToolUse { name, .. },
+                    ..
+                }) => Some(name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The tool-call argument JSON delivered to the caller, concatenated in
+    /// order, so alternate-choice arguments are visible if any leak.
+    fn tool_arguments(&self) -> String {
+        self.events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                    delta: ContentBlockDelta::InputJsonDelta { partial_json },
+                    ..
+                }) => Some(partial_json.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn has_message_delta(&self) -> bool {
         self.events
             .iter()
@@ -1752,6 +1798,391 @@ async fn mixed_frame_separators_with_done_stay_fail_closed() {
         "a mis-separated body must never produce a duplicate terminal event, got {:?}",
         outcome.events
     );
+}
+
+// ---------------------------------------------------------------------------
+// Standalone terminal sentinel — a completed empty turn
+//
+// A body whose only frame is `data: [DONE]` is a recognised, well-formed
+// stream that says the response finished having produced nothing. That is not
+// transport truncation: no bytes are missing, and the protocol's own terminal
+// marker arrived. It has to reach the caller as a completed logical turn — an
+// opening `message_start`, no content, one closing `message_stop` — because a
+// caller cannot tell "the model said nothing" from "the connection died" out
+// of an empty event list, and treating the two alike either fails a turn that
+// succeeded or re-runs inference that already ran.
+// ---------------------------------------------------------------------------
+
+/// Asserts a stream completed as an *empty* logical turn: it opened, it
+/// carried nothing, and it closed, at the cost of one inference POST.
+fn expect_complete_and_empty(outcome: &StreamOutcome) {
+    assert!(
+        outcome.error.is_none(),
+        "a recognised terminal sentinel is a completed stream, not a failure, got {:?}",
+        outcome.error
+    );
+    assert_eq!(
+        outcome.requests, 1,
+        "one logical turn must cost exactly one physical inference POST"
+    );
+    assert_eq!(
+        outcome.message_start_count(),
+        1,
+        "a completed turn must open exactly once, got {:?}",
+        outcome.events
+    );
+    assert!(
+        matches!(outcome.events.first(), Some(StreamEvent::MessageStart(_))),
+        "message_start must be the first event, got {:?}",
+        outcome.events
+    );
+    assert_eq!(
+        outcome.message_stop_count(),
+        1,
+        "a completed turn must terminate exactly once, got {:?}",
+        outcome.events
+    );
+    assert!(
+        matches!(outcome.events.last(), Some(StreamEvent::MessageStop(_))),
+        "message_stop must be the final event, got {:?}",
+        outcome.events
+    );
+    assert_eq!(
+        outcome.content_block_start_count(),
+        0,
+        "an empty turn must open no content block, got {:?}",
+        outcome.events
+    );
+    assert_eq!(outcome.text(), "", "an empty turn must carry no text");
+    assert!(
+        !outcome.has_tool_use(),
+        "an empty turn must carry no tool call, got {:?}",
+        outcome.events
+    );
+}
+
+/// P2-A. The sentinel alone. Nothing was delivered, but the stream did say it
+/// finished, so the caller must receive a completed empty turn rather than an
+/// event list it cannot distinguish from a dead connection.
+#[tokio::test]
+async fn standalone_done_yields_a_completed_empty_turn() {
+    let outcome = run_stream_case("data: [DONE]\n\n", "text/event-stream").await;
+    expect_complete_and_empty(&outcome);
+    assert_eq!(
+        outcome.stop_reason().as_deref(),
+        Some("end_turn"),
+        "an empty turn ends the same way any turn with no explicit reason does"
+    );
+}
+
+/// Leading whitespace is not content. It changes nothing about the reading.
+#[tokio::test]
+async fn whitespace_then_standalone_done_yields_a_completed_empty_turn() {
+    let outcome = run_stream_case("\n\n   \n\ndata: [DONE]\n\n", "text/event-stream").await;
+    expect_complete_and_empty(&outcome);
+}
+
+/// Trailing whitespace is not a continuation either.
+#[tokio::test]
+async fn standalone_done_then_whitespace_yields_a_completed_empty_turn() {
+    let outcome = run_stream_case("data: [DONE]\n\n   \n\n", "text/event-stream").await;
+    expect_complete_and_empty(&outcome);
+}
+
+/// An SSE comment carries no stream content, so a body that opens with one and
+/// then terminates is still an empty completed turn.
+#[tokio::test]
+async fn comment_then_standalone_done_yields_a_completed_empty_turn() {
+    let outcome = run_stream_case(": keep-alive\n\ndata: [DONE]\n\n", "text/event-stream").await;
+    expect_complete_and_empty(&outcome);
+}
+
+/// The empty turn must not weaken the post-terminal latch. Application bytes
+/// behind the sentinel are a protocol violation whether or not content came
+/// before it, and none of them may surface as the model's answer.
+#[tokio::test]
+async fn standalone_done_then_text_frame_never_reaches_the_caller() {
+    let body = concat!(
+        "data: [DONE]\n\n",
+        "data: {\"id\":\"s\",\"model\":\"qwen3:14b\",",
+        "\"choices\":[{\"delta\":{\"content\":\"AFTER\"}}]}\n\n"
+    );
+    let outcome = run_stream_case(body, "text/event-stream").await;
+    let detail = outcome.expect_incomplete();
+    assert!(
+        detail.contains("[DONE]"),
+        "the failure must name the terminal-marker contradiction, got {detail:?}"
+    );
+    assert_eq!(
+        outcome.text(),
+        "",
+        "post-terminal text must never be decoded"
+    );
+}
+
+/// The same for a tool call behind the sentinel.
+#[tokio::test]
+async fn standalone_done_then_tool_frame_never_reaches_the_caller() {
+    let body = concat!(
+        "data: [DONE]\n\n",
+        "data: {\"id\":\"s\",\"model\":\"qwen3:14b\",\"choices\":[{\"delta\":{",
+        "\"tool_calls\":[{\"index\":0,\"id\":\"call_after\",\"function\":{",
+        "\"name\":\"after\",\"arguments\":\"{}\"}}]}}]}\n\n"
+    );
+    let outcome = run_stream_case(body, "text/event-stream").await;
+    outcome.expect_incomplete();
+    assert!(
+        !outcome.has_tool_use(),
+        "post-terminal tool calls must never be decoded, got {:?}",
+        outcome.events
+    );
+}
+
+/// Malformed bytes behind the sentinel are never parsed, so they can neither
+/// surface as content nor be reported as a JSON error.
+#[tokio::test]
+async fn standalone_done_then_malformed_bytes_fails_closed() {
+    let outcome =
+        run_stream_case("data: [DONE]\n\n{not json at all}\n\n", "text/event-stream").await;
+    let detail = outcome.expect_incomplete();
+    assert!(
+        detail.contains("[DONE]"),
+        "the failure must name the terminal-marker contradiction, got {detail:?}"
+    );
+}
+
+/// A frame that begins behind the sentinel and never terminates is the same
+/// violation: the stream had already declared itself finished.
+#[tokio::test]
+async fn standalone_done_then_truncated_frame_fails_closed() {
+    let body = concat!(
+        "data: [DONE]\n\n",
+        "data: {\"id\":\"s\",\"choices\":[{\"delta\":{\"content\":\"lo"
+    );
+    let outcome = run_stream_case(body, "text/event-stream").await;
+    outcome.expect_incomplete();
+    assert_eq!(outcome.text(), "");
+}
+
+/// A second sentinel is application data behind a terminal marker, and keeps
+/// the strict reading the exact-head reviewer confirmed.
+#[tokio::test]
+async fn duplicate_standalone_done_stays_fail_closed() {
+    let outcome = run_stream_case("data: [DONE]\n\ndata: [DONE]\n\n", "text/event-stream").await;
+    let detail = outcome.expect_incomplete();
+    assert!(
+        detail.contains("[DONE]"),
+        "the failure must name the terminal-marker contradiction, got {detail:?}"
+    );
+}
+
+/// The repair must not broaden into "an unstarted stream always completes".
+/// A chunk that carries no choices starts the message but proves nothing about
+/// how the response ends, so a body that stops there is still incomplete.
+#[tokio::test]
+async fn a_started_stream_without_a_terminal_event_still_fails() {
+    let body = "data: {\"id\":\"s\",\"model\":\"qwen3:14b\",\"choices\":[]}\n\n";
+    let outcome = run_stream_case(body, "text/event-stream").await;
+    let detail = outcome.expect_incomplete();
+    assert!(
+        detail.contains("terminal event"),
+        "a stream that never said it finished must fail as one, got {detail:?}"
+    );
+}
+
+/// The same chunk followed by the sentinel does complete, and opens and closes
+/// exactly once — the message was already started, so the empty-turn path must
+/// not open a second one.
+#[tokio::test]
+async fn a_choiceless_chunk_then_done_opens_and_closes_exactly_once() {
+    let body = concat!(
+        "data: {\"id\":\"s\",\"model\":\"qwen3:14b\",\"choices\":[]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let outcome = run_stream_case(body, "text/event-stream").await;
+    outcome.expect_complete();
+    assert_eq!(
+        outcome.message_start_count(),
+        1,
+        "the empty-turn path must not open a message that a chunk already opened, got {:?}",
+        outcome.events
+    );
+    assert_eq!(outcome.message_stop_count(), 1);
+    assert_eq!(outcome.content_block_start_count(), 0);
+}
+
+/// A body that never framed and never proved completion must still fail, so
+/// the empty-turn path cannot be reached by a body that simply stopped.
+#[tokio::test]
+async fn an_unframed_incomplete_body_never_becomes_an_empty_turn() {
+    let outcome = run_stream_case("{\"object\":\"chat.completion\"}", "application/json").await;
+    outcome.expect_incomplete();
+    assert_eq!(outcome.message_start_count(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Compact recovery — selected-choice semantics
+//
+// `normalize_response` consumes `choices.first()` and nothing else, and
+// `build_chat_completion_request` never sends `n`, so one choice is the whole
+// of what this client reads. Compact recovery is a compatibility path for the
+// same responses, so it has to make the same selection. Converting every
+// returned choice instead concatenates alternate-choice text into one content
+// block and merges alternate tool calls by position — data the ordinary
+// non-streaming path would have ignored, surfaced to the caller as the model's
+// answer.
+// ---------------------------------------------------------------------------
+
+/// Two terminated choices. The second exists only so its content is
+/// recognisable if it leaks.
+const COMPACT_TWO_TERMINATED_CHOICES: &str = concat!(
+    "{\"id\":\"chatcmpl-multi\",\"object\":\"chat.completion\",\"model\":\"qwen3:14b\",",
+    "\"choices\":[",
+    "{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"first\"},",
+    "\"finish_reason\":\"stop\"},",
+    "{\"index\":1,\"message\":{\"role\":\"assistant\",\"content\":\"SECOND\"},",
+    "\"finish_reason\":\"stop\"}],",
+    "\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":5}}"
+);
+
+/// P2-B, case A. Only the choice the ordinary path would read may be
+/// delivered.
+#[tokio::test]
+async fn compact_recovery_delivers_only_the_selected_choice_text() {
+    let outcome = run_stream_case(COMPACT_TWO_TERMINATED_CHOICES, "application/json").await;
+    outcome.expect_complete();
+    assert_eq!(
+        outcome.text(),
+        "first",
+        "recovery must deliver the selected choice alone, got {:?}",
+        outcome.events
+    );
+    assert_eq!(
+        outcome.message_stop_count(),
+        1,
+        "alternate choices must not add terminal events, got {:?}",
+        outcome.events
+    );
+}
+
+/// Case B. An unterminated alternate says nothing about the selected choice,
+/// which is terminal and complete on its own.
+#[tokio::test]
+async fn compact_recovery_ignores_an_unterminated_alternate_choice() {
+    let body = concat!(
+        "{\"id\":\"chatcmpl-multi\",\"object\":\"chat.completion\",\"model\":\"qwen3:14b\",",
+        "\"choices\":[",
+        "{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"first\"},",
+        "\"finish_reason\":\"stop\"},",
+        "{\"index\":1,\"message\":{\"role\":\"assistant\",\"content\":\"SECOND\"},",
+        "\"finish_reason\":null}]}"
+    );
+    let outcome = run_stream_case(body, "application/json").await;
+    outcome.expect_complete();
+    assert_eq!(outcome.text(), "first");
+}
+
+/// Case C. The selected choice is the one validation reads. An alternate being
+/// terminal cannot stand in for it, so the body is rejected.
+#[tokio::test]
+async fn compact_recovery_rejects_an_unterminated_selected_choice_despite_a_terminal_alternate() {
+    let body = concat!(
+        "{\"id\":\"chatcmpl-multi\",\"object\":\"chat.completion\",\"model\":\"qwen3:14b\",",
+        "\"choices\":[",
+        "{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"first\"},",
+        "\"finish_reason\":null},",
+        "{\"index\":1,\"message\":{\"role\":\"assistant\",\"content\":\"SECOND\"},",
+        "\"finish_reason\":\"stop\"}]}"
+    );
+    let outcome = run_stream_case(body, "application/json").await;
+    outcome.expect_incomplete();
+    assert_eq!(
+        outcome.text(),
+        "",
+        "a rejected body must deliver nothing, got {:?}",
+        outcome.events
+    );
+}
+
+/// Case D. Tool calls merge by position, so an alternate choice's call would
+/// arrive as if it were the selected choice's. Only the selected call may
+/// reach the caller.
+#[tokio::test]
+async fn compact_recovery_delivers_only_the_selected_choice_tool_call() {
+    let body = concat!(
+        "{\"id\":\"chatcmpl-multi\",\"object\":\"chat.completion\",\"model\":\"qwen3:14b\",",
+        "\"choices\":[",
+        "{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":null,",
+        "\"tool_calls\":[{\"id\":\"call_a\",\"type\":\"function\",",
+        "\"function\":{\"name\":\"alpha\",\"arguments\":\"{\\\"a\\\":1}\"}}]},",
+        "\"finish_reason\":\"tool_calls\"},",
+        "{\"index\":1,\"message\":{\"role\":\"assistant\",\"content\":null,",
+        "\"tool_calls\":[{\"id\":\"call_b\",\"type\":\"function\",",
+        "\"function\":{\"name\":\"beta\",\"arguments\":\"{\\\"b\\\":2}\"}}]},",
+        "\"finish_reason\":\"tool_calls\"}]}"
+    );
+    let outcome = run_stream_case(body, "application/json").await;
+    outcome.expect_complete();
+    assert_eq!(
+        outcome.tool_use_names(),
+        vec!["alpha".to_string()],
+        "only the selected choice's tool call may reach the caller, got {:?}",
+        outcome.events
+    );
+    let arguments = outcome.tool_arguments();
+    assert!(
+        !arguments.contains("\"b\""),
+        "alternate-choice tool arguments must not be merged in, got {arguments:?}"
+    );
+}
+
+/// Case E. Selected text, alternate tool call. The tool call must not appear.
+#[tokio::test]
+async fn compact_recovery_drops_an_alternate_choice_tool_call_beside_selected_text() {
+    let body = concat!(
+        "{\"id\":\"chatcmpl-multi\",\"object\":\"chat.completion\",\"model\":\"qwen3:14b\",",
+        "\"choices\":[",
+        "{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"first\"},",
+        "\"finish_reason\":\"stop\"},",
+        "{\"index\":1,\"message\":{\"role\":\"assistant\",\"content\":null,",
+        "\"tool_calls\":[{\"id\":\"call_b\",\"type\":\"function\",",
+        "\"function\":{\"name\":\"beta\",\"arguments\":\"{\\\"b\\\":2}\"}}]},",
+        "\"finish_reason\":\"tool_calls\"}]}"
+    );
+    let outcome = run_stream_case(body, "application/json").await;
+    outcome.expect_complete();
+    assert_eq!(outcome.text(), "first");
+    assert!(
+        !outcome.has_tool_use(),
+        "an alternate choice's tool call must not reach the caller, got {:?}",
+        outcome.events
+    );
+    assert_eq!(outcome.stop_reason().as_deref(), Some("end_turn"));
+}
+
+/// Case F. Selected tool call, alternate text. The text must not appear.
+#[tokio::test]
+async fn compact_recovery_drops_alternate_choice_text_beside_a_selected_tool_call() {
+    let body = concat!(
+        "{\"id\":\"chatcmpl-multi\",\"object\":\"chat.completion\",\"model\":\"qwen3:14b\",",
+        "\"choices\":[",
+        "{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":null,",
+        "\"tool_calls\":[{\"id\":\"call_a\",\"type\":\"function\",",
+        "\"function\":{\"name\":\"alpha\",\"arguments\":\"{\\\"a\\\":1}\"}}]},",
+        "\"finish_reason\":\"tool_calls\"},",
+        "{\"index\":1,\"message\":{\"role\":\"assistant\",\"content\":\"SECOND\"},",
+        "\"finish_reason\":\"stop\"}]}"
+    );
+    let outcome = run_stream_case(body, "application/json").await;
+    outcome.expect_complete();
+    assert_eq!(
+        outcome.text(),
+        "",
+        "alternate-choice text must not reach the caller, got {:?}",
+        outcome.events
+    );
+    assert_eq!(outcome.tool_use_names(), vec!["alpha".to_string()]);
+    assert_eq!(outcome.stop_reason().as_deref(), Some("tool_use"));
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
