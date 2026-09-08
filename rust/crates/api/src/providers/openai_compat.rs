@@ -1132,7 +1132,13 @@ struct ChatMessage {
     role: String,
     #[serde(default)]
     content: Option<String>,
-    #[serde(default)]
+    /// Null-tolerant for the same reason `ChunkDelta` is: `#[serde(default)]`
+    /// covers an absent key but rejects an explicit `null`, and providers that
+    /// spell "no tool calls" that way would otherwise make the whole finished
+    /// message undecodable — failing the turn on both the ordinary
+    /// non-streaming path and compact recovery. A value that is neither a list
+    /// nor null still fails, as it must.
+    #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
     tool_calls: Vec<ResponseToolCall>,
 }
 

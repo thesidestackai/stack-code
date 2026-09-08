@@ -2391,3 +2391,202 @@ impl Drop for ScopedEnvVar {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// `tool_calls` null / missing / empty matrix
+//
+// `#[serde(default)]` alone covers an absent key; it does not accept an
+// explicit `null`. Some OpenAI-compatible providers emit `"tool_calls": null`
+// on a finished assistant message, and `ChatMessage` is the struct both the
+// compact-recovery path and the ordinary non-streaming path decode into, so
+// the same three benign shapes — absent, null, `[]` — must all mean "this
+// message carried no tool calls" on both paths. A value that is neither a
+// list nor null still proves nothing about the message and must stay a typed
+// failure: tolerating null is not tolerating any shape at all.
+// ---------------------------------------------------------------------------
+
+/// A finished compact completion whose assistant message carries `tool_calls`
+/// in the shape named by `tool_calls_field`, which is spliced in verbatim.
+fn compact_completion_with_tool_calls(tool_calls_field: &str) -> String {
+    format!(
+        "{{\"id\":\"chatcmpl-null-tools\",\"object\":\"chat.completion\",\
+          \"model\":\"qwen3:14b\",\
+          \"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\
+          \"content\":\"NULL_TOOLCALLS_OK\"{tool_calls_field}}},\
+          \"finish_reason\":\"stop\"}}],\
+          \"usage\":{{\"prompt_tokens\":11,\"completion_tokens\":5}}}}"
+    )
+}
+
+/// Runs one ordinary non-streaming turn against a server that answers `body`
+/// once, and reports how many physical POSTs it cost.
+async fn run_nonstream_case(body: &str) -> (Result<api::MessageResponse, ApiError>, usize) {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let server = spawn_server(
+        state.clone(),
+        vec![
+            http_response("200 OK", "application/json", body),
+            http_response("200 OK", "application/json", body),
+        ],
+    )
+    .await;
+
+    let client = OpenAiCompatClient::new("test-key", OpenAiCompatConfig::openai())
+        .with_base_url(server.base_url());
+    let result = client.send_message(&sample_request(false)).await;
+    let requests = state.lock().await.len();
+    (result, requests)
+}
+
+/// Matrix A. The field is absent: the historical shape, and the baseline the
+/// other two benign shapes must match.
+#[tokio::test]
+async fn compact_recovery_treats_missing_tool_calls_as_empty() {
+    let outcome =
+        run_stream_case(&compact_completion_with_tool_calls(""), "application/json").await;
+    outcome.expect_complete();
+    assert_eq!(outcome.text(), "NULL_TOOLCALLS_OK");
+    assert!(
+        outcome.tool_use_names().is_empty(),
+        "an absent tool_calls field must open no tool block, got {:?}",
+        outcome.tool_use_names()
+    );
+    assert_eq!(outcome.stop_reason().as_deref(), Some("end_turn"));
+}
+
+/// Matrix B. The reviewer's finding: an explicit `null` must mean the same
+/// thing an absent key means, so the answer the POST already paid for is
+/// delivered instead of being reported as an incomplete stream.
+#[tokio::test]
+async fn compact_recovery_treats_null_tool_calls_as_empty() {
+    let outcome = run_stream_case(
+        &compact_completion_with_tool_calls(",\"tool_calls\":null"),
+        "application/json",
+    )
+    .await;
+    outcome.expect_complete();
+    assert_eq!(outcome.text(), "NULL_TOOLCALLS_OK");
+    assert!(
+        outcome.tool_use_names().is_empty(),
+        "tool_calls:null must open no tool block, got {:?}",
+        outcome.tool_use_names()
+    );
+    assert_eq!(outcome.stop_reason().as_deref(), Some("end_turn"));
+}
+
+/// Matrix C. An explicit empty list is the third benign spelling.
+#[tokio::test]
+async fn compact_recovery_treats_empty_tool_calls_as_empty() {
+    let outcome = run_stream_case(
+        &compact_completion_with_tool_calls(",\"tool_calls\":[]"),
+        "application/json",
+    )
+    .await;
+    outcome.expect_complete();
+    assert_eq!(outcome.text(), "NULL_TOOLCALLS_OK");
+    assert!(
+        outcome.tool_use_names().is_empty(),
+        "tool_calls:[] must open no tool block, got {:?}",
+        outcome.tool_use_names()
+    );
+}
+
+/// Matrix D. Tolerating null must not cost a real list its contents: id, name
+/// and arguments all still reach the caller.
+#[tokio::test]
+async fn compact_recovery_still_carries_a_real_tool_call_list() {
+    let body = compact_completion_with_tool_calls(
+        ",\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\
+         \"function\":{\"name\":\"weather\",\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\"}}]",
+    );
+    let outcome = run_stream_case(&body, "application/json").await;
+    outcome.expect_complete();
+    assert_eq!(outcome.tool_use_names(), vec!["weather".to_string()]);
+    assert_eq!(outcome.tool_arguments(), "{\"city\":\"Paris\"}");
+    assert!(
+        outcome.events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                content_block: OutputContentBlock::ToolUse { id, .. },
+                ..
+            }) if id == "call_1"
+        )),
+        "the recovered tool call must keep its id, got {:?}",
+        outcome.events
+    );
+}
+
+/// Matrix E. A value that is neither a list nor null is not a benign spelling
+/// of "no tool calls" — it is an object this decoder cannot read, and the body
+/// therefore never proves it is the finished completion it claims to be.
+#[tokio::test]
+async fn compact_recovery_rejects_a_non_list_tool_calls_value() {
+    let outcome = run_stream_case(
+        &compact_completion_with_tool_calls(",\"tool_calls\":{}"),
+        "application/json",
+    )
+    .await;
+    assert!(
+        outcome
+            .expect_incomplete()
+            .contains("not a complete chat.completion"),
+        "a non-list tool_calls value must stay an undecodable body"
+    );
+}
+
+/// The same three benign shapes on the ordinary non-streaming path, which
+/// decodes the identical `ChatMessage`.
+#[tokio::test]
+async fn send_message_treats_missing_null_and_empty_tool_calls_alike() {
+    for field in ["", ",\"tool_calls\":null", ",\"tool_calls\":[]"] {
+        let (result, requests) =
+            run_nonstream_case(&compact_completion_with_tool_calls(field)).await;
+        let response = result.unwrap_or_else(|error| {
+            panic!("tool_calls shape {field:?} must decode, got {error:?}")
+        });
+        assert_eq!(
+            response.content,
+            vec![OutputContentBlock::Text {
+                text: "NULL_TOOLCALLS_OK".to_string(),
+            }],
+            "tool_calls shape {field:?} must deliver the text and no tool block"
+        );
+        assert_eq!(response.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(response.total_tokens(), 16);
+        assert_eq!(requests, 1, "tool_calls shape {field:?} must cost one POST");
+    }
+}
+
+/// A real tool list on the non-streaming path is unchanged by the same edit.
+#[tokio::test]
+async fn send_message_keeps_a_real_tool_call_list_intact() {
+    let body = compact_completion_with_tool_calls(
+        ",\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\
+         \"function\":{\"name\":\"weather\",\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\"}}]",
+    );
+    let (result, requests) = run_nonstream_case(&body).await;
+    let response = result.expect("a real tool call list must decode");
+    assert!(
+        response.content.iter().any(|block| matches!(
+            block,
+            OutputContentBlock::ToolUse { id, name, input }
+                if id == "call_1" && name == "weather" && input["city"] == json!("Paris")
+        )),
+        "the tool call must survive intact, got {:?}",
+        response.content
+    );
+    assert_eq!(requests, 1);
+}
+
+/// And a non-list value still fails the non-streaming path with a typed
+/// deserialization error rather than being read as an empty list.
+#[tokio::test]
+async fn send_message_rejects_a_non_list_tool_calls_value() {
+    let (result, requests) =
+        run_nonstream_case(&compact_completion_with_tool_calls(",\"tool_calls\":{}")).await;
+    assert!(
+        matches!(result, Err(ApiError::Json { .. })),
+        "a non-list tool_calls value must stay a typed decode failure, got {result:?}"
+    );
+    assert_eq!(requests, 1);
+}
