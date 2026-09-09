@@ -281,6 +281,7 @@ impl OpenAiCompatClient {
             parser: OpenAiSseParser::with_context(self.config.provider_name, request.model.clone()),
             pending: VecDeque::new(),
             done: false,
+            incomplete: None,
             state: StreamState::new(request.model.clone()),
         })
     }
@@ -460,6 +461,11 @@ pub struct MessageStream {
     parser: OpenAiSseParser,
     pending: VecDeque<StreamEvent>,
     done: bool,
+    /// Set once the body ended without proving the response completed. The
+    /// failure is latched so every later poll repeats it rather than falling
+    /// through to `StreamState::finish`, which would synthesise the very
+    /// terminal event the stream failed to deliver.
+    incomplete: Option<&'static str>,
     state: StreamState,
 }
 
@@ -475,6 +481,10 @@ impl MessageStream {
                 return Ok(Some(event));
             }
 
+            if let Some(detail) = self.incomplete {
+                return Err(ApiError::InvalidSseFrame(detail));
+            }
+
             if self.done {
                 self.pending.extend(self.state.finish()?);
                 if let Some(event) = self.pending.pop_front() {
@@ -483,23 +493,118 @@ impl MessageStream {
                 return Ok(None);
             }
 
-            match self.response.chunk().await? {
-                Some(chunk) => {
-                    for parsed in self.parser.push(&chunk)? {
-                        self.pending.extend(self.state.ingest_chunk(parsed)?);
-                    }
+            if let Some(chunk) = self.response.chunk().await? {
+                for parsed in self.parser.push(&chunk)? {
+                    self.pending.extend(self.state.ingest_chunk(parsed)?);
                 }
-                None => {
-                    self.done = true;
-                }
+            } else {
+                self.done = true;
+                self.finalize_at_eof()?;
             }
         }
     }
+
+    /// Decide, at end of body, whether this response proved that it completed.
+    ///
+    /// Reaching EOF is not that proof. The body simply stopped, and it stops
+    /// the same way whether the provider finished answering or the connection
+    /// died mid-frame. Completion has to be established from what actually
+    /// arrived, and when it cannot be, the turn fails: the inference behind
+    /// this response has already run, so a caller must diagnose an incomplete
+    /// stream rather than re-issue the request or record a truncated answer as
+    /// the model's answer.
+    fn finalize_at_eof(&mut self) -> Result<(), ApiError> {
+        // No `data:` frame was ever consumed, so there is no partially read
+        // stream here to confuse with a whole body. A gateway that ignores
+        // `stream: true` answers with the completed `chat.completion` object
+        // as a plain JSON body, which carries no frame separator to find;
+        // replay it as the single chunk it is equivalent to. Recovery is
+        // offered the entire body, so it succeeds only when the body is that
+        // object and nothing else — never when SSE framing surrounds it.
+        if self.parser.saw_no_data_frame() {
+            if let Some(chunk) = self.parser.take_unframed_completion() {
+                self.pending.extend(self.state.ingest_chunk(chunk)?);
+                return Ok(());
+            }
+            return Err(self.fail_incomplete(if self.parser.body_is_blank() {
+                EMPTY_STREAM_BODY
+            } else {
+                UNFRAMED_BODY_IS_NOT_A_COMPLETION
+            }));
+        }
+
+        // Framing was consumed, so anything left over is the beginning of a
+        // frame that never arrived. It is not a standalone compact completion
+        // and must not be decoded as one.
+        if self.parser.has_residual_frame() {
+            // Undrained bytes mean one of two different faults, and they are
+            // worth telling apart: before the sentinel the body stopped
+            // short, after it the body kept going when it had already said it
+            // was finished.
+            return Err(self.fail_incomplete(if self.parser.saw_done_sentinel() {
+                DATA_AFTER_TERMINAL_SENTINEL
+            } else {
+                TRUNCATED_TRAILING_FRAME
+            }));
+        }
+
+        // A stream can also stop cleanly on a frame boundary before the
+        // provider said it was finished. `[DONE]` and a `finish_reason` are
+        // the two markers this wire protocol uses to say so; without either,
+        // more frames were still expected.
+        if !self.parser.saw_done_sentinel() && self.state.stop_reason.is_none() {
+            return Err(self.fail_incomplete(NO_TERMINAL_EVENT));
+        }
+
+        Ok(())
+    }
+
+    /// Latch `detail` as this stream's terminal failure and build the error
+    /// for it, so repeated polling keeps failing the same way.
+    fn fail_incomplete(&mut self, detail: &'static str) -> ApiError {
+        self.incomplete = Some(detail);
+        ApiError::InvalidSseFrame(detail)
+    }
 }
+
+/// The body carried nothing at all: no frame, no completion object.
+const EMPTY_STREAM_BODY: &str = "stream ended with an empty body, so the response never completed";
+
+/// The body was never SSE-framed and is not a complete `chat.completion`
+/// object either, so nothing in it establishes a finished response.
+const UNFRAMED_BODY_IS_NOT_A_COMPLETION: &str =
+    "stream ended without an SSE frame, and the body is not a complete chat.completion response";
+
+/// Framing was consumed and then the body stopped part-way through a frame.
+const TRUNCATED_TRAILING_FRAME: &str =
+    "stream truncated: the body ended part-way through an SSE frame, so the response never completed";
+
+/// The terminal sentinel arrived and the body carried on past it. Whatever
+/// those bytes are, the stream had already declared itself finished, so they
+/// are not decoded and nothing in them reaches the caller.
+const DATA_AFTER_TERMINAL_SENTINEL: &str =
+    "stream continued past the [DONE] sentinel, so the response contradicts its own terminal marker";
+
+/// Framing was consumed and ended on a clean boundary, but nothing in it said
+/// the response was finished.
+const NO_TERMINAL_EVENT: &str =
+    "stream ended without a terminal event: neither a finish_reason nor a [DONE] sentinel arrived";
 
 #[derive(Debug, Default)]
 struct OpenAiSseParser {
+    /// Bytes received but not yet drained into a frame.
     buffer: Vec<u8>,
+    /// Every byte of the body, accumulated only while no `data:` frame has
+    /// been decoded and released as soon as one is. Until then nothing has
+    /// been consumed as a stream, so the whole body is still a candidate for
+    /// being one unframed `chat.completion` object; once framing starts it is
+    /// not, and holding the bytes would only invite decoding a fragment as if
+    /// it were the whole.
+    unframed_body: Vec<u8>,
+    /// Whether a frame carrying a `data:` payload has been decoded.
+    saw_data_frame: bool,
+    /// Whether a `data: [DONE]` frame arrived.
+    saw_done: bool,
     provider: String,
     model: String,
 }
@@ -508,6 +613,9 @@ impl OpenAiSseParser {
     fn with_context(provider: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
             buffer: Vec::new(),
+            unframed_body: Vec::new(),
+            saw_data_frame: false,
+            saw_done: false,
             provider: provider.into(),
             model: model.into(),
         }
@@ -515,16 +623,110 @@ impl OpenAiSseParser {
 
     fn push(&mut self, chunk: &[u8]) -> Result<Vec<ChatCompletionChunk>, ApiError> {
         self.buffer.extend_from_slice(chunk);
+        if !self.saw_data_frame {
+            self.unframed_body.extend_from_slice(chunk);
+        }
         let mut events = Vec::new();
 
-        while let Some(frame) = next_sse_frame(&mut self.buffer) {
-            if let Some(event) = parse_sse_frame(&frame, &self.provider, &self.model)? {
-                events.push(event);
+        // Draining stops at the terminal sentinel and never resumes, on this
+        // chunk or any later one. `[DONE]` is the end of the stream: the
+        // response is complete there, and `finalize_at_eof` already reads the
+        // sentinel as the proof that it is. Bytes behind it are therefore
+        // never decoded, so nothing they contain can become content the
+        // caller receives after the answer was already whole. They are left
+        // in the buffer undisturbed, where the end-of-body check reads them
+        // as the protocol violation they are.
+        while !self.saw_done {
+            let Some(frame) = next_sse_frame(&mut self.buffer) else {
+                break;
+            };
+            match parse_sse_frame(&frame, &self.provider, &self.model)? {
+                SseFrame::Chunk(chunk) => {
+                    self.mark_data_frame();
+                    events.push(*chunk);
+                }
+                SseFrame::Done => {
+                    self.mark_data_frame();
+                    self.saw_done = true;
+                }
+                // A comment or a frame with no `data:` payload carries no
+                // stream content, so it neither starts the stream nor proves
+                // anything about how it ends.
+                SseFrame::Ignored => {}
             }
         }
 
         Ok(events)
     }
+
+    /// Record that the body is a genuine SSE stream and release the bytes kept
+    /// for the unframed reading of it, which is no longer available.
+    fn mark_data_frame(&mut self) {
+        self.saw_data_frame = true;
+        self.unframed_body = Vec::new();
+    }
+
+    /// Whether the body has yet delivered a frame carrying a `data:` payload.
+    const fn saw_no_data_frame(&self) -> bool {
+        !self.saw_data_frame
+    }
+
+    const fn saw_done_sentinel(&self) -> bool {
+        self.saw_done
+    }
+
+    /// Whether undrained bytes remain that are the start of a frame whose
+    /// terminator never arrived. Trailing whitespace is not such a frame.
+    fn has_residual_frame(&self) -> bool {
+        !String::from_utf8_lossy(&self.buffer).trim().is_empty()
+    }
+
+    /// Whether the body, up to the point framing began, is empty or whitespace.
+    fn body_is_blank(&self) -> bool {
+        String::from_utf8_lossy(&self.unframed_body)
+            .trim()
+            .is_empty()
+    }
+
+    /// Decode a body that never became an SSE frame as a complete
+    /// `chat.completion` response.
+    ///
+    /// The whole body must parse, so a stream that framed anything at all
+    /// cannot be recovered this way: the framing bytes are still part of what
+    /// is offered here and no JSON object begins with `data:`. A truncated or
+    /// partial frame is rejected for the same reason a chunk is — a chunk
+    /// carries `choices[].delta`, a completed response carries
+    /// `choices[].message`, and the two shapes do not deserialize into
+    /// each other.
+    fn take_unframed_completion(&mut self) -> Option<ChatCompletionChunk> {
+        if self.saw_data_frame {
+            return None;
+        }
+        let body = std::str::from_utf8(&self.unframed_body).ok()?.trim();
+        let response = serde_json::from_str::<ChatCompletionResponse>(body).ok()?;
+        // Deserializing proved only that the bytes have the right shape. This
+        // path exists to deliver an answer the POST already paid for, so the
+        // object must also prove it is a finished chat completion before it is
+        // allowed to stand in for one.
+        if !response.proves_completion() {
+            return None;
+        }
+        // The body has been read exactly once, as one whole object.
+        self.buffer.clear();
+        self.unframed_body = Vec::new();
+        Some(response.into_equivalent_chunk())
+    }
+}
+
+/// What one drained SSE frame turned out to carry.
+#[derive(Debug)]
+enum SseFrame {
+    /// A `data:` payload that decoded into a streaming chunk.
+    Chunk(Box<ChatCompletionChunk>),
+    /// The `data: [DONE]` end-of-stream sentinel.
+    Done,
+    /// A comment, a blank frame, or fields this decoder does not read.
+    Ignored,
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -554,28 +756,38 @@ impl StreamState {
         }
     }
 
+    /// Open the assistant message. Every stream does this exactly once,
+    /// before any content and before its terminal event, so the two callers
+    /// that can be first to know a message exists — the first chunk, and the
+    /// end of a stream that never carried one — go through one construction.
+    fn open_message(&mut self, id: String, model: String) -> StreamEvent {
+        self.message_started = true;
+        StreamEvent::MessageStart(MessageStartEvent {
+            message: MessageResponse {
+                id,
+                kind: "message".to_string(),
+                role: "assistant".to_string(),
+                content: Vec::new(),
+                model,
+                stop_reason: None,
+                stop_sequence: None,
+                usage: Usage {
+                    input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                    output_tokens: 0,
+                },
+                request_id: None,
+            },
+        })
+    }
+
     fn ingest_chunk(&mut self, chunk: ChatCompletionChunk) -> Result<Vec<StreamEvent>, ApiError> {
         let mut events = Vec::new();
         if !self.message_started {
-            self.message_started = true;
-            events.push(StreamEvent::MessageStart(MessageStartEvent {
-                message: MessageResponse {
-                    id: chunk.id.clone(),
-                    kind: "message".to_string(),
-                    role: "assistant".to_string(),
-                    content: Vec::new(),
-                    model: chunk.model.clone().unwrap_or_else(|| self.model.clone()),
-                    stop_reason: None,
-                    stop_sequence: None,
-                    usage: Usage {
-                        input_tokens: 0,
-                        cache_creation_input_tokens: 0,
-                        cache_read_input_tokens: 0,
-                        output_tokens: 0,
-                    },
-                    request_id: None,
-                },
-            }));
+            let id = chunk.id.clone();
+            let model = chunk.model.clone().unwrap_or_else(|| self.model.clone());
+            events.push(self.open_message(id, model));
         }
 
         if let Some(usage) = chunk.usage {
@@ -652,6 +864,22 @@ impl StreamState {
         self.finished = true;
 
         let mut events = Vec::new();
+
+        // A stream can prove it finished without ever having started a
+        // message: a body whose only frame is the terminal sentinel says the
+        // response completed and carried nothing. That is the one way to
+        // arrive here unstarted — `finalize_at_eof` has already failed every
+        // body that could not prove completion, and any body that could either
+        // ingested a chunk or was recovered into one — so opening the message
+        // here cannot turn a truncation into a success. It has to be opened:
+        // the terminal events below are what tell a caller the turn ended, and
+        // an empty event list is indistinguishable from a connection that died
+        // before saying anything, which would fail a turn that succeeded.
+        if !self.message_started {
+            let model = self.model.clone();
+            events.push(self.open_message(EMPTY_TURN_MESSAGE_ID.to_string(), model));
+        }
+
         if self.text_started && !self.text_finished {
             self.text_finished = true;
             events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
@@ -763,13 +991,133 @@ impl ToolCallState {
     }
 }
 
+/// The id reported for a turn that terminated without ever sending a chunk.
+/// No chunk arrived, so the provider sent no id to carry; this names the
+/// situation rather than inventing a plausible-looking provider id that a
+/// reader could mistake for one the provider actually assigned.
+const EMPTY_TURN_MESSAGE_ID: &str = "empty-stream";
+
+/// The index of the one choice this client reads a response's content from.
+///
+/// `build_chat_completion_request` never sends `n`, so a response carries
+/// exactly one choice. Every path that reads one resolves it through this
+/// single constant — ordinary normalization, compact-recovery validation, and
+/// the compact-recovery conversion — so no path can select a different choice
+/// than the others and surface content the rest would have ignored.
+const SELECTED_CHOICE_INDEX: usize = 0;
+
+/// The selected choice, taken by value, for the paths that consume a response
+/// rather than inspect it. The borrowing form is
+/// [`ChatCompletionResponse::selected_choice`].
+fn take_selected_choice(choices: Vec<ChatChoice>) -> Option<ChatChoice> {
+    choices.into_iter().nth(SELECTED_CHOICE_INDEX)
+}
+
+/// The discriminator a completed `OpenAI` chat completion carries. A streaming
+/// fragment says `chat.completion.chunk`; only the finished object says this.
+const CHAT_COMPLETION_OBJECT: &str = "chat.completion";
+
 #[derive(Debug, Deserialize)]
 struct ChatCompletionResponse {
     id: String,
+    /// The wire discriminator, read only to prove a recovered body really is a
+    /// finished chat completion. Optional at the type level because the
+    /// non-streaming path reaches this struct through a `/chat/completions`
+    /// response that is already known to be one.
+    #[serde(default)]
+    object: Option<String>,
     model: String,
     choices: Vec<ChatChoice>,
     #[serde(default)]
     usage: Option<OpenAiUsage>,
+}
+
+impl ChatCompletionResponse {
+    /// Whether this body proves, on its own, that it is a *completed* `OpenAI`
+    /// chat completion.
+    ///
+    /// Serde is the hazard the check exists for. Every field that would
+    /// distinguish one object from another is optional or absent, so an error
+    /// envelope, a streaming fragment, or an unrelated object whose keys
+    /// happen to line up all deserialize into this struct just as a finished
+    /// response does. Deserializing is therefore evidence of shape, not of
+    /// completion, and two independent things have to hold before a body is
+    /// treated as the answer a turn already produced.
+    ///
+    /// The body must say what it is. Without the discriminator a
+    /// `chat.completion.chunk` — one mid-stream fragment, by definition not a
+    /// finished turn — is indistinguishable from the whole.
+    ///
+    /// And the choice this client consumes must say it stopped. A `null` or
+    /// absent `finish_reason` is exactly what a provider emits while a turn is
+    /// still running, so accepting it would let an unfinished answer be
+    /// recorded as the model's answer.
+    fn proves_completion(&self) -> bool {
+        if self.object.as_deref() != Some(CHAT_COMPLETION_OBJECT) {
+            return false;
+        }
+        self.selected_choice()
+            .and_then(|choice| choice.finish_reason.as_deref())
+            .is_some_and(|reason| !reason.trim().is_empty())
+    }
+
+    /// The one choice this client consumes.
+    ///
+    /// `build_chat_completion_request` never sends `n`, so a response carries
+    /// exactly one choice, and `normalize_response` reads the first and
+    /// nothing else. Validation follows that same selection: another choice
+    /// being terminal says nothing about the one whose content is delivered,
+    /// and requiring a choice the client never reads to be terminal would
+    /// reject responses that are fine.
+    fn selected_choice(&self) -> Option<&ChatChoice> {
+        self.choices.get(SELECTED_CHOICE_INDEX)
+    }
+
+    /// Reshape a completed response into the one streaming chunk that carries
+    /// the same content, so both wire shapes converge on a single decoder.
+    ///
+    /// Only the selected choice is converted, because only the selected choice
+    /// is what this client reads. `StreamState` merges everything a chunk
+    /// carries into one message — text concatenates into a single block, and
+    /// tool calls merge by position — so converting an alternate choice would
+    /// splice content into the answer that `normalize_response` would have
+    /// discarded, and deliver it as the model's. Validation already reads this
+    /// same choice, so recovery accepting a body and recovery delivering it
+    /// cannot disagree about which choice the body was judged on.
+    ///
+    /// Tool calls are indexed by position: a completed response lists them in
+    /// order and has no separate index field, and `ToolCallState` keys on the
+    /// index to build one content block per call.
+    fn into_equivalent_chunk(self) -> ChatCompletionChunk {
+        ChatCompletionChunk {
+            id: self.id,
+            model: Some(self.model),
+            choices: take_selected_choice(self.choices)
+                .into_iter()
+                .map(|choice| ChunkChoice {
+                    delta: ChunkDelta {
+                        content: choice.message.content,
+                        tool_calls: choice
+                            .message
+                            .tool_calls
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, call)| DeltaToolCall {
+                                index: u32::try_from(index).unwrap_or(u32::MAX),
+                                id: Some(call.id),
+                                function: DeltaFunction {
+                                    name: Some(call.function.name),
+                                    arguments: Some(call.function.arguments),
+                                },
+                            })
+                            .collect(),
+                    },
+                    finish_reason: choice.finish_reason,
+                })
+                .collect(),
+            usage: self.usage,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -784,7 +1132,13 @@ struct ChatMessage {
     role: String,
     #[serde(default)]
     content: Option<String>,
-    #[serde(default)]
+    /// Null-tolerant for the same reason `ChunkDelta` is: `#[serde(default)]`
+    /// covers an absent key but rejects an explicit `null`, and providers that
+    /// spell "no tool calls" that way would otherwise make the whole finished
+    /// message undecodable — failing the turn on both the ordinary
+    /// non-streaming path and compact recovery. A value that is neither a list
+    /// nor null still fails, as it must.
+    #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
     tool_calls: Vec<ResponseToolCall>,
 }
 
@@ -1370,13 +1724,9 @@ fn normalize_response(
     model: &str,
     response: ChatCompletionResponse,
 ) -> Result<MessageResponse, ApiError> {
-    let choice = response
-        .choices
-        .into_iter()
-        .next()
-        .ok_or(ApiError::InvalidSseFrame(
-            "chat completion response missing choices",
-        ))?;
+    let choice = take_selected_choice(response.choices).ok_or(ApiError::InvalidSseFrame(
+        "chat completion response missing choices",
+    ))?;
     let mut content = Vec::new();
     if let Some(text) = choice.message.content.filter(|value| !value.is_empty()) {
         content.push(OutputContentBlock::Text { text });
@@ -1437,14 +1787,10 @@ fn next_sse_frame(buffer: &mut Vec<u8>) -> Option<String> {
     Some(String::from_utf8_lossy(&frame[..frame_len]).into_owned())
 }
 
-fn parse_sse_frame(
-    frame: &str,
-    provider: &str,
-    model: &str,
-) -> Result<Option<ChatCompletionChunk>, ApiError> {
+fn parse_sse_frame(frame: &str, provider: &str, model: &str) -> Result<SseFrame, ApiError> {
     let trimmed = frame.trim();
     if trimmed.is_empty() {
-        return Ok(None);
+        return Ok(SseFrame::Ignored);
     }
 
     let mut data_lines = Vec::new();
@@ -1457,11 +1803,11 @@ fn parse_sse_frame(
         }
     }
     if data_lines.is_empty() {
-        return Ok(None);
+        return Ok(SseFrame::Ignored);
     }
     let payload = data_lines.join("\n");
     if payload == "[DONE]" {
-        return Ok(None);
+        return Ok(SseFrame::Done);
     }
     // Some backends embed an error object in a data: frame instead of using an
     // HTTP error status. Surface the error message directly rather than letting
@@ -1494,7 +1840,7 @@ fn parse_sse_frame(
         }
     }
     serde_json::from_str::<ChatCompletionChunk>(&payload)
-        .map(Some)
+        .map(|chunk| SseFrame::Chunk(Box::new(chunk)))
         .map_err(|error| ApiError::json_deserialize(provider, model, &payload, error))
 }
 
