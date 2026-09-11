@@ -168,6 +168,18 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_TARGET: Option<&str> = option_env!("TARGET");
 const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
 const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
+/// Upper bound on provider round-trips within a single CLI user turn.
+///
+/// Scoped to the CLI rather than raised as the `ConversationRuntime` default,
+/// which stays `usize::MAX` so embedding consumers keep their current
+/// behavior. Matches `DEFAULT_AGENT_MAX_ITERATIONS`, the bound the Agent
+/// subagent path already uses.
+///
+/// This is the independent circuit breaker behind duplicate-delivery
+/// containment: a `PreToolUse` hook that rewrites every repeat into a fresh
+/// value defeats semantic duplicate detection by design, and this budget is
+/// what still ends the turn.
+const DEFAULT_CLI_MAX_ITERATIONS: usize = 32;
 const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
 const LEGACY_SESSION_EXTENSION: &str = "json";
@@ -11488,6 +11500,34 @@ fn build_runtime(
     )
 }
 
+/// Single construction point for every CLI conversation runtime.
+///
+/// `build_runtime_with_plugin_state` routes through this so the CLI cannot
+/// build a runtime that lacks `DEFAULT_CLI_MAX_ITERATIONS`, and so the bound
+/// can be exercised directly with a fake client and executor.
+fn cli_conversation_runtime<C, T>(
+    session: Session,
+    api_client: C,
+    tool_executor: T,
+    policy: PermissionPolicy,
+    system_prompt: Vec<String>,
+    feature_config: &runtime::RuntimeFeatureConfig,
+) -> ConversationRuntime<C, T>
+where
+    C: ApiClient,
+    T: ToolExecutor,
+{
+    ConversationRuntime::new_with_features(
+        session,
+        api_client,
+        tool_executor,
+        policy,
+        system_prompt,
+        feature_config,
+    )
+    .with_max_iterations(DEFAULT_CLI_MAX_ITERATIONS)
+}
+
 #[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::too_many_arguments)]
 fn build_runtime_with_plugin_state(
@@ -11515,7 +11555,7 @@ fn build_runtime_with_plugin_state(
     plugin_registry.initialize()?;
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
-    let mut runtime = ConversationRuntime::new_with_features(
+    let mut runtime = cli_conversation_runtime(
         session,
         AnthropicRuntimeClient::new(
             session_id,
@@ -21262,5 +21302,108 @@ mod stream_fallback_tests {
             events.contains(&AssistantEvent::MessageStop),
             "the turn must terminate normally, got {events:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod cli_iteration_budget_tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use runtime::{
+        ApiClient, ApiRequest, AssistantEvent, ConversationRuntime, PermissionMode,
+        PermissionPolicy, RuntimeError, RuntimeFeatureConfig, Session, ToolError, ToolExecutor,
+    };
+
+    use super::{cli_conversation_runtime, DEFAULT_CLI_MAX_ITERATIONS};
+
+    /// Provider that never stops asking for a tool, so only a finite iteration
+    /// budget can end the turn.
+    struct NeverTerminatingApi {
+        calls: Rc<RefCell<usize>>,
+    }
+
+    impl ApiClient for NeverTerminatingApi {
+        fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            let index = *self.calls.borrow();
+            *self.calls.borrow_mut() = index + 1;
+            Ok(vec![
+                AssistantEvent::ToolUse {
+                    id: format!("call-{index}"),
+                    name: "Ping".to_string(),
+                    input: "{}".to_string(),
+                },
+                AssistantEvent::MessageStop,
+            ])
+        }
+    }
+
+    struct AlwaysOkExecutor;
+
+    impl ToolExecutor for AlwaysOkExecutor {
+        fn execute(&mut self, _tool_name: &str, _input: &str) -> Result<String, ToolError> {
+            Ok(String::from("pong"))
+        }
+    }
+
+    /// The CLI's own runtime construction path must apply a finite provider
+    /// budget. This drives `cli_conversation_runtime`, the single helper that
+    /// `build_runtime_with_plugin_state` uses to build every CLI runtime, so
+    /// the test fails if that helper ever stops applying the limit.
+    #[test]
+    fn cli_runtime_construction_applies_the_named_iteration_budget() {
+        let calls = Rc::new(RefCell::new(0usize));
+        let mut runtime = cli_conversation_runtime(
+            Session::new(),
+            NeverTerminatingApi {
+                calls: Rc::clone(&calls),
+            },
+            AlwaysOkExecutor,
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+            &RuntimeFeatureConfig::default(),
+        );
+
+        assert_eq!(
+            runtime.max_iterations(),
+            DEFAULT_CLI_MAX_ITERATIONS,
+            "the CLI builder helper must apply the named budget"
+        );
+
+        let error = runtime
+            .run_turn("go", None)
+            .expect_err("an unbounded tool loop must be stopped by the budget");
+        assert!(
+            error
+                .to_string()
+                .contains("conversation loop exceeded the maximum number of iterations"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            *calls.borrow(),
+            DEFAULT_CLI_MAX_ITERATIONS,
+            "the provider must be asked exactly the configured number of times"
+        );
+    }
+
+    /// The library default is deliberately left alone so embedding consumers
+    /// keep their current behavior; only the CLI opts into a bound.
+    #[test]
+    fn runtime_library_default_remains_unbounded() {
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            NeverTerminatingApi {
+                calls: Rc::new(RefCell::new(0)),
+            },
+            AlwaysOkExecutor,
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+        assert_eq!(runtime.max_iterations(), usize::MAX);
+    }
+
+    #[test]
+    fn cli_budget_is_thirty_two() {
+        assert_eq!(DEFAULT_CLI_MAX_ITERATIONS, 32);
     }
 }

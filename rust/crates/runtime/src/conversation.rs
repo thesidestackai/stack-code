@@ -18,6 +18,214 @@ use crate::usage::{TokenUsage, UsageTracker};
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
 
+/// Model-visible name of the user-delivery tool, plus its dispatch-only alias.
+/// `tools::execute_tool` routes both to the same implementation, so duplicate
+/// containment treats them as one family.
+const DELIVERY_TOOL_NAMES: [&str; 2] = ["SendUserMessage", "Brief"];
+
+/// Tool-result text returned instead of re-running a duplicate delivery call.
+///
+/// Deliberately makes NO claim that anything reached the operator: the current
+/// implementation echoes its input and renders nothing. This guard addresses
+/// non-termination only, and must not be mistaken for a delivery fix.
+/// Marker: `SENDUSERMESSAGE_DELIVERY_SEMANTICS_UNRESOLVED`
+const DUPLICATE_DELIVERY_GUIDANCE: &str = concat!(
+    "Duplicate SendUserMessage call suppressed. ",
+    "The delivery tool was not executed again. ",
+    "Do not repeat the identical delivery call. ",
+    "If this is the final response, return the message as ordinary assistant ",
+    "text instead."
+);
+
+/// Turn-ending error when a delivery call repeats in a later provider
+/// iteration, after the model has actually received the corrective result.
+/// Worded distinctly from the max-iterations error so telemetry and tests can
+/// tell which guard fired.
+const REPEATED_DELIVERY_ERROR: &str =
+    "repeated SendUserMessage delivery call after duplicate suppression";
+
+/// Tool-result text handed back for the offending delivery call that ends the
+/// turn. Makes the same no-delivery claim as `DUPLICATE_DELIVERY_GUIDANCE`,
+/// and additionally states that the whole assistant turn is being abandoned.
+const REPEATED_DELIVERY_GUIDANCE: &str = concat!(
+    "Repeated SendUserMessage delivery call after duplicate suppression. ",
+    "The delivery tool was not executed. ",
+    "The current assistant turn was aborted."
+);
+
+/// Tool-result text used to close out a tool call that shared the aborted
+/// assistant response but was never reached.
+///
+/// This is PROTOCOL CLOSURE, not execution and not an execution failure: the
+/// call never reached its `PreToolUse` hook, its permission decision, or the
+/// tool executor, and the wording says so, so neither the model nor an audit
+/// reader can mistake it for a tool that ran and failed.
+const ABORTED_SIBLING_GUIDANCE: &str = concat!(
+    "Tool not executed because the current assistant turn was aborted after ",
+    "repeated SendUserMessage containment. ",
+    "This call was closed out before its PreToolUse hook, its permission ",
+    "decision, and any execution, so nothing was run and nothing failed."
+);
+
+fn is_delivery_tool(tool_name: &str) -> bool {
+    DELIVERY_TOOL_NAMES.contains(&tool_name)
+}
+
+/// Delivery status accepted by the tool.
+///
+/// Mirrors `BriefStatus` in the `tools` crate. `runtime` cannot depend on
+/// `tools` (that would be a dependency cycle, because `tools` already depends
+/// on `runtime`), so the cross-behavior tests in
+/// `tools/tests/default_tool_delivery_guard.rs` drive the REAL dispatcher to
+/// keep this mirror honest if either side drifts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryStatus {
+    Normal,
+    Proactive,
+}
+
+/// Semantic identity of one delivery call.
+///
+/// Structural, not textual: there is no delimiter concatenation and no raw
+/// JSON string comparison, so no field value can forge a collision with
+/// another field, and `tool_use_id` (which differs on every call) is not part
+/// of identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeliveryCallKey {
+    message: String,
+    status: DeliveryStatus,
+    attachments: Option<Vec<String>>,
+}
+
+impl DeliveryCallKey {
+    /// Builds the semantic identity of a delivery call, or `None` when the
+    /// payload is not one this guard can classify.
+    ///
+    /// `None` is the safe direction: the call then takes the ordinary
+    /// execution path and the tool's own validation produces its existing
+    /// error, instead of containment guessing at intent.
+    ///
+    /// Field handling mirrors `BriefInput` and `execute_brief` in `tools`:
+    /// - `message` must be a string, and non-blank because `execute_brief`
+    ///   rejects a blank message before doing anything else.
+    /// - `status` must be present and exactly `normal` or `proactive`.
+    /// - `attachments` is `Option<Vec<String>>`. Serde maps both an omitted
+    ///   field and an explicit `null` to `None`, so those are the same call;
+    ///   `[]` stays `Some(vec![])` and really does produce a different
+    ///   `BriefOutput`, so it is deliberately NOT equated with `None`.
+    /// - Unknown fields are ignored, because `BriefInput` does not set
+    ///   `deny_unknown_fields`; the dispatcher discards them, so they cannot
+    ///   change what is executed.
+    fn parse(tool_name: &str, input: &str) -> Option<Self> {
+        if !is_delivery_tool(tool_name) {
+            return None;
+        }
+        let parsed = serde_json::from_str::<Value>(input).ok()?;
+        let object = parsed.as_object()?;
+
+        let message = object.get("message")?.as_str()?;
+        if message.trim().is_empty() {
+            return None;
+        }
+
+        let status = match object.get("status")?.as_str()? {
+            "normal" => DeliveryStatus::Normal,
+            "proactive" => DeliveryStatus::Proactive,
+            _ => return None,
+        };
+
+        let attachments = match object.get("attachments") {
+            None | Some(Value::Null) => None,
+            Some(Value::Array(items)) => {
+                let mut paths = Vec::with_capacity(items.len());
+                for item in items {
+                    paths.push(item.as_str()?.to_string());
+                }
+                Some(paths)
+            }
+            Some(_) => return None,
+        };
+
+        Some(Self {
+            message: message.to_string(),
+            status,
+            attachments,
+        })
+    }
+}
+
+/// A run of identical delivery calls, plus the provider iteration in which the
+/// model was handed a corrective result for it (if any).
+#[derive(Debug)]
+struct DeliveryRepeatSequence {
+    key: DeliveryCallKey,
+    warned_at_iteration: Option<usize>,
+}
+
+/// What to do with an already-allowed delivery call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryDecision {
+    Execute,
+    Suppress,
+    FailClosed,
+}
+
+/// Duplicate-delivery containment for exactly one `run_turn` invocation.
+///
+/// This models a repetition SEQUENCE rather than whole-turn historical
+/// membership, so a legitimate intervening action resets it and `A / B / A`
+/// stays legal.
+#[derive(Debug, Default)]
+struct DeliveryRepeatState {
+    sequence: Option<DeliveryRepeatSequence>,
+}
+
+impl DeliveryRepeatState {
+    /// Decide what to do with `key` seen during provider iteration
+    /// `iteration`, recording the corrective-result iteration on first
+    /// suppression.
+    fn classify(&mut self, key: &DeliveryCallKey, iteration: usize) -> DeliveryDecision {
+        let Some(sequence) = self.sequence.as_mut() else {
+            return DeliveryDecision::Execute;
+        };
+        if sequence.key != *key {
+            return DeliveryDecision::Execute;
+        }
+        match sequence.warned_at_iteration {
+            None => {
+                sequence.warned_at_iteration = Some(iteration);
+                DeliveryDecision::Suppress
+            }
+            // Still inside the provider iteration that produced the corrective
+            // result, so the model cannot have consumed it yet. Repeats within
+            // one assistant response are suppressed, never failed: the turn
+            // owes the model exactly one chance to react.
+            Some(warned) if iteration <= warned => DeliveryDecision::Suppress,
+            // A later provider iteration, so the corrective result was in the
+            // model's input and it repeated itself anyway.
+            Some(_) => DeliveryDecision::FailClosed,
+        }
+    }
+
+    /// Start a fresh repetition sequence from a delivery that really executed
+    /// and really succeeded. A failed or denied attempt never gets here, so it
+    /// can never be mistaken for a delivered message.
+    fn record_delivered(&mut self, key: DeliveryCallKey) {
+        self.sequence = Some(DeliveryRepeatSequence {
+            key,
+            warned_at_iteration: None,
+        });
+    }
+
+    /// Successful execution of an unrelated tool is material progress, so it
+    /// clears any stale sequence. Without this a delivery from early in the
+    /// turn would keep suppressing a legitimate repeat after real agent work.
+    /// Failures and denials deliberately do NOT count as progress.
+    fn record_progress(&mut self) {
+        self.sequence = None;
+    }
+}
+
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiRequest {
@@ -196,6 +404,14 @@ where
         self
     }
 
+    /// Provider round-trip budget for a single `run_turn`. Exposed so a
+    /// consumer's runtime-construction path can be tested for the bound it
+    /// claims to apply.
+    #[must_use]
+    pub fn max_iterations(&self) -> usize {
+        self.max_iterations
+    }
+
     #[must_use]
     pub fn with_auto_compaction_input_tokens_threshold(mut self, threshold: u32) -> Self {
         self.auto_compaction_input_tokens_threshold = threshold;
@@ -340,6 +556,9 @@ where
         let mut tool_results = Vec::new();
         let mut prompt_cache_events = Vec::new();
         let mut iterations = 0;
+        // Duplicate-delivery containment is a local, so it is scoped to exactly
+        // one `run_turn` invocation and never carries across user turns.
+        let mut delivery_state = DeliveryRepeatState::default();
 
         loop {
             iterations += 1;
@@ -399,7 +618,14 @@ where
                 break;
             }
 
-            for (tool_use_id, tool_name, input) in pending_tool_uses {
+            // Drained through `by_ref` so that a fail-closed abort can hand
+            // the remaining, unprocessed tool uses from this SAME already
+            // persisted assistant message a protocol-closing tool result
+            // before the turn returns.
+            let mut remaining_tool_uses = pending_tool_uses.into_iter();
+            let mut aborting: Option<RuntimeError> = None;
+
+            for (tool_use_id, tool_name, input) in remaining_tool_uses.by_ref() {
                 let pre_hook_result = self.run_pre_tool_use_hook(&tool_name, &input);
                 let effective_input = pre_hook_result
                     .updated_input()
@@ -446,7 +672,73 @@ where
                     )
                 };
 
+                // Duplicate containment runs only after the PreToolUse hook and
+                // the permission decision, and keys on `effective_input`, so a
+                // hook rewrite, a deny, a cancel, an override, or a prompt all
+                // keep their ordinary meaning. A hook that rewrites every
+                // repeat into a fresh value defeats this guard by design; the
+                // CLI's finite iteration budget is the independent circuit
+                // breaker for that case.
+                let delivery_key = DeliveryCallKey::parse(&tool_name, &effective_input);
+                let delivery_decision = match (&permission_outcome, &delivery_key) {
+                    (PermissionOutcome::Allow, Some(key)) => {
+                        delivery_state.classify(key, iterations)
+                    }
+                    _ => DeliveryDecision::Execute,
+                };
+                if delivery_decision == DeliveryDecision::FailClosed {
+                    // Answer the offending tool use, then abort. The turn
+                    // still fails, but the session stays well formed: an
+                    // assistant tool call left without a tool result would be
+                    // rejected by the provider if the session were resumed.
+                    //
+                    // This attempt already ran its `PreToolUse` hook and its
+                    // permission decision, and it is being reported as a
+                    // failed tool use, so it runs the SAME
+                    // `PostToolUseFailure` lifecycle as an ordinary suppressed
+                    // duplicate. The successful `PostToolUse` hook is
+                    // deliberately not run, because the tool never executed.
+                    let mut output = merge_hook_feedback(
+                        pre_hook_result.messages(),
+                        REPEATED_DELIVERY_GUIDANCE.to_string(),
+                        true,
+                    );
+                    let post_hook_result =
+                        self.run_post_tool_use_failure_hook(&tool_name, &effective_input, &output);
+                    output = merge_hook_feedback(post_hook_result.messages(), output, true);
+                    let result_message =
+                        ConversationMessage::tool_result(tool_use_id, tool_name, output, true);
+                    self.session
+                        .push_message(result_message.clone())
+                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                    self.record_tool_finished(iterations, &result_message);
+                    // Do NOT return yet: the assistant message is already
+                    // persisted, so every tool use it declared still owes the
+                    // session exactly one tool result.
+                    aborting = Some(RuntimeError::new(REPEATED_DELIVERY_ERROR));
+                    break;
+                }
+
                 let result_message = match permission_outcome {
+                    PermissionOutcome::Allow if delivery_decision == DeliveryDecision::Suppress => {
+                        // Allowed, but runtime policy refuses to run it again.
+                        // Represented as a failed tool use so audit hooks can
+                        // observe the rejection; the successful PostToolUse
+                        // hook is deliberately NOT run for a tool that never
+                        // executed.
+                        let mut output = merge_hook_feedback(
+                            pre_hook_result.messages(),
+                            DUPLICATE_DELIVERY_GUIDANCE.to_string(),
+                            true,
+                        );
+                        let post_hook_result = self.run_post_tool_use_failure_hook(
+                            &tool_name,
+                            &effective_input,
+                            &output,
+                        );
+                        output = merge_hook_feedback(post_hook_result.messages(), output, true);
+                        ConversationMessage::tool_result(tool_use_id, tool_name, output, true)
+                    }
                     PermissionOutcome::Allow => {
                         self.record_tool_started(iterations, &tool_name);
                         let (mut output, mut is_error) =
@@ -454,6 +746,19 @@ where
                                 Ok(output) => (output, false),
                                 Err(error) => (error.to_string(), true),
                             };
+                        if !is_error {
+                            match delivery_key {
+                                // A delivery that really succeeded starts a new
+                                // repetition sequence.
+                                Some(key) => delivery_state.record_delivered(key),
+                                // A delivery-family call this guard could not
+                                // classify leaves the sequence untouched.
+                                None if is_delivery_tool(&tool_name) => {}
+                                // Any other successful tool is material
+                                // progress and clears a stale sequence.
+                                None => delivery_state.record_progress(),
+                            }
+                        }
                         output = merge_hook_feedback(pre_hook_result.messages(), output, false);
 
                         let post_hook_result = if is_error {
@@ -498,6 +803,32 @@ where
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 self.record_tool_finished(iterations, &result_message);
                 tool_results.push(result_message);
+            }
+
+            if let Some(error) = aborting {
+                // Protocol closure for the tail of an aborted assistant
+                // response. Once the fail-closed decision is committed the
+                // runtime performs no further work on this turn, so these
+                // calls deliberately get NO `PreToolUse` hook, NO permission
+                // prompt, NO tool execution, and NO `PostToolUse` /
+                // `PostToolUseFailure` hook: running any of those would be new
+                // side effects after a terminal safety abort. They receive
+                // exactly one synthetic error tool result each, purely so the
+                // persisted session has no unanswered tool use.
+                for (tool_use_id, tool_name, _input) in remaining_tool_uses {
+                    let result_message = ConversationMessage::tool_result(
+                        tool_use_id,
+                        tool_name,
+                        ABORTED_SIBLING_GUIDANCE.to_string(),
+                        true,
+                    );
+                    self.session
+                        .push_message(result_message.clone())
+                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                    self.record_tool_finished(iterations, &result_message);
+                }
+                self.record_turn_failed(iterations, &error);
+                return Err(error);
             }
         }
 
