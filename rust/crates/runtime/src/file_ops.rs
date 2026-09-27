@@ -201,6 +201,20 @@ pub fn read_file(
     }
 
     let content = fs::read_to_string(&absolute_path)?;
+    Ok(text_window(
+        absolute_path.to_string_lossy().into_owned(),
+        &content,
+        offset,
+        limit,
+    ))
+}
+
+fn text_window(
+    file_path: String,
+    content: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> ReadFileOutput {
     let lines: Vec<&str> = content.lines().collect();
     let start_index = offset.unwrap_or(0).min(lines.len());
     let end_index = limit.map_or(lines.len(), |limit| {
@@ -208,16 +222,16 @@ pub fn read_file(
     });
     let selected = lines[start_index..end_index].join("\n");
 
-    Ok(ReadFileOutput {
+    ReadFileOutput {
         kind: String::from("text"),
         file: TextFilePayload {
-            file_path: absolute_path.to_string_lossy().into_owned(),
+            file_path,
             content: selected,
             num_lines: end_index.saturating_sub(start_index),
             start_line: start_index.saturating_add(1),
             total_lines: lines.len(),
         },
-    })
+    }
 }
 
 /// Replaces a file's contents and returns patch metadata.
@@ -356,6 +370,21 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
         .transpose()?
         .unwrap_or(std::env::current_dir()?);
 
+    grep_files(
+        input,
+        || collect_search_files(&base_path),
+        |path| fs::read_to_string(path).ok(),
+    )
+}
+
+/// Shared grep core: `files` enumerates candidates (after the pattern and
+/// filters are validated) and `read` yields a candidate's text, or `None` to
+/// skip it.
+fn grep_files(
+    input: &GrepSearchInput,
+    files: impl FnOnce() -> io::Result<Vec<PathBuf>>,
+    read: impl Fn(&Path) -> Option<String>,
+) -> io::Result<GrepSearchOutput> {
     let regex = RegexBuilder::new(&input.pattern)
         .case_insensitive(input.case_insensitive.unwrap_or(false))
         .dot_matches_new_line(input.multiline.unwrap_or(false))
@@ -379,12 +408,12 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
     let mut content_lines = Vec::new();
     let mut total_matches = 0usize;
 
-    for file_path in collect_search_files(&base_path)? {
+    for file_path in files()? {
         if !matches_optional_filters(&file_path, glob_filter.as_ref(), file_type) {
             continue;
         }
 
-        let Ok(file_contents) = fs::read_to_string(&file_path) else {
+        let Some(file_contents) = read(&file_path) else {
             continue;
         };
 
@@ -627,6 +656,558 @@ pub fn is_symlink_escape(path: &Path, workspace_root: &Path) -> io::Result<bool>
     Ok(!resolved.starts_with(&canonical_root))
 }
 
+/// Parse a confined tool path into workspace-relative components.
+///
+/// Lexical half of the confined-path contract: absolute paths and `..` are
+/// refused outright. The kernel half (`RESOLVE_BENEATH` and friends in
+/// [`WorkspaceRoot`]) is what actually keeps resolution beneath the root.
+fn workspace_relative(path: &str) -> io::Result<PathBuf> {
+    use std::path::Component;
+
+    if path.is_empty() {
+        return Err(confinement_denied(path, "is empty"));
+    }
+    let mut relative = PathBuf::new();
+    for component in Path::new(path).components() {
+        match component {
+            Component::Normal(part) => relative.push(part),
+            Component::CurDir => {}
+            Component::ParentDir => return Err(confinement_denied(path, "contains `..`")),
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(confinement_denied(path, "is absolute"));
+            }
+        }
+    }
+    Ok(relative)
+}
+
+fn confinement_denied(path: &str, reason: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!("path `{path}` refused by workspace confinement: {reason}"),
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub use confined::WorkspaceRoot;
+
+/// Descriptor-bound workspace authority for confined (controlled-smoke) file
+/// tools.
+///
+/// The workspace directory is opened once. Every later access resolves
+/// relative to that descriptor with `openat2(RESOLVE_BENEATH |
+/// RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV)`, and all
+/// type checks and I/O happen on the descriptor that was opened; nothing is
+/// ever re-resolved by pathname, and the process CWD is never consulted.
+#[cfg(target_os = "linux")]
+mod confined {
+    use std::ffi::OsStr;
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    use rustix::fd::OwnedFd;
+    use rustix::fs::{
+        fstat, openat2, statat, AtFlags, Dir, FileType, Mode, OFlags, ResolveFlags, Stat,
+    };
+    use rustix::io::Errno;
+
+    use super::{
+        confinement_denied, expand_braces, fs, grep_files, io, make_patch, text_window,
+        workspace_relative, EditFileOutput, GlobSearchOutput, GrepSearchInput, GrepSearchOutput,
+        Instant, Path, PathBuf, Pattern, ReadFileOutput, Reverse, WriteFileOutput, MAX_READ_SIZE,
+        MAX_WRITE_SIZE,
+    };
+
+    const RESOLVE: ResolveFlags = ResolveFlags::BENEATH
+        .union(ResolveFlags::NO_SYMLINKS)
+        .union(ResolveFlags::NO_MAGICLINKS)
+        .union(ResolveFlags::NO_XDEV);
+
+    /// Directory recursion bound for confined glob/grep enumeration.
+    const MAX_WALK_DEPTH: usize = 64;
+    /// Entry bound for confined glob/grep enumeration.
+    const MAX_WALK_ENTRIES: usize = 100_000;
+
+    #[derive(Debug)]
+    pub struct WorkspaceRoot {
+        dir: OwnedFd,
+        display: PathBuf,
+        dev: u64,
+        ino: u64,
+        writable: Vec<PathBuf>,
+    }
+
+    impl WorkspaceRoot {
+        /// Open `root` once and bind it as the confinement authority.
+        ///
+        /// `writable` lists the only workspace-relative files that confined
+        /// writes and edits may modify. They must already exist; confined
+        /// tools never create files or directories.
+        pub fn bind(root: &Path, writable: &[&str]) -> io::Result<Self> {
+            let dir = rustix::fs::open(
+                root,
+                OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|error| {
+                io::Error::new(
+                    io::Error::from(error).kind(),
+                    format!("workspace confinement root {}: {error}", root.display()),
+                )
+            })?;
+            let stat = fstat(&dir)?;
+            let writable = writable
+                .iter()
+                .map(|name| {
+                    let relative = workspace_relative(name)?;
+                    if relative.as_os_str().is_empty() {
+                        return Err(confinement_denied(name, "is not a file"));
+                    }
+                    Ok(relative)
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            Ok(Self {
+                display: root.canonicalize().unwrap_or_else(|_| root.to_path_buf()),
+                dev: stat.st_dev,
+                ino: stat.st_ino,
+                dir,
+                writable,
+            })
+        }
+
+        /// Human-readable root, for messages only; never used for access.
+        #[must_use]
+        pub fn display(&self) -> &Path {
+            &self.display
+        }
+
+        /// `(st_dev, st_ino)` of the bound directory.
+        #[must_use]
+        pub fn identity(&self) -> (u64, u64) {
+            (self.dev, self.ino)
+        }
+
+        /// The bound directory's current host path, resolved through the
+        /// held descriptor (it follows renames of the bound directory).
+        pub fn current_path(&self) -> io::Result<PathBuf> {
+            fs::read_link(format!("/proc/self/fd/{}", self.dir.as_raw_fd()))
+        }
+
+        /// Whether `path` names the bound directory itself (same inode).
+        pub fn is_same_directory(&self, path: &Path) -> io::Result<bool> {
+            let metadata = fs::metadata(path)?;
+            Ok(metadata.is_dir() && metadata.dev() == self.dev && metadata.ino() == self.ino)
+        }
+
+        /// Verify that each named fixture file is a regular file with exactly
+        /// one link. A hardlinked designated file is refused: writes through
+        /// it would reach an inode that may also be reachable from outside.
+        pub fn verify_single_link_files(&self, names: &[&str]) -> io::Result<()> {
+            for name in names {
+                let relative = workspace_relative(name)?;
+                let (_, stat) = self.open_regular(&relative, OFlags::RDONLY, name)?;
+                if stat.st_nlink != 1 {
+                    return Err(confinement_denied(
+                        name,
+                        &format!(
+                            "has {} hard links; the controlled fixture requires exactly one",
+                            stat.st_nlink
+                        ),
+                    ));
+                }
+            }
+            Ok(())
+        }
+
+        pub(super) fn open_beneath(
+            &self,
+            relative: &Path,
+            flags: OFlags,
+            shown: &str,
+        ) -> io::Result<OwnedFd> {
+            let target: &Path = if relative.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                relative
+            };
+            openat2(
+                &self.dir,
+                target,
+                flags | OFlags::CLOEXEC,
+                Mode::empty(),
+                RESOLVE,
+            )
+            .map_err(|error| resolution_error(shown, error))
+        }
+
+        /// Open a regular file beneath the root and return it with the
+        /// `fstat` of the very descriptor that was opened.
+        fn open_regular(
+            &self,
+            relative: &Path,
+            flags: OFlags,
+            shown: &str,
+        ) -> io::Result<(fs::File, Stat)> {
+            // O_NONBLOCK: opening a FIFO must not block before the type check.
+            let fd =
+                self.open_beneath(relative, flags | OFlags::NOCTTY | OFlags::NONBLOCK, shown)?;
+            let stat = fstat(&fd)?;
+            if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+                return Err(confinement_denied(shown, "is not a regular file"));
+            }
+            Ok((fs::File::from(fd), stat))
+        }
+
+        fn read_text(file: &mut fs::File, stat: &Stat, shown: &str) -> io::Result<String> {
+            let size = u64::try_from(stat.st_size).unwrap_or(u64::MAX);
+            if size > MAX_READ_SIZE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("file is too large ({size} bytes, max {MAX_READ_SIZE} bytes)"),
+                ));
+            }
+            let mut bytes = Vec::new();
+            Read::by_ref(file)
+                .take(MAX_READ_SIZE + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > MAX_READ_SIZE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("file `{shown}` grew beyond {MAX_READ_SIZE} bytes while reading"),
+                ));
+            }
+            if bytes[..bytes.len().min(8192)].contains(&0) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "file appears to be binary",
+                ));
+            }
+            String::from_utf8(bytes)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        }
+
+        /// Confined `read_file`.
+        pub fn read_file(
+            &self,
+            path: &str,
+            offset: Option<usize>,
+            limit: Option<usize>,
+        ) -> io::Result<ReadFileOutput> {
+            let relative = workspace_relative(path)?;
+            let (mut file, stat) = self.open_regular(&relative, OFlags::RDONLY, path)?;
+            let content = Self::read_text(&mut file, &stat, path)?;
+            Ok(text_window(
+                relative.to_string_lossy().into_owned(),
+                &content,
+                offset,
+                limit,
+            ))
+        }
+
+        /// Open a designated writable file for in-place update.
+        fn open_designated(&self, path: &str) -> io::Result<(PathBuf, fs::File, String)> {
+            let relative = workspace_relative(path)?;
+            if !self.writable.contains(&relative) {
+                return Err(confinement_denied(
+                    path,
+                    "is not a designated writable file",
+                ));
+            }
+            let (mut file, stat) = self.open_regular(&relative, OFlags::RDWR, path)?;
+            if stat.st_nlink != 1 {
+                return Err(confinement_denied(
+                    path,
+                    &format!("has {} hard links", stat.st_nlink),
+                ));
+            }
+            let original = Self::read_text(&mut file, &stat, path)?;
+            Ok((relative, file, original))
+        }
+
+        fn replace_contents(file: &mut fs::File, content: &str) -> io::Result<()> {
+            file.seek(SeekFrom::Start(0))?;
+            file.set_len(0)?;
+            file.write_all(content.as_bytes())?;
+            file.flush()
+        }
+
+        /// Confined `write_file`: replaces a designated, existing file.
+        pub fn write_file(&self, path: &str, content: &str) -> io::Result<WriteFileOutput> {
+            if content.len() > MAX_WRITE_SIZE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "content is too large ({} bytes, max {MAX_WRITE_SIZE} bytes)",
+                        content.len()
+                    ),
+                ));
+            }
+            let (relative, mut file, original) = self.open_designated(path)?;
+            Self::replace_contents(&mut file, content)?;
+            Ok(WriteFileOutput {
+                kind: String::from("update"),
+                file_path: relative.to_string_lossy().into_owned(),
+                content: content.to_owned(),
+                structured_patch: make_patch(&original, content),
+                original_file: Some(original),
+                git_diff: None,
+            })
+        }
+
+        /// Confined `edit_file`: string replacement in a designated file.
+        pub fn edit_file(
+            &self,
+            path: &str,
+            old_string: &str,
+            new_string: &str,
+            replace_all: bool,
+        ) -> io::Result<EditFileOutput> {
+            let (relative, mut file, original) = self.open_designated(path)?;
+            if old_string == new_string {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "old_string and new_string must differ",
+                ));
+            }
+            if !original.contains(old_string) {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "old_string not found in file",
+                ));
+            }
+            let updated = if replace_all {
+                original.replace(old_string, new_string)
+            } else {
+                original.replacen(old_string, new_string, 1)
+            };
+            if updated.len() > MAX_WRITE_SIZE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "edited content is too large",
+                ));
+            }
+            Self::replace_contents(&mut file, &updated)?;
+            Ok(EditFileOutput {
+                file_path: relative.to_string_lossy().into_owned(),
+                old_string: old_string.to_owned(),
+                new_string: new_string.to_owned(),
+                original_file: original.clone(),
+                structured_patch: make_patch(&original, &updated),
+                user_modified: false,
+                replace_all,
+                git_diff: None,
+            })
+        }
+
+        /// Enumerate regular files beneath `base` (workspace-relative),
+        /// returning root-relative paths with their mtimes. Symlinks, special
+        /// files and mount crossings are never followed or listed.
+        fn walk_regular_files(&self, base: &Path, shown: &str) -> io::Result<Vec<(PathBuf, i64)>> {
+            let fd = self.open_beneath(base, OFlags::PATH, shown)?;
+            let stat = fstat(&fd)?;
+            match FileType::from_raw_mode(stat.st_mode) {
+                FileType::RegularFile => return Ok(vec![(base.to_path_buf(), stat.st_mtime)]),
+                FileType::Directory => {}
+                _ => return Err(confinement_denied(shown, "is not a file or directory")),
+            }
+            let base_dir = self.open_beneath(base, OFlags::RDONLY | OFlags::DIRECTORY, shown)?;
+            let mut files = Vec::new();
+            let mut visited = 0usize;
+            let mut stack = vec![(base_dir, base.to_path_buf(), 0usize)];
+            while let Some((dir, prefix, depth)) = stack.pop() {
+                for entry in Dir::read_from(&dir)? {
+                    let entry = entry?;
+                    let name = entry.file_name();
+                    if name.to_bytes() == b"." || name.to_bytes() == b".." {
+                        continue;
+                    }
+                    visited += 1;
+                    if visited > MAX_WALK_ENTRIES {
+                        return Ok(files);
+                    }
+                    let Ok(stat) = statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW) else {
+                        continue;
+                    };
+                    let relative = prefix.join(OsStr::from_bytes(name.to_bytes()));
+                    match FileType::from_raw_mode(stat.st_mode) {
+                        FileType::RegularFile => files.push((relative, stat.st_mtime)),
+                        FileType::Directory if depth < MAX_WALK_DEPTH => {
+                            if let Ok(child) = openat2(
+                                &dir,
+                                name,
+                                OFlags::RDONLY
+                                    | OFlags::DIRECTORY
+                                    | OFlags::NOFOLLOW
+                                    | OFlags::CLOEXEC,
+                                Mode::empty(),
+                                RESOLVE,
+                            ) {
+                                stack.push((child, relative, depth + 1));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(files)
+        }
+
+        /// Confined `glob_search`: patterns match workspace-relative paths of
+        /// enumerated regular files; results are workspace-relative.
+        pub fn glob_search(
+            &self,
+            pattern: &str,
+            path: Option<&str>,
+        ) -> io::Result<GlobSearchOutput> {
+            let started = Instant::now();
+            let base = path
+                .map(workspace_relative)
+                .transpose()?
+                .unwrap_or_default();
+            let mut compiled = Vec::new();
+            for expanded in expand_braces(pattern) {
+                let relative = workspace_relative(&expanded)?;
+                compiled.push(Pattern::new(&relative.to_string_lossy()).map_err(|error| {
+                    io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
+                })?);
+            }
+            let options = glob::MatchOptions {
+                case_sensitive: true,
+                require_literal_separator: true,
+                require_literal_leading_dot: false,
+            };
+            let mut matches = self
+                .walk_regular_files(&base, path.unwrap_or("."))?
+                .into_iter()
+                .filter(|(relative, _)| {
+                    let below_base = relative.strip_prefix(&base).unwrap_or(relative);
+                    compiled
+                        .iter()
+                        .any(|pattern| pattern.matches_path_with(below_base, options))
+                })
+                .collect::<Vec<_>>();
+            matches.sort_by_key(|(_, mtime)| Reverse(*mtime));
+            let truncated = matches.len() > 100;
+            let filenames = matches
+                .into_iter()
+                .take(100)
+                .map(|(relative, _)| relative.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            Ok(GlobSearchOutput {
+                duration_ms: started.elapsed().as_millis(),
+                num_files: filenames.len(),
+                filenames,
+                truncated,
+            })
+        }
+
+        /// Confined `grep_search`: an omitted `path` searches the bound root,
+        /// never the process CWD.
+        pub fn grep_search(&self, input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
+            let shown = input.path.as_deref().unwrap_or(".");
+            let base = input
+                .path
+                .as_deref()
+                .map(workspace_relative)
+                .transpose()?
+                .unwrap_or_default();
+            grep_files(
+                input,
+                || {
+                    Ok(self
+                        .walk_regular_files(&base, shown)?
+                        .into_iter()
+                        .map(|(relative, _)| relative)
+                        .collect())
+                },
+                |relative| {
+                    let shown = relative.to_string_lossy();
+                    let (mut file, stat) =
+                        self.open_regular(relative, OFlags::RDONLY, &shown).ok()?;
+                    Self::read_text(&mut file, &stat, &shown).ok()
+                },
+            )
+        }
+    }
+
+    fn resolution_error(shown: &str, error: Errno) -> io::Error {
+        match error {
+            Errno::XDEV => confinement_denied(shown, "resolves outside the workspace"),
+            Errno::LOOP => confinement_denied(shown, "traverses a symlink"),
+            other => {
+                let error = io::Error::from(other);
+                io::Error::new(error.kind(), format!("`{shown}`: {error}"))
+            }
+        }
+    }
+}
+
+/// Non-Linux stand-in: confinement needs `openat2`, so every operation fails
+/// closed rather than degrading to unconfined path handling.
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug)]
+pub struct WorkspaceRoot {
+    _unconstructible: (),
+}
+
+#[cfg(not(target_os = "linux"))]
+impl WorkspaceRoot {
+    fn unsupported() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "workspace confinement requires Linux (openat2)",
+        )
+    }
+    pub fn bind(_root: &Path, _writable: &[&str]) -> io::Result<Self> {
+        Err(Self::unsupported())
+    }
+    #[must_use]
+    pub fn display(&self) -> &Path {
+        Path::new("")
+    }
+    #[must_use]
+    pub fn identity(&self) -> (u64, u64) {
+        (0, 0)
+    }
+    pub fn current_path(&self) -> io::Result<PathBuf> {
+        Err(Self::unsupported())
+    }
+    pub fn is_same_directory(&self, _path: &Path) -> io::Result<bool> {
+        Err(Self::unsupported())
+    }
+    pub fn verify_single_link_files(&self, _names: &[&str]) -> io::Result<()> {
+        Err(Self::unsupported())
+    }
+    pub fn read_file(
+        &self,
+        _path: &str,
+        _offset: Option<usize>,
+        _limit: Option<usize>,
+    ) -> io::Result<ReadFileOutput> {
+        Err(Self::unsupported())
+    }
+    pub fn write_file(&self, _path: &str, _content: &str) -> io::Result<WriteFileOutput> {
+        Err(Self::unsupported())
+    }
+    pub fn edit_file(
+        &self,
+        _path: &str,
+        _old_string: &str,
+        _new_string: &str,
+        _replace_all: bool,
+    ) -> io::Result<EditFileOutput> {
+        Err(Self::unsupported())
+    }
+    pub fn glob_search(&self, _pattern: &str, _path: Option<&str>) -> io::Result<GlobSearchOutput> {
+        Err(Self::unsupported())
+    }
+    pub fn grep_search(&self, _input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
+        Err(Self::unsupported())
+    }
+}
+
 /// Expand shell-style brace groups in a glob pattern.
 ///
 /// Handles one level of braces: `foo.{a,b,c}` → `["foo.a", "foo.b", "foo.c"]`.
@@ -835,5 +1416,267 @@ mod tests {
             "should match .rs and .toml but not .txt"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod confined_tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use rustix::fs::OFlags;
+
+    use super::{GrepSearchInput, WorkspaceRoot};
+
+    struct Fixture {
+        base: PathBuf,
+        workspace: PathBuf,
+        outside: PathBuf,
+    }
+
+    impl Fixture {
+        fn new(name: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos();
+            let base = std::env::temp_dir().join(format!("claw-confined-{name}-{unique}"));
+            let workspace = base.join("workspace");
+            let outside = base.join("outside");
+            fs::create_dir_all(&workspace).expect("workspace");
+            fs::create_dir_all(&outside).expect("outside");
+            fs::write(
+                workspace.join("calculator.py"),
+                "def add(a, b):\n    return a - b\n",
+            )
+            .expect("calculator");
+            fs::write(workspace.join("test_calculator.py"), "ORACLE\n").expect("oracle");
+            fs::write(outside.join("sentinel.txt"), "OUTSIDE\n").expect("sentinel");
+            Self {
+                base,
+                workspace,
+                outside,
+            }
+        }
+
+        fn root(&self) -> WorkspaceRoot {
+            WorkspaceRoot::bind(&self.workspace, &["calculator.py"]).expect("bind")
+        }
+
+        fn sentinel(&self) -> String {
+            fs::read_to_string(self.outside.join("sentinel.txt")).expect("sentinel")
+        }
+
+        fn oracle(&self) -> String {
+            fs::read_to_string(self.workspace.join("test_calculator.py")).expect("oracle")
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.base);
+        }
+    }
+
+    fn grep(pattern: &str, path: Option<&str>) -> GrepSearchInput {
+        GrepSearchInput {
+            pattern: pattern.to_string(),
+            path: path.map(str::to_string),
+            glob: None,
+            output_mode: Some("content".to_string()),
+            before: None,
+            after: None,
+            context_short: None,
+            context: None,
+            line_numbers: None,
+            case_insensitive: None,
+            file_type: None,
+            head_limit: None,
+            offset: None,
+            multiline: None,
+        }
+    }
+
+    #[test]
+    fn kernel_resolution_refuses_parent_escape_without_the_lexical_check() {
+        // Bypasses `workspace_relative` on purpose: RESOLVE_BENEATH alone must
+        // stop `..` even if the lexical layer were missing.
+        let fixture = Fixture::new("beneath");
+        let root = fixture.root();
+        let error = root
+            .open_beneath(
+                Path::new("../outside/sentinel.txt"),
+                OFlags::RDONLY,
+                "../outside/sentinel.txt",
+            )
+            .expect_err("openat2 must refuse to resolve above the root");
+        assert!(
+            error.to_string().contains("outside the workspace"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn relative_paths_resolve_beneath_the_bound_root_only() {
+        let fixture = Fixture::new("relative");
+        let root = fixture.root();
+        let read = root.read_file("calculator.py", None, None).expect("read");
+        assert_eq!(read.file.file_path, "calculator.py");
+        assert!(read.file.content.contains("return a - b"));
+        for path in [
+            "../outside/sentinel.txt",
+            "new-dir/../../outside/new.txt",
+            "./../outside/sentinel.txt",
+        ] {
+            let error = root.read_file(path, None, None).expect_err(path);
+            assert!(error.to_string().contains("`..`"), "{error}");
+            assert!(root.write_file(path, "X").is_err(), "{path}");
+        }
+        let absolute = fixture.workspace.join("calculator.py");
+        let error = root
+            .read_file(absolute.to_str().expect("utf8"), None, None)
+            .expect_err("absolute paths are refused, even inside the workspace");
+        assert!(error.to_string().contains("absolute"), "{error}");
+        assert!(!fixture.workspace.join("new-dir").exists());
+        assert!(!fixture.outside.join("new.txt").exists());
+        assert_eq!(fixture.sentinel(), "OUTSIDE\n");
+    }
+
+    #[test]
+    fn symlinks_are_refused_even_when_they_point_inside() {
+        let fixture = Fixture::new("symlink");
+        std::os::unix::fs::symlink(
+            fixture.outside.join("sentinel.txt"),
+            fixture.workspace.join("escape.txt"),
+        )
+        .expect("symlink");
+        std::os::unix::fs::symlink(&fixture.outside, fixture.workspace.join("door"))
+            .expect("symlink");
+        let root = fixture.root();
+        // Replace the designated file with an inside-pointing symlink after binding.
+        fs::remove_file(fixture.workspace.join("calculator.py")).expect("remove");
+        std::os::unix::fs::symlink(
+            "test_calculator.py",
+            fixture.workspace.join("calculator.py"),
+        )
+        .expect("symlink");
+        for path in ["escape.txt", "door/sentinel.txt", "calculator.py"] {
+            let error = root.read_file(path, None, None).expect_err(path);
+            assert!(error.to_string().contains("symlink"), "{path}: {error}");
+        }
+        assert!(root.write_file("calculator.py", "PWNED").is_err());
+        assert!(root
+            .edit_file("calculator.py", "ORACLE", "PWNED", false)
+            .is_err());
+        assert_eq!(fixture.oracle(), "ORACLE\n");
+        assert_eq!(fixture.sentinel(), "OUTSIDE\n");
+    }
+
+    #[test]
+    fn only_designated_existing_regular_files_are_writable() {
+        let fixture = Fixture::new("designated");
+        let root = fixture.root();
+        let error = root
+            .write_file("test_calculator.py", "PWNED")
+            .expect_err("the oracle is not designated");
+        assert!(error.to_string().contains("designated"), "{error}");
+        assert!(root
+            .edit_file("test_calculator.py", "ORACLE", "PWNED", false)
+            .is_err());
+        assert!(root.write_file("new.py", "x").is_err());
+        assert!(!fixture.workspace.join("new.py").exists());
+        assert_eq!(fixture.oracle(), "ORACLE\n");
+
+        let edit = root
+            .edit_file("calculator.py", "return a - b", "return a + b", false)
+            .expect("designated edit");
+        assert_eq!(edit.file_path, "calculator.py");
+        assert_eq!(
+            fs::read_to_string(fixture.workspace.join("calculator.py")).expect("calculator"),
+            "def add(a, b):\n    return a + b\n"
+        );
+    }
+
+    #[test]
+    fn hardlinked_designated_files_are_refused() {
+        let fixture = Fixture::new("hardlink");
+        let root = fixture.root();
+        root.verify_single_link_files(&["calculator.py", "test_calculator.py"])
+            .expect("clean fixture");
+        fs::hard_link(
+            fixture.workspace.join("calculator.py"),
+            fixture.outside.join("linked.py"),
+        )
+        .expect("hardlink");
+        let error = root
+            .verify_single_link_files(&["calculator.py"])
+            .expect_err("hardlinked fixture must be rejected");
+        assert!(error.to_string().contains("hard links"), "{error}");
+        assert!(root.write_file("calculator.py", "PWNED").is_err());
+        assert_eq!(
+            fs::read_to_string(fixture.outside.join("linked.py")).expect("linked"),
+            "def add(a, b):\n    return a - b\n"
+        );
+    }
+
+    #[test]
+    fn special_files_are_refused_without_blocking() {
+        let fixture = Fixture::new("fifo");
+        let fifo = fixture.workspace.join("pipe");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o600),
+            0,
+        )
+        .expect("fifo");
+        let root = fixture.root();
+        let error = root.read_file("pipe", None, None).expect_err("fifo");
+        assert!(error.to_string().contains("not a regular file"), "{error}");
+    }
+
+    #[test]
+    fn glob_and_grep_enumerate_beneath_the_root_only() {
+        let fixture = Fixture::new("search");
+        std::os::unix::fs::symlink(&fixture.outside, fixture.workspace.join("dir-link"))
+            .expect("symlink");
+        fs::create_dir(fixture.workspace.join("sub")).expect("sub");
+        fs::write(fixture.workspace.join("sub/inner.py"), "OUTSIDE-looking\n").expect("inner");
+        let root = fixture.root();
+
+        let all = root.glob_search("**/*", None).expect("glob");
+        let mut names = all.filenames.clone();
+        names.sort();
+        assert_eq!(
+            names,
+            ["calculator.py", "sub/inner.py", "test_calculator.py"]
+        );
+        assert_eq!(
+            root.glob_search("dir-link/*", None)
+                .expect("glob")
+                .num_files,
+            0
+        );
+        for pattern in [
+            "../outside/*",
+            "/etc/*",
+            "{../outside/*,*.py}",
+            "{..,sub}/*",
+        ] {
+            assert!(root.glob_search(pattern, None).is_err(), "{pattern}");
+        }
+        assert!(root.glob_search("*", Some("../outside")).is_err());
+        assert!(root.glob_search("*", Some("dir-link")).is_err());
+
+        let found = root.grep_search(&grep("OUTSIDE", None)).expect("grep");
+        assert_eq!(found.filenames, ["sub/inner.py"]);
+        assert!(root
+            .grep_search(&grep("OUTSIDE", Some("../outside")))
+            .is_err());
+        assert!(root
+            .grep_search(&grep("OUTSIDE", Some("dir-link")))
+            .is_err());
     }
 }

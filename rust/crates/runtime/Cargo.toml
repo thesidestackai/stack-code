@@ -16,5 +16,11 @@ telemetry = { path = "../telemetry" }
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "process", "rt", "rt-multi-thread", "time"] }
 walkdir = "2"
 
+# Controlled-smoke containment: descriptor-relative `openat2` resolution for
+# confined file tools and pidfd-based settlement of the contained process tree.
+# Already locked at 1.1.4 (via fd-lock); promoted to a direct dependency.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.4", default-features = false, features = ["std", "fs", "process", "event"] }
+
 [lints]
 workspace = true

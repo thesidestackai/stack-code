@@ -199,6 +199,8 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--dangerously-skip-permissions",
     "--allowedTools",
     "--allowed-tools",
+    "--data-dir",
+    "--workspace-confine",
     "--resume",
     "--acp",
     "-acp",
@@ -350,7 +352,20 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
-    match parse_args(&args)? {
+    let (filtered_args, data_dir, confine_root) = extract_process_flags(&args)?;
+    // Install confinement BEFORE parsing the action: parsing can already
+    // build the runtime tool registry (`--allowedTools`), and that build must
+    // see the confinement so it does not start hooks, plugins or MCP servers.
+    if let Some(root) = confine_root {
+        let confinement = tools::WorkspaceConfinement::new(&root, tools::CONFINED_BASH_TIMEOUT_MS)?;
+        tools::set_workspace_confinement(confinement)?;
+    }
+    let action = parse_args_core(
+        &filtered_args,
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+    )?;
+    match action {
         CliAction::DumpManifests {
             output_format,
             manifests_dir,
@@ -383,7 +398,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             session_path,
             commands,
             output_format,
-        } => resume_session(&session_path, &commands, output_format),
+        } => {
+            let session_store = current_session_store(data_dir.as_deref())?;
+            resume_session(&session_store, &session_path, &commands, output_format);
+        }
         CliAction::ResumeRepl {
             session_reference,
             context,
@@ -395,6 +413,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             context.reasoning_effort,
             context.allow_broad_cwd,
             Some(session_reference),
+            data_dir,
         )?,
         CliAction::Status {
             model,
@@ -432,7 +451,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
-            let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
+            let session_store = current_session_store(data_dir.as_deref())?;
+            let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode, session_store)?;
             cli.set_reasoning_effort(reasoning_effort);
             cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
         }
@@ -473,7 +493,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             session_reference,
             output_path,
             output_format,
-        } => run_export(&session_reference, output_path.as_deref(), output_format)?,
+        } => {
+            let session_store = current_session_store(data_dir.as_deref())?;
+            run_export(
+                &session_store,
+                &session_reference,
+                output_path.as_deref(),
+                output_format,
+            )?;
+        }
         CliAction::Repl {
             model,
             allowed_tools,
@@ -489,6 +517,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             reasoning_effort,
             allow_broad_cwd,
             None,
+            data_dir,
         )?,
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
@@ -505,6 +534,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             workspace_write_preview,
             workspace_root,
         } => {
+            refuse_host_process("`plan run`")?;
             let code = run_plan_subcommand(
                 &file,
                 dry_run,
@@ -620,6 +650,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(code);
         }
         CliAction::TaskRun { task_spec } => {
+            refuse_host_process("`task run`")?;
             let stdout = std::io::stdout();
             let mut stdout_lock = stdout.lock();
             let code = runnable_task_bridge::run_task_command(&task_spec, &mut stdout_lock);
@@ -3851,7 +3882,11 @@ impl CliOutputFormat {
 
 /// Production entry point: probe the real terminal state and parse.
 fn parse_args(args: &[String]) -> Result<CliAction, String> {
-    parse_args_with_terminal(
+    parse_invocation(args).map(|(action, _)| action)
+}
+
+fn parse_invocation(args: &[String]) -> Result<(CliAction, Option<PathBuf>), String> {
+    parse_invocation_with_terminal(
         args,
         std::io::stdin().is_terminal(),
         std::io::stdout().is_terminal(),
@@ -3860,8 +3895,123 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
 
 /// Parse with terminal state injected, so interactive-vs-automation behavior
 /// is deterministic under test regardless of how the runner is invoked.
-#[allow(clippy::too_many_lines)]
 fn parse_args_with_terminal(
+    args: &[String],
+    stdin_is_tty: bool,
+    stdout_is_tty: bool,
+) -> Result<CliAction, String> {
+    parse_invocation_with_terminal(args, stdin_is_tty, stdout_is_tty).map(|(action, _)| action)
+}
+
+fn parse_invocation_with_terminal(
+    args: &[String],
+    stdin_is_tty: bool,
+    stdout_is_tty: bool,
+) -> Result<(CliAction, Option<PathBuf>), String> {
+    parse_full_invocation_with_terminal(args, stdin_is_tty, stdout_is_tty)
+        .map(|(action, data_dir, _)| (action, data_dir))
+}
+
+/// Parsed invocation including the opt-in workspace confinement root.
+///
+/// `--workspace-confine` is extracted here, alongside `--data-dir`, rather
+/// than threaded through every `CliAction`, because it is a process-level
+/// policy rather than a per-action argument.
+fn parse_full_invocation_with_terminal(
+    args: &[String],
+    stdin_is_tty: bool,
+    stdout_is_tty: bool,
+) -> Result<(CliAction, Option<PathBuf>, Option<PathBuf>), String> {
+    let (filtered_args, data_dir, confine_root) = extract_process_flags(args)?;
+    let action = parse_args_core(&filtered_args, stdin_is_tty, stdout_is_tty)?;
+    Ok((action, data_dir, confine_root))
+}
+
+/// Remaining action arguments, `--data-dir`, and `--workspace-confine` root.
+type ProcessFlags = (Vec<String>, Option<PathBuf>, Option<PathBuf>);
+
+/// Strip the process-level flags (`--data-dir`, `--workspace-confine`) and
+/// return the remaining arguments for action parsing.
+fn extract_process_flags(args: &[String]) -> Result<ProcessFlags, String> {
+    let (filtered_args, data_dir) = extract_data_dir(args)?;
+    let (filtered_args, confine_root) = extract_workspace_confine(&filtered_args)?;
+    Ok((filtered_args, data_dir, confine_root))
+}
+
+/// Extract `--workspace-confine` or `--workspace-confine=PATH`.
+///
+/// A bare `--workspace-confine` confines to the current working directory,
+/// which is the workspace the CLI already treats as its root, and consumes no
+/// following argument, so it can precede a positional action or prompt. An
+/// explicit root is given only as `--workspace-confine=PATH`. The flag may
+/// appear once: a second occurrence would leave the confinement root
+/// ambiguous, so it is rejected rather than resolved by position.
+fn extract_workspace_confine(args: &[String]) -> Result<(Vec<String>, Option<PathBuf>), String> {
+    let mut filtered = Vec::with_capacity(args.len());
+    let mut root = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--workspace-confine" => {
+                if root.is_some() {
+                    return Err("--workspace-confine may be given only once".to_string());
+                }
+                root = Some(env::current_dir().map_err(|error| error.to_string())?);
+                index += 1;
+            }
+            flag if flag.starts_with("--workspace-confine=") => {
+                if root.is_some() {
+                    return Err("--workspace-confine may be given only once".to_string());
+                }
+                let value = &flag["--workspace-confine=".len()..];
+                if value.is_empty() {
+                    return Err("missing value for --workspace-confine".to_string());
+                }
+                root = Some(PathBuf::from(value));
+                index += 1;
+            }
+            _ => {
+                filtered.push(args[index].clone());
+                index += 1;
+            }
+        }
+    }
+    Ok((filtered, root))
+}
+
+fn extract_data_dir(args: &[String]) -> Result<(Vec<String>, Option<PathBuf>), String> {
+    let mut filtered = Vec::with_capacity(args.len());
+    let mut data_dir = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--data-dir" => {
+                let value = args
+                    .get(index + 1)
+                    .filter(|value| !value.starts_with('-'))
+                    .ok_or_else(|| "missing value for --data-dir".to_string())?;
+                data_dir = Some(PathBuf::from(value));
+                index += 2;
+            }
+            flag if flag.starts_with("--data-dir=") => {
+                let value = &flag[11..];
+                if value.is_empty() {
+                    return Err("missing value for --data-dir".to_string());
+                }
+                data_dir = Some(PathBuf::from(value));
+                index += 1;
+            }
+            _ => {
+                filtered.push(args[index].clone());
+                index += 1;
+            }
+        }
+    }
+    Ok((filtered, data_dir))
+}
+
+#[allow(clippy::too_many_lines)]
+fn parse_args_core(
     args: &[String],
     stdin_is_tty: bool,
     stdout_is_tty: bool,
@@ -5757,10 +5907,10 @@ fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error::Error>> {
     let config_loader = ConfigLoader::default_for(&cwd);
     let config = config_loader.load();
     let discovered_config = config_loader.discover();
-    let project_context = ProjectContext::discover_with_git(&cwd, DEFAULT_DATE)?;
+    let project_context = cli_project_context(&cwd, DEFAULT_DATE)?;
     let (project_root, git_branch) =
         parse_git_status_metadata(project_context.git_status.as_deref());
-    let git_summary = parse_git_workspace_summary(project_context.git_status.as_deref());
+    let git_summary = cli_git_summary(project_context.git_status.as_deref());
     let empty_config = runtime::RuntimeConfig::empty();
     let sandbox_config = config.as_ref().ok().unwrap_or(&empty_config);
     let context = StatusContext {
@@ -5775,7 +5925,7 @@ fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error::Error>> {
         project_root,
         git_branch,
         git_summary,
-        sandbox_status: resolve_sandbox_status(sandbox_config.sandbox(), &cwd),
+        sandbox_status: cli_sandbox_status(sandbox_config.sandbox(), &cwd),
         // Doctor path has its own config check; StatusContext here is only
         // fed into health renderers that don't read config_load_error.
         config_load_error: config.as_ref().err().map(ToString::to_string),
@@ -6111,6 +6261,7 @@ fn check_install_source_health() -> DiagnosticCheck {
 
 fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck {
     let in_repo = context.project_root.is_some();
+    let git_collected = context.git_summary.is_some();
     DiagnosticCheck::new(
         "Workspace",
         if in_repo {
@@ -6123,25 +6274,35 @@ fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck {
                 "project root detected on branch {}",
                 context.git_branch.as_deref().unwrap_or("unknown")
             )
-        } else {
+        } else if git_collected {
             "current directory is not inside a git project".to_string()
+        } else {
+            GIT_STATE_NOT_COLLECTED_DETAIL.to_string()
         },
     )
     .with_details(vec![
         format!("Cwd              {}", context.cwd.display()),
         format!(
             "Project root     {}",
-            context
-                .project_root
-                .as_ref()
-                .map_or_else(|| "<none>".to_string(), |path| path.display().to_string())
+            match (&context.project_root, git_collected) {
+                (Some(path), _) => path.display().to_string(),
+                (None, true) => "<none>".to_string(),
+                // Discovery was skipped, so absence was not observed.
+                (None, false) => GIT_STATE_NOT_COLLECTED.to_string(),
+            }
         ),
         format!(
             "Git branch       {}",
             context.git_branch.as_deref().unwrap_or("unknown")
         ),
-        format!("Git state        {}", context.git_summary.headline()),
-        format!("Changed files    {}", context.git_summary.changed_files),
+        format!(
+            "Git state        {}",
+            git_state_headline(context.git_summary)
+        ),
+        format!(
+            "Changed files    {}",
+            git_count_text(context.git_summary.map(|summary| summary.changed_files))
+        ),
         format!(
             "Memory files     {} · config files loaded {}/{}",
             context.memory_file_count, context.loaded_config_files, context.discovered_config_files
@@ -6156,15 +6317,22 @@ fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck {
                 .as_ref()
                 .map(|path| path.display().to_string())),
         ),
-        ("in_git_repo".to_string(), json!(in_repo)),
+        (
+            "in_git_repo".to_string(),
+            if git_collected {
+                json!(in_repo)
+            } else {
+                Value::Null
+            },
+        ),
         ("git_branch".to_string(), json!(context.git_branch)),
         (
             "git_state".to_string(),
-            json!(context.git_summary.headline()),
+            json!(git_state_headline(context.git_summary)),
         ),
         (
             "changed_files".to_string(),
-            json!(context.git_summary.changed_files),
+            json!(context.git_summary.map(|summary| summary.changed_files)),
         ),
         (
             "memory_file_count".to_string(),
@@ -6409,7 +6577,7 @@ fn print_system_prompt(
     date: String,
     output_format: CliOutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let sections = load_system_prompt(cwd, date, env::consts::OS, "unknown")?;
+    let sections = cli_system_prompt(cwd, date, env::consts::OS, "unknown")?;
     let message = sections.join(
         "
 
@@ -6450,9 +6618,14 @@ fn version_json_value() -> serde_json::Value {
 }
 
 #[allow(clippy::too_many_lines)]
-fn resume_session(session_path: &Path, commands: &[String], output_format: CliOutputFormat) {
+fn resume_session(
+    session_store: &runtime::SessionStore,
+    session_path: &Path,
+    commands: &[String],
+    output_format: CliOutputFormat,
+) {
     let session_reference = session_path.display().to_string();
-    let (handle, session) = match load_session_reference(&session_reference) {
+    let (handle, session) = match load_session_reference(session_store, &session_reference) {
         Ok(loaded) => loaded,
         Err(error) => {
             if output_format == CliOutputFormat::Json {
@@ -6562,7 +6735,7 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
                 std::process::exit(2);
             }
         };
-        match run_resume_command(&resolved_path, &session, &command) {
+        match run_resume_command(session_store, &resolved_path, &session, &command) {
             Ok(ResumeCommandOutcome {
                 session: next_session,
                 message,
@@ -6618,7 +6791,9 @@ struct StatusContext {
     memory_file_count: usize,
     project_root: Option<PathBuf>,
     git_branch: Option<String>,
-    git_summary: GitWorkspaceSummary,
+    /// `None` when git state was not collected: workspace confinement
+    /// forbids running git, and unobserved state is not reported as clean.
+    git_summary: Option<GitWorkspaceSummary>,
     sandbox_status: runtime::SandboxStatus,
     /// #143: when `.claw.json` (or another loaded config file) fails to parse,
     /// we capture the parse error here and still populate every field that
@@ -6850,6 +7025,34 @@ fn parse_git_status_branch(status: Option<&str>) -> Option<String> {
     }
 }
 
+/// Headline for a git state that was deliberately not observed.
+const GIT_STATE_NOT_COLLECTED: &str = "not collected (workspace confinement)";
+
+/// Doctor summary when git state was deliberately not observed.
+const GIT_STATE_NOT_COLLECTED_DETAIL: &str =
+    "git state not collected: workspace confinement forbids running git";
+
+/// Workspace summary for status reports. Under confinement git is never run,
+/// so the state is unknown (`None`) rather than an empty, "clean" summary.
+fn cli_git_summary(status: Option<&str>) -> Option<GitWorkspaceSummary> {
+    if host_processes_forbidden() {
+        return None;
+    }
+    Some(parse_git_workspace_summary(status))
+}
+
+fn git_state_headline(summary: Option<GitWorkspaceSummary>) -> String {
+    summary.map_or_else(
+        || GIT_STATE_NOT_COLLECTED.to_string(),
+        GitWorkspaceSummary::headline,
+    )
+}
+
+/// A git count for text reports; "unknown" when git state was not collected.
+fn git_count_text(count: Option<usize>) -> String {
+    count.map_or_else(|| "unknown".to_string(), |count| count.to_string())
+}
+
 fn parse_git_workspace_summary(status: Option<&str>) -> GitWorkspaceSummary {
     let mut summary = GitWorkspaceSummary::default();
     let Some(status) = status else {
@@ -6907,6 +7110,9 @@ fn resolve_git_branch_for(cwd: &Path) -> Option<String> {
 }
 
 fn run_git_capture_in(cwd: &Path, args: &[&str]) -> Option<String> {
+    if host_processes_forbidden() {
+        return None;
+    }
     let output = std::process::Command::new("git")
         .args(args)
         .current_dir(cwd)
@@ -6919,6 +7125,7 @@ fn run_git_capture_in(cwd: &Path, args: &[&str]) -> Option<String> {
 }
 
 fn find_git_root_in(cwd: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    refuse_host_process("git")?;
     let output = std::process::Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(cwd)
@@ -6944,6 +7151,7 @@ fn parse_git_status_metadata_for(
 
 #[allow(clippy::too_many_lines)]
 fn run_resume_command(
+    session_store: &runtime::SessionStore,
     session_path: &Path,
     session: &Session,
     command: &SlashCommand,
@@ -7051,7 +7259,7 @@ fn run_resume_command(
             let cwd = env::current_dir()?;
             let loader = ConfigLoader::default_for(&cwd);
             let runtime_config = loader.load()?;
-            let status = resolve_sandbox_status(runtime_config.sandbox(), &cwd);
+            let status = cli_sandbox_status(runtime_config.sandbox(), &cwd);
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(format_sandbox_report(&status)),
@@ -7083,6 +7291,7 @@ fn run_resume_command(
             })
         }
         SlashCommand::Mcp { action, target } => {
+            refuse_external_integration("`/mcp`")?;
             let cwd = env::current_dir()?;
             let args = match (action.as_deref(), target.as_deref()) {
                 (None, None) => None,
@@ -7170,6 +7379,7 @@ fn run_resume_command(
                     "resumed /skills invocations are interactive-only; start `claw` and run `/skills <skill>` in the REPL".into(),
                 );
             }
+            refuse_external_integration("`/skills`")?;
             let cwd = env::current_dir()?;
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
@@ -7225,10 +7435,11 @@ fn run_resume_command(
             action: Some(ref act),
             ..
         } if act == "list" => {
-            let sessions = list_managed_sessions().unwrap_or_default();
+            let sessions = list_managed_sessions(session_store).unwrap_or_default();
             let session_ids: Vec<String> = sessions.iter().map(|s| s.id.clone()).collect();
             let active_id = session.session_id.clone();
-            let text = render_session_list(&active_id).unwrap_or_else(|e| format!("error: {e}"));
+            let text = render_session_list(session_store, &active_id)
+                .unwrap_or_else(|e| format!("error: {e}"));
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(text),
@@ -7376,6 +7587,14 @@ fn run_stale_base_preflight(flag_value: Option<&str>) {
         return;
     };
     let source = resolve_expected_base(flag_value, &cwd);
+    if host_processes_forbidden() {
+        if source.is_some() {
+            eprintln!(
+                "warning: stale-base check skipped under workspace confinement (it runs git)"
+            );
+        }
+        return;
+    }
     let state = check_base_commit(&cwd, source.as_ref());
     if let Some(warning) = format_stale_base_warning(&state) {
         eprintln!("{warning}");
@@ -7391,6 +7610,7 @@ fn run_repl(
     reasoning_effort: Option<String>,
     allow_broad_cwd: bool,
     initial_resume: Option<String>,
+    data_dir: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
     run_stale_base_preflight(base_commit.as_deref());
@@ -7403,13 +7623,20 @@ fn run_repl(
     // just-created session instead of the operator's actual conversation.
     // Resolving first also fails fast on an unknown reference, before a REPL
     // banner or a throwaway session file has been produced.
+    let session_store = current_session_store(data_dir.as_deref())?;
     let resolved_resume = match initial_resume {
-        Some(reference) => Some(resolve_session_reference(&reference)?.path),
+        Some(reference) => Some(resolve_session_reference(&session_store, &reference)?.path),
         None => None,
     };
 
     let resolved_model = resolve_repl_model(model);
-    let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
+    let mut cli = LiveCli::new(
+        resolved_model,
+        true,
+        allowed_tools,
+        permission_mode,
+        session_store,
+    )?;
     cli.set_reasoning_effort(reasoning_effort);
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
@@ -7504,6 +7731,7 @@ struct LiveCli {
     permission_mode: PermissionMode,
     system_prompt: Vec<String>,
     runtime: BuiltRuntime,
+    session_store: runtime::SessionStore,
     session: SessionHandle,
     prompt_history: Vec<PromptHistoryEntry>,
 }
@@ -7642,6 +7870,7 @@ impl RuntimeMcpState {
     fn new(
         runtime_config: &runtime::RuntimeConfig,
     ) -> Result<Option<(Self, runtime::McpToolDiscoveryReport)>, Box<dyn std::error::Error>> {
+        refuse_external_integration("MCP server startup")?;
         let mut manager = McpServerManager::from_runtime_config(runtime_config);
         if manager.server_names().is_empty() && manager.unsupported_servers().is_empty() {
             return Ok(None);
@@ -8331,10 +8560,11 @@ impl LiveCli {
         enable_tools: bool,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
+        session_store: runtime::SessionStore,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt()?;
         let session_state = new_cli_session()?;
-        let session = create_managed_session_handle(&session_state.session_id)?;
+        let session = create_managed_session_handle(&session_store, &session_state.session_id)?;
         let runtime = build_runtime(
             session_state.with_persistence_path(session.path.clone()),
             &session.id,
@@ -8352,6 +8582,7 @@ impl LiveCli {
             permission_mode,
             system_prompt,
             runtime,
+            session_store,
             session,
             prompt_history: Vec::new(),
         };
@@ -8377,7 +8608,7 @@ impl LiveCli {
             .unwrap_or("unknown");
         let workspace = status.as_ref().map_or_else(
             || "unknown".to_string(),
-            |context| context.git_summary.headline(),
+            |context| git_state_headline(context.git_summary),
         );
         let session_path = self.session.path.strip_prefix(Path::new(&cwd)).map_or_else(
             |_| self.session.path.display().to_string(),
@@ -8413,7 +8644,7 @@ impl LiveCli {
         Ok(slash_command_completion_candidates_with_sessions(
             &self.model,
             Some(&self.session.id),
-            list_managed_sessions()?
+            list_managed_sessions(&self.session_store)?
                 .into_iter()
                 .map(|session| session.id)
                 .collect(),
@@ -8839,7 +9070,7 @@ impl LiveCli {
             .unwrap_or_else(|_| runtime::RuntimeConfig::empty());
         println!(
             "{}",
-            format_sandbox_report(&resolve_sandbox_status(runtime_config.sandbox(), &cwd))
+            format_sandbox_report(&cli_sandbox_status(runtime_config.sandbox(), &cwd))
         );
     }
 
@@ -8948,7 +9179,8 @@ impl LiveCli {
 
         let previous_session = self.session.clone();
         let session_state = new_cli_session()?;
-        self.session = create_managed_session_handle(&session_state.session_id)?;
+        self.session =
+            create_managed_session_handle(&self.session_store, &session_state.session_id)?;
         let runtime = build_runtime(
             session_state.with_persistence_path(self.session.path.clone()),
             &self.session.id,
@@ -8987,7 +9219,7 @@ impl LiveCli {
             return Ok(false);
         };
 
-        let (handle, session) = load_session_reference(&session_ref)?;
+        let (handle, session) = load_session_reference(&self.session_store, &session_ref)?;
         let message_count = session.messages.len();
         let session_id = session.session_id.clone();
         let runtime = build_runtime(
@@ -9046,6 +9278,7 @@ impl LiveCli {
         args: Option<&str>,
         output_format: CliOutputFormat,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        refuse_external_integration("`mcp`")?;
         // `claw mcp serve` starts a stdio MCP server exposing claw's built-in
         // tools. All other `mcp` subcommands fall through to the existing
         // configured-server reporter (`list`, `status`, ...).
@@ -9076,6 +9309,7 @@ impl LiveCli {
         args: Option<&str>,
         output_format: CliOutputFormat,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        refuse_external_integration("`skills`")?;
         let cwd = env::current_dir()?;
         match output_format {
             CliOutputFormat::Text => println!("{}", handle_skills_slash_command(args, &cwd)?),
@@ -9092,6 +9326,7 @@ impl LiveCli {
         target: Option<&str>,
         output_format: CliOutputFormat,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        refuse_external_integration("`plugins`")?;
         let cwd = env::current_dir()?;
         let loader = ConfigLoader::default_for(&cwd);
         let runtime_config = loader.load()?;
@@ -9144,7 +9379,10 @@ impl LiveCli {
     ) -> Result<bool, Box<dyn std::error::Error>> {
         match action {
             None | Some("list") => {
-                println!("{}", render_session_list(&self.session.id)?);
+                println!(
+                    "{}",
+                    render_session_list(&self.session_store, &self.session.id)?
+                );
                 Ok(false)
             }
             Some("switch") => {
@@ -9152,7 +9390,7 @@ impl LiveCli {
                     println!("Usage: /session switch <session-id>");
                     return Ok(false);
                 };
-                let (handle, session) = load_session_reference(target)?;
+                let (handle, session) = load_session_reference(&self.session_store, target)?;
                 let message_count = session.messages.len();
                 let session_id = session.session_id.clone();
                 let runtime = build_runtime(
@@ -9182,7 +9420,8 @@ impl LiveCli {
             Some("fork") => {
                 let forked = self.runtime.fork_session(target.map(ToOwned::to_owned));
                 let parent_session_id = self.session.id.clone();
-                let handle = create_managed_session_handle(&forked.session_id)?;
+                let handle =
+                    create_managed_session_handle(&self.session_store, &forked.session_id)?;
                 let branch_name = forked
                     .fork
                     .as_ref()
@@ -9218,7 +9457,7 @@ impl LiveCli {
                     println!("Usage: /session delete <session-id> [--force]");
                     return Ok(false);
                 };
-                let handle = resolve_session_reference(target)?;
+                let handle = resolve_session_reference(&self.session_store, target)?;
                 if handle.id == self.session.id {
                     println!(
                         "delete: refusing to delete the active session '{}'.\nSwitch to another session first with /session switch <session-id>.",
@@ -9243,7 +9482,7 @@ impl LiveCli {
                     println!("Usage: /session delete <session-id> [--force]");
                     return Ok(false);
                 };
-                let handle = resolve_session_reference(target)?;
+                let handle = resolve_session_reference(&self.session_store, target)?;
                 if handle.id == self.session.id {
                     println!(
                         "delete: refusing to delete the active session '{}'.\nSwitch to another session first with /session switch <session-id>.",
@@ -9273,6 +9512,7 @@ impl LiveCli {
         action: Option<&str>,
         target: Option<&str>,
     ) -> Result<bool, Box<dyn std::error::Error>> {
+        refuse_external_integration("`/plugins`")?;
         let cwd = env::current_dir()?;
         let loader = ConfigLoader::default_for(&cwd);
         let runtime_config = loader.load()?;
@@ -9412,13 +9652,19 @@ impl LiveCli {
     }
 }
 
-fn sessions_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    Ok(current_session_store()?.sessions_dir().to_path_buf())
+fn sessions_dir(session_store: &runtime::SessionStore) -> PathBuf {
+    session_store.sessions_dir().to_path_buf()
 }
 
-fn current_session_store() -> Result<runtime::SessionStore, Box<dyn std::error::Error>> {
+fn current_session_store(
+    data_dir: Option<&Path>,
+) -> Result<runtime::SessionStore, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
-    runtime::SessionStore::from_cwd(&cwd).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+    match data_dir {
+        Some(data_dir) => runtime::SessionStore::from_data_dir(data_dir, &cwd),
+        None => runtime::SessionStore::from_cwd(&cwd),
+    }
+    .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
 }
 
 fn new_cli_session() -> Result<Session, Box<dyn std::error::Error>> {
@@ -9426,17 +9672,21 @@ fn new_cli_session() -> Result<Session, Box<dyn std::error::Error>> {
 }
 
 fn create_managed_session_handle(
+    session_store: &runtime::SessionStore,
     session_id: &str,
 ) -> Result<SessionHandle, Box<dyn std::error::Error>> {
-    let handle = current_session_store()?.create_handle(session_id);
+    let handle = session_store.create_handle(session_id);
     Ok(SessionHandle {
         id: handle.id,
         path: handle.path,
     })
 }
 
-fn resolve_session_reference(reference: &str) -> Result<SessionHandle, Box<dyn std::error::Error>> {
-    let handle = current_session_store()?
+fn resolve_session_reference(
+    session_store: &runtime::SessionStore,
+    reference: &str,
+) -> Result<SessionHandle, Box<dyn std::error::Error>> {
+    let handle = session_store
         .resolve_reference(reference)
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     Ok(SessionHandle {
@@ -9445,14 +9695,19 @@ fn resolve_session_reference(reference: &str) -> Result<SessionHandle, Box<dyn s
     })
 }
 
-fn resolve_managed_session_path(session_id: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    current_session_store()?
+fn resolve_managed_session_path(
+    session_store: &runtime::SessionStore,
+    session_id: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    session_store
         .resolve_managed_path(session_id)
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
 }
 
-fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::error::Error>> {
-    Ok(current_session_store()?
+fn list_managed_sessions(
+    session_store: &runtime::SessionStore,
+) -> Result<Vec<ManagedSessionSummary>, Box<dyn std::error::Error>> {
+    Ok(session_store
         .list_sessions()
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?
         .into_iter()
@@ -9468,8 +9723,10 @@ fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::er
         .collect())
 }
 
-fn latest_managed_session() -> Result<ManagedSessionSummary, Box<dyn std::error::Error>> {
-    let session = current_session_store()?
+fn latest_managed_session(
+    session_store: &runtime::SessionStore,
+) -> Result<ManagedSessionSummary, Box<dyn std::error::Error>> {
+    let session = session_store
         .latest_session()
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     Ok(ManagedSessionSummary {
@@ -9484,9 +9741,10 @@ fn latest_managed_session() -> Result<ManagedSessionSummary, Box<dyn std::error:
 }
 
 fn load_session_reference(
+    session_store: &runtime::SessionStore,
     reference: &str,
 ) -> Result<(SessionHandle, Session), Box<dyn std::error::Error>> {
-    let loaded = current_session_store()?
+    let loaded = session_store
         .load_session(reference)
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     Ok((
@@ -9516,11 +9774,17 @@ fn confirm_session_deletion(session_id: &str) -> bool {
     matches!(answer.trim(), "y" | "Y" | "yes" | "Yes" | "YES")
 }
 
-fn render_session_list(active_session_id: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let sessions = list_managed_sessions()?;
+fn render_session_list(
+    session_store: &runtime::SessionStore,
+    active_session_id: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let sessions = list_managed_sessions(session_store)?;
     let mut lines = vec![
         "Sessions".to_string(),
-        format!("  Directory         {}", sessions_dir()?.display()),
+        format!(
+            "  Directory         {}",
+            sessions_dir(session_store).display()
+        ),
     ];
     if sessions.is_empty() {
         lines.push("  No managed sessions saved yet.".to_string());
@@ -9708,11 +9972,11 @@ fn status_json_value(
             "cwd": context.cwd,
             "project_root": context.project_root,
             "git_branch": context.git_branch,
-            "git_state": context.git_summary.headline(),
-            "changed_files": context.git_summary.changed_files,
-            "staged_files": context.git_summary.staged_files,
-            "unstaged_files": context.git_summary.unstaged_files,
-            "untracked_files": context.git_summary.untracked_files,
+            "git_state": git_state_headline(context.git_summary),
+            "changed_files": context.git_summary.map(|summary| summary.changed_files),
+            "staged_files": context.git_summary.map(|summary| summary.staged_files),
+            "unstaged_files": context.git_summary.map(|summary| summary.unstaged_files),
+            "untracked_files": context.git_summary.map(|summary| summary.untracked_files),
             "session": context.session_path.as_ref().map_or_else(|| "live-repl".to_string(), |path| path.display().to_string()),
             "session_id": context.session_path.as_ref().and_then(|path| {
                 // Session files are named <session-id>.jsonl directly under
@@ -9755,7 +10019,7 @@ fn status_context(
     let (loaded_config_files, sandbox_status, config_load_error) = match loader.load() {
         Ok(runtime_config) => (
             runtime_config.loaded_entries().len(),
-            resolve_sandbox_status(runtime_config.sandbox(), &cwd),
+            cli_sandbox_status(runtime_config.sandbox(), &cwd),
             None,
         ),
         Err(err) => (
@@ -9765,14 +10029,14 @@ fn status_context(
             // produce the same output as a runtime config with no sandbox
             // overrides, which is the right degraded-mode shape: we cannot
             // report what the user *intended*, only what is actually in effect.
-            resolve_sandbox_status(&runtime::SandboxConfig::default(), &cwd),
+            cli_sandbox_status(&runtime::SandboxConfig::default(), &cwd),
             Some(err.to_string()),
         ),
     };
-    let project_context = ProjectContext::discover_with_git(&cwd, DEFAULT_DATE)?;
+    let project_context = cli_project_context(&cwd, DEFAULT_DATE)?;
     let (project_root, git_branch) =
         parse_git_status_metadata(project_context.git_status.as_deref());
-    let git_summary = parse_git_workspace_summary(project_context.git_status.as_deref());
+    let git_summary = cli_git_summary(project_context.git_status.as_deref());
     Ok(StatusContext {
         cwd,
         session_path: session_path.map(Path::to_path_buf),
@@ -9864,11 +10128,11 @@ fn format_status_report(
                 .as_ref()
                 .map_or_else(|| "unknown".to_string(), |path| path.display().to_string()),
             context.git_branch.as_deref().unwrap_or("unknown"),
-            context.git_summary.headline(),
-            context.git_summary.changed_files,
-            context.git_summary.staged_files,
-            context.git_summary.unstaged_files,
-            context.git_summary.untracked_files,
+            git_state_headline(context.git_summary),
+            git_count_text(context.git_summary.map(|summary| summary.changed_files)),
+            git_count_text(context.git_summary.map(|summary| summary.staged_files)),
+            git_count_text(context.git_summary.map(|summary| summary.unstaged_files)),
+            git_count_text(context.git_summary.map(|summary| summary.untracked_files)),
             context.session_path.as_ref().map_or_else(
                 || "live-repl".to_string(),
                 |path| path.display().to_string()
@@ -9956,7 +10220,7 @@ fn print_sandbox_status_snapshot(
     let runtime_config = loader
         .load()
         .unwrap_or_else(|_| runtime::RuntimeConfig::empty());
-    let status = resolve_sandbox_status(runtime_config.sandbox(), &cwd);
+    let status = cli_sandbox_status(runtime_config.sandbox(), &cwd);
     match output_format {
         CliOutputFormat::Text => println!("{}", format_sandbox_report(&status)),
         CliOutputFormat::Json => println!(
@@ -10341,6 +10605,7 @@ fn render_diff_report() -> Result<String, Box<dyn std::error::Error>> {
 }
 
 fn render_diff_report_for(cwd: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    refuse_host_process("diff")?;
     // Verify we are inside a git repository before calling `git diff`.
     // Running `git diff --cached` outside a git tree produces a misleading
     // "unknown option `cached`" error because git falls back to --no-index mode.
@@ -10377,6 +10642,7 @@ fn render_diff_report_for(cwd: &Path) -> Result<String, Box<dyn std::error::Erro
 }
 
 fn render_diff_json_for(cwd: &Path) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    refuse_host_process("diff")?;
     let in_git_repo = std::process::Command::new("git")
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(cwd)
@@ -10404,6 +10670,7 @@ fn run_git_diff_command_in(
     cwd: &Path,
     args: &[&str],
 ) -> Result<String, Box<dyn std::error::Error>> {
+    refuse_host_process("git")?;
     let output = std::process::Command::new("git")
         .args(args)
         .current_dir(cwd)
@@ -10416,6 +10683,7 @@ fn run_git_diff_command_in(
 }
 
 fn render_teleport_report(target: &str) -> Result<String, Box<dyn std::error::Error>> {
+    refuse_host_process("`/teleport`")?;
     let cwd = env::current_dir()?;
 
     let file_list = Command::new("rg")
@@ -10583,6 +10851,7 @@ fn format_issue_report(context: Option<&str>) -> String {
 }
 
 fn git_output(args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
+    refuse_host_process("git")?;
     let output = Command::new("git")
         .args(args)
         .current_dir(env::current_dir()?)
@@ -10595,6 +10864,7 @@ fn git_output(args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
 }
 
 fn git_status_ok(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
+    refuse_host_process("git")?;
     let output = Command::new("git")
         .args(args)
         .current_dir(env::current_dir()?)
@@ -10607,6 +10877,9 @@ fn git_status_ok(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn command_exists(name: &str) -> bool {
+    if host_processes_forbidden() {
+        return false;
+    }
     Command::new("which")
         .arg(name)
         .output()
@@ -10909,11 +11182,12 @@ fn summarize_tool_payload_for_markdown(payload: &str) -> String {
 }
 
 fn run_export(
+    session_store: &runtime::SessionStore,
     session_reference: &str,
     output_path: Option<&Path>,
     output_format: CliOutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (handle, session) = load_session_reference(session_reference)?;
+    let (handle, session) = load_session_reference(session_store, session_reference)?;
     let markdown = render_session_markdown(&session, &handle.id, &handle.path);
 
     if let Some(path) = output_path {
@@ -11061,9 +11335,9 @@ fn short_tool_id(id: &str) -> String {
 }
 
 fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    Ok(load_system_prompt(
+    Ok(cli_system_prompt(
         env::current_dir()?,
-        DEFAULT_DATE,
+        DEFAULT_DATE.to_string(),
         env::consts::OS,
         "unknown",
     )?)
@@ -11076,11 +11350,122 @@ fn build_runtime_plugin_state() -> Result<RuntimePluginState, Box<dyn std::error
     build_runtime_plugin_state_with_loader(&cwd, &loader, &runtime_config)
 }
 
+/// Whether hooks, plugins and MCP servers are disabled for this process.
+///
+/// Workspace confinement bounds the built-in tools only. Hook commands, plugin
+/// lifecycle/tool commands and stdio MCP servers would execute outside it, so
+/// while confinement is active they are never loaded, initialized or spawned.
+fn external_integrations_disabled() -> bool {
+    tools::workspace_confinement().is_some()
+}
+
+/// Refuse an integration-management surface while confinement is active.
+fn refuse_external_integration(surface: &str) -> Result<(), String> {
+    if external_integrations_disabled() {
+        return Err(format!(
+            "{surface} is disabled under workspace confinement: hooks, plugins and MCP servers would run outside it"
+        ));
+    }
+    Ok(())
+}
+
+/// Whether this process may start host subprocesses.
+///
+/// While confinement is active the only process the CLI may start is the
+/// approved smoke command, which `tools` runs inside the Bubblewrap sandbox.
+/// Every other subprocess (git, rg, the `unshare` sandbox probe, plan and
+/// task children) would run on the host outside that boundary, and git in
+/// particular executes commands named by workspace or user configuration.
+/// Callers check this before spawning and refuse or degrade instead.
+fn host_processes_forbidden() -> bool {
+    tools::workspace_confinement().is_some()
+}
+
+/// Refuse a surface that needs a host subprocess while confinement is active.
+fn refuse_host_process(surface: &str) -> Result<(), String> {
+    if host_processes_forbidden() {
+        return Err(format!(
+            "{surface} is unavailable under workspace confinement: it would run a host process outside the sandbox"
+        ));
+    }
+    Ok(())
+}
+
+/// Project context for prompts and reports; without git under confinement.
+fn cli_project_context(cwd: &Path, current_date: &str) -> std::io::Result<ProjectContext> {
+    if host_processes_forbidden() {
+        return ProjectContext::discover(cwd, current_date);
+    }
+    ProjectContext::discover_with_git(cwd, current_date)
+}
+
+/// `load_system_prompt`, except that under confinement the project context
+/// is gathered without running git.
+fn cli_system_prompt(
+    cwd: PathBuf,
+    current_date: String,
+    os_name: &str,
+    os_version: &str,
+) -> Result<Vec<String>, runtime::PromptBuildError> {
+    if !host_processes_forbidden() {
+        return load_system_prompt(cwd, current_date, os_name, os_version);
+    }
+    let project_context = ProjectContext::discover(&cwd, current_date)?;
+    let config = ConfigLoader::default_for(&cwd).load()?;
+    Ok(runtime::SystemPromptBuilder::new()
+        .with_os(os_name, os_version)
+        .with_project_context(project_context)
+        .with_runtime_config(config)
+        .build())
+}
+
+/// Sandbox status for reports. Resolving it probes `unshare` on the host, so
+/// under confinement the requested configuration is reported unprobed.
+fn cli_sandbox_status(config: &runtime::SandboxConfig, cwd: &Path) -> runtime::SandboxStatus {
+    if host_processes_forbidden() {
+        let requested = config.resolve_request(None, None, None, None, None);
+        return runtime::SandboxStatus {
+            enabled: requested.enabled,
+            requested,
+            fallback_reason: Some("sandbox probe skipped under workspace confinement".to_string()),
+            ..runtime::SandboxStatus::default()
+        };
+    }
+    resolve_sandbox_status(config, cwd)
+}
+
 fn build_runtime_plugin_state_with_loader(
     cwd: &Path,
     loader: &ConfigLoader,
     runtime_config: &runtime::RuntimeConfig,
 ) -> Result<RuntimePluginState, Box<dyn std::error::Error>> {
+    build_runtime_plugin_state_for(
+        cwd,
+        loader,
+        runtime_config,
+        external_integrations_disabled(),
+    )
+}
+
+fn build_runtime_plugin_state_for(
+    cwd: &Path,
+    loader: &ConfigLoader,
+    runtime_config: &runtime::RuntimeConfig,
+    integrations_disabled: bool,
+) -> Result<RuntimePluginState, Box<dyn std::error::Error>> {
+    if integrations_disabled {
+        // No plugin discovery, no hook commands, no MCP servers: built-in
+        // tools only, which confinement admits or refuses individually.
+        return Ok(RuntimePluginState {
+            feature_config: runtime_config
+                .feature_config()
+                .clone()
+                .with_hooks(runtime::RuntimeHookConfig::default()),
+            tool_registry: GlobalToolRegistry::builtin(),
+            plugin_registry: PluginRegistry::default(),
+            mcp_state: None,
+        });
+    }
     let plugin_manager = build_plugin_manager(cwd, loader, runtime_config);
     let plugin_registry = plugin_manager.plugin_registry()?;
     let plugin_hook_config =
@@ -13047,6 +13432,7 @@ impl CliToolExecutor {
 
 impl ToolExecutor for CliToolExecutor {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+        tools::confined_tool_permitted(tool_name).map_err(ToolError::new)?;
         if self
             .allowed_tools
             .as_ref()
@@ -13275,6 +13661,14 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
+        "  --data-dir PATH            Store managed sessions outside the workspace under PATH/sessions/"
+    )?;
+    writeln!(
+        out,
+        "  --workspace-confine[=PATH] Controlled-smoke confinement of PATH (default: cwd): file tools bound beneath it, writes only to calculator.py, bash only the approved unittest command in a Bubblewrap sandbox; hooks, plugins and MCP servers disabled"
+    )?;
+    writeln!(
+        out,
         "  --dangerously-skip-permissions  Skip all permission checks"
     )?;
     writeln!(out, "  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)")?;
@@ -13362,7 +13756,7 @@ mod tests {
     use super::{
         build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
         classify_error_kind, collect_session_prompt_history, create_managed_session_handle,
-        default_permission_mode, describe_tool_progress, filter_tool_specs,
+        current_session_store, default_permission_mode, describe_tool_progress, filter_tool_specs,
         format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
         format_compact_report, format_connected_line, format_cost_report, format_history_timestamp,
         format_internal_prompt_progress_line, format_issue_report, format_model_report,
@@ -13370,23 +13764,23 @@ mod tests {
         format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
         format_tool_result, format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error,
-        maybe_parse_tool_result_json_envelope, merge_prompt_with_stdin, normalize_permission_mode,
-        parse_args, parse_args_with_terminal, parse_export_args, parse_git_status_branch,
-        parse_git_status_metadata_for, parse_git_workspace_summary, parse_history_count,
-        permission_policy, print_help_to, push_output_block, render_config_report,
-        render_diff_report, render_diff_report_for, render_help_topic, render_memory_report,
-        render_prompt_history_report, render_repl_help, render_resume_usage,
-        render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
-        resolve_model_env_alias, resolve_repl_model, resolve_session_reference, response_to_events,
-        resume_should_continue_interactively, resume_supported_slash_commands, run_resume_command,
-        runtime_mcp_inventory_json_for_loader, short_tool_id,
-        slash_command_completion_candidates_with_sessions, split_error_hint, status_context,
-        summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt, validate_model_syntax,
-        validate_no_args, write_mcp_server_fixture, write_mcp_tools_list_disconnect_fixture,
-        CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
-        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
-        PromptHistoryEntry, ResumeReplContext, RuntimePluginState, SlashCommand, StatusUsage,
-        DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
+        load_session_reference, maybe_parse_tool_result_json_envelope, merge_prompt_with_stdin,
+        normalize_permission_mode, parse_args, parse_args_with_terminal, parse_export_args,
+        parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
+        parse_history_count, parse_invocation_with_terminal, permission_policy, print_help_to,
+        push_output_block, render_config_report, render_diff_report, render_diff_report_for,
+        render_help_topic, render_memory_report, render_prompt_history_report, render_repl_help,
+        render_resume_usage, render_session_markdown, resolve_model_alias,
+        resolve_model_alias_with_config, resolve_model_env_alias, resolve_repl_model,
+        resolve_session_reference, response_to_events, resume_should_continue_interactively,
+        resume_supported_slash_commands, run_resume_command, runtime_mcp_inventory_json_for_loader,
+        short_tool_id, slash_command_completion_candidates_with_sessions, split_error_hint,
+        status_context, summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt,
+        validate_model_syntax, validate_no_args, write_mcp_server_fixture,
+        write_mcp_tools_list_disconnect_fixture, CliAction, CliOutputFormat, CliToolExecutor,
+        GitWorkspaceSummary, InternalPromptProgressEvent, InternalPromptProgressState, LiveCli,
+        LocalHelpTopic, PromptHistoryEntry, ResumeReplContext, RuntimePluginState, SlashCommand,
+        StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
     use api::{
         ApiError, InputContentBlock, MessageResponse, OutputContentBlock, ToolResultContentBlock,
@@ -15940,11 +16334,13 @@ mod tests {
         fs::create_dir_all(&root).expect("root dir");
 
         let banner = with_current_dir(&root, || {
+            let session_store = current_session_store(None).expect("session store");
             LiveCli::new(
                 "claude-sonnet-4-6".to_string(),
                 true,
                 None,
                 PermissionMode::DangerFullAccess,
+                session_store,
             )
             .expect("cli should initialize")
             .startup_banner()
@@ -16157,8 +16553,9 @@ mod tests {
 
         let (restored_messages, session_path, (session_id, fixture_session_id)) =
             with_current_dir(&workspace, || {
-                let handle =
-                    create_managed_session_handle("session-resume-target").expect("session handle");
+                let session_store = current_session_store(None).expect("session store");
+                let handle = create_managed_session_handle(&session_store, "session-resume-target")
+                    .expect("session handle");
                 let mut session = Session::new()
                     .with_workspace_root(workspace.clone())
                     .with_persistence_path(handle.path.clone());
@@ -16175,6 +16572,7 @@ mod tests {
                     true,
                     None,
                     PermissionMode::DangerFullAccess,
+                    session_store,
                 )
                 .expect("cli should initialize");
 
@@ -16216,7 +16614,9 @@ mod tests {
         std::fs::create_dir_all(&workspace).expect("workspace should create");
 
         let error = with_current_dir(&workspace, || {
-            let handle = create_managed_session_handle("session-foreign").expect("session handle");
+            let session_store = current_session_store(None).expect("session store");
+            let handle = create_managed_session_handle(&session_store, "session-foreign")
+                .expect("session handle");
             Session::new()
                 .with_workspace_root(PathBuf::from("/some/other/workspace"))
                 .with_persistence_path(handle.path.clone())
@@ -16228,6 +16628,7 @@ mod tests {
                 true,
                 None,
                 PermissionMode::DangerFullAccess,
+                session_store,
             )
             .expect("cli should initialize");
 
@@ -16453,13 +16854,13 @@ mod tests {
                 memory_file_count: 4,
                 project_root: Some(PathBuf::from("/tmp")),
                 git_branch: Some("main".to_string()),
-                git_summary: GitWorkspaceSummary {
+                git_summary: Some(GitWorkspaceSummary {
                     changed_files: 3,
                     staged_files: 1,
                     unstaged_files: 1,
                     untracked_files: 1,
                     conflicted_files: 0,
-                },
+                }),
                 sandbox_status: runtime::SandboxStatus::default(),
                 config_load_error: None,
             },
@@ -16713,7 +17114,8 @@ UU conflicted.rs",
 
         let session = Session::load_from_path(&session_path).expect("session should load");
         let outcome = with_current_dir(&root, || {
-            run_resume_command(&session_path, &session, &SlashCommand::Diff)
+            let session_store = current_session_store(None).expect("session store");
+            run_resume_command(&session_store, &session_path, &session, &SlashCommand::Diff)
                 .expect("resume diff should work")
         });
         let message = outcome.message.expect("diff message should exist");
@@ -16805,6 +17207,164 @@ UU conflicted.rs",
     }
 
     #[test]
+    fn missing_external_data_dir_value_is_rejected() {
+        let workspace = temp_workspace("missing-data-dir-value");
+        std::fs::create_dir_all(&workspace).expect("workspace should create");
+        let error = with_current_dir(&workspace, || {
+            parse_args_with_terminal(&["--data-dir".to_string()], false, false)
+                .expect_err("missing --data-dir value should fail")
+        });
+        assert_eq!(error, "missing value for --data-dir");
+        assert!(!workspace.join(".claw").exists());
+        std::fs::remove_dir_all(workspace).expect("workspace should clean up");
+    }
+
+    #[test]
+    fn help_documents_external_data_dir() {
+        let mut help = Vec::new();
+        print_help_to(&mut help).expect("help should render");
+        let help = String::from_utf8(help).expect("help should be utf8");
+        assert!(help.contains("--data-dir PATH"));
+        assert!(help.contains("Store managed sessions outside the workspace"));
+    }
+
+    #[test]
+    fn external_data_dir_is_parsed_once_for_managed_session_actions() {
+        let data_dir = PathBuf::from("/state/claw");
+        for args in [
+            vec![
+                "--data-dir".to_string(),
+                data_dir.display().to_string(),
+                "--resume".to_string(),
+                "latest".to_string(),
+            ],
+            vec![
+                "export".to_string(),
+                format!("--data-dir={}", data_dir.display()),
+                "--session".to_string(),
+                "latest".to_string(),
+            ],
+        ] {
+            let (_, parsed_data_dir) = parse_invocation_with_terminal(&args, false, false)
+                .expect("external data dir should parse");
+            assert_eq!(parsed_data_dir, Some(data_dir.clone()));
+        }
+    }
+
+    #[test]
+    fn default_session_store_remains_workspace_local() {
+        let workspace = temp_workspace("default-session-store");
+        std::fs::create_dir_all(&workspace).expect("workspace should create");
+
+        let sessions_dir = with_current_dir(&workspace, || {
+            current_session_store(None)
+                .expect("default session store should create")
+                .sessions_dir()
+                .to_path_buf()
+        });
+
+        assert!(sessions_dir.starts_with(workspace.join(".claw/sessions")));
+        assert!(workspace.join(".claw").is_dir());
+        std::fs::remove_dir_all(workspace).expect("workspace should clean up");
+    }
+
+    #[test]
+    fn explicit_data_dir_stores_sessions_outside_workspace() {
+        let root = temp_workspace("external-session-store");
+        let workspace = root.join("workspace");
+        let data_dir = root.join("state-root");
+        std::fs::create_dir_all(&workspace).expect("workspace should create");
+
+        with_current_dir(&workspace, || {
+            let session_store =
+                current_session_store(Some(&data_dir)).expect("external store should create");
+            let handle = create_managed_session_handle(&session_store, "session-external")
+                .expect("external handle should create");
+            Session::new()
+                .with_workspace_root(workspace.clone())
+                .with_persistence_path(handle.path.clone())
+                .save_to_path(&handle.path)
+                .expect("external session should save");
+
+            assert!(handle.path.starts_with(data_dir.join("sessions")));
+            assert!(handle.path.is_file());
+            assert!(!workspace.join(".claw").exists());
+        });
+
+        std::fs::remove_dir_all(root).expect("fixture root should clean up");
+    }
+
+    #[test]
+    fn external_data_dir_preserves_resume_latest_and_workspace_isolation() {
+        let root = temp_workspace("external-session-isolation");
+        let workspace_a = root.join("workspace-a");
+        let workspace_b = root.join("workspace-b");
+        let data_dir = root.join("state-root");
+        std::fs::create_dir_all(&workspace_a).expect("workspace a should create");
+        std::fs::create_dir_all(&workspace_b).expect("workspace b should create");
+
+        let (session_path, session_id, sessions_a) = with_current_dir(&workspace_a, || {
+            let session_store =
+                current_session_store(Some(&data_dir)).expect("workspace a store should create");
+            let handle = create_managed_session_handle(&session_store, "session-workspace-a")
+                .expect("workspace a handle should create");
+            let session = Session::new()
+                .with_workspace_root(workspace_a.clone())
+                .with_persistence_path(handle.path.clone());
+            let session_id = session.session_id.clone();
+            session
+                .save_to_path(&handle.path)
+                .expect("workspace a session should save");
+
+            let loaded = load_session_reference(&session_store, "session-workspace-a")
+                .expect("same-workspace session should load");
+            let latest = resolve_session_reference(&session_store, "latest")
+                .expect("latest should resolve from external store");
+            assert_eq!(loaded.0.path, handle.path);
+            assert_eq!(loaded.1.session_id, session_id);
+            assert_eq!(latest.path, handle.path);
+            (
+                handle.path,
+                session_id,
+                session_store.sessions_dir().to_path_buf(),
+            )
+        });
+
+        with_current_dir(&workspace_b, || {
+            let session_store =
+                current_session_store(Some(&data_dir)).expect("workspace b store should create");
+            assert_ne!(session_store.sessions_dir(), sessions_a);
+            let error = load_session_reference(&session_store, &session_path.display().to_string())
+                .expect_err("cross-workspace session should be rejected");
+            assert!(error.to_string().contains("session workspace mismatch"));
+        });
+
+        assert!(session_path.is_file());
+        assert!(!session_id.is_empty());
+        assert!(!workspace_a.join(".claw").exists());
+        assert!(!workspace_b.join(".claw").exists());
+        std::fs::remove_dir_all(root).expect("fixture root should clean up");
+    }
+
+    #[test]
+    fn inaccessible_explicit_data_dir_does_not_fall_back_to_workspace() {
+        let root = temp_workspace("inaccessible-external-session-store");
+        let workspace = root.join("workspace");
+        let data_dir = root.join("not-a-directory");
+        std::fs::create_dir_all(&workspace).expect("workspace should create");
+        std::fs::write(&data_dir, "fixture").expect("blocking file should create");
+
+        let error = with_current_dir(&workspace, || {
+            current_session_store(Some(&data_dir))
+                .expect_err("invalid external data dir should fail")
+                .to_string()
+        });
+        assert!(!error.is_empty());
+        assert!(!workspace.join(".claw").exists());
+        std::fs::remove_dir_all(root).expect("fixture root should clean up");
+    }
+
+    #[test]
     fn managed_sessions_default_to_jsonl_and_resolve_legacy_json() {
         let _guard = cwd_guard();
         let workspace = temp_workspace("session-resolution");
@@ -16812,7 +17372,9 @@ UU conflicted.rs",
         let previous = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(&workspace).expect("switch cwd");
 
-        let handle = create_managed_session_handle("session-alpha").expect("jsonl handle");
+        let session_store = current_session_store(None).expect("session store");
+        let handle =
+            create_managed_session_handle(&session_store, "session-alpha").expect("jsonl handle");
         assert!(handle.path.ends_with("session-alpha.jsonl"));
 
         let legacy_path = workspace.join(".claw/sessions/legacy.json");
@@ -16828,7 +17390,8 @@ UU conflicted.rs",
             .save_to_path(&legacy_path)
             .expect("legacy session should save");
 
-        let resolved = resolve_session_reference("legacy").expect("legacy session should resolve");
+        let resolved = resolve_session_reference(&session_store, "legacy")
+            .expect("legacy session should resolve");
         assert_eq!(
             resolved
                 .path
@@ -16851,19 +17414,23 @@ UU conflicted.rs",
         let previous = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(&workspace).expect("switch cwd");
 
-        let older = create_managed_session_handle("session-older").expect("older handle");
+        let session_store = current_session_store(None).expect("session store");
+        let older =
+            create_managed_session_handle(&session_store, "session-older").expect("older handle");
         Session::new()
             .with_persistence_path(older.path.clone())
             .save_to_path(&older.path)
             .expect("older session should save");
         std::thread::sleep(Duration::from_millis(20));
-        let newer = create_managed_session_handle("session-newer").expect("newer handle");
+        let newer =
+            create_managed_session_handle(&session_store, "session-newer").expect("newer handle");
         Session::new()
             .with_persistence_path(newer.path.clone())
             .save_to_path(&newer.path)
             .expect("newer session should save");
 
-        let resolved = resolve_session_reference("latest").expect("latest session should resolve");
+        let resolved = resolve_session_reference(&session_store, "latest")
+            .expect("latest session should resolve");
         assert_eq!(
             resolved
                 .path
@@ -16899,8 +17466,10 @@ UU conflicted.rs",
             .save_to_path(&session_path)
             .expect("session should save");
 
-        let error = crate::load_session_reference(&session_path.display().to_string())
-            .expect_err("mismatched workspace should fail");
+        let session_store = current_session_store(None).expect("session store");
+        let error =
+            crate::load_session_reference(&session_store, &session_path.display().to_string())
+                .expect_err("mismatched workspace should fail");
         assert!(
             error.to_string().contains("session workspace mismatch"),
             "unexpected error: {error}"
@@ -18323,6 +18892,366 @@ UU conflicted.rs",
                 "stub command {with_slash} should not appear in REPL completions"
             );
         }
+    }
+
+    // ---- PR #183 review repair: workspace-confine grammar (P2) ----
+
+    fn confine_args(args: &[&str]) -> Vec<String> {
+        args.iter().map(ToString::to_string).collect()
+    }
+
+    /// Terminal stdin/stdout, so an argument list left empty by a faulty
+    /// extractor parses to the REPL instead of waiting on piped stdin.
+    fn parse_confined(args: &[&str]) -> Result<(CliAction, Option<PathBuf>), String> {
+        super::parse_full_invocation_with_terminal(&confine_args(args), true, true)
+            .map(|(action, _, root)| (action, root))
+    }
+
+    #[test]
+    fn bare_workspace_confine_keeps_the_following_action_and_prompt() {
+        let cwd = temp_dir();
+        fs::create_dir_all(&cwd).expect("cwd");
+        let (action, root) = with_current_dir(&cwd, || {
+            parse_confined(&["--workspace-confine", "prompt", "repair calculator"])
+        })
+        .expect("bare flag followed by an action should parse");
+        assert_eq!(root, Some(fs::canonicalize(&cwd).expect("canonical cwd")));
+        assert!(
+            matches!(&action, CliAction::Prompt { prompt, .. } if prompt == "repair calculator"),
+            "the action and prompt must survive, got {action:?}"
+        );
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn bare_workspace_confine_keeps_a_positional_prompt() {
+        let cwd = temp_dir();
+        fs::create_dir_all(&cwd).expect("cwd");
+        let (action, root) = with_current_dir(&cwd, || {
+            parse_confined(&["--workspace-confine", "repair calculator"])
+        })
+        .expect("bare flag followed by a prompt should parse");
+        assert_eq!(root, Some(fs::canonicalize(&cwd).expect("canonical cwd")));
+        assert!(
+            matches!(&action, CliAction::Prompt { prompt, .. } if prompt == "repair calculator"),
+            "the positional prompt must survive, got {action:?}"
+        );
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn workspace_confine_equals_path_sets_an_absolute_or_relative_root() {
+        for (flag, expected) in [
+            ("--workspace-confine=/tmp/work", "/tmp/work"),
+            ("--workspace-confine=relative-work", "relative-work"),
+        ] {
+            let (action, root) = parse_confined(&[flag, "prompt", "repair calculator"])
+                .expect("explicit root should parse");
+            assert_eq!(root, Some(PathBuf::from(expected)));
+            assert!(
+                matches!(&action, CliAction::Prompt { prompt, .. } if prompt == "repair calculator"),
+                "the prompt must survive {flag}, got {action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_confine_rejects_an_empty_explicit_root() {
+        let error = parse_confined(&["--workspace-confine=", "prompt", "x"])
+            .expect_err("empty root must be refused");
+        assert_eq!(error, "missing value for --workspace-confine");
+    }
+
+    #[test]
+    fn workspace_confine_rejects_repeated_occurrences() {
+        for args in [
+            ["--workspace-confine", "--workspace-confine=/x"],
+            ["--workspace-confine=/x", "--workspace-confine"],
+            ["--workspace-confine=/x", "--workspace-confine=/y"],
+            ["--workspace-confine", "--workspace-confine"],
+        ] {
+            let error = super::extract_workspace_confine(&confine_args(&args))
+                .expect_err("a repeated confinement root is ambiguous");
+            assert_eq!(
+                error, "--workspace-confine may be given only once",
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_workspace_confine_never_consumes_a_separated_path() {
+        let cwd = temp_dir();
+        fs::create_dir_all(&cwd).expect("cwd");
+        let (filtered, root) = with_current_dir(&cwd, || {
+            super::extract_workspace_confine(&confine_args(&[
+                "--workspace-confine",
+                "/tmp/work",
+                "prompt",
+                "repair calculator",
+            ]))
+        })
+        .expect("extraction should succeed");
+        assert_eq!(
+            filtered,
+            confine_args(&["/tmp/work", "prompt", "repair calculator"]),
+            "the separated token must be left for ordinary parsing"
+        );
+        assert_eq!(
+            root,
+            Some(fs::canonicalize(&cwd).expect("canonical cwd")),
+            "a bare flag always confines to the current directory"
+        );
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    // ---- PR #183 review repair: no external integrations while confined (P1) ----
+
+    /// Workspace plus config home whose settings configure every hook stage
+    /// and one stdio MCP server; each only `touch`es a marker in `outside`.
+    struct IntegrationFixture {
+        root: PathBuf,
+        workspace: PathBuf,
+        config_home: PathBuf,
+        outside: PathBuf,
+    }
+
+    impl IntegrationFixture {
+        fn new() -> Self {
+            let root = temp_dir();
+            let fixture = Self {
+                workspace: root.join("ws"),
+                config_home: root.join("config"),
+                outside: root.join("outside"),
+                root,
+            };
+            for dir in [&fixture.workspace, &fixture.config_home, &fixture.outside] {
+                fs::create_dir_all(dir).expect("fixture dir");
+            }
+            let marker = |name: &str| fixture.outside.join(name).display().to_string();
+            fs::write(
+                fixture.config_home.join("settings.json"),
+                json!({
+                    "hooks": {
+                        "PreToolUse": [format!("touch '{}'", marker("hook-pre"))],
+                        "PostToolUse": [format!("touch '{}'", marker("hook-post"))],
+                        "PostToolUseFailure": [format!("touch '{}'", marker("hook-failure"))],
+                    },
+                    "mcpServers": {
+                        "probe": {
+                            "command": "sh",
+                            "args": ["-c", format!("touch '{}'; exit 0", marker("mcp-spawned"))],
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .expect("settings");
+            fixture
+        }
+
+        fn install_lifecycle_plugin(&self) {
+            let source = self.root.join("plugin-src");
+            fs::create_dir_all(source.join(".claude-plugin")).expect("manifest dir");
+            fs::create_dir_all(source.join("lifecycle")).expect("lifecycle dir");
+            fs::write(
+                source.join("lifecycle").join("init.sh"),
+                format!(
+                    "#!/bin/sh\ntouch '{}'\n",
+                    self.outside.join("plugin-init").display()
+                ),
+            )
+            .expect("init script");
+            fs::write(
+                source.join(".claude-plugin").join("plugin.json"),
+                r#"{"name":"confine-probe","version":"1.0.0","description":"probe","lifecycle":{"Init":["./lifecycle/init.sh"]}}"#,
+            )
+            .expect("manifest");
+            PluginManager::new(PluginManagerConfig::new(&self.config_home))
+                .install(source.to_str().expect("utf8"))
+                .expect("plugin install");
+        }
+
+        fn state(&self, integrations_disabled: bool) -> super::RuntimePluginState {
+            let loader = ConfigLoader::new(&self.workspace, &self.config_home);
+            let runtime_config = loader.load().expect("config");
+            super::build_runtime_plugin_state_for(
+                &self.workspace,
+                &loader,
+                &runtime_config,
+                integrations_disabled,
+            )
+            .expect("plugin state")
+        }
+
+        fn marker(&self, name: &str) -> bool {
+            self.outside.join(name).exists()
+        }
+    }
+
+    impl Drop for IntegrationFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// Provider that asks for one succeeding and one failing tool, then stops.
+    struct TwoToolApi {
+        calls: usize,
+    }
+
+    impl runtime::ApiClient for TwoToolApi {
+        fn stream(
+            &mut self,
+            _request: runtime::ApiRequest,
+        ) -> Result<Vec<AssistantEvent>, runtime::RuntimeError> {
+            self.calls += 1;
+            if self.calls == 1 {
+                return Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: "ok".to_string(),
+                        name: "read_file".to_string(),
+                        input: "{}".to_string(),
+                    },
+                    AssistantEvent::ToolUse {
+                        id: "fail".to_string(),
+                        name: "grep_search".to_string(),
+                        input: "{}".to_string(),
+                    },
+                    AssistantEvent::MessageStop,
+                ]);
+            }
+            Ok(vec![
+                AssistantEvent::TextDelta("done".to_string()),
+                AssistantEvent::MessageStop,
+            ])
+        }
+    }
+
+    struct OneFailingExecutor;
+
+    impl runtime::ToolExecutor for OneFailingExecutor {
+        fn execute(&mut self, tool_name: &str, _input: &str) -> Result<String, runtime::ToolError> {
+            if tool_name == "grep_search" {
+                Err(runtime::ToolError::new("probe failure"))
+            } else {
+                Ok("ok".to_string())
+            }
+        }
+    }
+
+    fn run_two_tool_turn(state: &super::RuntimePluginState) {
+        let mut runtime = super::cli_conversation_runtime(
+            Session::new(),
+            TwoToolApi { calls: 0 },
+            OneFailingExecutor,
+            runtime::PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+            &state.feature_config,
+        );
+        runtime.run_turn("go", None).expect("turn should finish");
+    }
+
+    #[test]
+    fn confined_runtime_runs_no_hook_commands() {
+        let fixture = IntegrationFixture::new();
+        run_two_tool_turn(&fixture.state(true));
+        for marker in ["hook-pre", "hook-post", "hook-failure"] {
+            assert!(!fixture.marker(marker), "{marker} ran while confined");
+        }
+    }
+
+    #[test]
+    fn unconfined_runtime_still_runs_hook_commands() {
+        let fixture = IntegrationFixture::new();
+        run_two_tool_turn(&fixture.state(false));
+        for marker in ["hook-pre", "hook-post", "hook-failure"] {
+            assert!(fixture.marker(marker), "{marker} must still run unconfined");
+        }
+    }
+
+    #[test]
+    fn confined_runtime_spawns_no_mcp_server() {
+        let fixture = IntegrationFixture::new();
+        let state = fixture.state(true);
+        assert!(
+            state.mcp_state.is_none(),
+            "no MCP state may exist while confined"
+        );
+        assert!(
+            !fixture.marker("mcp-spawned"),
+            "MCP server spawned while confined"
+        );
+    }
+
+    #[test]
+    fn unconfined_runtime_still_spawns_configured_mcp_servers() {
+        let fixture = IntegrationFixture::new();
+        let state = fixture.state(false);
+        assert!(
+            fixture.marker("mcp-spawned"),
+            "MCP server must still spawn unconfined"
+        );
+        if let Some(mcp_state) = state.mcp_state {
+            mcp_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .shutdown()
+                .expect("mcp shutdown");
+        }
+    }
+
+    fn build_plugin_runtime(state: super::RuntimePluginState) -> super::BuiltRuntime {
+        build_runtime_with_plugin_state(
+            Session::new(),
+            "confine-plugin-probe",
+            DEFAULT_MODEL.to_string(),
+            vec!["system".to_string()],
+            true,
+            false,
+            None,
+            PermissionMode::DangerFullAccess,
+            None,
+            state,
+        )
+        .expect("runtime should build")
+    }
+
+    #[test]
+    fn confined_runtime_initializes_no_plugin() {
+        let _guard = env_lock();
+        std::env::set_var("ANTHROPIC_API_KEY", "test-dummy-key-for-confine-probe");
+        let fixture = IntegrationFixture::new();
+        fixture.install_lifecycle_plugin();
+        let state = fixture.state(true);
+        assert!(state.plugin_registry.plugins().is_empty());
+        let mut runtime = build_plugin_runtime(state);
+        runtime.shutdown_plugins().expect("shutdown");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        assert!(
+            !fixture.marker("plugin-init"),
+            "plugin initialized while confined"
+        );
+    }
+
+    #[test]
+    fn unconfined_runtime_still_initializes_plugins() {
+        let _guard = env_lock();
+        std::env::set_var("ANTHROPIC_API_KEY", "test-dummy-key-for-confine-probe");
+        let fixture = IntegrationFixture::new();
+        fixture.install_lifecycle_plugin();
+        let mut runtime = build_plugin_runtime(fixture.state(false));
+        runtime.shutdown_plugins().expect("shutdown");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        assert!(
+            fixture.marker("plugin-init"),
+            "plugin must still initialize unconfined"
+        );
+    }
+
+    #[test]
+    fn integration_commands_stay_available_without_confinement() {
+        assert!(super::refuse_external_integration("`mcp`").is_ok());
     }
 }
 

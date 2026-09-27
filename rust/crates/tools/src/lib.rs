@@ -11,8 +11,10 @@ use api::{
 use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
-    check_freshness, dedupe_superseded_commit_events, edit_file, execute_bash, glob_search,
-    grep_search, load_system_prompt,
+    check_freshness,
+    contained::{approved_command, run_contained, ContainedRequest, ContainedTermination},
+    dedupe_superseded_commit_events, edit_file, execute_bash, glob_search, grep_search,
+    load_system_prompt,
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
@@ -26,10 +28,172 @@ use runtime::{
     GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventName,
     LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole, PermissionMode,
     PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError, Session, TaskPacket,
-    ToolError, ToolExecutor,
+    ToolError, ToolExecutor, WorkspaceRoot,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+/// Opt-in controlled-smoke confinement for the built-in tools.
+///
+/// Unset by default, so ordinary invocations keep their existing behavior.
+/// When the CLI is started with `--workspace-confine`, this is populated once
+/// before any tool runs. From then on:
+///
+/// - only [`CONFINED_TOOLS`] may run;
+/// - file tools resolve workspace-relative paths through the descriptor-bound
+///   [`WorkspaceRoot`] (`openat2` beneath the root, no symlinks, no mount
+///   crossings, no ambient CWD), and may modify only
+///   [`CONTROLLED_SMOKE_WRITABLE`];
+/// - `bash` runs only an approved command, inside the Bubblewrap sandbox of
+///   `runtime::contained`, and returns only after the sandbox's whole process
+///   tree is settled. There is no fallback to unsandboxed execution.
+static WORKSPACE_CONFINEMENT: std::sync::OnceLock<WorkspaceConfinement> =
+    std::sync::OnceLock::new();
+
+/// Bounded shell duration applied to confined `bash` calls when the model
+/// supplies no `timeout`, and as an upper bound when it supplies one.
+///
+/// `60_000` is not a new invented constant: it is the value the repository
+/// already uses for a tool call that has to terminate,
+/// `runtime::mcp_client::DEFAULT_MCP_TOOL_CALL_TIMEOUT_MS`.
+pub const CONFINED_BASH_TIMEOUT_MS: u64 = 60_000;
+
+/// Tools that may run under confinement; every other tool is refused.
+pub const CONFINED_TOOLS: &[&str] = &[
+    "read_file",
+    "write_file",
+    "edit_file",
+    "glob_search",
+    "grep_search",
+    "bash",
+];
+
+/// The only workspace files confined writes and edits may modify.
+pub const CONTROLLED_SMOKE_WRITABLE: &[&str] = &["calculator.py"];
+
+/// Fixture files that must be regular, single-link files when confinement is
+/// bound. `test_calculator.py` is the immutable oracle.
+pub const CONTROLLED_SMOKE_FIXTURE: &[&str] = &["calculator.py", "test_calculator.py"];
+
+/// An active confinement: the descriptor-bound workspace plus the bounded
+/// command duration applied to shell calls made under it.
+#[derive(Debug)]
+pub struct WorkspaceConfinement {
+    root: WorkspaceRoot,
+    bash_timeout_ms: u64,
+    halted: std::sync::atomic::AtomicBool,
+}
+
+impl WorkspaceConfinement {
+    /// Open and bind `root`, then validate the controlled fixture.
+    ///
+    /// Fails when the root cannot be opened or a designated fixture file is
+    /// missing, special or hardlinked, so a bad root is reported rather than
+    /// silently degrading to "no confinement".
+    pub fn new(root: impl AsRef<Path>, bash_timeout_ms: u64) -> Result<Self, String> {
+        if bash_timeout_ms == 0 {
+            return Err("workspace confinement bash timeout must be non-zero".to_string());
+        }
+        let root = WorkspaceRoot::bind(root.as_ref(), CONTROLLED_SMOKE_WRITABLE)
+            .map_err(|error| error.to_string())?;
+        root.verify_single_link_files(CONTROLLED_SMOKE_FIXTURE)
+            .map_err(|error| format!("controlled fixture rejected: {error}"))?;
+        Ok(Self {
+            root,
+            bash_timeout_ms,
+            halted: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    #[must_use]
+    pub fn root(&self) -> &WorkspaceRoot {
+        &self.root
+    }
+
+    #[must_use]
+    pub fn bash_timeout_ms(&self) -> u64 {
+        self.bash_timeout_ms
+    }
+
+    /// Refuse all further confined operations once a contained command could
+    /// not be proven settled.
+    fn ensure_not_halted(&self) -> Result<(), String> {
+        if self.halted.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(
+                "workspace confinement is halted: a contained command could not be \
+                 proven settled, so no further confined operations are permitted"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    fn halt(&self) {
+        self.halted.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Install the process-wide confinement. Returns an error if one is already
+/// installed, so a second, weaker root can never replace the first.
+pub fn set_workspace_confinement(confinement: WorkspaceConfinement) -> Result<(), String> {
+    WORKSPACE_CONFINEMENT
+        .set(confinement)
+        .map_err(|_| "workspace confinement is already set for this process".to_string())
+}
+
+/// The active confinement, if any.
+#[must_use]
+pub fn workspace_confinement() -> Option<&'static WorkspaceConfinement> {
+    WORKSPACE_CONFINEMENT.get()
+}
+
+/// Refuse tools outside [`CONFINED_TOOLS`] while confinement is active.
+///
+/// The single predicate for tool admission under confinement; the CLI calls
+/// it for runtime/MCP tools and [`execute_tool_with_enforcer`] for built-ins.
+pub fn confined_tool_permitted(name: &str) -> Result<(), String> {
+    confined_tool_permitted_with(name, workspace_confinement())
+}
+
+fn confined_tool_permitted_with(
+    name: &str,
+    confinement: Option<&WorkspaceConfinement>,
+) -> Result<(), String> {
+    match confinement {
+        Some(_) if !CONFINED_TOOLS.contains(&name) => Err(format!(
+            "tool `{name}` is not available under workspace confinement"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Apply a confinement to a `bash` request.
+///
+/// Kept separate from the global so it can be exercised directly: under a
+/// confinement, background execution is refused (it would outlive the bounded
+/// call and escape the duration bound) and the command duration is always
+/// bounded, whether or not the model supplied one.
+fn confine_bash_input(
+    mut input: BashCommandInput,
+    confinement: Option<&WorkspaceConfinement>,
+) -> Result<BashCommandInput, String> {
+    let Some(confinement) = confinement else {
+        return Ok(input);
+    };
+    if input.run_in_background.unwrap_or(false) {
+        return Err(
+            "background execution is not permitted under workspace confinement".to_string(),
+        );
+    }
+    if input.dangerously_disable_sandbox.unwrap_or(false) {
+        return Err(
+            "dangerouslyDisableSandbox is not permitted under workspace confinement".to_string(),
+        );
+    }
+    let cap = confinement.bash_timeout_ms();
+    input.timeout = Some(input.timeout.map_or(cap, |requested| requested.min(cap)));
+    Ok(input)
+}
 
 /// Global task registry shared across tool invocations within a session.
 fn global_lsp_registry() -> &'static LspRegistry {
@@ -1195,6 +1359,7 @@ fn execute_tool_with_enforcer(
     name: &str,
     input: &Value,
 ) -> Result<String, String> {
+    confined_tool_permitted(name)?;
     match name {
         "bash" => {
             // Parse input to get the command for permission classification
@@ -1906,11 +2071,119 @@ fn has_dangerous_paths(command: &str) -> bool {
 }
 
 fn run_bash(input: BashCommandInput) -> Result<String, String> {
+    if let Some(confinement) = workspace_confinement() {
+        return run_contained_bash(input, confinement);
+    }
     if let Some(output) = workspace_test_branch_preflight(&input.command) {
         return serde_json::to_string_pretty(&output).map_err(|error| error.to_string());
     }
     serde_json::to_string_pretty(&execute_bash(input).map_err(|error| error.to_string())?)
         .map_err(|error| error.to_string())
+}
+
+/// Confined `bash`: only an approved command, only from the bound workspace,
+/// only inside the settled sandbox. Never falls back to [`execute_bash`].
+fn run_contained_bash(
+    input: BashCommandInput,
+    confinement: &WorkspaceConfinement,
+) -> Result<String, String> {
+    use std::fmt::Write as _;
+
+    confinement.ensure_not_halted()?;
+    let input = confine_bash_input(input, Some(confinement))?;
+    let command = approved_command(&input.command).ok_or_else(|| {
+        format!(
+            "command {:?} is not approved for contained execution under workspace confinement",
+            input.command
+        )
+    })?;
+    let cwd = std::env::current_dir()
+        .map_err(|error| format!("cannot read the launcher working directory: {error}"))?;
+    if !confinement
+        .root()
+        .is_same_directory(&cwd)
+        .map_err(|error| format!("cannot verify the launcher working directory: {error}"))?
+    {
+        return Err(format!(
+            "launcher working directory {} is not the confined workspace {}; refusing to run",
+            cwd.display(),
+            confinement.root().display().display()
+        ));
+    }
+    let timeout_ms = input.timeout.unwrap_or(confinement.bash_timeout_ms());
+    let outcome = run_contained(&ContainedRequest {
+        root: confinement.root(),
+        command,
+        timeout: Duration::from_millis(timeout_ms),
+        cancel: None,
+    })
+    .map_err(|error| {
+        if error.is_settlement_failure() {
+            confinement.halt();
+        }
+        format!("containment failure: {error}")
+    })?;
+
+    let mut stderr = outcome.stderr;
+    let (interrupted, interpretation) = match outcome.termination {
+        ContainedTermination::Exited {
+            code: Some(0),
+            signal: None,
+        } => (false, None),
+        ContainedTermination::Exited { code, signal } => (
+            false,
+            Some(match (code, signal) {
+                (Some(code), _) => format!("exit_code:{code}"),
+                (None, Some(signal)) => format!("signal:{signal}"),
+                (None, None) => "exit_code:unknown".to_string(),
+            }),
+        ),
+        ContainedTermination::TimedOut => {
+            let _ = write!(stderr, "\nCommand exceeded timeout of {timeout_ms} ms");
+            (true, Some("timeout".to_string()))
+        }
+        ContainedTermination::Cancelled => (true, Some("cancelled".to_string())),
+    };
+    let mut stdout = outcome.stdout;
+    for (text, truncated) in [
+        (&mut stdout, outcome.stdout_truncated),
+        (&mut stderr, outcome.stderr_truncated),
+    ] {
+        if truncated {
+            let _ = write!(
+                text,
+                "\n\n[output truncated — exceeded {} bytes]",
+                runtime::contained::CAPTURE_LIMIT_BYTES
+            );
+        }
+    }
+    let no_output_expected = Some(stdout.trim().is_empty() && stderr.trim().is_empty());
+    let output = BashCommandOutput {
+        stdout,
+        stderr,
+        raw_output_path: None,
+        interrupted,
+        is_image: None,
+        background_task_id: None,
+        backgrounded_by_user: None,
+        assistant_auto_backgrounded: None,
+        dangerously_disable_sandbox: input.dangerously_disable_sandbox,
+        return_code_interpretation: interpretation,
+        no_output_expected,
+        structured_content: Some(vec![json!({
+            "containment": {
+                "launcher": "/usr/bin/bwrap",
+                "settled": true,
+                "namespaceInitPid": outcome.settlement.namespace_init_pid,
+                "pidNamespace": outcome.settlement.pid_namespace,
+                "residualProcesses": outcome.settlement.residual_processes,
+            }
+        })]),
+        persisted_output_path: None,
+        persisted_output_size: None,
+        sandbox_status: None,
+    };
+    serde_json::to_string_pretty(&output).map_err(|error| error.to_string())
 }
 
 fn workspace_test_branch_preflight(command: &str) -> Option<BashCommandOutput> {
@@ -2061,35 +2334,117 @@ fn branch_divergence_output(
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_read_file(input: ReadFileInput) -> Result<String, String> {
-    to_pretty_json(read_file(&input.path, input.offset, input.limit).map_err(io_to_string)?)
+    run_read_file_with(input, workspace_confinement())
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_read_file_with(
+    input: ReadFileInput,
+    confinement: Option<&WorkspaceConfinement>,
+) -> Result<String, String> {
+    let output = match confinement {
+        Some(confinement) => {
+            confinement.ensure_not_halted()?;
+            confinement
+                .root()
+                .read_file(&input.path, input.offset, input.limit)
+        }
+        None => read_file(&input.path, input.offset, input.limit),
+    };
+    to_pretty_json(output.map_err(io_to_string)?)
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_write_file(input: WriteFileInput) -> Result<String, String> {
-    to_pretty_json(write_file(&input.path, &input.content).map_err(io_to_string)?)
+    run_write_file_with(input, workspace_confinement())
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_write_file_with(
+    input: WriteFileInput,
+    confinement: Option<&WorkspaceConfinement>,
+) -> Result<String, String> {
+    let output = match confinement {
+        Some(confinement) => {
+            confinement.ensure_not_halted()?;
+            confinement.root().write_file(&input.path, &input.content)
+        }
+        None => write_file(&input.path, &input.content),
+    };
+    to_pretty_json(output.map_err(io_to_string)?)
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_edit_file(input: EditFileInput) -> Result<String, String> {
-    to_pretty_json(
-        edit_file(
+    run_edit_file_with(input, workspace_confinement())
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_edit_file_with(
+    input: EditFileInput,
+    confinement: Option<&WorkspaceConfinement>,
+) -> Result<String, String> {
+    let replace_all = input.replace_all.unwrap_or(false);
+    let output = match confinement {
+        Some(confinement) => {
+            confinement.ensure_not_halted()?;
+            confinement.root().edit_file(
+                &input.path,
+                &input.old_string,
+                &input.new_string,
+                replace_all,
+            )
+        }
+        None => edit_file(
             &input.path,
             &input.old_string,
             &input.new_string,
-            input.replace_all.unwrap_or(false),
-        )
-        .map_err(io_to_string)?,
-    )
+            replace_all,
+        ),
+    };
+    to_pretty_json(output.map_err(io_to_string)?)
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_glob_search(input: GlobSearchInputValue) -> Result<String, String> {
-    to_pretty_json(glob_search(&input.pattern, input.path.as_deref()).map_err(io_to_string)?)
+    run_glob_search_with(input, workspace_confinement())
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_glob_search_with(
+    input: GlobSearchInputValue,
+    confinement: Option<&WorkspaceConfinement>,
+) -> Result<String, String> {
+    let output = match confinement {
+        Some(confinement) => {
+            confinement.ensure_not_halted()?;
+            confinement
+                .root()
+                .glob_search(&input.pattern, input.path.as_deref())
+        }
+        None => glob_search(&input.pattern, input.path.as_deref()),
+    };
+    to_pretty_json(output.map_err(io_to_string)?)
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_grep_search(input: GrepSearchInput) -> Result<String, String> {
-    to_pretty_json(grep_search(&input).map_err(io_to_string)?)
+    run_grep_search_with(input, workspace_confinement())
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_grep_search_with(
+    input: GrepSearchInput,
+    confinement: Option<&WorkspaceConfinement>,
+) -> Result<String, String> {
+    let output = match confinement {
+        Some(confinement) => {
+            confinement.ensure_not_halted()?;
+            confinement.root().grep_search(&input)
+        }
+        None => grep_search(&input),
+    };
+    to_pretty_json(output.map_err(io_to_string)?)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -6128,13 +6483,18 @@ mod tests {
 
     use super::{
         agent_permission_policy, allowed_tools_for_subagent, classify_lane_failure,
-        derive_agent_state, execute_agent_with_spawn, execute_tool, extract_recovery_outcome,
-        final_assistant_text, global_cron_registry, maybe_commit_provenance, mvp_tool_specs,
-        permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
-        run_task_packet, AgentInput, AgentJob, GlobalToolRegistry, LaneEventName, LaneFailureClass,
-        ProviderRuntimeClient, SubagentToolExecutor,
+        confine_bash_input, confined_tool_permitted_with, derive_agent_state,
+        execute_agent_with_spawn, execute_tool, extract_recovery_outcome, final_assistant_text,
+        global_cron_registry, maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
+        persist_agent_terminal_state, push_output_block, run_contained_bash, run_edit_file_with,
+        run_glob_search_with, run_grep_search_with, run_read_file_with, run_task_packet,
+        run_write_file_with, AgentInput, AgentJob, BashCommandInput, EditFileInput,
+        GlobSearchInputValue, GlobalToolRegistry, LaneEventName, LaneFailureClass,
+        ProviderRuntimeClient, ReadFileInput, SubagentToolExecutor, WorkspaceConfinement,
+        WriteFileInput, CONFINED_BASH_TIMEOUT_MS,
     };
     use api::OutputContentBlock;
+    use runtime::GrepSearchInput;
     use runtime::ProviderFallbackConfig;
     use runtime::{
         permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, ConversationRuntime,
@@ -9682,5 +10042,668 @@ printf 'pwsh:%s' "$1"
             )
             .into_bytes()
         }
+    }
+
+    // ------------------------------------------------------------------
+    // North-Star CLI readiness: controlled-smoke confinement + command boundary
+    // ------------------------------------------------------------------
+
+    /// Disposable fixture mirroring the future North-Star smoke: a
+    /// deliberately wrong `add` plus the unit tests that catch it.
+    struct NorthStarFixture {
+        base: PathBuf,
+        workspace: PathBuf,
+        outside: PathBuf,
+    }
+
+    const NORTH_STAR_TESTS: &str = "import unittest\n\
+                 from calculator import add\n\n\
+                 class TestAdd(unittest.TestCase):\n\
+                 \x20   def test_positive(self):\n\
+                 \x20       self.assertEqual(add(2, 3), 5)\n\n\
+                 \x20   def test_negative(self):\n\
+                 \x20       self.assertEqual(add(-2, -3), -5)\n\n\
+                 \x20   def test_zero(self):\n\
+                 \x20       self.assertEqual(add(0, 0), 0)\n";
+
+    impl NorthStarFixture {
+        fn new(name: &str) -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos();
+            let base = std::env::temp_dir().join(format!("claw-northstar-{name}-{unique}"));
+            let workspace = base.join("workspace");
+            let outside = base.join("outside");
+            fs::create_dir_all(&workspace).expect("workspace should be created");
+            fs::create_dir_all(&outside).expect("outside dir should be created");
+            fs::write(
+                workspace.join("calculator.py"),
+                "def add(a, b):\n    return a - b\n",
+            )
+            .expect("calculator fixture should be written");
+            fs::write(workspace.join("test_calculator.py"), NORTH_STAR_TESTS)
+                .expect("test fixture should be written");
+            fs::write(outside.join("secret.txt"), "out-of-bounds content\n")
+                .expect("outside fixture should be written");
+            Self {
+                base,
+                workspace,
+                outside,
+            }
+        }
+
+        fn confinement(&self) -> WorkspaceConfinement {
+            WorkspaceConfinement::new(&self.workspace, CONFINED_BASH_TIMEOUT_MS)
+                .expect("confinement should bind to the fixture workspace")
+        }
+
+        fn outside_file(&self) -> String {
+            self.outside
+                .join("secret.txt")
+                .to_string_lossy()
+                .into_owned()
+        }
+
+        fn secret(&self) -> String {
+            fs::read_to_string(self.outside.join("secret.txt"))
+                .expect("outside fixture should still exist")
+        }
+    }
+
+    impl Drop for NorthStarFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.base);
+        }
+    }
+
+    fn read_input(path: &str) -> ReadFileInput {
+        serde_json::from_value(json!({ "path": path })).expect("read input should parse")
+    }
+
+    fn write_input(path: &str, content: &str) -> WriteFileInput {
+        serde_json::from_value(json!({ "path": path, "content": content }))
+            .expect("write input should parse")
+    }
+
+    fn edit_input(path: &str, old: &str, new: &str) -> EditFileInput {
+        serde_json::from_value(json!({
+            "path": path,
+            "old_string": old,
+            "new_string": new,
+        }))
+        .expect("edit input should parse")
+    }
+
+    #[test]
+    fn confined_file_tools_allow_the_north_star_fixture() {
+        let fixture = NorthStarFixture::new("allow");
+        let confinement = fixture.confinement();
+
+        let read = run_read_file_with(read_input("calculator.py"), Some(&confinement))
+            .expect("reading the fixture inside the workspace should succeed");
+        assert!(
+            read.contains("return a - b"),
+            "unexpected read payload: {read}"
+        );
+
+        run_read_file_with(read_input("test_calculator.py"), Some(&confinement))
+            .expect("reading the test fixture should succeed");
+
+        run_edit_file_with(
+            edit_input("calculator.py", "return a - b", "return a + b"),
+            Some(&confinement),
+        )
+        .expect("editing the designated file should succeed");
+
+        let patched = fs::read_to_string(fixture.workspace.join("calculator.py"))
+            .expect("patched fixture should be readable");
+        assert!(
+            patched.contains("return a + b"),
+            "edit did not apply: {patched}"
+        );
+    }
+
+    #[test]
+    fn confined_file_tools_resolve_against_the_bound_root_not_the_cwd() {
+        // The process CWD is wherever the test runner is; confined paths are
+        // relative to the bound descriptor regardless.
+        let fixture = NorthStarFixture::new("relative");
+        let confinement = fixture.confinement();
+        let payload = run_read_file_with(read_input("./calculator.py"), Some(&confinement))
+            .expect("relative path inside the workspace should be allowed");
+        assert!(payload.contains("return a - b"));
+    }
+
+    #[test]
+    fn confined_file_tools_deny_absolute_paths() {
+        let fixture = NorthStarFixture::new("absolute");
+        let confinement = fixture.confinement();
+        let inside = fixture
+            .workspace
+            .join("calculator.py")
+            .to_string_lossy()
+            .into_owned();
+
+        for path in [fixture.outside_file(), inside] {
+            let read = run_read_file_with(read_input(&path), Some(&confinement))
+                .expect_err("absolute reads must be denied");
+            assert!(read.contains("is absolute"), "unexpected error: {read}");
+            let write = run_write_file_with(write_input(&path, "pwned"), Some(&confinement))
+                .expect_err("absolute writes must be denied");
+            assert!(write.contains("is absolute"), "unexpected error: {write}");
+            run_edit_file_with(
+                edit_input(&path, "out-of-bounds", "pwned"),
+                Some(&confinement),
+            )
+            .expect_err("absolute edits must be denied");
+        }
+        assert_eq!(fixture.secret(), "out-of-bounds content\n");
+    }
+
+    #[test]
+    fn confined_file_tools_deny_parent_directory_traversal() {
+        let fixture = NorthStarFixture::new("traversal");
+        let confinement = fixture.confinement();
+
+        for path in ["../outside/secret.txt", "new-dir/../../outside/new.txt"] {
+            let read = run_read_file_with(read_input(path), Some(&confinement))
+                .expect_err("../ traversal read must be denied");
+            assert!(read.contains("`..`"), "unexpected error: {read}");
+            let write = run_write_file_with(write_input(path, "pwned"), Some(&confinement))
+                .expect_err("../ traversal write must be denied");
+            assert!(write.contains("`..`"), "unexpected error: {write}");
+        }
+        assert!(!fixture.workspace.join("new-dir").exists());
+        assert!(!fixture.outside.join("new.txt").exists());
+        assert_eq!(fixture.secret(), "out-of-bounds content\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confined_file_tools_deny_symlinks() {
+        let fixture = NorthStarFixture::new("symlink");
+        std::os::unix::fs::symlink(
+            fixture.outside.join("secret.txt"),
+            fixture.workspace.join("escape.txt"),
+        )
+        .expect("symlink should be created");
+        std::os::unix::fs::symlink(&fixture.outside, fixture.workspace.join("door"))
+            .expect("directory symlink should be created");
+        let confinement = fixture.confinement();
+
+        for path in ["escape.txt", "door/secret.txt"] {
+            let read = run_read_file_with(read_input(path), Some(&confinement))
+                .expect_err("symlink read must be denied");
+            assert!(read.contains("symlink"), "unexpected error: {read}");
+            run_write_file_with(write_input(path, "pwned"), Some(&confinement))
+                .expect_err("symlink write must be denied");
+        }
+        run_write_file_with(write_input("door/planted.txt", "pwned"), Some(&confinement))
+            .expect_err("a new file through a symlinked parent must be denied");
+        assert!(!fixture.outside.join("planted.txt").exists());
+        assert_eq!(fixture.secret(), "out-of-bounds content\n");
+    }
+
+    #[test]
+    fn confined_writes_are_limited_to_the_designated_file() {
+        let fixture = NorthStarFixture::new("designated");
+        let confinement = fixture.confinement();
+        let oracle = run_write_file_with(
+            write_input("test_calculator.py", "pwned"),
+            Some(&confinement),
+        )
+        .expect_err("the test oracle must not be writable");
+        assert!(oracle.contains("designated"), "unexpected error: {oracle}");
+        run_edit_file_with(
+            edit_input("test_calculator.py", "assertEqual", "assertNotEqual"),
+            Some(&confinement),
+        )
+        .expect_err("the test oracle must not be editable");
+        run_write_file_with(write_input("new.py", "x"), Some(&confinement))
+            .expect_err("confined tools never create files");
+        assert_eq!(
+            fs::read_to_string(fixture.workspace.join("test_calculator.py"))
+                .expect("oracle should exist"),
+            NORTH_STAR_TESTS
+        );
+        assert!(!fixture.workspace.join("new.py").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confined_search_tools_stay_beneath_the_root() {
+        let fixture = NorthStarFixture::new("search");
+        std::os::unix::fs::symlink(&fixture.outside, fixture.workspace.join("dir-link"))
+            .expect("directory symlink should be created");
+        let confinement = fixture.confinement();
+
+        for value in [
+            json!({ "pattern": "*.txt", "path": fixture.outside.to_string_lossy() }),
+            json!({ "pattern": "../outside/*" }),
+            json!({ "pattern": fixture.outside.join("*").to_string_lossy() }),
+            json!({ "pattern": "{../outside/*,*.py}" }),
+            json!({ "pattern": "*", "path": "dir-link" }),
+        ] {
+            let input: GlobSearchInputValue =
+                serde_json::from_value(value.clone()).expect("glob input should parse");
+            run_glob_search_with(input, Some(&confinement))
+                .expect_err(&format!("glob must be denied: {value}"));
+        }
+        let listed: GlobSearchInputValue =
+            serde_json::from_value(json!({ "pattern": "**/*" })).expect("glob input should parse");
+        let listed = run_glob_search_with(listed, Some(&confinement)).expect("glob");
+        assert!(
+            !listed.contains("secret"),
+            "glob followed a symlink: {listed}"
+        );
+        assert!(listed.contains("calculator.py"));
+
+        let grep_input: GrepSearchInput = serde_json::from_value(
+            json!({ "pattern": "bounds", "path": fixture.outside.to_string_lossy() }),
+        )
+        .expect("grep input should parse");
+        run_grep_search_with(grep_input, Some(&confinement))
+            .expect_err("grep outside the workspace must be denied");
+        let grep_input: GrepSearchInput =
+            serde_json::from_value(json!({ "pattern": "bounds", "output_mode": "content" }))
+                .expect("grep input should parse");
+        let found = run_grep_search_with(grep_input, Some(&confinement)).expect("grep");
+        assert!(
+            !found.contains("out-of-bounds"),
+            "grep left the root: {found}"
+        );
+    }
+
+    #[test]
+    fn confinement_rejects_a_hardlinked_fixture() {
+        let fixture = NorthStarFixture::new("hardlink");
+        fs::hard_link(
+            fixture.workspace.join("calculator.py"),
+            fixture.outside.join("calculator-link.py"),
+        )
+        .expect("hardlink should be created");
+        let error = WorkspaceConfinement::new(&fixture.workspace, CONFINED_BASH_TIMEOUT_MS)
+            .expect_err("a hardlinked designated file must reject the fixture");
+        assert!(error.contains("controlled fixture rejected"), "{error}");
+        assert!(error.contains("hard links"), "{error}");
+    }
+
+    #[test]
+    fn confinement_admits_only_the_confined_tools() {
+        let fixture = NorthStarFixture::new("admission");
+        let confinement = fixture.confinement();
+        for tool in super::CONFINED_TOOLS {
+            confined_tool_permitted_with(tool, Some(&confinement))
+                .expect("confined tools are admitted");
+        }
+        for tool in [
+            "REPL",
+            "PowerShell",
+            "Agent",
+            "WebFetch",
+            "TodoWrite",
+            "NotebookEdit",
+            "MCP",
+        ] {
+            let error = confined_tool_permitted_with(tool, Some(&confinement))
+                .expect_err("other tools are refused under confinement");
+            assert!(error.contains("not available under workspace confinement"));
+        }
+        // NEGATIVE CONTROL: without confinement nothing is refused here.
+        confined_tool_permitted_with("REPL", None).expect("unconfined admission is unchanged");
+    }
+
+    // --- negative controls: confinement disabled -----------------------
+
+    #[test]
+    fn unconfined_file_tools_keep_existing_behavior() {
+        let fixture = NorthStarFixture::new("unconfined");
+
+        // NEGATIVE CONTROL for every confinement assertion above: with the
+        // mechanism disabled the exact same outside read succeeds, so the
+        // denials are produced by the confinement and not by a broken path.
+        let read = run_read_file_with(read_input(&fixture.outside_file()), None)
+            .expect("unconfined read outside the workspace still succeeds");
+        assert!(
+            read.contains("out-of-bounds content"),
+            "unexpected payload: {read}"
+        );
+    }
+
+    #[test]
+    fn workspace_confinement_refuses_an_unresolvable_root() {
+        let missing = std::env::temp_dir().join("claw-northstar-missing-root-does-not-exist");
+        let error = WorkspaceConfinement::new(&missing, CONFINED_BASH_TIMEOUT_MS)
+            .expect_err("an unresolvable confinement root must fail loudly");
+        assert!(
+            error.contains("workspace confinement root"),
+            "unexpected error: {error}"
+        );
+    }
+
+    // --- shell containment ---------------------------------------------
+
+    fn bash_input(value: serde_json::Value) -> BashCommandInput {
+        serde_json::from_value(value).expect("bash input should parse")
+    }
+
+    const SMOKE_COMMAND: &str = "python3 -B -m unittest -v test_calculator";
+
+    #[test]
+    fn confined_bash_bounds_command_duration() {
+        let fixture = NorthStarFixture::new("bash-timeout");
+        let confinement = fixture.confinement();
+
+        let defaulted = confine_bash_input(
+            bash_input(json!({ "command": SMOKE_COMMAND })),
+            Some(&confinement),
+        )
+        .expect("the smoke command should be accepted");
+        assert_eq!(
+            defaulted.timeout,
+            Some(CONFINED_BASH_TIMEOUT_MS),
+            "a model that supplies no timeout must still be bounded"
+        );
+
+        let capped = confine_bash_input(
+            bash_input(json!({ "command": SMOKE_COMMAND, "timeout": 86_400_000u64 })),
+            Some(&confinement),
+        )
+        .expect("an over-long timeout should be capped, not rejected");
+        assert_eq!(capped.timeout, Some(CONFINED_BASH_TIMEOUT_MS));
+
+        let preserved = confine_bash_input(
+            bash_input(json!({ "command": SMOKE_COMMAND, "timeout": 5_000u64 })),
+            Some(&confinement),
+        )
+        .expect("a shorter timeout should be preserved");
+        assert_eq!(preserved.timeout, Some(5_000));
+    }
+
+    #[test]
+    fn confined_bash_refuses_background_and_sandbox_opt_out() {
+        let fixture = NorthStarFixture::new("bash-background");
+        let confinement = fixture.confinement();
+
+        let background = confine_bash_input(
+            bash_input(json!({ "command": SMOKE_COMMAND, "run_in_background": true })),
+            Some(&confinement),
+        )
+        .expect_err("background execution must be refused under confinement");
+        assert!(
+            background.contains("background execution"),
+            "unexpected error: {background}"
+        );
+
+        let unsandboxed = confine_bash_input(
+            bash_input(json!({ "command": SMOKE_COMMAND, "dangerouslyDisableSandbox": true })),
+            Some(&confinement),
+        )
+        .expect_err("sandbox opt-out must be refused under confinement");
+        assert!(
+            unsandboxed.contains("dangerouslyDisableSandbox"),
+            "unexpected error: {unsandboxed}"
+        );
+    }
+
+    #[test]
+    fn unconfined_bash_keeps_existing_behavior() {
+        // NEGATIVE CONTROL for both shell assertions: with confinement off,
+        // the same inputs pass through untouched.
+        let unbounded = confine_bash_input(bash_input(json!({ "command": SMOKE_COMMAND })), None)
+            .expect("unconfined bash should pass through");
+        assert_eq!(
+            unbounded.timeout, None,
+            "confinement disabled must not bound the call"
+        );
+
+        let background = confine_bash_input(
+            bash_input(json!({ "command": SMOKE_COMMAND, "run_in_background": true })),
+            None,
+        )
+        .expect("unconfined background execution is still permitted");
+        assert_eq!(background.run_in_background, Some(true));
+    }
+
+    /// The command boundary itself is the existing production permission
+    /// policy: `bash` requires `DangerFullAccess`, so under `workspace-write`
+    /// it is denied unless an explicit allow rule matches the command.
+    fn smoke_command_policy() -> PermissionPolicy {
+        let rules = runtime::RuntimePermissionRuleConfig::new(
+            vec![format!("bash({SMOKE_COMMAND})")],
+            Vec::new(),
+            Vec::new(),
+        );
+        mvp_tool_specs().into_iter().fold(
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite).with_permission_rules(&rules),
+            |policy, spec| policy.with_tool_requirement(spec.name, spec.required_permission),
+        )
+    }
+
+    fn bash_decision(policy: &PermissionPolicy, input: serde_json::Value) -> bool {
+        matches!(
+            policy.authorize("bash", &input.to_string(), None),
+            runtime::PermissionOutcome::Allow
+        )
+    }
+
+    #[test]
+    fn command_boundary_allows_only_the_exact_smoke_command() {
+        let policy = smoke_command_policy();
+        assert!(
+            bash_decision(&policy, json!({ "command": SMOKE_COMMAND })),
+            "the exact bounded smoke command must be allowed"
+        );
+    }
+
+    #[test]
+    fn command_boundary_denies_unauthorized_command_classes() {
+        let policy = smoke_command_policy();
+        for command in [
+            // version control
+            "git push origin main",
+            "git status",
+            // network
+            "curl https://example.com",
+            "wget https://example.com/x",
+            "ssh user@host",
+            // package installers
+            "pip install requests",
+            "npm install left-pad",
+            "apt-get install -y curl",
+            "cargo install ripgrep",
+            // service management
+            "systemctl restart n8n",
+            "service nginx reload",
+            // containers
+            "docker run -it ubuntu",
+            "podman ps",
+            // model management
+            "ollama pull qwen3:14b",
+            "ollama list",
+            // chaining another command onto the authorized one
+            "python3 -B -m unittest -v test_calculator && curl https://example.com",
+            "python3 -B -m unittest -v test_calculator; git push",
+            "python3 -B -m unittest -v test_calculator | tee /etc/passwd",
+            // redirection outside the workspace
+            "python3 -B -m unittest -v test_calculator > /etc/cron.d/pwn",
+            "python3 -B -m unittest -v test_calculator >> ../outside/log",
+            // parent-directory and absolute outside writes
+            "cp calculator.py ../outside/",
+            "echo pwned > /tmp/pwned",
+            // near-misses on the authorized command
+            "python3 -B -m unittest -v test_calculator extra",
+            " python3 -B -m unittest -v test_calculator",
+            "python3 -m unittest -v test_calculator",
+        ] {
+            assert!(
+                !bash_decision(&policy, json!({ "command": command })),
+                "command must be denied by the smoke policy: {command}"
+            );
+        }
+    }
+
+    fn sandbox_ready() -> bool {
+        let ready = std::path::Path::new("/usr/bin/bwrap").is_file()
+            && Command::new("/usr/bin/bwrap")
+                .args([
+                    "--unshare-user",
+                    "--unshare-pid",
+                    "--unshare-net",
+                    "--ro-bind",
+                    "/usr",
+                    "/usr",
+                    "--symlink",
+                    "usr/lib64",
+                    "/lib64",
+                    "--symlink",
+                    "usr/lib",
+                    "/lib",
+                    "/usr/bin/python3",
+                    "--version",
+                ])
+                .output()
+                .is_ok_and(|output| output.status.success());
+        if !ready {
+            eprintln!("skipping: Bubblewrap user-namespace sandbox unavailable on this host");
+        }
+        ready
+    }
+
+    fn contained_output(result: Result<String, String>) -> serde_json::Value {
+        serde_json::from_str(&result.expect("contained command should run"))
+            .expect("bash output should be JSON")
+    }
+
+    /// Runs the authorized smoke command through the *production* confined
+    /// shell path (`run_contained_bash` -> Bubblewrap) in the disposable
+    /// fixture. Offline end to end: no model, no network, no service.
+    #[test]
+    fn confined_shell_runs_the_north_star_loop_offline() {
+        if !sandbox_ready() {
+            return;
+        }
+        let fixture = NorthStarFixture::new("shell-loop");
+        let confinement = fixture.confinement();
+        let _guard = env_lock().lock().unwrap_or_else(|error| error.into_inner());
+        let previous = std::env::current_dir().expect("cwd should be readable");
+        std::env::set_current_dir(&fixture.workspace).expect("cwd should move into the fixture");
+
+        let before = run_contained_bash(
+            bash_input(json!({ "command": SMOKE_COMMAND })),
+            &confinement,
+        );
+        let edited = run_edit_file_with(
+            edit_input("calculator.py", "return a - b", "return a + b"),
+            Some(&confinement),
+        );
+        let after = run_contained_bash(
+            bash_input(json!({ "command": SMOKE_COMMAND })),
+            &confinement,
+        );
+        let unapproved = run_contained_bash(
+            bash_input(json!({ "command": "python3 -m unittest -v test_calculator" })),
+            &confinement,
+        );
+
+        std::env::set_current_dir(previous).expect("cwd should be restored");
+
+        let before = contained_output(before);
+        assert_eq!(before["interrupted"], false);
+        assert_eq!(before["returnCodeInterpretation"], "exit_code:1");
+        assert!(
+            before["stderr"]
+                .as_str()
+                .is_some_and(|stderr| stderr.contains("FAILED (failures=2)")),
+            "the wrong `add` must fail its unit tests: {before}"
+        );
+        assert_eq!(
+            before["structuredContent"][0]["containment"]["residualProcesses"],
+            0
+        );
+
+        edited.expect("repairing the fixture through the confined edit tool should succeed");
+
+        let after = contained_output(after);
+        assert!(after["returnCodeInterpretation"].is_null(), "{after}");
+        assert!(
+            after["stderr"].as_str().is_some_and(
+                |stderr| stderr.contains("Ran 3 tests") && stderr.trim_end().ends_with("OK")
+            ),
+            "the repaired `add` must pass its unit tests: {after}"
+        );
+        let unapproved = unapproved.expect_err("only the approved command may run");
+        assert!(unapproved.contains("not approved"), "{unapproved}");
+        assert_eq!(
+            fs::read_to_string(fixture.workspace.join("test_calculator.py"))
+                .expect("oracle should exist"),
+            NORTH_STAR_TESTS
+        );
+    }
+
+    #[test]
+    fn confined_shell_contains_code_imported_by_the_approved_command() {
+        if !sandbox_ready() {
+            return;
+        }
+        let fixture = NorthStarFixture::new("imported-code");
+        let confinement = fixture.confinement();
+        let marker = fixture.outside.join("shell-side-effect.txt");
+        run_write_file_with(
+            write_input(
+                "calculator.py",
+                &format!(
+                    "import pathlib\ntry:\n    pathlib.Path({marker:?}).write_text('ESCAPED')\nexcept OSError:\n    pass\n\ndef add(a, b):\n    return a + b\n"
+                ),
+            ),
+            Some(&confinement),
+        )
+        .expect("the designated file is writable");
+        let _guard = env_lock().lock().unwrap_or_else(|error| error.into_inner());
+        let previous = std::env::current_dir().expect("cwd should be readable");
+        std::env::set_current_dir(&fixture.workspace).expect("cwd should move into the fixture");
+        let result = run_contained_bash(
+            bash_input(json!({ "command": SMOKE_COMMAND })),
+            &confinement,
+        );
+        std::env::set_current_dir(previous).expect("cwd should be restored");
+        let output = contained_output(result);
+        assert!(output["returnCodeInterpretation"].is_null(), "{output}");
+        assert!(
+            !marker.exists(),
+            "imported code wrote outside the workspace"
+        );
+    }
+
+    #[test]
+    fn confined_shell_refuses_a_launcher_cwd_outside_the_workspace() {
+        let fixture = NorthStarFixture::new("outside-cwd");
+        let confinement = fixture.confinement();
+        let _guard = env_lock().lock().unwrap_or_else(|error| error.into_inner());
+        let previous = std::env::current_dir().expect("cwd should be readable");
+        std::env::set_current_dir(&fixture.outside).expect("cwd should move outside");
+        let result = run_contained_bash(
+            bash_input(json!({ "command": SMOKE_COMMAND })),
+            &confinement,
+        );
+        std::env::set_current_dir(previous).expect("cwd should be restored");
+        let error = result.expect_err("an outside launcher CWD must be refused");
+        assert!(error.contains("not the confined workspace"), "{error}");
+    }
+
+    #[test]
+    fn command_boundary_default_denies_bash_without_an_allow_rule() {
+        // NEGATIVE CONTROL for the command boundary: drop the allow rule and
+        // even the authorized smoke command is denied, proving the allow rule
+        // (not some unrelated default) is what admits it.
+        let policy = mvp_tool_specs().into_iter().fold(
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            |policy, spec| policy.with_tool_requirement(spec.name, spec.required_permission),
+        );
+        assert!(
+            !bash_decision(&policy, json!({ "command": SMOKE_COMMAND })),
+            "bash must be default-denied when no allow rule matches"
+        );
     }
 }
