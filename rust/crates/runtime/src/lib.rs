@@ -11,6 +11,7 @@ pub mod branch_lock;
 mod compact;
 mod config;
 pub mod config_validate;
+pub mod contained;
 mod conversation;
 mod file_ops;
 mod git_context;
@@ -76,7 +77,7 @@ pub use conversation::{
 pub use file_ops::{
     edit_file, glob_search, grep_search, read_file, write_file, EditFileOutput, GlobSearchOutput,
     GrepSearchInput, GrepSearchOutput, ReadFileOutput, StructuredPatchHunk, TextFilePayload,
-    WriteFileOutput,
+    WorkspaceRoot, WriteFileOutput,
 };
 pub use git_context::{GitCommitEntry, GitContext};
 pub use hooks::{

@@ -199,6 +199,8 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--dangerously-skip-permissions",
     "--allowedTools",
     "--allowed-tools",
+    "--data-dir",
+    "--workspace-confine",
     "--resume",
     "--acp",
     "-acp",
@@ -350,7 +352,16 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
-    match parse_args(&args)? {
+    let (action, data_dir, confine_root) = parse_full_invocation_with_terminal(
+        &args,
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+    )?;
+    if let Some(root) = confine_root {
+        let confinement = tools::WorkspaceConfinement::new(&root, tools::CONFINED_BASH_TIMEOUT_MS)?;
+        tools::set_workspace_confinement(confinement)?;
+    }
+    match action {
         CliAction::DumpManifests {
             output_format,
             manifests_dir,
@@ -383,7 +394,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             session_path,
             commands,
             output_format,
-        } => resume_session(&session_path, &commands, output_format),
+        } => {
+            let session_store = current_session_store(data_dir.as_deref())?;
+            resume_session(&session_store, &session_path, &commands, output_format);
+        }
         CliAction::ResumeRepl {
             session_reference,
             context,
@@ -395,6 +409,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             context.reasoning_effort,
             context.allow_broad_cwd,
             Some(session_reference),
+            data_dir,
         )?,
         CliAction::Status {
             model,
@@ -432,7 +447,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
-            let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
+            let session_store = current_session_store(data_dir.as_deref())?;
+            let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode, session_store)?;
             cli.set_reasoning_effort(reasoning_effort);
             cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
         }
@@ -473,7 +489,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             session_reference,
             output_path,
             output_format,
-        } => run_export(&session_reference, output_path.as_deref(), output_format)?,
+        } => {
+            let session_store = current_session_store(data_dir.as_deref())?;
+            run_export(
+                &session_store,
+                &session_reference,
+                output_path.as_deref(),
+                output_format,
+            )?;
+        }
         CliAction::Repl {
             model,
             allowed_tools,
@@ -489,6 +513,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             reasoning_effort,
             allow_broad_cwd,
             None,
+            data_dir,
         )?,
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
@@ -3851,7 +3876,11 @@ impl CliOutputFormat {
 
 /// Production entry point: probe the real terminal state and parse.
 fn parse_args(args: &[String]) -> Result<CliAction, String> {
-    parse_args_with_terminal(
+    parse_invocation(args).map(|(action, _)| action)
+}
+
+fn parse_invocation(args: &[String]) -> Result<(CliAction, Option<PathBuf>), String> {
+    parse_invocation_with_terminal(
         args,
         std::io::stdin().is_terminal(),
         std::io::stdout().is_terminal(),
@@ -3860,8 +3889,112 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
 
 /// Parse with terminal state injected, so interactive-vs-automation behavior
 /// is deterministic under test regardless of how the runner is invoked.
-#[allow(clippy::too_many_lines)]
 fn parse_args_with_terminal(
+    args: &[String],
+    stdin_is_tty: bool,
+    stdout_is_tty: bool,
+) -> Result<CliAction, String> {
+    parse_invocation_with_terminal(args, stdin_is_tty, stdout_is_tty).map(|(action, _)| action)
+}
+
+fn parse_invocation_with_terminal(
+    args: &[String],
+    stdin_is_tty: bool,
+    stdout_is_tty: bool,
+) -> Result<(CliAction, Option<PathBuf>), String> {
+    parse_full_invocation_with_terminal(args, stdin_is_tty, stdout_is_tty)
+        .map(|(action, data_dir, _)| (action, data_dir))
+}
+
+/// Parsed invocation including the opt-in workspace confinement root.
+///
+/// `--workspace-confine` is extracted here, alongside `--data-dir`, rather
+/// than threaded through every `CliAction`, because it is a process-level
+/// policy rather than a per-action argument.
+fn parse_full_invocation_with_terminal(
+    args: &[String],
+    stdin_is_tty: bool,
+    stdout_is_tty: bool,
+) -> Result<(CliAction, Option<PathBuf>, Option<PathBuf>), String> {
+    let (filtered_args, data_dir) = extract_data_dir(args)?;
+    let (filtered_args, confine_root) = extract_workspace_confine(&filtered_args)?;
+    let action = parse_args_core(&filtered_args, stdin_is_tty, stdout_is_tty)?;
+    Ok((action, data_dir, confine_root))
+}
+
+/// Extract `--workspace-confine [PATH]`.
+///
+/// The value is optional: a bare `--workspace-confine` confines to the
+/// current working directory, which is the workspace the CLI already treats
+/// as its root.
+fn extract_workspace_confine(args: &[String]) -> Result<(Vec<String>, Option<PathBuf>), String> {
+    let mut filtered = Vec::with_capacity(args.len());
+    let mut root = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--workspace-confine" => {
+                match args.get(index + 1).filter(|value| !value.starts_with('-')) {
+                    Some(value) => {
+                        root = Some(PathBuf::from(value));
+                        index += 2;
+                    }
+                    None => {
+                        root = Some(env::current_dir().map_err(|error| error.to_string())?);
+                        index += 1;
+                    }
+                }
+            }
+            flag if flag.starts_with("--workspace-confine=") => {
+                let value = &flag["--workspace-confine=".len()..];
+                if value.is_empty() {
+                    return Err("missing value for --workspace-confine".to_string());
+                }
+                root = Some(PathBuf::from(value));
+                index += 1;
+            }
+            _ => {
+                filtered.push(args[index].clone());
+                index += 1;
+            }
+        }
+    }
+    Ok((filtered, root))
+}
+
+fn extract_data_dir(args: &[String]) -> Result<(Vec<String>, Option<PathBuf>), String> {
+    let mut filtered = Vec::with_capacity(args.len());
+    let mut data_dir = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--data-dir" => {
+                let value = args
+                    .get(index + 1)
+                    .filter(|value| !value.starts_with('-'))
+                    .ok_or_else(|| "missing value for --data-dir".to_string())?;
+                data_dir = Some(PathBuf::from(value));
+                index += 2;
+            }
+            flag if flag.starts_with("--data-dir=") => {
+                let value = &flag[11..];
+                if value.is_empty() {
+                    return Err("missing value for --data-dir".to_string());
+                }
+                data_dir = Some(PathBuf::from(value));
+                index += 1;
+            }
+            _ => {
+                filtered.push(args[index].clone());
+                index += 1;
+            }
+        }
+    }
+    Ok((filtered, data_dir))
+}
+
+#[allow(clippy::too_many_lines)]
+fn parse_args_core(
     args: &[String],
     stdin_is_tty: bool,
     stdout_is_tty: bool,
@@ -6450,9 +6583,14 @@ fn version_json_value() -> serde_json::Value {
 }
 
 #[allow(clippy::too_many_lines)]
-fn resume_session(session_path: &Path, commands: &[String], output_format: CliOutputFormat) {
+fn resume_session(
+    session_store: &runtime::SessionStore,
+    session_path: &Path,
+    commands: &[String],
+    output_format: CliOutputFormat,
+) {
     let session_reference = session_path.display().to_string();
-    let (handle, session) = match load_session_reference(&session_reference) {
+    let (handle, session) = match load_session_reference(session_store, &session_reference) {
         Ok(loaded) => loaded,
         Err(error) => {
             if output_format == CliOutputFormat::Json {
@@ -6562,7 +6700,7 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
                 std::process::exit(2);
             }
         };
-        match run_resume_command(&resolved_path, &session, &command) {
+        match run_resume_command(session_store, &resolved_path, &session, &command) {
             Ok(ResumeCommandOutcome {
                 session: next_session,
                 message,
@@ -6944,6 +7082,7 @@ fn parse_git_status_metadata_for(
 
 #[allow(clippy::too_many_lines)]
 fn run_resume_command(
+    session_store: &runtime::SessionStore,
     session_path: &Path,
     session: &Session,
     command: &SlashCommand,
@@ -7225,10 +7364,11 @@ fn run_resume_command(
             action: Some(ref act),
             ..
         } if act == "list" => {
-            let sessions = list_managed_sessions().unwrap_or_default();
+            let sessions = list_managed_sessions(session_store).unwrap_or_default();
             let session_ids: Vec<String> = sessions.iter().map(|s| s.id.clone()).collect();
             let active_id = session.session_id.clone();
-            let text = render_session_list(&active_id).unwrap_or_else(|e| format!("error: {e}"));
+            let text = render_session_list(session_store, &active_id)
+                .unwrap_or_else(|e| format!("error: {e}"));
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(text),
@@ -7391,6 +7531,7 @@ fn run_repl(
     reasoning_effort: Option<String>,
     allow_broad_cwd: bool,
     initial_resume: Option<String>,
+    data_dir: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
     run_stale_base_preflight(base_commit.as_deref());
@@ -7403,13 +7544,20 @@ fn run_repl(
     // just-created session instead of the operator's actual conversation.
     // Resolving first also fails fast on an unknown reference, before a REPL
     // banner or a throwaway session file has been produced.
+    let session_store = current_session_store(data_dir.as_deref())?;
     let resolved_resume = match initial_resume {
-        Some(reference) => Some(resolve_session_reference(&reference)?.path),
+        Some(reference) => Some(resolve_session_reference(&session_store, &reference)?.path),
         None => None,
     };
 
     let resolved_model = resolve_repl_model(model);
-    let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
+    let mut cli = LiveCli::new(
+        resolved_model,
+        true,
+        allowed_tools,
+        permission_mode,
+        session_store,
+    )?;
     cli.set_reasoning_effort(reasoning_effort);
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
@@ -7504,6 +7652,7 @@ struct LiveCli {
     permission_mode: PermissionMode,
     system_prompt: Vec<String>,
     runtime: BuiltRuntime,
+    session_store: runtime::SessionStore,
     session: SessionHandle,
     prompt_history: Vec<PromptHistoryEntry>,
 }
@@ -8331,10 +8480,11 @@ impl LiveCli {
         enable_tools: bool,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
+        session_store: runtime::SessionStore,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt()?;
         let session_state = new_cli_session()?;
-        let session = create_managed_session_handle(&session_state.session_id)?;
+        let session = create_managed_session_handle(&session_store, &session_state.session_id)?;
         let runtime = build_runtime(
             session_state.with_persistence_path(session.path.clone()),
             &session.id,
@@ -8352,6 +8502,7 @@ impl LiveCli {
             permission_mode,
             system_prompt,
             runtime,
+            session_store,
             session,
             prompt_history: Vec::new(),
         };
@@ -8413,7 +8564,7 @@ impl LiveCli {
         Ok(slash_command_completion_candidates_with_sessions(
             &self.model,
             Some(&self.session.id),
-            list_managed_sessions()?
+            list_managed_sessions(&self.session_store)?
                 .into_iter()
                 .map(|session| session.id)
                 .collect(),
@@ -8948,7 +9099,8 @@ impl LiveCli {
 
         let previous_session = self.session.clone();
         let session_state = new_cli_session()?;
-        self.session = create_managed_session_handle(&session_state.session_id)?;
+        self.session =
+            create_managed_session_handle(&self.session_store, &session_state.session_id)?;
         let runtime = build_runtime(
             session_state.with_persistence_path(self.session.path.clone()),
             &self.session.id,
@@ -8987,7 +9139,7 @@ impl LiveCli {
             return Ok(false);
         };
 
-        let (handle, session) = load_session_reference(&session_ref)?;
+        let (handle, session) = load_session_reference(&self.session_store, &session_ref)?;
         let message_count = session.messages.len();
         let session_id = session.session_id.clone();
         let runtime = build_runtime(
@@ -9144,7 +9296,10 @@ impl LiveCli {
     ) -> Result<bool, Box<dyn std::error::Error>> {
         match action {
             None | Some("list") => {
-                println!("{}", render_session_list(&self.session.id)?);
+                println!(
+                    "{}",
+                    render_session_list(&self.session_store, &self.session.id)?
+                );
                 Ok(false)
             }
             Some("switch") => {
@@ -9152,7 +9307,7 @@ impl LiveCli {
                     println!("Usage: /session switch <session-id>");
                     return Ok(false);
                 };
-                let (handle, session) = load_session_reference(target)?;
+                let (handle, session) = load_session_reference(&self.session_store, target)?;
                 let message_count = session.messages.len();
                 let session_id = session.session_id.clone();
                 let runtime = build_runtime(
@@ -9182,7 +9337,8 @@ impl LiveCli {
             Some("fork") => {
                 let forked = self.runtime.fork_session(target.map(ToOwned::to_owned));
                 let parent_session_id = self.session.id.clone();
-                let handle = create_managed_session_handle(&forked.session_id)?;
+                let handle =
+                    create_managed_session_handle(&self.session_store, &forked.session_id)?;
                 let branch_name = forked
                     .fork
                     .as_ref()
@@ -9218,7 +9374,7 @@ impl LiveCli {
                     println!("Usage: /session delete <session-id> [--force]");
                     return Ok(false);
                 };
-                let handle = resolve_session_reference(target)?;
+                let handle = resolve_session_reference(&self.session_store, target)?;
                 if handle.id == self.session.id {
                     println!(
                         "delete: refusing to delete the active session '{}'.\nSwitch to another session first with /session switch <session-id>.",
@@ -9243,7 +9399,7 @@ impl LiveCli {
                     println!("Usage: /session delete <session-id> [--force]");
                     return Ok(false);
                 };
-                let handle = resolve_session_reference(target)?;
+                let handle = resolve_session_reference(&self.session_store, target)?;
                 if handle.id == self.session.id {
                     println!(
                         "delete: refusing to delete the active session '{}'.\nSwitch to another session first with /session switch <session-id>.",
@@ -9412,13 +9568,19 @@ impl LiveCli {
     }
 }
 
-fn sessions_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    Ok(current_session_store()?.sessions_dir().to_path_buf())
+fn sessions_dir(session_store: &runtime::SessionStore) -> PathBuf {
+    session_store.sessions_dir().to_path_buf()
 }
 
-fn current_session_store() -> Result<runtime::SessionStore, Box<dyn std::error::Error>> {
+fn current_session_store(
+    data_dir: Option<&Path>,
+) -> Result<runtime::SessionStore, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
-    runtime::SessionStore::from_cwd(&cwd).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+    match data_dir {
+        Some(data_dir) => runtime::SessionStore::from_data_dir(data_dir, &cwd),
+        None => runtime::SessionStore::from_cwd(&cwd),
+    }
+    .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
 }
 
 fn new_cli_session() -> Result<Session, Box<dyn std::error::Error>> {
@@ -9426,17 +9588,21 @@ fn new_cli_session() -> Result<Session, Box<dyn std::error::Error>> {
 }
 
 fn create_managed_session_handle(
+    session_store: &runtime::SessionStore,
     session_id: &str,
 ) -> Result<SessionHandle, Box<dyn std::error::Error>> {
-    let handle = current_session_store()?.create_handle(session_id);
+    let handle = session_store.create_handle(session_id);
     Ok(SessionHandle {
         id: handle.id,
         path: handle.path,
     })
 }
 
-fn resolve_session_reference(reference: &str) -> Result<SessionHandle, Box<dyn std::error::Error>> {
-    let handle = current_session_store()?
+fn resolve_session_reference(
+    session_store: &runtime::SessionStore,
+    reference: &str,
+) -> Result<SessionHandle, Box<dyn std::error::Error>> {
+    let handle = session_store
         .resolve_reference(reference)
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     Ok(SessionHandle {
@@ -9445,14 +9611,19 @@ fn resolve_session_reference(reference: &str) -> Result<SessionHandle, Box<dyn s
     })
 }
 
-fn resolve_managed_session_path(session_id: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    current_session_store()?
+fn resolve_managed_session_path(
+    session_store: &runtime::SessionStore,
+    session_id: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    session_store
         .resolve_managed_path(session_id)
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
 }
 
-fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::error::Error>> {
-    Ok(current_session_store()?
+fn list_managed_sessions(
+    session_store: &runtime::SessionStore,
+) -> Result<Vec<ManagedSessionSummary>, Box<dyn std::error::Error>> {
+    Ok(session_store
         .list_sessions()
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?
         .into_iter()
@@ -9468,8 +9639,10 @@ fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::er
         .collect())
 }
 
-fn latest_managed_session() -> Result<ManagedSessionSummary, Box<dyn std::error::Error>> {
-    let session = current_session_store()?
+fn latest_managed_session(
+    session_store: &runtime::SessionStore,
+) -> Result<ManagedSessionSummary, Box<dyn std::error::Error>> {
+    let session = session_store
         .latest_session()
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     Ok(ManagedSessionSummary {
@@ -9484,9 +9657,10 @@ fn latest_managed_session() -> Result<ManagedSessionSummary, Box<dyn std::error:
 }
 
 fn load_session_reference(
+    session_store: &runtime::SessionStore,
     reference: &str,
 ) -> Result<(SessionHandle, Session), Box<dyn std::error::Error>> {
-    let loaded = current_session_store()?
+    let loaded = session_store
         .load_session(reference)
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     Ok((
@@ -9516,11 +9690,17 @@ fn confirm_session_deletion(session_id: &str) -> bool {
     matches!(answer.trim(), "y" | "Y" | "yes" | "Yes" | "YES")
 }
 
-fn render_session_list(active_session_id: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let sessions = list_managed_sessions()?;
+fn render_session_list(
+    session_store: &runtime::SessionStore,
+    active_session_id: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let sessions = list_managed_sessions(session_store)?;
     let mut lines = vec![
         "Sessions".to_string(),
-        format!("  Directory         {}", sessions_dir()?.display()),
+        format!(
+            "  Directory         {}",
+            sessions_dir(session_store).display()
+        ),
     ];
     if sessions.is_empty() {
         lines.push("  No managed sessions saved yet.".to_string());
@@ -10909,11 +11089,12 @@ fn summarize_tool_payload_for_markdown(payload: &str) -> String {
 }
 
 fn run_export(
+    session_store: &runtime::SessionStore,
     session_reference: &str,
     output_path: Option<&Path>,
     output_format: CliOutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (handle, session) = load_session_reference(session_reference)?;
+    let (handle, session) = load_session_reference(session_store, session_reference)?;
     let markdown = render_session_markdown(&session, &handle.id, &handle.path);
 
     if let Some(path) = output_path {
@@ -13047,6 +13228,7 @@ impl CliToolExecutor {
 
 impl ToolExecutor for CliToolExecutor {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+        tools::confined_tool_permitted(tool_name).map_err(ToolError::new)?;
         if self
             .allowed_tools
             .as_ref()
@@ -13275,6 +13457,14 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
+        "  --data-dir PATH            Store managed sessions outside the workspace under PATH/sessions/"
+    )?;
+    writeln!(
+        out,
+        "  --workspace-confine [PATH] Controlled-smoke confinement of PATH (default: cwd): file tools bound beneath it, writes only to calculator.py, bash only the approved unittest command in a Bubblewrap sandbox"
+    )?;
+    writeln!(
+        out,
         "  --dangerously-skip-permissions  Skip all permission checks"
     )?;
     writeln!(out, "  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)")?;
@@ -13362,7 +13552,7 @@ mod tests {
     use super::{
         build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
         classify_error_kind, collect_session_prompt_history, create_managed_session_handle,
-        default_permission_mode, describe_tool_progress, filter_tool_specs,
+        current_session_store, default_permission_mode, describe_tool_progress, filter_tool_specs,
         format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
         format_compact_report, format_connected_line, format_cost_report, format_history_timestamp,
         format_internal_prompt_progress_line, format_issue_report, format_model_report,
@@ -13370,23 +13560,23 @@ mod tests {
         format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
         format_tool_result, format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error,
-        maybe_parse_tool_result_json_envelope, merge_prompt_with_stdin, normalize_permission_mode,
-        parse_args, parse_args_with_terminal, parse_export_args, parse_git_status_branch,
-        parse_git_status_metadata_for, parse_git_workspace_summary, parse_history_count,
-        permission_policy, print_help_to, push_output_block, render_config_report,
-        render_diff_report, render_diff_report_for, render_help_topic, render_memory_report,
-        render_prompt_history_report, render_repl_help, render_resume_usage,
-        render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
-        resolve_model_env_alias, resolve_repl_model, resolve_session_reference, response_to_events,
-        resume_should_continue_interactively, resume_supported_slash_commands, run_resume_command,
-        runtime_mcp_inventory_json_for_loader, short_tool_id,
-        slash_command_completion_candidates_with_sessions, split_error_hint, status_context,
-        summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt, validate_model_syntax,
-        validate_no_args, write_mcp_server_fixture, write_mcp_tools_list_disconnect_fixture,
-        CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
-        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
-        PromptHistoryEntry, ResumeReplContext, RuntimePluginState, SlashCommand, StatusUsage,
-        DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
+        load_session_reference, maybe_parse_tool_result_json_envelope, merge_prompt_with_stdin,
+        normalize_permission_mode, parse_args, parse_args_with_terminal, parse_export_args,
+        parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
+        parse_history_count, parse_invocation_with_terminal, permission_policy, print_help_to,
+        push_output_block, render_config_report, render_diff_report, render_diff_report_for,
+        render_help_topic, render_memory_report, render_prompt_history_report, render_repl_help,
+        render_resume_usage, render_session_markdown, resolve_model_alias,
+        resolve_model_alias_with_config, resolve_model_env_alias, resolve_repl_model,
+        resolve_session_reference, response_to_events, resume_should_continue_interactively,
+        resume_supported_slash_commands, run_resume_command, runtime_mcp_inventory_json_for_loader,
+        short_tool_id, slash_command_completion_candidates_with_sessions, split_error_hint,
+        status_context, summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt,
+        validate_model_syntax, validate_no_args, write_mcp_server_fixture,
+        write_mcp_tools_list_disconnect_fixture, CliAction, CliOutputFormat, CliToolExecutor,
+        GitWorkspaceSummary, InternalPromptProgressEvent, InternalPromptProgressState, LiveCli,
+        LocalHelpTopic, PromptHistoryEntry, ResumeReplContext, RuntimePluginState, SlashCommand,
+        StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
     use api::{
         ApiError, InputContentBlock, MessageResponse, OutputContentBlock, ToolResultContentBlock,
@@ -15940,11 +16130,13 @@ mod tests {
         fs::create_dir_all(&root).expect("root dir");
 
         let banner = with_current_dir(&root, || {
+            let session_store = current_session_store(None).expect("session store");
             LiveCli::new(
                 "claude-sonnet-4-6".to_string(),
                 true,
                 None,
                 PermissionMode::DangerFullAccess,
+                session_store,
             )
             .expect("cli should initialize")
             .startup_banner()
@@ -16157,8 +16349,9 @@ mod tests {
 
         let (restored_messages, session_path, (session_id, fixture_session_id)) =
             with_current_dir(&workspace, || {
-                let handle =
-                    create_managed_session_handle("session-resume-target").expect("session handle");
+                let session_store = current_session_store(None).expect("session store");
+                let handle = create_managed_session_handle(&session_store, "session-resume-target")
+                    .expect("session handle");
                 let mut session = Session::new()
                     .with_workspace_root(workspace.clone())
                     .with_persistence_path(handle.path.clone());
@@ -16175,6 +16368,7 @@ mod tests {
                     true,
                     None,
                     PermissionMode::DangerFullAccess,
+                    session_store,
                 )
                 .expect("cli should initialize");
 
@@ -16216,7 +16410,9 @@ mod tests {
         std::fs::create_dir_all(&workspace).expect("workspace should create");
 
         let error = with_current_dir(&workspace, || {
-            let handle = create_managed_session_handle("session-foreign").expect("session handle");
+            let session_store = current_session_store(None).expect("session store");
+            let handle = create_managed_session_handle(&session_store, "session-foreign")
+                .expect("session handle");
             Session::new()
                 .with_workspace_root(PathBuf::from("/some/other/workspace"))
                 .with_persistence_path(handle.path.clone())
@@ -16228,6 +16424,7 @@ mod tests {
                 true,
                 None,
                 PermissionMode::DangerFullAccess,
+                session_store,
             )
             .expect("cli should initialize");
 
@@ -16713,7 +16910,8 @@ UU conflicted.rs",
 
         let session = Session::load_from_path(&session_path).expect("session should load");
         let outcome = with_current_dir(&root, || {
-            run_resume_command(&session_path, &session, &SlashCommand::Diff)
+            let session_store = current_session_store(None).expect("session store");
+            run_resume_command(&session_store, &session_path, &session, &SlashCommand::Diff)
                 .expect("resume diff should work")
         });
         let message = outcome.message.expect("diff message should exist");
@@ -16805,6 +17003,164 @@ UU conflicted.rs",
     }
 
     #[test]
+    fn missing_external_data_dir_value_is_rejected() {
+        let workspace = temp_workspace("missing-data-dir-value");
+        std::fs::create_dir_all(&workspace).expect("workspace should create");
+        let error = with_current_dir(&workspace, || {
+            parse_args_with_terminal(&["--data-dir".to_string()], false, false)
+                .expect_err("missing --data-dir value should fail")
+        });
+        assert_eq!(error, "missing value for --data-dir");
+        assert!(!workspace.join(".claw").exists());
+        std::fs::remove_dir_all(workspace).expect("workspace should clean up");
+    }
+
+    #[test]
+    fn help_documents_external_data_dir() {
+        let mut help = Vec::new();
+        print_help_to(&mut help).expect("help should render");
+        let help = String::from_utf8(help).expect("help should be utf8");
+        assert!(help.contains("--data-dir PATH"));
+        assert!(help.contains("Store managed sessions outside the workspace"));
+    }
+
+    #[test]
+    fn external_data_dir_is_parsed_once_for_managed_session_actions() {
+        let data_dir = PathBuf::from("/state/claw");
+        for args in [
+            vec![
+                "--data-dir".to_string(),
+                data_dir.display().to_string(),
+                "--resume".to_string(),
+                "latest".to_string(),
+            ],
+            vec![
+                "export".to_string(),
+                format!("--data-dir={}", data_dir.display()),
+                "--session".to_string(),
+                "latest".to_string(),
+            ],
+        ] {
+            let (_, parsed_data_dir) = parse_invocation_with_terminal(&args, false, false)
+                .expect("external data dir should parse");
+            assert_eq!(parsed_data_dir, Some(data_dir.clone()));
+        }
+    }
+
+    #[test]
+    fn default_session_store_remains_workspace_local() {
+        let workspace = temp_workspace("default-session-store");
+        std::fs::create_dir_all(&workspace).expect("workspace should create");
+
+        let sessions_dir = with_current_dir(&workspace, || {
+            current_session_store(None)
+                .expect("default session store should create")
+                .sessions_dir()
+                .to_path_buf()
+        });
+
+        assert!(sessions_dir.starts_with(workspace.join(".claw/sessions")));
+        assert!(workspace.join(".claw").is_dir());
+        std::fs::remove_dir_all(workspace).expect("workspace should clean up");
+    }
+
+    #[test]
+    fn explicit_data_dir_stores_sessions_outside_workspace() {
+        let root = temp_workspace("external-session-store");
+        let workspace = root.join("workspace");
+        let data_dir = root.join("state-root");
+        std::fs::create_dir_all(&workspace).expect("workspace should create");
+
+        with_current_dir(&workspace, || {
+            let session_store =
+                current_session_store(Some(&data_dir)).expect("external store should create");
+            let handle = create_managed_session_handle(&session_store, "session-external")
+                .expect("external handle should create");
+            Session::new()
+                .with_workspace_root(workspace.clone())
+                .with_persistence_path(handle.path.clone())
+                .save_to_path(&handle.path)
+                .expect("external session should save");
+
+            assert!(handle.path.starts_with(data_dir.join("sessions")));
+            assert!(handle.path.is_file());
+            assert!(!workspace.join(".claw").exists());
+        });
+
+        std::fs::remove_dir_all(root).expect("fixture root should clean up");
+    }
+
+    #[test]
+    fn external_data_dir_preserves_resume_latest_and_workspace_isolation() {
+        let root = temp_workspace("external-session-isolation");
+        let workspace_a = root.join("workspace-a");
+        let workspace_b = root.join("workspace-b");
+        let data_dir = root.join("state-root");
+        std::fs::create_dir_all(&workspace_a).expect("workspace a should create");
+        std::fs::create_dir_all(&workspace_b).expect("workspace b should create");
+
+        let (session_path, session_id, sessions_a) = with_current_dir(&workspace_a, || {
+            let session_store =
+                current_session_store(Some(&data_dir)).expect("workspace a store should create");
+            let handle = create_managed_session_handle(&session_store, "session-workspace-a")
+                .expect("workspace a handle should create");
+            let session = Session::new()
+                .with_workspace_root(workspace_a.clone())
+                .with_persistence_path(handle.path.clone());
+            let session_id = session.session_id.clone();
+            session
+                .save_to_path(&handle.path)
+                .expect("workspace a session should save");
+
+            let loaded = load_session_reference(&session_store, "session-workspace-a")
+                .expect("same-workspace session should load");
+            let latest = resolve_session_reference(&session_store, "latest")
+                .expect("latest should resolve from external store");
+            assert_eq!(loaded.0.path, handle.path);
+            assert_eq!(loaded.1.session_id, session_id);
+            assert_eq!(latest.path, handle.path);
+            (
+                handle.path,
+                session_id,
+                session_store.sessions_dir().to_path_buf(),
+            )
+        });
+
+        with_current_dir(&workspace_b, || {
+            let session_store =
+                current_session_store(Some(&data_dir)).expect("workspace b store should create");
+            assert_ne!(session_store.sessions_dir(), sessions_a);
+            let error = load_session_reference(&session_store, &session_path.display().to_string())
+                .expect_err("cross-workspace session should be rejected");
+            assert!(error.to_string().contains("session workspace mismatch"));
+        });
+
+        assert!(session_path.is_file());
+        assert!(!session_id.is_empty());
+        assert!(!workspace_a.join(".claw").exists());
+        assert!(!workspace_b.join(".claw").exists());
+        std::fs::remove_dir_all(root).expect("fixture root should clean up");
+    }
+
+    #[test]
+    fn inaccessible_explicit_data_dir_does_not_fall_back_to_workspace() {
+        let root = temp_workspace("inaccessible-external-session-store");
+        let workspace = root.join("workspace");
+        let data_dir = root.join("not-a-directory");
+        std::fs::create_dir_all(&workspace).expect("workspace should create");
+        std::fs::write(&data_dir, "fixture").expect("blocking file should create");
+
+        let error = with_current_dir(&workspace, || {
+            current_session_store(Some(&data_dir))
+                .expect_err("invalid external data dir should fail")
+                .to_string()
+        });
+        assert!(!error.is_empty());
+        assert!(!workspace.join(".claw").exists());
+        std::fs::remove_dir_all(root).expect("fixture root should clean up");
+    }
+
+    #[test]
     fn managed_sessions_default_to_jsonl_and_resolve_legacy_json() {
         let _guard = cwd_guard();
         let workspace = temp_workspace("session-resolution");
@@ -16812,7 +17168,9 @@ UU conflicted.rs",
         let previous = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(&workspace).expect("switch cwd");
 
-        let handle = create_managed_session_handle("session-alpha").expect("jsonl handle");
+        let session_store = current_session_store(None).expect("session store");
+        let handle =
+            create_managed_session_handle(&session_store, "session-alpha").expect("jsonl handle");
         assert!(handle.path.ends_with("session-alpha.jsonl"));
 
         let legacy_path = workspace.join(".claw/sessions/legacy.json");
@@ -16828,7 +17186,8 @@ UU conflicted.rs",
             .save_to_path(&legacy_path)
             .expect("legacy session should save");
 
-        let resolved = resolve_session_reference("legacy").expect("legacy session should resolve");
+        let resolved = resolve_session_reference(&session_store, "legacy")
+            .expect("legacy session should resolve");
         assert_eq!(
             resolved
                 .path
@@ -16851,19 +17210,23 @@ UU conflicted.rs",
         let previous = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(&workspace).expect("switch cwd");
 
-        let older = create_managed_session_handle("session-older").expect("older handle");
+        let session_store = current_session_store(None).expect("session store");
+        let older =
+            create_managed_session_handle(&session_store, "session-older").expect("older handle");
         Session::new()
             .with_persistence_path(older.path.clone())
             .save_to_path(&older.path)
             .expect("older session should save");
         std::thread::sleep(Duration::from_millis(20));
-        let newer = create_managed_session_handle("session-newer").expect("newer handle");
+        let newer =
+            create_managed_session_handle(&session_store, "session-newer").expect("newer handle");
         Session::new()
             .with_persistence_path(newer.path.clone())
             .save_to_path(&newer.path)
             .expect("newer session should save");
 
-        let resolved = resolve_session_reference("latest").expect("latest session should resolve");
+        let resolved = resolve_session_reference(&session_store, "latest")
+            .expect("latest session should resolve");
         assert_eq!(
             resolved
                 .path
@@ -16899,8 +17262,10 @@ UU conflicted.rs",
             .save_to_path(&session_path)
             .expect("session should save");
 
-        let error = crate::load_session_reference(&session_path.display().to_string())
-            .expect_err("mismatched workspace should fail");
+        let session_store = current_session_store(None).expect("session store");
+        let error =
+            crate::load_session_reference(&session_store, &session_path.display().to_string())
+                .expect_err("mismatched workspace should fail");
         assert!(
             error.to_string().contains("session workspace mismatch"),
             "unexpected error: {error}"
