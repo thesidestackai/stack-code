@@ -352,15 +352,19 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
-    let (action, data_dir, confine_root) = parse_full_invocation_with_terminal(
-        &args,
-        std::io::stdin().is_terminal(),
-        std::io::stdout().is_terminal(),
-    )?;
+    let (filtered_args, data_dir, confine_root) = extract_process_flags(&args)?;
+    // Install confinement BEFORE parsing the action: parsing can already
+    // build the runtime tool registry (`--allowedTools`), and that build must
+    // see the confinement so it does not start hooks, plugins or MCP servers.
     if let Some(root) = confine_root {
         let confinement = tools::WorkspaceConfinement::new(&root, tools::CONFINED_BASH_TIMEOUT_MS)?;
         tools::set_workspace_confinement(confinement)?;
     }
+    let action = parse_args_core(
+        &filtered_args,
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+    )?;
     match action {
         CliAction::DumpManifests {
             output_format,
@@ -530,6 +534,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             workspace_write_preview,
             workspace_root,
         } => {
+            refuse_host_process("`plan run`")?;
             let code = run_plan_subcommand(
                 &file,
                 dry_run,
@@ -645,6 +650,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(code);
         }
         CliAction::TaskRun { task_spec } => {
+            refuse_host_process("`task run`")?;
             let stdout = std::io::stdout();
             let mut stdout_lock = stdout.lock();
             let code = runnable_task_bridge::run_task_command(&task_spec, &mut stdout_lock);
@@ -3916,17 +3922,30 @@ fn parse_full_invocation_with_terminal(
     stdin_is_tty: bool,
     stdout_is_tty: bool,
 ) -> Result<(CliAction, Option<PathBuf>, Option<PathBuf>), String> {
-    let (filtered_args, data_dir) = extract_data_dir(args)?;
-    let (filtered_args, confine_root) = extract_workspace_confine(&filtered_args)?;
+    let (filtered_args, data_dir, confine_root) = extract_process_flags(args)?;
     let action = parse_args_core(&filtered_args, stdin_is_tty, stdout_is_tty)?;
     Ok((action, data_dir, confine_root))
 }
 
-/// Extract `--workspace-confine [PATH]`.
+/// Remaining action arguments, `--data-dir`, and `--workspace-confine` root.
+type ProcessFlags = (Vec<String>, Option<PathBuf>, Option<PathBuf>);
+
+/// Strip the process-level flags (`--data-dir`, `--workspace-confine`) and
+/// return the remaining arguments for action parsing.
+fn extract_process_flags(args: &[String]) -> Result<ProcessFlags, String> {
+    let (filtered_args, data_dir) = extract_data_dir(args)?;
+    let (filtered_args, confine_root) = extract_workspace_confine(&filtered_args)?;
+    Ok((filtered_args, data_dir, confine_root))
+}
+
+/// Extract `--workspace-confine` or `--workspace-confine=PATH`.
 ///
-/// The value is optional: a bare `--workspace-confine` confines to the
-/// current working directory, which is the workspace the CLI already treats
-/// as its root.
+/// A bare `--workspace-confine` confines to the current working directory,
+/// which is the workspace the CLI already treats as its root, and consumes no
+/// following argument, so it can precede a positional action or prompt. An
+/// explicit root is given only as `--workspace-confine=PATH`. The flag may
+/// appear once: a second occurrence would leave the confinement root
+/// ambiguous, so it is rejected rather than resolved by position.
 fn extract_workspace_confine(args: &[String]) -> Result<(Vec<String>, Option<PathBuf>), String> {
     let mut filtered = Vec::with_capacity(args.len());
     let mut root = None;
@@ -3934,18 +3953,16 @@ fn extract_workspace_confine(args: &[String]) -> Result<(Vec<String>, Option<Pat
     while index < args.len() {
         match args[index].as_str() {
             "--workspace-confine" => {
-                match args.get(index + 1).filter(|value| !value.starts_with('-')) {
-                    Some(value) => {
-                        root = Some(PathBuf::from(value));
-                        index += 2;
-                    }
-                    None => {
-                        root = Some(env::current_dir().map_err(|error| error.to_string())?);
-                        index += 1;
-                    }
+                if root.is_some() {
+                    return Err("--workspace-confine may be given only once".to_string());
                 }
+                root = Some(env::current_dir().map_err(|error| error.to_string())?);
+                index += 1;
             }
             flag if flag.starts_with("--workspace-confine=") => {
+                if root.is_some() {
+                    return Err("--workspace-confine may be given only once".to_string());
+                }
                 let value = &flag["--workspace-confine=".len()..];
                 if value.is_empty() {
                     return Err("missing value for --workspace-confine".to_string());
@@ -5890,10 +5907,10 @@ fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error::Error>> {
     let config_loader = ConfigLoader::default_for(&cwd);
     let config = config_loader.load();
     let discovered_config = config_loader.discover();
-    let project_context = ProjectContext::discover_with_git(&cwd, DEFAULT_DATE)?;
+    let project_context = cli_project_context(&cwd, DEFAULT_DATE)?;
     let (project_root, git_branch) =
         parse_git_status_metadata(project_context.git_status.as_deref());
-    let git_summary = parse_git_workspace_summary(project_context.git_status.as_deref());
+    let git_summary = cli_git_summary(project_context.git_status.as_deref());
     let empty_config = runtime::RuntimeConfig::empty();
     let sandbox_config = config.as_ref().ok().unwrap_or(&empty_config);
     let context = StatusContext {
@@ -5908,7 +5925,7 @@ fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error::Error>> {
         project_root,
         git_branch,
         git_summary,
-        sandbox_status: resolve_sandbox_status(sandbox_config.sandbox(), &cwd),
+        sandbox_status: cli_sandbox_status(sandbox_config.sandbox(), &cwd),
         // Doctor path has its own config check; StatusContext here is only
         // fed into health renderers that don't read config_load_error.
         config_load_error: config.as_ref().err().map(ToString::to_string),
@@ -6244,6 +6261,7 @@ fn check_install_source_health() -> DiagnosticCheck {
 
 fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck {
     let in_repo = context.project_root.is_some();
+    let git_collected = context.git_summary.is_some();
     DiagnosticCheck::new(
         "Workspace",
         if in_repo {
@@ -6256,25 +6274,35 @@ fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck {
                 "project root detected on branch {}",
                 context.git_branch.as_deref().unwrap_or("unknown")
             )
-        } else {
+        } else if git_collected {
             "current directory is not inside a git project".to_string()
+        } else {
+            GIT_STATE_NOT_COLLECTED_DETAIL.to_string()
         },
     )
     .with_details(vec![
         format!("Cwd              {}", context.cwd.display()),
         format!(
             "Project root     {}",
-            context
-                .project_root
-                .as_ref()
-                .map_or_else(|| "<none>".to_string(), |path| path.display().to_string())
+            match (&context.project_root, git_collected) {
+                (Some(path), _) => path.display().to_string(),
+                (None, true) => "<none>".to_string(),
+                // Discovery was skipped, so absence was not observed.
+                (None, false) => GIT_STATE_NOT_COLLECTED.to_string(),
+            }
         ),
         format!(
             "Git branch       {}",
             context.git_branch.as_deref().unwrap_or("unknown")
         ),
-        format!("Git state        {}", context.git_summary.headline()),
-        format!("Changed files    {}", context.git_summary.changed_files),
+        format!(
+            "Git state        {}",
+            git_state_headline(context.git_summary)
+        ),
+        format!(
+            "Changed files    {}",
+            git_count_text(context.git_summary.map(|summary| summary.changed_files))
+        ),
         format!(
             "Memory files     {} · config files loaded {}/{}",
             context.memory_file_count, context.loaded_config_files, context.discovered_config_files
@@ -6289,15 +6317,22 @@ fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck {
                 .as_ref()
                 .map(|path| path.display().to_string())),
         ),
-        ("in_git_repo".to_string(), json!(in_repo)),
+        (
+            "in_git_repo".to_string(),
+            if git_collected {
+                json!(in_repo)
+            } else {
+                Value::Null
+            },
+        ),
         ("git_branch".to_string(), json!(context.git_branch)),
         (
             "git_state".to_string(),
-            json!(context.git_summary.headline()),
+            json!(git_state_headline(context.git_summary)),
         ),
         (
             "changed_files".to_string(),
-            json!(context.git_summary.changed_files),
+            json!(context.git_summary.map(|summary| summary.changed_files)),
         ),
         (
             "memory_file_count".to_string(),
@@ -6542,7 +6577,7 @@ fn print_system_prompt(
     date: String,
     output_format: CliOutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let sections = load_system_prompt(cwd, date, env::consts::OS, "unknown")?;
+    let sections = cli_system_prompt(cwd, date, env::consts::OS, "unknown")?;
     let message = sections.join(
         "
 
@@ -6756,7 +6791,9 @@ struct StatusContext {
     memory_file_count: usize,
     project_root: Option<PathBuf>,
     git_branch: Option<String>,
-    git_summary: GitWorkspaceSummary,
+    /// `None` when git state was not collected: workspace confinement
+    /// forbids running git, and unobserved state is not reported as clean.
+    git_summary: Option<GitWorkspaceSummary>,
     sandbox_status: runtime::SandboxStatus,
     /// #143: when `.claw.json` (or another loaded config file) fails to parse,
     /// we capture the parse error here and still populate every field that
@@ -6988,6 +7025,34 @@ fn parse_git_status_branch(status: Option<&str>) -> Option<String> {
     }
 }
 
+/// Headline for a git state that was deliberately not observed.
+const GIT_STATE_NOT_COLLECTED: &str = "not collected (workspace confinement)";
+
+/// Doctor summary when git state was deliberately not observed.
+const GIT_STATE_NOT_COLLECTED_DETAIL: &str =
+    "git state not collected: workspace confinement forbids running git";
+
+/// Workspace summary for status reports. Under confinement git is never run,
+/// so the state is unknown (`None`) rather than an empty, "clean" summary.
+fn cli_git_summary(status: Option<&str>) -> Option<GitWorkspaceSummary> {
+    if host_processes_forbidden() {
+        return None;
+    }
+    Some(parse_git_workspace_summary(status))
+}
+
+fn git_state_headline(summary: Option<GitWorkspaceSummary>) -> String {
+    summary.map_or_else(
+        || GIT_STATE_NOT_COLLECTED.to_string(),
+        GitWorkspaceSummary::headline,
+    )
+}
+
+/// A git count for text reports; "unknown" when git state was not collected.
+fn git_count_text(count: Option<usize>) -> String {
+    count.map_or_else(|| "unknown".to_string(), |count| count.to_string())
+}
+
 fn parse_git_workspace_summary(status: Option<&str>) -> GitWorkspaceSummary {
     let mut summary = GitWorkspaceSummary::default();
     let Some(status) = status else {
@@ -7045,6 +7110,9 @@ fn resolve_git_branch_for(cwd: &Path) -> Option<String> {
 }
 
 fn run_git_capture_in(cwd: &Path, args: &[&str]) -> Option<String> {
+    if host_processes_forbidden() {
+        return None;
+    }
     let output = std::process::Command::new("git")
         .args(args)
         .current_dir(cwd)
@@ -7057,6 +7125,7 @@ fn run_git_capture_in(cwd: &Path, args: &[&str]) -> Option<String> {
 }
 
 fn find_git_root_in(cwd: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    refuse_host_process("git")?;
     let output = std::process::Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(cwd)
@@ -7190,7 +7259,7 @@ fn run_resume_command(
             let cwd = env::current_dir()?;
             let loader = ConfigLoader::default_for(&cwd);
             let runtime_config = loader.load()?;
-            let status = resolve_sandbox_status(runtime_config.sandbox(), &cwd);
+            let status = cli_sandbox_status(runtime_config.sandbox(), &cwd);
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(format_sandbox_report(&status)),
@@ -7222,6 +7291,7 @@ fn run_resume_command(
             })
         }
         SlashCommand::Mcp { action, target } => {
+            refuse_external_integration("`/mcp`")?;
             let cwd = env::current_dir()?;
             let args = match (action.as_deref(), target.as_deref()) {
                 (None, None) => None,
@@ -7309,6 +7379,7 @@ fn run_resume_command(
                     "resumed /skills invocations are interactive-only; start `claw` and run `/skills <skill>` in the REPL".into(),
                 );
             }
+            refuse_external_integration("`/skills`")?;
             let cwd = env::current_dir()?;
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
@@ -7516,6 +7587,14 @@ fn run_stale_base_preflight(flag_value: Option<&str>) {
         return;
     };
     let source = resolve_expected_base(flag_value, &cwd);
+    if host_processes_forbidden() {
+        if source.is_some() {
+            eprintln!(
+                "warning: stale-base check skipped under workspace confinement (it runs git)"
+            );
+        }
+        return;
+    }
     let state = check_base_commit(&cwd, source.as_ref());
     if let Some(warning) = format_stale_base_warning(&state) {
         eprintln!("{warning}");
@@ -7791,6 +7870,7 @@ impl RuntimeMcpState {
     fn new(
         runtime_config: &runtime::RuntimeConfig,
     ) -> Result<Option<(Self, runtime::McpToolDiscoveryReport)>, Box<dyn std::error::Error>> {
+        refuse_external_integration("MCP server startup")?;
         let mut manager = McpServerManager::from_runtime_config(runtime_config);
         if manager.server_names().is_empty() && manager.unsupported_servers().is_empty() {
             return Ok(None);
@@ -8528,7 +8608,7 @@ impl LiveCli {
             .unwrap_or("unknown");
         let workspace = status.as_ref().map_or_else(
             || "unknown".to_string(),
-            |context| context.git_summary.headline(),
+            |context| git_state_headline(context.git_summary),
         );
         let session_path = self.session.path.strip_prefix(Path::new(&cwd)).map_or_else(
             |_| self.session.path.display().to_string(),
@@ -8990,7 +9070,7 @@ impl LiveCli {
             .unwrap_or_else(|_| runtime::RuntimeConfig::empty());
         println!(
             "{}",
-            format_sandbox_report(&resolve_sandbox_status(runtime_config.sandbox(), &cwd))
+            format_sandbox_report(&cli_sandbox_status(runtime_config.sandbox(), &cwd))
         );
     }
 
@@ -9198,6 +9278,7 @@ impl LiveCli {
         args: Option<&str>,
         output_format: CliOutputFormat,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        refuse_external_integration("`mcp`")?;
         // `claw mcp serve` starts a stdio MCP server exposing claw's built-in
         // tools. All other `mcp` subcommands fall through to the existing
         // configured-server reporter (`list`, `status`, ...).
@@ -9228,6 +9309,7 @@ impl LiveCli {
         args: Option<&str>,
         output_format: CliOutputFormat,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        refuse_external_integration("`skills`")?;
         let cwd = env::current_dir()?;
         match output_format {
             CliOutputFormat::Text => println!("{}", handle_skills_slash_command(args, &cwd)?),
@@ -9244,6 +9326,7 @@ impl LiveCli {
         target: Option<&str>,
         output_format: CliOutputFormat,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        refuse_external_integration("`plugins`")?;
         let cwd = env::current_dir()?;
         let loader = ConfigLoader::default_for(&cwd);
         let runtime_config = loader.load()?;
@@ -9429,6 +9512,7 @@ impl LiveCli {
         action: Option<&str>,
         target: Option<&str>,
     ) -> Result<bool, Box<dyn std::error::Error>> {
+        refuse_external_integration("`/plugins`")?;
         let cwd = env::current_dir()?;
         let loader = ConfigLoader::default_for(&cwd);
         let runtime_config = loader.load()?;
@@ -9888,11 +9972,11 @@ fn status_json_value(
             "cwd": context.cwd,
             "project_root": context.project_root,
             "git_branch": context.git_branch,
-            "git_state": context.git_summary.headline(),
-            "changed_files": context.git_summary.changed_files,
-            "staged_files": context.git_summary.staged_files,
-            "unstaged_files": context.git_summary.unstaged_files,
-            "untracked_files": context.git_summary.untracked_files,
+            "git_state": git_state_headline(context.git_summary),
+            "changed_files": context.git_summary.map(|summary| summary.changed_files),
+            "staged_files": context.git_summary.map(|summary| summary.staged_files),
+            "unstaged_files": context.git_summary.map(|summary| summary.unstaged_files),
+            "untracked_files": context.git_summary.map(|summary| summary.untracked_files),
             "session": context.session_path.as_ref().map_or_else(|| "live-repl".to_string(), |path| path.display().to_string()),
             "session_id": context.session_path.as_ref().and_then(|path| {
                 // Session files are named <session-id>.jsonl directly under
@@ -9935,7 +10019,7 @@ fn status_context(
     let (loaded_config_files, sandbox_status, config_load_error) = match loader.load() {
         Ok(runtime_config) => (
             runtime_config.loaded_entries().len(),
-            resolve_sandbox_status(runtime_config.sandbox(), &cwd),
+            cli_sandbox_status(runtime_config.sandbox(), &cwd),
             None,
         ),
         Err(err) => (
@@ -9945,14 +10029,14 @@ fn status_context(
             // produce the same output as a runtime config with no sandbox
             // overrides, which is the right degraded-mode shape: we cannot
             // report what the user *intended*, only what is actually in effect.
-            resolve_sandbox_status(&runtime::SandboxConfig::default(), &cwd),
+            cli_sandbox_status(&runtime::SandboxConfig::default(), &cwd),
             Some(err.to_string()),
         ),
     };
-    let project_context = ProjectContext::discover_with_git(&cwd, DEFAULT_DATE)?;
+    let project_context = cli_project_context(&cwd, DEFAULT_DATE)?;
     let (project_root, git_branch) =
         parse_git_status_metadata(project_context.git_status.as_deref());
-    let git_summary = parse_git_workspace_summary(project_context.git_status.as_deref());
+    let git_summary = cli_git_summary(project_context.git_status.as_deref());
     Ok(StatusContext {
         cwd,
         session_path: session_path.map(Path::to_path_buf),
@@ -10044,11 +10128,11 @@ fn format_status_report(
                 .as_ref()
                 .map_or_else(|| "unknown".to_string(), |path| path.display().to_string()),
             context.git_branch.as_deref().unwrap_or("unknown"),
-            context.git_summary.headline(),
-            context.git_summary.changed_files,
-            context.git_summary.staged_files,
-            context.git_summary.unstaged_files,
-            context.git_summary.untracked_files,
+            git_state_headline(context.git_summary),
+            git_count_text(context.git_summary.map(|summary| summary.changed_files)),
+            git_count_text(context.git_summary.map(|summary| summary.staged_files)),
+            git_count_text(context.git_summary.map(|summary| summary.unstaged_files)),
+            git_count_text(context.git_summary.map(|summary| summary.untracked_files)),
             context.session_path.as_ref().map_or_else(
                 || "live-repl".to_string(),
                 |path| path.display().to_string()
@@ -10136,7 +10220,7 @@ fn print_sandbox_status_snapshot(
     let runtime_config = loader
         .load()
         .unwrap_or_else(|_| runtime::RuntimeConfig::empty());
-    let status = resolve_sandbox_status(runtime_config.sandbox(), &cwd);
+    let status = cli_sandbox_status(runtime_config.sandbox(), &cwd);
     match output_format {
         CliOutputFormat::Text => println!("{}", format_sandbox_report(&status)),
         CliOutputFormat::Json => println!(
@@ -10521,6 +10605,7 @@ fn render_diff_report() -> Result<String, Box<dyn std::error::Error>> {
 }
 
 fn render_diff_report_for(cwd: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    refuse_host_process("diff")?;
     // Verify we are inside a git repository before calling `git diff`.
     // Running `git diff --cached` outside a git tree produces a misleading
     // "unknown option `cached`" error because git falls back to --no-index mode.
@@ -10557,6 +10642,7 @@ fn render_diff_report_for(cwd: &Path) -> Result<String, Box<dyn std::error::Erro
 }
 
 fn render_diff_json_for(cwd: &Path) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    refuse_host_process("diff")?;
     let in_git_repo = std::process::Command::new("git")
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(cwd)
@@ -10584,6 +10670,7 @@ fn run_git_diff_command_in(
     cwd: &Path,
     args: &[&str],
 ) -> Result<String, Box<dyn std::error::Error>> {
+    refuse_host_process("git")?;
     let output = std::process::Command::new("git")
         .args(args)
         .current_dir(cwd)
@@ -10596,6 +10683,7 @@ fn run_git_diff_command_in(
 }
 
 fn render_teleport_report(target: &str) -> Result<String, Box<dyn std::error::Error>> {
+    refuse_host_process("`/teleport`")?;
     let cwd = env::current_dir()?;
 
     let file_list = Command::new("rg")
@@ -10763,6 +10851,7 @@ fn format_issue_report(context: Option<&str>) -> String {
 }
 
 fn git_output(args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
+    refuse_host_process("git")?;
     let output = Command::new("git")
         .args(args)
         .current_dir(env::current_dir()?)
@@ -10775,6 +10864,7 @@ fn git_output(args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
 }
 
 fn git_status_ok(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
+    refuse_host_process("git")?;
     let output = Command::new("git")
         .args(args)
         .current_dir(env::current_dir()?)
@@ -10787,6 +10877,9 @@ fn git_status_ok(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn command_exists(name: &str) -> bool {
+    if host_processes_forbidden() {
+        return false;
+    }
     Command::new("which")
         .arg(name)
         .output()
@@ -11242,9 +11335,9 @@ fn short_tool_id(id: &str) -> String {
 }
 
 fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    Ok(load_system_prompt(
+    Ok(cli_system_prompt(
         env::current_dir()?,
-        DEFAULT_DATE,
+        DEFAULT_DATE.to_string(),
         env::consts::OS,
         "unknown",
     )?)
@@ -11257,11 +11350,122 @@ fn build_runtime_plugin_state() -> Result<RuntimePluginState, Box<dyn std::error
     build_runtime_plugin_state_with_loader(&cwd, &loader, &runtime_config)
 }
 
+/// Whether hooks, plugins and MCP servers are disabled for this process.
+///
+/// Workspace confinement bounds the built-in tools only. Hook commands, plugin
+/// lifecycle/tool commands and stdio MCP servers would execute outside it, so
+/// while confinement is active they are never loaded, initialized or spawned.
+fn external_integrations_disabled() -> bool {
+    tools::workspace_confinement().is_some()
+}
+
+/// Refuse an integration-management surface while confinement is active.
+fn refuse_external_integration(surface: &str) -> Result<(), String> {
+    if external_integrations_disabled() {
+        return Err(format!(
+            "{surface} is disabled under workspace confinement: hooks, plugins and MCP servers would run outside it"
+        ));
+    }
+    Ok(())
+}
+
+/// Whether this process may start host subprocesses.
+///
+/// While confinement is active the only process the CLI may start is the
+/// approved smoke command, which `tools` runs inside the Bubblewrap sandbox.
+/// Every other subprocess (git, rg, the `unshare` sandbox probe, plan and
+/// task children) would run on the host outside that boundary, and git in
+/// particular executes commands named by workspace or user configuration.
+/// Callers check this before spawning and refuse or degrade instead.
+fn host_processes_forbidden() -> bool {
+    tools::workspace_confinement().is_some()
+}
+
+/// Refuse a surface that needs a host subprocess while confinement is active.
+fn refuse_host_process(surface: &str) -> Result<(), String> {
+    if host_processes_forbidden() {
+        return Err(format!(
+            "{surface} is unavailable under workspace confinement: it would run a host process outside the sandbox"
+        ));
+    }
+    Ok(())
+}
+
+/// Project context for prompts and reports; without git under confinement.
+fn cli_project_context(cwd: &Path, current_date: &str) -> std::io::Result<ProjectContext> {
+    if host_processes_forbidden() {
+        return ProjectContext::discover(cwd, current_date);
+    }
+    ProjectContext::discover_with_git(cwd, current_date)
+}
+
+/// `load_system_prompt`, except that under confinement the project context
+/// is gathered without running git.
+fn cli_system_prompt(
+    cwd: PathBuf,
+    current_date: String,
+    os_name: &str,
+    os_version: &str,
+) -> Result<Vec<String>, runtime::PromptBuildError> {
+    if !host_processes_forbidden() {
+        return load_system_prompt(cwd, current_date, os_name, os_version);
+    }
+    let project_context = ProjectContext::discover(&cwd, current_date)?;
+    let config = ConfigLoader::default_for(&cwd).load()?;
+    Ok(runtime::SystemPromptBuilder::new()
+        .with_os(os_name, os_version)
+        .with_project_context(project_context)
+        .with_runtime_config(config)
+        .build())
+}
+
+/// Sandbox status for reports. Resolving it probes `unshare` on the host, so
+/// under confinement the requested configuration is reported unprobed.
+fn cli_sandbox_status(config: &runtime::SandboxConfig, cwd: &Path) -> runtime::SandboxStatus {
+    if host_processes_forbidden() {
+        let requested = config.resolve_request(None, None, None, None, None);
+        return runtime::SandboxStatus {
+            enabled: requested.enabled,
+            requested,
+            fallback_reason: Some("sandbox probe skipped under workspace confinement".to_string()),
+            ..runtime::SandboxStatus::default()
+        };
+    }
+    resolve_sandbox_status(config, cwd)
+}
+
 fn build_runtime_plugin_state_with_loader(
     cwd: &Path,
     loader: &ConfigLoader,
     runtime_config: &runtime::RuntimeConfig,
 ) -> Result<RuntimePluginState, Box<dyn std::error::Error>> {
+    build_runtime_plugin_state_for(
+        cwd,
+        loader,
+        runtime_config,
+        external_integrations_disabled(),
+    )
+}
+
+fn build_runtime_plugin_state_for(
+    cwd: &Path,
+    loader: &ConfigLoader,
+    runtime_config: &runtime::RuntimeConfig,
+    integrations_disabled: bool,
+) -> Result<RuntimePluginState, Box<dyn std::error::Error>> {
+    if integrations_disabled {
+        // No plugin discovery, no hook commands, no MCP servers: built-in
+        // tools only, which confinement admits or refuses individually.
+        return Ok(RuntimePluginState {
+            feature_config: runtime_config
+                .feature_config()
+                .clone()
+                .with_hooks(runtime::RuntimeHookConfig::default()),
+            tool_registry: GlobalToolRegistry::builtin(),
+            plugin_registry: PluginRegistry::default(),
+            mcp_state: None,
+        });
+    }
     let plugin_manager = build_plugin_manager(cwd, loader, runtime_config);
     let plugin_registry = plugin_manager.plugin_registry()?;
     let plugin_hook_config =
@@ -13461,7 +13665,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  --workspace-confine [PATH] Controlled-smoke confinement of PATH (default: cwd): file tools bound beneath it, writes only to calculator.py, bash only the approved unittest command in a Bubblewrap sandbox"
+        "  --workspace-confine[=PATH] Controlled-smoke confinement of PATH (default: cwd): file tools bound beneath it, writes only to calculator.py, bash only the approved unittest command in a Bubblewrap sandbox; hooks, plugins and MCP servers disabled"
     )?;
     writeln!(
         out,
@@ -16650,13 +16854,13 @@ mod tests {
                 memory_file_count: 4,
                 project_root: Some(PathBuf::from("/tmp")),
                 git_branch: Some("main".to_string()),
-                git_summary: GitWorkspaceSummary {
+                git_summary: Some(GitWorkspaceSummary {
                     changed_files: 3,
                     staged_files: 1,
                     unstaged_files: 1,
                     untracked_files: 1,
                     conflicted_files: 0,
-                },
+                }),
                 sandbox_status: runtime::SandboxStatus::default(),
                 config_load_error: None,
             },
@@ -18688,6 +18892,366 @@ UU conflicted.rs",
                 "stub command {with_slash} should not appear in REPL completions"
             );
         }
+    }
+
+    // ---- PR #183 review repair: workspace-confine grammar (P2) ----
+
+    fn confine_args(args: &[&str]) -> Vec<String> {
+        args.iter().map(ToString::to_string).collect()
+    }
+
+    /// Terminal stdin/stdout, so an argument list left empty by a faulty
+    /// extractor parses to the REPL instead of waiting on piped stdin.
+    fn parse_confined(args: &[&str]) -> Result<(CliAction, Option<PathBuf>), String> {
+        super::parse_full_invocation_with_terminal(&confine_args(args), true, true)
+            .map(|(action, _, root)| (action, root))
+    }
+
+    #[test]
+    fn bare_workspace_confine_keeps_the_following_action_and_prompt() {
+        let cwd = temp_dir();
+        fs::create_dir_all(&cwd).expect("cwd");
+        let (action, root) = with_current_dir(&cwd, || {
+            parse_confined(&["--workspace-confine", "prompt", "repair calculator"])
+        })
+        .expect("bare flag followed by an action should parse");
+        assert_eq!(root, Some(fs::canonicalize(&cwd).expect("canonical cwd")));
+        assert!(
+            matches!(&action, CliAction::Prompt { prompt, .. } if prompt == "repair calculator"),
+            "the action and prompt must survive, got {action:?}"
+        );
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn bare_workspace_confine_keeps_a_positional_prompt() {
+        let cwd = temp_dir();
+        fs::create_dir_all(&cwd).expect("cwd");
+        let (action, root) = with_current_dir(&cwd, || {
+            parse_confined(&["--workspace-confine", "repair calculator"])
+        })
+        .expect("bare flag followed by a prompt should parse");
+        assert_eq!(root, Some(fs::canonicalize(&cwd).expect("canonical cwd")));
+        assert!(
+            matches!(&action, CliAction::Prompt { prompt, .. } if prompt == "repair calculator"),
+            "the positional prompt must survive, got {action:?}"
+        );
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn workspace_confine_equals_path_sets_an_absolute_or_relative_root() {
+        for (flag, expected) in [
+            ("--workspace-confine=/tmp/work", "/tmp/work"),
+            ("--workspace-confine=relative-work", "relative-work"),
+        ] {
+            let (action, root) = parse_confined(&[flag, "prompt", "repair calculator"])
+                .expect("explicit root should parse");
+            assert_eq!(root, Some(PathBuf::from(expected)));
+            assert!(
+                matches!(&action, CliAction::Prompt { prompt, .. } if prompt == "repair calculator"),
+                "the prompt must survive {flag}, got {action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_confine_rejects_an_empty_explicit_root() {
+        let error = parse_confined(&["--workspace-confine=", "prompt", "x"])
+            .expect_err("empty root must be refused");
+        assert_eq!(error, "missing value for --workspace-confine");
+    }
+
+    #[test]
+    fn workspace_confine_rejects_repeated_occurrences() {
+        for args in [
+            ["--workspace-confine", "--workspace-confine=/x"],
+            ["--workspace-confine=/x", "--workspace-confine"],
+            ["--workspace-confine=/x", "--workspace-confine=/y"],
+            ["--workspace-confine", "--workspace-confine"],
+        ] {
+            let error = super::extract_workspace_confine(&confine_args(&args))
+                .expect_err("a repeated confinement root is ambiguous");
+            assert_eq!(
+                error, "--workspace-confine may be given only once",
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_workspace_confine_never_consumes_a_separated_path() {
+        let cwd = temp_dir();
+        fs::create_dir_all(&cwd).expect("cwd");
+        let (filtered, root) = with_current_dir(&cwd, || {
+            super::extract_workspace_confine(&confine_args(&[
+                "--workspace-confine",
+                "/tmp/work",
+                "prompt",
+                "repair calculator",
+            ]))
+        })
+        .expect("extraction should succeed");
+        assert_eq!(
+            filtered,
+            confine_args(&["/tmp/work", "prompt", "repair calculator"]),
+            "the separated token must be left for ordinary parsing"
+        );
+        assert_eq!(
+            root,
+            Some(fs::canonicalize(&cwd).expect("canonical cwd")),
+            "a bare flag always confines to the current directory"
+        );
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    // ---- PR #183 review repair: no external integrations while confined (P1) ----
+
+    /// Workspace plus config home whose settings configure every hook stage
+    /// and one stdio MCP server; each only `touch`es a marker in `outside`.
+    struct IntegrationFixture {
+        root: PathBuf,
+        workspace: PathBuf,
+        config_home: PathBuf,
+        outside: PathBuf,
+    }
+
+    impl IntegrationFixture {
+        fn new() -> Self {
+            let root = temp_dir();
+            let fixture = Self {
+                workspace: root.join("ws"),
+                config_home: root.join("config"),
+                outside: root.join("outside"),
+                root,
+            };
+            for dir in [&fixture.workspace, &fixture.config_home, &fixture.outside] {
+                fs::create_dir_all(dir).expect("fixture dir");
+            }
+            let marker = |name: &str| fixture.outside.join(name).display().to_string();
+            fs::write(
+                fixture.config_home.join("settings.json"),
+                json!({
+                    "hooks": {
+                        "PreToolUse": [format!("touch '{}'", marker("hook-pre"))],
+                        "PostToolUse": [format!("touch '{}'", marker("hook-post"))],
+                        "PostToolUseFailure": [format!("touch '{}'", marker("hook-failure"))],
+                    },
+                    "mcpServers": {
+                        "probe": {
+                            "command": "sh",
+                            "args": ["-c", format!("touch '{}'; exit 0", marker("mcp-spawned"))],
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .expect("settings");
+            fixture
+        }
+
+        fn install_lifecycle_plugin(&self) {
+            let source = self.root.join("plugin-src");
+            fs::create_dir_all(source.join(".claude-plugin")).expect("manifest dir");
+            fs::create_dir_all(source.join("lifecycle")).expect("lifecycle dir");
+            fs::write(
+                source.join("lifecycle").join("init.sh"),
+                format!(
+                    "#!/bin/sh\ntouch '{}'\n",
+                    self.outside.join("plugin-init").display()
+                ),
+            )
+            .expect("init script");
+            fs::write(
+                source.join(".claude-plugin").join("plugin.json"),
+                r#"{"name":"confine-probe","version":"1.0.0","description":"probe","lifecycle":{"Init":["./lifecycle/init.sh"]}}"#,
+            )
+            .expect("manifest");
+            PluginManager::new(PluginManagerConfig::new(&self.config_home))
+                .install(source.to_str().expect("utf8"))
+                .expect("plugin install");
+        }
+
+        fn state(&self, integrations_disabled: bool) -> super::RuntimePluginState {
+            let loader = ConfigLoader::new(&self.workspace, &self.config_home);
+            let runtime_config = loader.load().expect("config");
+            super::build_runtime_plugin_state_for(
+                &self.workspace,
+                &loader,
+                &runtime_config,
+                integrations_disabled,
+            )
+            .expect("plugin state")
+        }
+
+        fn marker(&self, name: &str) -> bool {
+            self.outside.join(name).exists()
+        }
+    }
+
+    impl Drop for IntegrationFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// Provider that asks for one succeeding and one failing tool, then stops.
+    struct TwoToolApi {
+        calls: usize,
+    }
+
+    impl runtime::ApiClient for TwoToolApi {
+        fn stream(
+            &mut self,
+            _request: runtime::ApiRequest,
+        ) -> Result<Vec<AssistantEvent>, runtime::RuntimeError> {
+            self.calls += 1;
+            if self.calls == 1 {
+                return Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: "ok".to_string(),
+                        name: "read_file".to_string(),
+                        input: "{}".to_string(),
+                    },
+                    AssistantEvent::ToolUse {
+                        id: "fail".to_string(),
+                        name: "grep_search".to_string(),
+                        input: "{}".to_string(),
+                    },
+                    AssistantEvent::MessageStop,
+                ]);
+            }
+            Ok(vec![
+                AssistantEvent::TextDelta("done".to_string()),
+                AssistantEvent::MessageStop,
+            ])
+        }
+    }
+
+    struct OneFailingExecutor;
+
+    impl runtime::ToolExecutor for OneFailingExecutor {
+        fn execute(&mut self, tool_name: &str, _input: &str) -> Result<String, runtime::ToolError> {
+            if tool_name == "grep_search" {
+                Err(runtime::ToolError::new("probe failure"))
+            } else {
+                Ok("ok".to_string())
+            }
+        }
+    }
+
+    fn run_two_tool_turn(state: &super::RuntimePluginState) {
+        let mut runtime = super::cli_conversation_runtime(
+            Session::new(),
+            TwoToolApi { calls: 0 },
+            OneFailingExecutor,
+            runtime::PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+            &state.feature_config,
+        );
+        runtime.run_turn("go", None).expect("turn should finish");
+    }
+
+    #[test]
+    fn confined_runtime_runs_no_hook_commands() {
+        let fixture = IntegrationFixture::new();
+        run_two_tool_turn(&fixture.state(true));
+        for marker in ["hook-pre", "hook-post", "hook-failure"] {
+            assert!(!fixture.marker(marker), "{marker} ran while confined");
+        }
+    }
+
+    #[test]
+    fn unconfined_runtime_still_runs_hook_commands() {
+        let fixture = IntegrationFixture::new();
+        run_two_tool_turn(&fixture.state(false));
+        for marker in ["hook-pre", "hook-post", "hook-failure"] {
+            assert!(fixture.marker(marker), "{marker} must still run unconfined");
+        }
+    }
+
+    #[test]
+    fn confined_runtime_spawns_no_mcp_server() {
+        let fixture = IntegrationFixture::new();
+        let state = fixture.state(true);
+        assert!(
+            state.mcp_state.is_none(),
+            "no MCP state may exist while confined"
+        );
+        assert!(
+            !fixture.marker("mcp-spawned"),
+            "MCP server spawned while confined"
+        );
+    }
+
+    #[test]
+    fn unconfined_runtime_still_spawns_configured_mcp_servers() {
+        let fixture = IntegrationFixture::new();
+        let state = fixture.state(false);
+        assert!(
+            fixture.marker("mcp-spawned"),
+            "MCP server must still spawn unconfined"
+        );
+        if let Some(mcp_state) = state.mcp_state {
+            mcp_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .shutdown()
+                .expect("mcp shutdown");
+        }
+    }
+
+    fn build_plugin_runtime(state: super::RuntimePluginState) -> super::BuiltRuntime {
+        build_runtime_with_plugin_state(
+            Session::new(),
+            "confine-plugin-probe",
+            DEFAULT_MODEL.to_string(),
+            vec!["system".to_string()],
+            true,
+            false,
+            None,
+            PermissionMode::DangerFullAccess,
+            None,
+            state,
+        )
+        .expect("runtime should build")
+    }
+
+    #[test]
+    fn confined_runtime_initializes_no_plugin() {
+        let _guard = env_lock();
+        std::env::set_var("ANTHROPIC_API_KEY", "test-dummy-key-for-confine-probe");
+        let fixture = IntegrationFixture::new();
+        fixture.install_lifecycle_plugin();
+        let state = fixture.state(true);
+        assert!(state.plugin_registry.plugins().is_empty());
+        let mut runtime = build_plugin_runtime(state);
+        runtime.shutdown_plugins().expect("shutdown");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        assert!(
+            !fixture.marker("plugin-init"),
+            "plugin initialized while confined"
+        );
+    }
+
+    #[test]
+    fn unconfined_runtime_still_initializes_plugins() {
+        let _guard = env_lock();
+        std::env::set_var("ANTHROPIC_API_KEY", "test-dummy-key-for-confine-probe");
+        let fixture = IntegrationFixture::new();
+        fixture.install_lifecycle_plugin();
+        let mut runtime = build_plugin_runtime(fixture.state(false));
+        runtime.shutdown_plugins().expect("shutdown");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        assert!(
+            fixture.marker("plugin-init"),
+            "plugin must still initialize unconfined"
+        );
+    }
+
+    #[test]
+    fn integration_commands_stay_available_without_confinement() {
+        assert!(super::refuse_external_integration("`mcp`").is_ok());
     }
 }
 
