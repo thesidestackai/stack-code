@@ -213,6 +213,30 @@ impl Fixture {
         }
     }
 
+    /// Turn the workspace into a clean Git repository without the calculator
+    /// fixture: two nested files to declare writable, one unlisted file and
+    /// a symlink to a declared file.
+    fn make_generic(&self) {
+        fs::remove_file(self.workspace.join("calculator.py")).expect("calculator");
+        fs::remove_file(self.workspace.join("test_calculator.py")).expect("oracle");
+        fs::create_dir_all(self.workspace.join("scripts")).expect("scripts");
+        fs::create_dir_all(self.workspace.join("tests/a2_l4")).expect("tests");
+        fs::write(
+            self.workspace.join("scripts/pretty_print.py"),
+            "print('Plan steps:')\n",
+        )
+        .expect("source");
+        fs::write(
+            self.workspace.join("tests/a2_l4/test_pretty_print.py"),
+            "import unittest\n",
+        )
+        .expect("test");
+        fs::write(self.workspace.join("README.md"), "readme\n").expect("readme");
+        std::os::unix::fs::symlink("scripts/pretty_print.py", self.workspace.join("alias.py"))
+            .expect("symlink");
+        self.init_repo(false);
+    }
+
     fn git(&self, args: &[&str]) {
         let status = Command::new("/usr/bin/git")
             .current_dir(&self.workspace)
@@ -938,6 +962,133 @@ fn malformed_confined_invocations_start_nothing() {
         fixture.assert_no_survivors();
     }
     assert_eq!(hits.load(Ordering::SeqCst), 0, "no substrate request");
+}
+
+const GENERIC_WRITES: &[&str] = &[
+    "--workspace-confine-write",
+    "scripts/pretty_print.py",
+    "--workspace-confine-write=tests/a2_l4/test_pretty_print.py",
+];
+
+#[test]
+fn declared_writes_confine_a_repository_without_the_calculator_fixture() {
+    let fixture = Fixture::new("generic");
+    fixture.make_generic();
+
+    let mut args = GENERIC_WRITES.to_vec();
+    args.push("status");
+    let output = fixture.confined(&args);
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        stdout(&output).contains(&format!("Git state        {NOT_COLLECTED}")),
+        "confinement must be active: {}",
+        stdout(&output)
+    );
+    assert_eq!(fixture.markers(), expected(&[]));
+    fixture.assert_no_survivors();
+
+    let mut args = GENERIC_WRITES.to_vec();
+    args.extend(["prompt", "repair the planner output"]);
+    let output = fixture.confined(&args);
+    assert_stopped_at_credentials(&output);
+    assert_eq!(fixture.markers(), expected(&[]));
+    fixture.assert_no_survivors();
+
+    // NEGATIVE CONTROL: without declarations the controlled smoke is selected
+    // and refuses this repository before anything starts.
+    let output = fixture.confined(&["status"]);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        stderr(&output).contains("controlled fixture rejected"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(fixture.markers(), expected(&[]));
+}
+
+#[test]
+fn invalid_writable_declarations_start_nothing() {
+    for (label, invalid, reason) in [
+        (
+            "absolute",
+            &["--workspace-confine-write", "/etc/hostname"][..],
+            "is absolute",
+        ),
+        (
+            "traversal",
+            &["--workspace-confine-write", "../outside/x.py"][..],
+            "contains `..`",
+        ),
+        (
+            "nested-traversal",
+            &["--workspace-confine-write=scripts/../../x.py"][..],
+            "contains `..`",
+        ),
+        (
+            "root",
+            &["--workspace-confine-write", "."][..],
+            "is not a file",
+        ),
+        (
+            "missing",
+            &["--workspace-confine-write", "scripts/missing.py"][..],
+            "No such file",
+        ),
+        (
+            "directory",
+            &["--workspace-confine-write", "scripts"][..],
+            "is not a regular file",
+        ),
+        (
+            "symlink",
+            &["--workspace-confine-write", "alias.py"][..],
+            "traverses a symlink",
+        ),
+        (
+            "empty",
+            &["--workspace-confine-write="][..],
+            "missing value",
+        ),
+        (
+            "no-value",
+            &["--workspace-confine-write"][..],
+            "missing value",
+        ),
+    ] {
+        let fixture = Fixture::new(label);
+        fixture.make_generic();
+        // A valid declaration alongside must not rescue an invalid one.
+        let mut args = vec![
+            "--workspace-confine-write",
+            "scripts/pretty_print.py",
+            "status",
+        ];
+        args.extend_from_slice(invalid);
+        let output = fixture.confined(&args);
+        assert!(!output.status.success(), "{label}: {output:?}");
+        assert!(stderr(&output).contains(reason), "{label}: {output:?}");
+        assert!(
+            !stdout(&output).contains("Git state"),
+            "{label}: {output:?}"
+        );
+        assert_eq!(fixture.markers(), expected(&[]), "{label}");
+        fixture.assert_no_survivors();
+    }
+
+    let fixture = Fixture::new("no-root");
+    fixture.make_generic();
+    let output = fixture.claw(&[
+        "--workspace-confine-write",
+        "scripts/pretty_print.py",
+        "status",
+    ]);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        stderr(&output).contains("--workspace-confine-write requires --workspace-confine"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(fixture.markers(), expected(&[]));
 }
 
 const NOT_COLLECTED: &str = "not collected (workspace confinement)";

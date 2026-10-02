@@ -201,6 +201,7 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--allowed-tools",
     "--data-dir",
     "--workspace-confine",
+    "--workspace-confine-write",
     "--resume",
     "--acp",
     "-acp",
@@ -352,12 +353,12 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
-    let (filtered_args, data_dir, confine_root) = extract_process_flags(&args)?;
+    let (filtered_args, data_dir, confine_root, confine_writable) = extract_process_flags(&args)?;
     // Install confinement BEFORE parsing the action: parsing can already
     // build the runtime tool registry (`--allowedTools`), and that build must
     // see the confinement so it does not start hooks, plugins or MCP servers.
     if let Some(root) = confine_root {
-        let confinement = tools::WorkspaceConfinement::new(&root, tools::CONFINED_BASH_TIMEOUT_MS)?;
+        let confinement = build_workspace_confinement(&root, &confine_writable)?;
         tools::set_workspace_confinement(confinement)?;
     }
     let action = parse_args_core(
@@ -3922,20 +3923,83 @@ fn parse_full_invocation_with_terminal(
     stdin_is_tty: bool,
     stdout_is_tty: bool,
 ) -> Result<(CliAction, Option<PathBuf>, Option<PathBuf>), String> {
-    let (filtered_args, data_dir, confine_root) = extract_process_flags(args)?;
+    let (filtered_args, data_dir, confine_root, _) = extract_process_flags(args)?;
     let action = parse_args_core(&filtered_args, stdin_is_tty, stdout_is_tty)?;
     Ok((action, data_dir, confine_root))
 }
 
-/// Remaining action arguments, `--data-dir`, and `--workspace-confine` root.
-type ProcessFlags = (Vec<String>, Option<PathBuf>, Option<PathBuf>);
+/// Remaining action arguments, `--data-dir`, `--workspace-confine` root, and
+/// the `--workspace-confine-write` declarations in command-line order.
+type ProcessFlags = (Vec<String>, Option<PathBuf>, Option<PathBuf>, Vec<String>);
 
-/// Strip the process-level flags (`--data-dir`, `--workspace-confine`) and
-/// return the remaining arguments for action parsing.
+/// Strip the process-level flags (`--data-dir`, `--workspace-confine`,
+/// `--workspace-confine-write`) and return the remaining arguments for
+/// action parsing.
 fn extract_process_flags(args: &[String]) -> Result<ProcessFlags, String> {
     let (filtered_args, data_dir) = extract_data_dir(args)?;
+    let (filtered_args, confine_writable) = extract_workspace_confine_writes(&filtered_args)?;
     let (filtered_args, confine_root) = extract_workspace_confine(&filtered_args)?;
-    Ok((filtered_args, data_dir, confine_root))
+    if confine_root.is_none() && !confine_writable.is_empty() {
+        return Err("--workspace-confine-write requires --workspace-confine".to_string());
+    }
+    Ok((filtered_args, data_dir, confine_root, confine_writable))
+}
+
+/// Extract each `--workspace-confine-write PATH` or
+/// `--workspace-confine-write=PATH`.
+///
+/// Each names one existing workspace-relative file that confined writes and
+/// edits may modify. The flag repeats and declarations keep their order. Only
+/// a missing or empty value is refused here; the paths themselves are
+/// validated when the confinement is bound, before any action is parsed.
+fn extract_workspace_confine_writes(args: &[String]) -> Result<(Vec<String>, Vec<String>), String> {
+    let mut filtered = Vec::with_capacity(args.len());
+    let mut writable = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--workspace-confine-write" => {
+                let value = args
+                    .get(index + 1)
+                    .filter(|value| !value.is_empty() && !value.starts_with('-'))
+                    .ok_or_else(|| "missing value for --workspace-confine-write".to_string())?;
+                writable.push(value.clone());
+                index += 2;
+            }
+            flag if flag.starts_with("--workspace-confine-write=") => {
+                let value = &flag["--workspace-confine-write=".len()..];
+                if value.is_empty() {
+                    return Err("missing value for --workspace-confine-write".to_string());
+                }
+                writable.push(value.to_string());
+                index += 1;
+            }
+            _ => {
+                filtered.push(args[index].clone());
+                index += 1;
+            }
+        }
+    }
+    Ok((filtered, writable))
+}
+
+/// Bind the process confinement for `root`.
+///
+/// Operator-declared writable files select the generic policy; with none,
+/// the controlled calculator smoke keeps its fixture policy. Either way an
+/// invalid root or declaration is an error here, before any action runs.
+fn build_workspace_confinement(
+    root: &Path,
+    writable: &[String],
+) -> Result<tools::WorkspaceConfinement, String> {
+    if writable.is_empty() {
+        return tools::WorkspaceConfinement::controlled_smoke(
+            root,
+            tools::CONFINED_BASH_TIMEOUT_MS,
+        );
+    }
+    let writable = writable.iter().map(String::as_str).collect::<Vec<_>>();
+    tools::WorkspaceConfinement::new(root, &writable, tools::CONFINED_BASH_TIMEOUT_MS)
 }
 
 /// Extract `--workspace-confine` or `--workspace-confine=PATH`.
@@ -13665,7 +13729,11 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  --workspace-confine[=PATH] Controlled-smoke confinement of PATH (default: cwd): file tools bound beneath it, writes only to calculator.py, bash only the approved unittest command in a Bubblewrap sandbox; hooks, plugins and MCP servers disabled"
+        "  --workspace-confine[=PATH] Confine to PATH (default: cwd): file tools bound beneath it, writes only to declared files (calculator.py when none are declared), bash only the approved unittest command in a Bubblewrap sandbox; hooks, plugins and MCP servers disabled"
+    )?;
+    writeln!(
+        out,
+        "  --workspace-confine-write PATH  Declare an existing workspace-relative file writable under --workspace-confine (repeatable)"
     )?;
     writeln!(
         out,
@@ -19003,6 +19071,145 @@ UU conflicted.rs",
             "a bare flag always confines to the current directory"
         );
         let _ = fs::remove_dir_all(cwd);
+    }
+
+    // ---- CLI_START seam: operator-declared writable files ----
+
+    fn extract_confined(args: &[&str]) -> Result<super::ProcessFlags, String> {
+        super::extract_process_flags(&confine_args(args))
+    }
+
+    #[test]
+    fn workspace_confine_write_is_repeatable_in_declaration_order() {
+        let (filtered, _, root, writable) = extract_confined(&[
+            "--workspace-confine=/tmp/work",
+            "--workspace-confine-write",
+            "scripts/pretty_print_planner_output.py",
+            "--workspace-confine-write=tests/a2_l4/test_pretty_print_planner_output.py",
+            "prompt",
+            "repair",
+        ])
+        .expect("repeated writable declarations should parse");
+        assert_eq!(root, Some(PathBuf::from("/tmp/work")));
+        assert_eq!(
+            writable,
+            vec![
+                "scripts/pretty_print_planner_output.py".to_string(),
+                "tests/a2_l4/test_pretty_print_planner_output.py".to_string(),
+            ]
+        );
+        assert_eq!(
+            filtered,
+            confine_args(&["prompt", "repair"]),
+            "process-only flags must not reach the action parser"
+        );
+    }
+
+    #[test]
+    fn workspace_confine_write_requires_a_non_empty_value() {
+        for args in [
+            &["--workspace-confine", "--workspace-confine-write"][..],
+            &[
+                "--workspace-confine",
+                "--workspace-confine-write",
+                "--model",
+                "x",
+            ][..],
+            &["--workspace-confine", "--workspace-confine-write", ""][..],
+            &["--workspace-confine", "--workspace-confine-write="][..],
+        ] {
+            let error =
+                extract_confined(args).expect_err("a missing writable path must be refused");
+            assert_eq!(
+                error, "missing value for --workspace-confine-write",
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_confine_write_without_confinement_is_refused() {
+        for args in [
+            &["--workspace-confine-write", "scripts/a.py", "status"][..],
+            &["--workspace-confine-write=scripts/a.py", "prompt", "x"][..],
+        ] {
+            let error = extract_confined(args).expect_err("writes without a root must be refused");
+            assert_eq!(
+                error, "--workspace-confine-write requires --workspace-confine",
+                "{args:?}"
+            );
+            parse_confined(args).expect_err("the full parser must refuse it too");
+        }
+    }
+
+    #[test]
+    fn bare_workspace_confine_with_writes_keeps_the_prompt_action() {
+        let cwd = temp_dir();
+        fs::create_dir_all(&cwd).expect("cwd");
+        let (action, root) = with_current_dir(&cwd, || {
+            parse_confined(&[
+                "--workspace-confine",
+                "--workspace-confine-write",
+                "a.py",
+                "prompt",
+                "repair",
+            ])
+        })
+        .expect("bare flag with a writable declaration should parse");
+        assert_eq!(root, Some(fs::canonicalize(&cwd).expect("canonical cwd")));
+        assert!(
+            matches!(&action, CliAction::Prompt { prompt, .. } if prompt == "repair"),
+            "the action and prompt must survive, got {action:?}"
+        );
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn declared_writable_files_confine_a_workspace_without_the_calculator_fixture() {
+        let workspace = temp_dir();
+        fs::create_dir_all(workspace.join("scripts")).expect("scripts");
+        fs::create_dir_all(workspace.join("tests")).expect("tests");
+        fs::write(workspace.join("scripts/a.py"), "a\n").expect("a");
+        fs::write(workspace.join("tests/b.py"), "b\n").expect("b");
+        fs::write(workspace.join("README.md"), "readme\n").expect("readme");
+
+        let confinement = super::build_workspace_confinement(
+            &workspace,
+            &["scripts/a.py".to_string(), "tests/b.py".to_string()],
+        )
+        .expect("declared files must confine a workspace without the calculator fixture");
+        for declared in ["scripts/a.py", "tests/b.py"] {
+            confinement
+                .root()
+                .write_file(declared, "changed\n")
+                .expect("a declared file is writable");
+        }
+        confinement
+            .root()
+            .write_file("README.md", "pwned\n")
+            .expect_err("an unlisted file is not writable");
+        assert_eq!(
+            fs::read_to_string(workspace.join("README.md")).expect("readme"),
+            "readme\n"
+        );
+
+        // NEGATIVE CONTROL: without declarations the controlled smoke is
+        // selected, and it still refuses a workspace lacking its fixture.
+        let error = super::build_workspace_confinement(&workspace, &[])
+            .expect_err("the controlled smoke still requires its fixture");
+        assert!(error.contains("controlled fixture rejected"), "{error}");
+
+        let outside = workspace.join("..").join("claw-outside-declared");
+        for invalid in [
+            "../outside.py",
+            "/etc/hostname",
+            "missing.py",
+            outside.to_str().expect("utf8"),
+        ] {
+            super::build_workspace_confinement(&workspace, &[invalid.to_string()])
+                .expect_err("an invalid declaration must fail closed");
+        }
+        let _ = fs::remove_dir_all(workspace);
     }
 
     // ---- PR #183 review repair: no external integrations while confined (P1) ----

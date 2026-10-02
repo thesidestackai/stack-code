@@ -42,8 +42,9 @@ use serde_json::{json, Value};
 /// - only [`CONFINED_TOOLS`] may run;
 /// - file tools resolve workspace-relative paths through the descriptor-bound
 ///   [`WorkspaceRoot`] (`openat2` beneath the root, no symlinks, no mount
-///   crossings, no ambient CWD), and may modify only
-///   [`CONTROLLED_SMOKE_WRITABLE`];
+///   crossings, no ambient CWD), and may modify only the writable files the
+///   operator declared (`--workspace-confine-write`), or
+///   [`CONTROLLED_SMOKE_WRITABLE`] for the controlled smoke;
 /// - `bash` runs only an approved command, inside the Bubblewrap sandbox of
 ///   `runtime::contained`, and returns only after the sandbox's whole process
 ///   tree is settled. There is no fallback to unsandboxed execution.
@@ -68,11 +69,12 @@ pub const CONFINED_TOOLS: &[&str] = &[
     "bash",
 ];
 
-/// The only workspace files confined writes and edits may modify.
+/// The only workspace files the controlled smoke's confined writes and edits
+/// may modify; see [`WorkspaceConfinement::controlled_smoke`].
 pub const CONTROLLED_SMOKE_WRITABLE: &[&str] = &["calculator.py"];
 
-/// Fixture files that must be regular, single-link files when confinement is
-/// bound. `test_calculator.py` is the immutable oracle.
+/// Fixture files that must be regular, single-link files when the controlled
+/// smoke is bound. `test_calculator.py` is the immutable oracle.
 pub const CONTROLLED_SMOKE_FIXTURE: &[&str] = &["calculator.py", "test_calculator.py"];
 
 /// An active confinement: the descriptor-bound workspace plus the bounded
@@ -85,19 +87,47 @@ pub struct WorkspaceConfinement {
 }
 
 impl WorkspaceConfinement {
-    /// Open and bind `root`, then validate the controlled fixture.
+    /// Open and bind `root` with an operator-declared writable set.
     ///
-    /// Fails when the root cannot be opened or a designated fixture file is
-    /// missing, special or hardlinked, so a bad root is reported rather than
-    /// silently degrading to "no confinement".
-    pub fn new(root: impl AsRef<Path>, bash_timeout_ms: u64) -> Result<Self, String> {
+    /// `writable` lists the only workspace-relative files confined writes
+    /// and edits may modify. Each must already exist beneath `root` as a
+    /// regular, single-link file reached without symlinks. An absolute path,
+    /// `..`, the root itself, or a missing, special, symlinked or hardlinked
+    /// file refuses the whole confinement rather than silently degrading it.
+    pub fn new(
+        root: impl AsRef<Path>,
+        writable: &[&str],
+        bash_timeout_ms: u64,
+    ) -> Result<Self, String> {
+        let confinement = Self::bind(root.as_ref(), writable, bash_timeout_ms)?;
+        confinement
+            .root
+            .verify_single_link_files(writable)
+            .map_err(|error| format!("declared writable file rejected: {error}"))?;
+        Ok(confinement)
+    }
+
+    /// Open and bind `root` for the controlled calculator smoke: only
+    /// [`CONTROLLED_SMOKE_WRITABLE`] is writable, and every
+    /// [`CONTROLLED_SMOKE_FIXTURE`] file must be a regular, single-link file.
+    ///
+    /// Fails when the root cannot be opened or a fixture file is missing,
+    /// special or hardlinked, so a bad root is reported rather than silently
+    /// degrading to "no confinement".
+    pub fn controlled_smoke(root: impl AsRef<Path>, bash_timeout_ms: u64) -> Result<Self, String> {
+        let confinement = Self::bind(root.as_ref(), CONTROLLED_SMOKE_WRITABLE, bash_timeout_ms)?;
+        confinement
+            .root
+            .verify_single_link_files(CONTROLLED_SMOKE_FIXTURE)
+            .map_err(|error| format!("controlled fixture rejected: {error}"))?;
+        Ok(confinement)
+    }
+
+    fn bind(root: &Path, writable: &[&str], bash_timeout_ms: u64) -> Result<Self, String> {
         if bash_timeout_ms == 0 {
             return Err("workspace confinement bash timeout must be non-zero".to_string());
         }
-        let root = WorkspaceRoot::bind(root.as_ref(), CONTROLLED_SMOKE_WRITABLE)
-            .map_err(|error| error.to_string())?;
-        root.verify_single_link_files(CONTROLLED_SMOKE_FIXTURE)
-            .map_err(|error| format!("controlled fixture rejected: {error}"))?;
+        let root = WorkspaceRoot::bind(root, writable).map_err(|error| error.to_string())?;
         Ok(Self {
             root,
             bash_timeout_ms,
@@ -10094,7 +10124,7 @@ printf 'pwsh:%s' "$1"
         }
 
         fn confinement(&self) -> WorkspaceConfinement {
-            WorkspaceConfinement::new(&self.workspace, CONFINED_BASH_TIMEOUT_MS)
+            WorkspaceConfinement::controlled_smoke(&self.workspace, CONFINED_BASH_TIMEOUT_MS)
                 .expect("confinement should bind to the fixture workspace")
         }
 
@@ -10323,8 +10353,9 @@ printf 'pwsh:%s' "$1"
             fixture.outside.join("calculator-link.py"),
         )
         .expect("hardlink should be created");
-        let error = WorkspaceConfinement::new(&fixture.workspace, CONFINED_BASH_TIMEOUT_MS)
-            .expect_err("a hardlinked designated file must reject the fixture");
+        let error =
+            WorkspaceConfinement::controlled_smoke(&fixture.workspace, CONFINED_BASH_TIMEOUT_MS)
+                .expect_err("a hardlinked designated file must reject the fixture");
         assert!(error.contains("controlled fixture rejected"), "{error}");
         assert!(error.contains("hard links"), "{error}");
     }
@@ -10374,8 +10405,14 @@ printf 'pwsh:%s' "$1"
     #[test]
     fn workspace_confinement_refuses_an_unresolvable_root() {
         let missing = std::env::temp_dir().join("claw-northstar-missing-root-does-not-exist");
-        let error = WorkspaceConfinement::new(&missing, CONFINED_BASH_TIMEOUT_MS)
+        let error = WorkspaceConfinement::controlled_smoke(&missing, CONFINED_BASH_TIMEOUT_MS)
             .expect_err("an unresolvable confinement root must fail loudly");
+        assert!(
+            error.contains("workspace confinement root"),
+            "unexpected error: {error}"
+        );
+        let error = WorkspaceConfinement::new(&missing, &["README.md"], CONFINED_BASH_TIMEOUT_MS)
+            .expect_err("an unresolvable generic confinement root must fail loudly");
         assert!(
             error.contains("workspace confinement root"),
             "unexpected error: {error}"
@@ -10704,6 +10741,437 @@ printf 'pwsh:%s' "$1"
         assert!(
             !bash_decision(&policy, json!({ "command": SMOKE_COMMAND })),
             "bash must be default-denied when no allow rule matches"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Generic confinement: an arbitrary workspace (no calculator fixture)
+    // whose writable files are declared by the operator.
+    // ------------------------------------------------------------------
+
+    const GENERIC_SOURCE: &str = "print(\"Plan steps:\")\n";
+    const GENERIC_TEST: &str = "import unittest\n";
+    const GENERIC_README: &str = "do not touch\n";
+    const GENERIC_SECRET: &str = "out-of-bounds content\n";
+    const GENERIC_WRITABLE: &[&str] = &[
+        "scripts/pretty_print.py",
+        "tests/a2_l4/test_pretty_print.py",
+    ];
+
+    /// Repository-shaped workspace without the calculator fixture: two nested
+    /// files the operator declares writable and one unlisted file.
+    struct GenericWorkspace {
+        base: PathBuf,
+        workspace: PathBuf,
+        outside: PathBuf,
+    }
+
+    impl GenericWorkspace {
+        fn new(name: &str) -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos();
+            let base = std::env::temp_dir().join(format!("claw-generic-{name}-{unique}"));
+            let workspace = base.join("workspace");
+            let outside = base.join("outside");
+            fs::create_dir_all(workspace.join("scripts")).expect("scripts dir should be created");
+            fs::create_dir_all(workspace.join("tests/a2_l4")).expect("tests dir should be created");
+            fs::create_dir_all(&outside).expect("outside dir should be created");
+            fs::write(workspace.join("scripts/pretty_print.py"), GENERIC_SOURCE)
+                .expect("source should be written");
+            fs::write(
+                workspace.join("tests/a2_l4/test_pretty_print.py"),
+                GENERIC_TEST,
+            )
+            .expect("test should be written");
+            fs::write(workspace.join("README.md"), GENERIC_README)
+                .expect("unlisted file should be written");
+            fs::write(outside.join("secret.txt"), GENERIC_SECRET)
+                .expect("outside fixture should be written");
+            Self {
+                base,
+                workspace,
+                outside,
+            }
+        }
+
+        fn confine(&self, writable: &[&str]) -> Result<WorkspaceConfinement, String> {
+            WorkspaceConfinement::new(&self.workspace, writable, CONFINED_BASH_TIMEOUT_MS)
+        }
+
+        fn confinement(&self) -> WorkspaceConfinement {
+            self.confine(GENERIC_WRITABLE)
+                .expect("generic confinement should bind to the workspace")
+        }
+
+        fn read(&self, relative: &str) -> String {
+            fs::read_to_string(self.workspace.join(relative)).expect("workspace file should exist")
+        }
+
+        fn secret(&self) -> String {
+            fs::read_to_string(self.outside.join("secret.txt"))
+                .expect("outside fixture should still exist")
+        }
+    }
+
+    impl Drop for GenericWorkspace {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.base);
+        }
+    }
+
+    #[test]
+    fn generic_confinement_binds_a_workspace_without_the_calculator_fixture() {
+        let ws = GenericWorkspace::new("bind");
+        assert!(!ws.workspace.join("calculator.py").exists());
+        ws.confine(GENERIC_WRITABLE)
+            .expect("explicit writable files must bind without the calculator fixture");
+        // NEGATIVE CONTROL: the controlled-smoke policy still demands its
+        // fixture, so the generic constructor is what admits this workspace.
+        let legacy =
+            WorkspaceConfinement::controlled_smoke(&ws.workspace, CONFINED_BASH_TIMEOUT_MS)
+                .expect_err("the controlled smoke must still require its fixture");
+        assert!(legacy.contains("controlled fixture rejected"), "{legacy}");
+        assert!(legacy.contains("calculator.py"), "{legacy}");
+    }
+
+    #[test]
+    fn generic_confinement_writes_and_edits_only_declared_files() {
+        let ws = GenericWorkspace::new("declared");
+        let confinement = ws.confinement();
+
+        run_write_file_with(
+            write_input(
+                "tests/a2_l4/test_pretty_print.py",
+                "import unittest\n# added\n",
+            ),
+            Some(&confinement),
+        )
+        .expect("a declared file should be writable");
+        assert_eq!(
+            ws.read("tests/a2_l4/test_pretty_print.py"),
+            "import unittest\n# added\n"
+        );
+        run_edit_file_with(
+            edit_input("scripts/pretty_print.py", "Plan steps:", "Plan steps (N):"),
+            Some(&confinement),
+        )
+        .expect("a declared file should be editable");
+        assert_eq!(
+            ws.read("scripts/pretty_print.py"),
+            "print(\"Plan steps (N):\")\n"
+        );
+
+        let write = run_write_file_with(write_input("README.md", "pwned"), Some(&confinement))
+            .expect_err("an unlisted file must not be writable");
+        assert!(write.contains("not a designated writable file"), "{write}");
+        let edit = run_edit_file_with(
+            edit_input("README.md", "do not touch", "pwned"),
+            Some(&confinement),
+        )
+        .expect_err("an unlisted file must not be editable");
+        assert!(edit.contains("not a designated writable file"), "{edit}");
+        run_write_file_with(write_input("scripts/new.py", "x"), Some(&confinement))
+            .expect_err("confined tools never create files");
+        assert_eq!(ws.read("README.md"), GENERIC_README);
+        assert!(!ws.workspace.join("scripts/new.py").exists());
+
+        // Reads are not narrowed by the writable list.
+        let read = run_read_file_with(read_input("README.md"), Some(&confinement))
+            .expect("unlisted files stay readable");
+        assert!(read.contains("do not touch"), "{read}");
+    }
+
+    #[test]
+    fn generic_confinement_rejects_invalid_writable_declarations() {
+        let ws = GenericWorkspace::new("invalid");
+        let fifo = ws.workspace.join("pipe");
+        let made = Command::new("/usr/bin/mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo should run");
+        assert!(made.success(), "fifo should be created");
+        let inside_absolute = ws
+            .workspace
+            .join("README.md")
+            .to_string_lossy()
+            .into_owned();
+
+        for (declared, reason) in [
+            ("../outside/secret.txt", "`..`"),
+            ("a/../../foo", "`..`"),
+            ("scripts/../README.md", "`..`"),
+            ("/etc/hostname", "is absolute"),
+            (inside_absolute.as_str(), "is absolute"),
+            ("", "is empty"),
+            (".", "is not a file"),
+            ("./", "is not a file"),
+            ("scripts/missing.py", "No such file"),
+            ("scripts", "not a regular file"),
+            ("pipe", "not a regular file"),
+        ] {
+            let error = ws
+                .confine(&["scripts/pretty_print.py", declared])
+                .expect_err("an invalid writable declaration must refuse the whole confinement");
+            assert!(error.contains(reason), "{declared:?}: {error}");
+        }
+        assert_eq!(ws.secret(), GENERIC_SECRET);
+        assert!(!ws.workspace.join("scripts/missing.py").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generic_confinement_rejects_symlinked_writable_declarations() {
+        let ws = GenericWorkspace::new("symlink");
+        std::os::unix::fs::symlink("scripts/pretty_print.py", ws.workspace.join("alias.py"))
+            .expect("inside symlink should be created");
+        std::os::unix::fs::symlink(
+            ws.outside.join("secret.txt"),
+            ws.workspace.join("escape.txt"),
+        )
+        .expect("outside symlink should be created");
+        std::os::unix::fs::symlink("scripts", ws.workspace.join("linked-scripts"))
+            .expect("inside directory symlink should be created");
+        std::os::unix::fs::symlink(&ws.outside, ws.workspace.join("door"))
+            .expect("outside directory symlink should be created");
+
+        for declared in [
+            "alias.py",
+            "escape.txt",
+            "linked-scripts/pretty_print.py",
+            "door/secret.txt",
+        ] {
+            let error = ws
+                .confine(&[declared])
+                .expect_err("a symlinked writable declaration must be refused");
+            assert!(error.contains("symlink"), "{declared}: {error}");
+        }
+        assert_eq!(ws.secret(), GENERIC_SECRET);
+    }
+
+    #[test]
+    fn generic_confinement_rejects_hardlinked_writable_declarations() {
+        let ws = GenericWorkspace::new("hardlink");
+        fs::hard_link(
+            ws.workspace.join("scripts/pretty_print.py"),
+            ws.outside.join("alias.py"),
+        )
+        .expect("hardlink should be created");
+        let error = ws
+            .confine(GENERIC_WRITABLE)
+            .expect_err("a hardlinked writable declaration must be refused");
+        assert!(error.contains("hard links"), "{error}");
+        // NEGATIVE CONTROL: the single-link declaration alone still binds.
+        ws.confine(&["tests/a2_l4/test_pretty_print.py"])
+            .expect("a single-link declaration should bind");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generic_confinement_refuses_declared_files_replaced_after_binding() {
+        let ws = GenericWorkspace::new("replaced");
+        let confinement = ws.confinement();
+
+        let declared = ws.workspace.join("scripts/pretty_print.py");
+        fs::remove_file(&declared).expect("declared file should be removable");
+        std::os::unix::fs::symlink(ws.outside.join("secret.txt"), &declared)
+            .expect("replacement symlink should be created");
+        let swapped = run_write_file_with(
+            write_input("scripts/pretty_print.py", "pwned"),
+            Some(&confinement),
+        )
+        .expect_err("a declared path swapped for a symlink must be refused");
+        assert!(swapped.contains("symlink"), "{swapped}");
+
+        fs::hard_link(
+            ws.workspace.join("tests/a2_l4/test_pretty_print.py"),
+            ws.outside.join("alias.py"),
+        )
+        .expect("late hardlink should be created");
+        let linked = run_edit_file_with(
+            edit_input("tests/a2_l4/test_pretty_print.py", "import", "pwned"),
+            Some(&confinement),
+        )
+        .expect_err("a declared file hardlinked after binding must be refused");
+        assert!(linked.contains("hard links"), "{linked}");
+
+        assert_eq!(ws.secret(), GENERIC_SECRET);
+        assert_eq!(
+            fs::read_to_string(ws.outside.join("alias.py")).expect("alias should exist"),
+            GENERIC_TEST
+        );
+    }
+
+    #[test]
+    fn generic_confinement_keeps_the_confined_tool_and_bash_policy() {
+        let ws = GenericWorkspace::new("policy");
+        let confinement = ws.confinement();
+        for tool in super::CONFINED_TOOLS {
+            confined_tool_permitted_with(tool, Some(&confinement))
+                .expect("confined tools are admitted");
+        }
+        for tool in ["REPL", "PowerShell", "Agent", "WebFetch", "MCP"] {
+            let error = confined_tool_permitted_with(tool, Some(&confinement))
+                .expect_err("other tools are refused under confinement");
+            assert!(error.contains("not available under workspace confinement"));
+        }
+
+        let defaulted = confine_bash_input(
+            bash_input(json!({ "command": SMOKE_COMMAND })),
+            Some(&confinement),
+        )
+        .expect("a foreground command should be accepted");
+        assert_eq!(defaulted.timeout, Some(CONFINED_BASH_TIMEOUT_MS));
+        let capped = confine_bash_input(
+            bash_input(json!({ "command": SMOKE_COMMAND, "timeout": 86_400_000u64 })),
+            Some(&confinement),
+        )
+        .expect("an over-long timeout should be capped");
+        assert_eq!(capped.timeout, Some(CONFINED_BASH_TIMEOUT_MS));
+        let background = confine_bash_input(
+            bash_input(json!({ "command": SMOKE_COMMAND, "run_in_background": true })),
+            Some(&confinement),
+        )
+        .expect_err("background execution must be refused");
+        assert!(background.contains("background execution"), "{background}");
+        let unsandboxed = confine_bash_input(
+            bash_input(json!({ "command": SMOKE_COMMAND, "dangerouslyDisableSandbox": true })),
+            Some(&confinement),
+        )
+        .expect_err("sandbox opt-out must be refused");
+        assert!(
+            unsandboxed.contains("dangerouslyDisableSandbox"),
+            "{unsandboxed}"
+        );
+    }
+
+    /// Generic workspace whose operator also declares `test_calculator.py`
+    /// writable, so the approved command imports code written through the
+    /// confined file tool: the strongest payload position the shell offers.
+    fn generic_shell_workspace(name: &str) -> (GenericWorkspace, WorkspaceConfinement) {
+        let ws = GenericWorkspace::new(name);
+        fs::write(ws.workspace.join("test_calculator.py"), "").expect("module should be written");
+        let mut writable = GENERIC_WRITABLE.to_vec();
+        writable.push("test_calculator.py");
+        let confinement = ws
+            .confine(&writable)
+            .expect("generic confinement should bind");
+        (ws, confinement)
+    }
+
+    fn plant_payload(confinement: &WorkspaceConfinement, payload: &str) {
+        run_write_file_with(
+            write_input("test_calculator.py", payload),
+            Some(confinement),
+        )
+        .expect("the declared module is writable through the file tool");
+    }
+
+    fn run_in_workspace(
+        workspace: &Path,
+        confinement: &WorkspaceConfinement,
+        input: serde_json::Value,
+    ) -> Result<String, String> {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = std::env::current_dir().expect("cwd should be readable");
+        std::env::set_current_dir(workspace).expect("cwd should move into the workspace");
+        let result = run_contained_bash(bash_input(input), confinement);
+        std::env::set_current_dir(previous).expect("cwd should be restored");
+        result
+    }
+
+    #[test]
+    fn generic_confined_shell_cannot_write_the_workspace_or_escape() {
+        if !sandbox_ready() {
+            return;
+        }
+        let (ws, confinement) = generic_shell_workspace("shell");
+        plant_payload(
+            &confinement,
+            &format!(
+                "import os\n\
+                 results = []\n\
+                 for label, path in (('declared', 'scripts/pretty_print.py'), ('unlisted', 'README.md'), ('new', 'new.py'), ('parent', '../escape.txt'), ('outside', {secret:?})):\n\
+                 \x20   try:\n\
+                 \x20       with open(path, 'a') as handle:\n\
+                 \x20           handle.write('#')\n\
+                 \x20       results.append(label + ':WROTE')\n\
+                 \x20   except OSError:\n\
+                 \x20       results.append(label + ':REFUSED')\n\
+                 print(' '.join(results))\n\
+                 print('HOST', os.path.exists({outside:?}))\n",
+                secret = ws.outside.join("secret.txt").to_string_lossy(),
+                outside = ws.outside.to_string_lossy(),
+            ),
+        );
+
+        let result = run_in_workspace(
+            &ws.workspace,
+            &confinement,
+            json!({ "command": SMOKE_COMMAND }),
+        );
+        let unapproved = run_in_workspace(
+            &ws.workspace,
+            &confinement,
+            json!({ "command": "echo pwned > README.md" }),
+        );
+
+        let output = contained_output(result);
+        let stdout = output["stdout"].as_str().unwrap_or_default();
+        // The sandbox mounts the workspace read-only: even a declared file is
+        // writable only through the confined file tools, never from the shell.
+        assert!(
+            stdout.contains(
+                "declared:REFUSED unlisted:REFUSED new:REFUSED parent:REFUSED outside:REFUSED"
+            ),
+            "the sandbox must refuse every workspace and host write: {output}"
+        );
+        assert!(stdout.contains("HOST False"), "host tree visible: {output}");
+        assert_eq!(
+            output["structuredContent"][0]["containment"]["launcher"],
+            "/usr/bin/bwrap"
+        );
+        assert_eq!(
+            output["structuredContent"][0]["containment"]["residualProcesses"],
+            0
+        );
+        let unapproved = unapproved.expect_err("only the approved command may run");
+        assert!(unapproved.contains("not approved"), "{unapproved}");
+
+        assert_eq!(ws.read("README.md"), GENERIC_README);
+        assert_eq!(ws.read("scripts/pretty_print.py"), GENERIC_SOURCE);
+        assert!(!ws.workspace.join("new.py").exists());
+        assert!(!ws.base.join("escape.txt").exists());
+        assert_eq!(ws.secret(), GENERIC_SECRET);
+    }
+
+    #[test]
+    fn generic_confined_shell_timeout_is_bounded() {
+        if !sandbox_ready() {
+            return;
+        }
+        let (ws, confinement) = generic_shell_workspace("shell-timeout");
+        plant_payload(&confinement, "import time\ntime.sleep(30)\n");
+        let started = std::time::Instant::now();
+        let result = run_in_workspace(
+            &ws.workspace,
+            &confinement,
+            json!({ "command": SMOKE_COMMAND, "timeout": 1_000u64 }),
+        );
+        let elapsed = started.elapsed();
+        let output = contained_output(result);
+        assert_eq!(output["interrupted"], true, "{output}");
+        assert_eq!(output["returnCodeInterpretation"], "timeout", "{output}");
+        assert_eq!(
+            output["structuredContent"][0]["containment"]["residualProcesses"],
+            0
+        );
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "the timeout must bound the call, took {elapsed:?}"
         );
     }
 }
