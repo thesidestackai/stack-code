@@ -18109,6 +18109,112 @@ UU conflicted.rs",
     }
 
     #[test]
+    fn insertion_operation_diff_reaches_the_openai_tool_message() {
+        // Real `insert_before` / `insert_after` results carried along the
+        // live model path: tool registry -> `convert_messages` ->
+        // OpenAI-compatible `role:"tool"` message, i.e. what the next turn
+        // reads. The fixture has a method/class boundary; names are unrelated.
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("claw-insert-wire-{unique}"));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("test_shapes.py");
+        let original = "import unittest\n\n\nclass SquareTests(unittest.TestCase):\n    def test_area(self):\n        self.assertEqual(4, 2 * 2)\n\n\nclass CircleTests(unittest.TestCase):\n    def test_radius(self):\n        self.assertEqual(1, 1)\n";
+        fs::write(&path, original).expect("seed file");
+        let shown = fs::canonicalize(&path)
+            .expect("canonical path")
+            .to_string_lossy()
+            .into_owned();
+
+        let registry = GlobalToolRegistry::builtin();
+        let added = "    def test_side(self):\n        self.assertEqual(2, 4 // 2)\n\n\n";
+        let before_output = registry
+            .execute(
+                "insert_before",
+                &json!({ "path": path, "anchor": "class CircleTests(unittest.TestCase):", "content": added }),
+            )
+            .expect("insert_before");
+        let after_output = registry
+            .execute(
+                "insert_after",
+                &json!({ "path": path, "anchor": "import unittest\n", "content": "import math\n" }),
+            )
+            .expect("insert_after");
+        let expected = original
+            .replacen("import unittest\n", "import unittest\nimport math\n", 1)
+            .replacen("class CircleTests", &format!("{added}class CircleTests"), 1);
+        assert_eq!(fs::read_to_string(&path).expect("file"), expected);
+        let large_output = registry
+            .execute(
+                "insert_after",
+                &json!({ "path": path, "anchor": "import math\n", "content": "X = 0\n".repeat(4_000) }),
+            )
+            .expect("large insert_after");
+        let _ = fs::remove_dir_all(&dir);
+
+        let to_wire = |id: &str, tool: &str, output: &str| -> Value {
+            let messages = vec![ConversationMessage {
+                role: MessageRole::Tool,
+                blocks: vec![ContentBlock::ToolResult {
+                    tool_use_id: id.to_string(),
+                    tool_name: tool.to_string(),
+                    output: output.to_string(),
+                    is_error: false,
+                }],
+                usage: None,
+            }];
+            let converted = super::convert_messages(&messages);
+            let wire = api::translate_message(&converted[0], "local-model");
+            assert_eq!(wire.len(), 1);
+            assert_eq!(wire[0]["role"], "tool");
+            assert_eq!(wire[0]["tool_call_id"], id);
+            let content = wire[0]["content"].as_str().expect("string content");
+            assert_eq!(
+                content, output,
+                "insertion results reach the model verbatim"
+            );
+            let result: Value = serde_json::from_str(content).expect("json");
+            assert_eq!(result["success"], true);
+            assert_eq!(result["filePath"], shown.as_str());
+            assert!(content.find("\"filePath\":") < content.find("\"operationDiff\":"));
+            result
+        };
+        let diff_of = |result: &Value| -> String {
+            result["operationDiff"]
+                .as_str()
+                .expect("operationDiff must be model-visible")
+                .to_string()
+        };
+        let removed = |diff: &str| {
+            diff.lines()
+                .skip(2)
+                .filter(|line| line.starts_with('-'))
+                .count()
+        };
+
+        let before_diff = diff_of(&to_wire("call_before", "insert_before", &before_output));
+        assert_eq!(
+            before_diff,
+            format!(
+                "--- {shown}\n+++ {shown}\n@@ -6,6 +6,10 @@\n         self.assertEqual(4, 2 * 2)\n \n \n+    def test_side(self):\n+        self.assertEqual(2, 4 // 2)\n+\n+\n class CircleTests(unittest.TestCase):\n     def test_radius(self):\n         self.assertEqual(1, 1)\n"
+            )
+        );
+        let after_diff = diff_of(&to_wire("call_after", "insert_after", &after_output));
+        assert_eq!(removed(&after_diff), 0, "{after_diff}");
+        assert!(after_diff.contains("\n import unittest\n+import math\n \n"));
+
+        let large_diff = diff_of(&to_wire("call_large", "insert_after", &large_output));
+        assert_eq!(removed(&large_diff), 0);
+        assert!(large_diff.len() <= 16_384, "{} bytes", large_diff.len());
+        assert!(
+            large_diff.contains("\n[operation diff truncated — exceeded 16384 bytes; "),
+            "truncation must be explicit on the wire"
+        );
+    }
+
+    #[test]
     fn repl_help_mentions_history_completion_and_multiline() {
         let help = render_repl_help();
         assert!(help.contains("Up/Down"));

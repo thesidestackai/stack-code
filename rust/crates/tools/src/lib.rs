@@ -16,7 +16,7 @@ use runtime::{
         approved_command, run_contained, ApprovedCommand, ContainedRequest, ContainedTermination,
     },
     dedupe_superseded_commit_events, edit_file, execute_bash, glob_search, grep_search,
-    load_system_prompt,
+    insert_text, load_system_prompt,
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
@@ -27,10 +27,10 @@ use runtime::{
     worker_boot::{WorkerReadySnapshot, WorkerRegistry, WorkerTaskReceipt},
     write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
     BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime,
-    GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventName,
-    LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole, PermissionMode,
-    PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError, Session, TaskPacket,
-    ToolError, ToolExecutor, WorkspaceRoot,
+    GrepSearchInput, InsertPosition, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
+    LaneEventName, LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole,
+    PermissionMode, PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError,
+    Session, TaskPacket, ToolError, ToolExecutor, WorkspaceRoot,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -69,6 +69,8 @@ pub const CONFINED_TOOLS: &[&str] = &[
     "read_file",
     "write_file",
     "edit_file",
+    "insert_before",
+    "insert_after",
     "glob_search",
     "grep_search",
     "bash",
@@ -715,6 +717,28 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "required": ["path", "old_string", "new_string"],
                 "additionalProperties": false
             }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "insert_before",
+            description: "Insert new text into an existing workspace file immediately before \
+                an anchor, replacing nothing. `anchor` is exact existing text that must occur \
+                exactly once in the file; it and every other existing byte stay unchanged. \
+                `content` is inserted exactly as given, so include any newlines and indentation \
+                it needs. Use this instead of edit_file when adding new text while preserving \
+                the anchor unchanged.",
+            input_schema: insert_text_schema(),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "insert_after",
+            description: "Insert new text into an existing workspace file immediately after \
+                an anchor, replacing nothing. `anchor` is exact existing text that must occur \
+                exactly once in the file; it and every other existing byte stay unchanged. \
+                `content` is inserted exactly as given, so include any newlines and indentation \
+                it needs. Use this instead of edit_file when adding new text while preserving \
+                the anchor unchanged.",
+            input_schema: insert_text_schema(),
             required_permission: PermissionMode::WorkspaceWrite,
         },
         ToolSpec {
@@ -1438,6 +1462,20 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
     ]
 }
 
+/// Input schema shared by `insert_before` and `insert_after`.
+fn insert_text_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "path": { "type": "string" },
+            "anchor": { "type": "string" },
+            "content": { "type": "string" }
+        },
+        "required": ["path", "anchor", "content"],
+        "additionalProperties": false
+    })
+}
+
 /// Check permission before executing a tool. Returns Err with denial reason if blocked.
 pub fn enforce_permission_check(
     enforcer: &PermissionEnforcer,
@@ -1457,6 +1495,7 @@ pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
     execute_tool_with_enforcer(None, name, input)
 }
 
+#[allow(clippy::too_many_lines)]
 fn execute_tool_with_enforcer(
     enforcer: Option<&PermissionEnforcer>,
     name: &str,
@@ -1482,6 +1521,16 @@ fn execute_tool_with_enforcer(
         "edit_file" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
             from_value::<EditFileInput>(input).and_then(run_edit_file)
+        }
+        "insert_before" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<InsertTextInput>(input)
+                .and_then(|input| run_insert_text(input, InsertPosition::Before))
+        }
+        "insert_after" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<InsertTextInput>(input)
+                .and_then(|input| run_insert_text(input, InsertPosition::After))
         }
         "glob_search" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
@@ -2512,6 +2561,29 @@ fn run_edit_file_with(
 }
 
 #[allow(clippy::needless_pass_by_value)]
+fn run_insert_text(input: InsertTextInput, position: InsertPosition) -> Result<String, String> {
+    run_insert_text_with(input, position, workspace_confinement())
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_insert_text_with(
+    input: InsertTextInput,
+    position: InsertPosition,
+    confinement: Option<&WorkspaceConfinement>,
+) -> Result<String, String> {
+    let output = match confinement {
+        Some(confinement) => {
+            confinement.ensure_not_halted()?;
+            confinement
+                .root()
+                .insert_text(&input.path, &input.anchor, &input.content, position)
+        }
+        None => insert_text(&input.path, &input.anchor, &input.content, position),
+    };
+    to_pretty_json(output.map_err(io_to_string)?)
+}
+
+#[allow(clippy::needless_pass_by_value)]
 fn run_glob_search(input: GlobSearchInputValue) -> Result<String, String> {
     run_glob_search_with(input, workspace_confinement())
 }
@@ -2715,6 +2787,13 @@ struct EditFileInput {
     old_string: String,
     new_string: String,
     replace_all: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InsertTextInput {
+    path: String,
+    anchor: String,
+    content: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5336,7 +5415,14 @@ fn deferred_tool_specs() -> Vec<ToolSpec> {
         .filter(|spec| {
             !matches!(
                 spec.name,
-                "bash" | "read_file" | "write_file" | "edit_file" | "glob_search" | "grep_search"
+                "bash"
+                    | "read_file"
+                    | "write_file"
+                    | "edit_file"
+                    | "insert_before"
+                    | "insert_after"
+                    | "glob_search"
+                    | "grep_search"
             )
         })
         .collect()
@@ -6593,18 +6679,19 @@ mod tests {
         execute_agent_with_spawn, execute_tool, extract_recovery_outcome, final_assistant_text,
         global_cron_registry, maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
         persist_agent_terminal_state, push_output_block, run_contained_bash, run_edit_file_with,
-        run_glob_search_with, run_grep_search_with, run_read_file_with, run_task_packet,
-        run_write_file_with, AgentInput, AgentJob, BashCommandInput, EditFileInput,
-        GlobSearchInputValue, GlobalToolRegistry, LaneEventName, LaneFailureClass,
-        ProviderRuntimeClient, ReadFileInput, SubagentToolExecutor, WorkspaceConfinement,
-        WriteFileInput, CONFINED_BASH_TIMEOUT_MS,
+        run_glob_search_with, run_grep_search_with, run_insert_text_with, run_read_file_with,
+        run_task_packet, run_write_file_with, AgentInput, AgentJob, BashCommandInput,
+        EditFileInput, GlobSearchInputValue, GlobalToolRegistry, InsertTextInput, LaneEventName,
+        LaneFailureClass, ProviderRuntimeClient, ReadFileInput, SubagentToolExecutor,
+        WorkspaceConfinement, WriteFileInput, CONFINED_BASH_TIMEOUT_MS,
     };
     use api::OutputContentBlock;
     use runtime::GrepSearchInput;
     use runtime::ProviderFallbackConfig;
     use runtime::{
         permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, ConversationRuntime,
-        PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket, ToolExecutor,
+        InsertPosition, PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket,
+        ToolExecutor,
     };
     use serde_json::json;
 
@@ -11222,6 +11309,541 @@ if __name__ == "__main__":
             format!(
                 "{headers}[operation diff truncated — exceeded 16384 bytes; 4 more diff lines omitted]\n"
             )
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Anchored insertion: `insert_before` / `insert_after`.
+    // ------------------------------------------------------------------
+
+    fn insert_input(path: &str, anchor: &str, content: &str) -> InsertTextInput {
+        serde_json::from_value(json!({ "path": path, "anchor": anchor, "content": content }))
+            .expect("insert input should parse")
+    }
+
+    fn operation_diff_of(visible: &str) -> String {
+        let result: serde_json::Value = serde_json::from_str(visible).expect("json result");
+        assert_eq!(result["success"], true, "{visible}");
+        result["operationDiff"]
+            .as_str()
+            .expect("the model-visible result must carry operationDiff")
+            .to_string()
+    }
+
+    fn removed_lines(diff: &str) -> Vec<&str> {
+        diff.lines()
+            .skip(2)
+            .filter(|line| line.starts_with('-'))
+            .collect()
+    }
+
+    /// Test-only Python structure: every method with the class it belongs
+    /// to, in file order. Python-specific on purpose: production insertion
+    /// knows no language, so structure is asserted here, never enforced there.
+    fn python_methods(source: &str) -> Vec<(String, String)> {
+        python_scopes(source)
+            .into_iter()
+            .filter_map(|(class, method, line)| {
+                line.starts_with("    def ")
+                    .then(|| class.zip(method))
+                    .flatten()
+            })
+            .collect()
+    }
+
+    /// The `(class, function)` holding the one line that contains `needle`.
+    fn python_owner(source: &str, needle: &str) -> (Option<String>, Option<String>) {
+        let owners = python_scopes(source)
+            .into_iter()
+            .filter(|(_, _, line)| line.contains(needle))
+            .map(|(class, function, _)| (class, function))
+            .collect::<Vec<_>>();
+        assert_eq!(owners.len(), 1, "{needle:?} must occur on exactly one line");
+        owners.into_iter().next().expect("one owner")
+    }
+
+    fn python_scopes(source: &str) -> Vec<(Option<String>, Option<String>, &str)> {
+        let ident = |rest: &str| rest.split(['(', ':']).next().unwrap_or(rest).to_string();
+        let (mut class, mut function) = (None, None);
+        source
+            .lines()
+            .map(|line| {
+                if let Some(rest) = line.strip_prefix("class ") {
+                    (class, function) = (Some(ident(rest)), None);
+                } else if let Some(rest) = line.strip_prefix("def ") {
+                    (class, function) = (None, Some(ident(rest)));
+                } else if let Some(rest) = line.strip_prefix("    def ") {
+                    function = Some(ident(rest));
+                } else if !line.is_empty() && !line.starts_with(' ') {
+                    (class, function) = (None, None);
+                }
+                (class.clone(), function.clone(), line)
+            })
+            .collect()
+    }
+
+    fn owned(class: &str, function: &str) -> (Option<String>, Option<String>) {
+        (Some(class.to_string()), Some(function.to_string()))
+    }
+
+    #[test]
+    fn insertion_tools_are_registered_with_an_explicit_anchor_schema() {
+        let specs = mvp_tool_specs();
+        let spec = |name: &str| {
+            specs
+                .iter()
+                .find(|spec| spec.name == name)
+                .unwrap_or_else(|| panic!("{name} must be a built-in tool"))
+        };
+        for (name, side) in [("insert_before", "before"), ("insert_after", "after")] {
+            let insert = spec(name);
+            assert_eq!(insert.required_permission, PermissionMode::WorkspaceWrite);
+            assert_eq!(
+                insert.input_schema,
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "anchor": { "type": "string" },
+                        "content": { "type": "string" }
+                    },
+                    "required": ["path", "anchor", "content"],
+                    "additionalProperties": false
+                })
+            );
+            for phrase in [
+                format!("immediately {side} an anchor, replacing nothing"),
+                "must occur exactly once in the file".to_string(),
+                "every other existing byte stay unchanged".to_string(),
+                "inserted exactly as given".to_string(),
+                "while preserving the anchor unchanged".to_string(),
+            ] {
+                assert!(insert.description.contains(&phrase), "{name}: {phrase}");
+            }
+        }
+
+        // Offered to the model, selectable with --allowedTools, and
+        // permission-classified like edit_file.
+        let registry = GlobalToolRegistry::builtin();
+        let offered = registry
+            .definitions(None)
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<BTreeSet<_>>();
+        assert!(offered.contains("insert_before") && offered.contains("insert_after"));
+        let allowed = registry
+            .normalize_allowed_tools(&[
+                "read_file,insert-before".to_string(),
+                "INSERT_AFTER".to_string(),
+            ])
+            .expect("insertion tools are valid --allowedTools names")
+            .expect("allowlist");
+        assert_eq!(
+            allowed,
+            ["insert_after", "insert_before", "read_file"]
+                .map(String::from)
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+        );
+        assert_eq!(
+            registry
+                .definitions(Some(&allowed))
+                .into_iter()
+                .map(|definition| definition.name)
+                .collect::<Vec<_>>(),
+            ["read_file", "insert_before", "insert_after"]
+        );
+        let permissions = registry
+            .permission_specs(None)
+            .expect("permission specs")
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        for name in ["insert_before", "insert_after"] {
+            assert_eq!(permissions[name], permissions["edit_file"], "{name}");
+        }
+    }
+
+    #[test]
+    fn replacement_and_whole_file_tools_keep_their_frozen_specs() {
+        let specs = mvp_tool_specs();
+        let spec = |name: &str| {
+            specs
+                .iter()
+                .find(|spec| spec.name == name)
+                .unwrap_or_else(|| panic!("{name} must be a built-in tool"))
+        };
+        assert_eq!(
+            spec("edit_file").description,
+            "Replace text in a workspace file."
+        );
+        assert_eq!(
+            spec("edit_file").input_schema,
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "old_string": { "type": "string" },
+                    "new_string": { "type": "string" },
+                    "replace_all": { "type": "boolean" }
+                },
+                "required": ["path", "old_string", "new_string"],
+                "additionalProperties": false
+            })
+        );
+        assert_eq!(
+            spec("write_file").description,
+            "Write a text file in the workspace."
+        );
+        assert_eq!(
+            spec("write_file").input_schema,
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "content": { "type": "string" }
+                },
+                "required": ["path", "content"],
+                "additionalProperties": false
+            })
+        );
+    }
+
+    #[test]
+    fn confinement_admits_the_insertion_tools_and_nothing_else_new() {
+        assert_eq!(
+            super::CONFINED_TOOLS,
+            [
+                "read_file",
+                "write_file",
+                "edit_file",
+                "insert_before",
+                "insert_after",
+                "glob_search",
+                "grep_search",
+                "bash",
+            ]
+        );
+        let ws = GenericWorkspace::new("insert-admission");
+        let confinement = ws.confinement();
+        for tool in ["insert_before", "insert_after"] {
+            confined_tool_permitted_with(tool, Some(&confinement))
+                .expect("insertion tools are admitted under confinement");
+        }
+        for tool in [
+            "NotebookEdit",
+            "REPL",
+            "PowerShell",
+            "Agent",
+            "WebFetch",
+            "TodoWrite",
+            "Config",
+            "MCP",
+            "insert_text",
+        ] {
+            let error = confined_tool_permitted_with(tool, Some(&confinement))
+                .expect_err("other tools stay refused under confinement");
+            assert!(error.contains("not available under workspace confinement"));
+        }
+    }
+
+    #[test]
+    fn insertion_obeys_the_ordinary_permission_layer() {
+        let ws = GenericWorkspace::new("insert-permission");
+        let target = ws.workspace.join("scripts/pretty_print.py");
+        let path = target.to_string_lossy().into_owned();
+        let input = json!({ "path": path, "anchor": "print(", "content": "# added\n" });
+
+        let read_only = read_only_registry();
+        for tool in ["insert_before", "insert_after"] {
+            let error = read_only
+                .execute(tool, &input)
+                .expect_err("insertion must be denied in read-only mode");
+            assert!(
+                error.contains("current mode is read-only"),
+                "{tool}: {error}"
+            );
+        }
+        let rules = runtime::RuntimePermissionRuleConfig::new(
+            Vec::new(),
+            vec![format!("insert_after({path})")],
+            Vec::new(),
+        );
+        let policy = mvp_tool_specs().into_iter().fold(
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite).with_permission_rules(&rules),
+            |policy, spec| policy.with_tool_requirement(spec.name, spec.required_permission),
+        );
+        let mut registry = GlobalToolRegistry::builtin();
+        registry.set_enforcer(PermissionEnforcer::new(policy));
+        let denied = registry
+            .execute("insert_after", &input)
+            .expect_err("a deny rule on the path applies to insertion");
+        assert!(denied.contains("denied by rule"), "{denied}");
+        assert_eq!(ws.read("scripts/pretty_print.py"), GENERIC_SOURCE);
+
+        // NEGATIVE CONTROL: the same workspace-write policy admits the other
+        // insertion tool, which no rule names.
+        let visible = registry
+            .execute("insert_before", &input)
+            .expect("workspace-write mode admits insertion");
+        assert_eq!(
+            ws.read("scripts/pretty_print.py"),
+            format!("# added\n{GENERIC_SOURCE}")
+        );
+        assert!(removed_lines(&operation_diff_of(&visible)).is_empty());
+    }
+
+    #[test]
+    fn generic_confinement_inserts_only_into_declared_files() {
+        let ws = GenericWorkspace::new("insert-declared");
+        let confinement = ws.confinement();
+        let visible = run_insert_text_with(
+            insert_input("scripts/pretty_print.py", "print(", "import sys\n\n"),
+            InsertPosition::Before,
+            Some(&confinement),
+        )
+        .expect("a declared file accepts insertion");
+        assert_eq!(
+            ws.read("scripts/pretty_print.py"),
+            format!("import sys\n\n{GENERIC_SOURCE}")
+        );
+        let result: serde_json::Value = serde_json::from_str(&visible).expect("json result");
+        assert_eq!(
+            result,
+            json!({
+                "filePath": "scripts/pretty_print.py",
+                "success": true,
+                "operationDiff": "--- scripts/pretty_print.py\n+++ scripts/pretty_print.py\n@@ -1,1 +1,3 @@\n+import sys\n+\n print(\"Plan steps:\")\n"
+            })
+        );
+
+        let inside_absolute = ws
+            .workspace
+            .join("README.md")
+            .to_string_lossy()
+            .into_owned();
+        let outside_absolute = ws.outside.join("secret.txt").to_string_lossy().into_owned();
+        for (path, anchor, reason) in [
+            (
+                "README.md",
+                "do not touch",
+                "not a designated writable file",
+            ),
+            ("scripts/new.py", "x", "not a designated writable file"),
+            ("../outside/secret.txt", "out-of-bounds", "`..`"),
+            ("scripts/../README.md", "do not touch", "`..`"),
+            (&inside_absolute, "do not touch", "is absolute"),
+            (&outside_absolute, "out-of-bounds", "is absolute"),
+        ] {
+            for position in [InsertPosition::Before, InsertPosition::After] {
+                let error = run_insert_text_with(
+                    insert_input(path, anchor, "pwned"),
+                    position,
+                    Some(&confinement),
+                )
+                .expect_err(path);
+                assert!(error.contains(reason), "{path}: {error}");
+            }
+        }
+        assert_eq!(ws.read("README.md"), GENERIC_README);
+        assert_eq!(ws.secret(), GENERIC_SECRET);
+        assert!(!ws.workspace.join("scripts/new.py").exists());
+
+        // A halted confinement refuses insertion like every confined tool.
+        confinement.halt();
+        let halted = run_insert_text_with(
+            insert_input("tests/a2_l4/test_pretty_print.py", "import", "# x\n"),
+            InsertPosition::Before,
+            Some(&confinement),
+        )
+        .expect_err("a halted confinement refuses insertion");
+        assert!(halted.contains("halted"), "{halted}");
+        assert_eq!(ws.read("tests/a2_l4/test_pretty_print.py"), GENERIC_TEST);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generic_confinement_refuses_insertion_into_files_swapped_after_binding() {
+        let ws = GenericWorkspace::new("insert-replaced");
+        let confinement = ws.confinement();
+
+        let declared = ws.workspace.join("scripts/pretty_print.py");
+        fs::remove_file(&declared).expect("declared file should be removable");
+        std::os::unix::fs::symlink(ws.outside.join("secret.txt"), &declared)
+            .expect("replacement symlink should be created");
+        let swapped = run_insert_text_with(
+            insert_input("scripts/pretty_print.py", "out-of-bounds", "pwned"),
+            InsertPosition::After,
+            Some(&confinement),
+        )
+        .expect_err("a declared path swapped for a symlink must be refused");
+        assert!(swapped.contains("symlink"), "{swapped}");
+
+        fs::hard_link(
+            ws.workspace.join("tests/a2_l4/test_pretty_print.py"),
+            ws.outside.join("alias.py"),
+        )
+        .expect("late hardlink should be created");
+        let linked = run_insert_text_with(
+            insert_input("tests/a2_l4/test_pretty_print.py", "import", "pwned"),
+            InsertPosition::Before,
+            Some(&confinement),
+        )
+        .expect_err("a declared file hardlinked after binding must be refused");
+        assert!(linked.contains("hard links"), "{linked}");
+
+        assert_eq!(ws.secret(), GENERIC_SECRET);
+        assert_eq!(
+            fs::read_to_string(ws.outside.join("alias.py")).expect("alias should exist"),
+            GENERIC_TEST
+        );
+    }
+
+    /// The class each method of [`REPLACED_TEST_BEFORE`] belongs to, with
+    /// `added` placed right after `after` in `class`.
+    fn methods_with(class: &str, after: &str, added: &str) -> Vec<(String, String)> {
+        let mut methods = python_methods(REPLACED_TEST_BEFORE);
+        let at = methods
+            .iter()
+            .position(|(_, method)| method == after)
+            .expect("existing method");
+        methods.insert(at + 1, (class.to_string(), added.to_string()));
+        methods
+    }
+
+    const ADDED_TEST: &str = "test_item_count_in_heading";
+    const KEPT_TEST: &str = "test_full_report_renders_and_exits_zero";
+    const KEPT_ASSERTION: &str = "        self.assertIn(\"not executed\", result.stdout.lower())\n";
+    const NEXT_CLASS: &str = "class RenderRefusalTests(unittest.TestCase):";
+
+    #[test]
+    fn insertion_adds_a_test_beside_a_complete_existing_test() {
+        // Run-1 shape: the whole existing method is the anchor; the new
+        // method goes after it. Through confinement, as the CLI runs it.
+        const TARGET: &str = "tests/a2_l4/test_pretty_print.py";
+        let ws = GenericWorkspace::new("insert-beside-test");
+        fs::write(ws.workspace.join(TARGET), REPLACED_TEST_BEFORE).expect("seed test file");
+        let confinement = ws.confinement();
+        let content = format!("\n\n{REPLACED_TEST_NEW}");
+
+        let visible = run_insert_text_with(
+            insert_input(TARGET, REPLACED_TEST_OLD, &content),
+            InsertPosition::After,
+            Some(&confinement),
+        )
+        .expect("the insertion is applied");
+        let after = ws.read(TARGET);
+        let at = REPLACED_TEST_BEFORE
+            .find(REPLACED_TEST_OLD)
+            .expect("anchor")
+            + REPLACED_TEST_OLD.len();
+        assert_eq!(
+            after,
+            format!(
+                "{}{content}{}",
+                &REPLACED_TEST_BEFORE[..at],
+                &REPLACED_TEST_BEFORE[at..]
+            )
+        );
+        assert_eq!(
+            after.matches(REPLACED_TEST_OLD).count(),
+            1,
+            "existing test kept whole"
+        );
+        assert_eq!(
+            python_methods(&after),
+            methods_with("RenderValidTests", KEPT_TEST, ADDED_TEST)
+        );
+        assert_eq!(
+            python_owner(&after, "\"not executed\""),
+            owned("RenderValidTests", KEPT_TEST)
+        );
+
+        let diff = operation_diff_of(&visible);
+        assert!(removed_lines(&diff).is_empty(), "{diff}");
+        assert!(diff.contains(&format!("\n+    def {ADDED_TEST}(self) -> None:\n")));
+        assert!(diff.contains(&format!("\n {KEPT_ASSERTION}")), "{diff}");
+
+        // COUNTERFACTUAL: the replacement that shape was emulated with drops
+        // the existing test, which insertion cannot.
+        let replaced = REPLACED_TEST_BEFORE.replacen(REPLACED_TEST_OLD, REPLACED_TEST_NEW, 1);
+        assert!(!python_methods(&replaced)
+            .iter()
+            .any(|(_, method)| method == KEPT_TEST));
+    }
+
+    #[test]
+    fn insertion_at_a_narrow_class_boundary_keeps_the_assertion_and_the_class() {
+        // Run-2 shape: a test is added at the end of a class, just before
+        // the next class header. The anchor is that header alone.
+        const TARGET: &str = "tests/a2_l4/test_pretty_print.py";
+        let ws = GenericWorkspace::new("insert-class-boundary");
+        let confinement = ws.confinement();
+        let insert = |anchor: &str, content: &str, position| -> String {
+            fs::write(ws.workspace.join(TARGET), REPLACED_TEST_BEFORE).expect("seed test file");
+            let visible = run_insert_text_with(
+                insert_input(TARGET, anchor, content),
+                position,
+                Some(&confinement),
+            )
+            .expect("the insertion is applied");
+            let after = ws.read(TARGET);
+            // Byte preservation holds whatever the anchor.
+            let start = REPLACED_TEST_BEFORE.find(anchor).expect("anchor");
+            let at = match position {
+                InsertPosition::Before => start,
+                InsertPosition::After => start + anchor.len(),
+            };
+            assert_eq!(
+                after,
+                format!(
+                    "{}{content}{}",
+                    &REPLACED_TEST_BEFORE[..at],
+                    &REPLACED_TEST_BEFORE[at..]
+                )
+            );
+            assert!(removed_lines(&operation_diff_of(&visible)).is_empty());
+            after
+        };
+
+        let after = insert(
+            NEXT_CLASS,
+            &format!("{REPLACED_TEST_NEW}\n\n\n"),
+            InsertPosition::Before,
+        );
+        assert_eq!(after.matches(KEPT_ASSERTION).count(), 1);
+        assert_eq!(after.matches(&format!("\n{NEXT_CLASS}\n")).count(), 1);
+        assert_eq!(
+            python_owner(&after, "\"not executed\""),
+            owned("RenderValidTests", KEPT_TEST)
+        );
+        assert_eq!(
+            python_methods(&after),
+            methods_with("RenderValidTests", KEPT_TEST, ADDED_TEST)
+        );
+
+        // Byte preservation is not placement: anchoring on the whole span
+        // from the assertion through the next class header, as replacement
+        // did, would misplace the block either way.
+        let wide = format!("{KEPT_ASSERTION}\n\n{NEXT_CLASS}");
+        let into_next_class = insert(
+            &wide,
+            &format!("\n{REPLACED_TEST_NEW}\n"),
+            InsertPosition::After,
+        );
+        assert_eq!(
+            python_methods(&into_next_class),
+            methods_with("RenderRefusalTests", KEPT_TEST, ADDED_TEST),
+            "the new test would join the next class"
+        );
+        let relocated = insert(
+            &wide,
+            &format!("{REPLACED_TEST_NEW}\n"),
+            InsertPosition::Before,
+        );
+        assert_eq!(
+            python_owner(&relocated, "\"not executed\""),
+            owned("RenderValidTests", ADDED_TEST),
+            "the assertion would leave its test"
         );
     }
 

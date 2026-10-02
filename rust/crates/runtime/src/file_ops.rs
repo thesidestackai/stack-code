@@ -120,6 +120,27 @@ pub struct EditFileOutput {
     pub git_diff: Option<serde_json::Value>,
 }
 
+/// Which side of its anchor an anchored insertion lands on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertPosition {
+    /// `insert_before`: the inserted text ends where the anchor begins.
+    Before,
+    /// `insert_after`: the inserted text begins where the anchor ends.
+    After,
+}
+
+/// Output envelope for anchored insertions (`insert_before`, `insert_after`).
+/// Nothing is replaced, so `operationDiff` is the whole story of the change.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InsertTextOutput {
+    #[serde(rename = "filePath")]
+    pub file_path: String,
+    pub success: bool,
+    /// Bounded unified diff of this one insertion, before → after.
+    #[serde(rename = "operationDiff")]
+    pub operation_diff: String,
+}
+
 /// Result of a glob-based filename search.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GlobSearchOutput {
@@ -313,6 +334,87 @@ pub fn edit_file(
         replace_all,
         git_diff: None,
     })
+}
+
+/// Inserts `content` immediately before or after the one occurrence of
+/// `anchor` in an existing file, changing no existing byte.
+pub fn insert_text(
+    path: &str,
+    anchor: &str,
+    content: &str,
+    position: InsertPosition,
+) -> io::Result<InsertTextOutput> {
+    let absolute_path = normalize_path(path)?;
+    let original_file = fs::read_to_string(&absolute_path)?;
+    let updated = insert_at_anchor(&original_file, anchor, content, position)?;
+    fs::write(&absolute_path, &updated)?;
+
+    let file_path = absolute_path.to_string_lossy().into_owned();
+    Ok(InsertTextOutput {
+        operation_diff: make_operation_diff(&file_path, &original_file, &updated),
+        file_path,
+        success: true,
+    })
+}
+
+/// `original` with `content` inserted immediately before or after the one
+/// occurrence of `anchor`: `original[..at] + content + original[at..]`, where
+/// `at` is where the anchor starts (`Before`) or ends (`After`). Every
+/// original byte, the anchor included, is kept as it was; only `content` is
+/// added, verbatim, with no newline, indentation or line ending of its own.
+///
+/// Refused before anything is built: an empty anchor or content, an anchor
+/// that does not occur, one that occurs more than once (overlapping
+/// occurrences count), and a result over [`MAX_WRITE_SIZE`].
+fn insert_at_anchor(
+    original: &str,
+    anchor: &str,
+    content: &str,
+    position: InsertPosition,
+) -> io::Result<String> {
+    if anchor.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "anchor must not be empty",
+        ));
+    }
+    if content.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "content must not be empty",
+        ));
+    }
+    let Some(start) = original.find(anchor) else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "anchor not found in file",
+        ));
+    };
+    // A second occurrence may overlap the first, so look again from the
+    // anchor's second character rather than from its end.
+    let second = start + anchor.chars().next().map_or(1, char::len_utf8);
+    if original[second..].contains(anchor) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "anchor occurs more than once in file; it must occur exactly once",
+        ));
+    }
+    let size = original.len().saturating_add(content.len());
+    if size > MAX_WRITE_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("file would be too large after insertion ({size} bytes, max {MAX_WRITE_SIZE} bytes)"),
+        ));
+    }
+    let at = match position {
+        InsertPosition::Before => start,
+        InsertPosition::After => start + anchor.len(),
+    };
+    let mut updated = String::with_capacity(size);
+    updated.push_str(&original[..at]);
+    updated.push_str(content);
+    updated.push_str(&original[at..]);
+    Ok(updated)
 }
 
 /// Expands a glob pattern and returns matching filenames.
@@ -966,10 +1068,11 @@ mod confined {
     use rustix::io::Errno;
 
     use super::{
-        confinement_denied, expand_braces, fs, grep_files, io, make_operation_diff, make_patch,
-        text_window, workspace_relative, EditFileOutput, GlobSearchOutput, GrepSearchInput,
-        GrepSearchOutput, Instant, Path, PathBuf, Pattern, ReadFileOutput, Reverse,
-        WriteFileOutput, MAX_READ_SIZE, MAX_WRITE_SIZE,
+        confinement_denied, expand_braces, fs, grep_files, insert_at_anchor, io,
+        make_operation_diff, make_patch, text_window, workspace_relative, EditFileOutput,
+        GlobSearchOutput, GrepSearchInput, GrepSearchOutput, InsertPosition, InsertTextOutput,
+        Instant, Path, PathBuf, Pattern, ReadFileOutput, Reverse, WriteFileOutput, MAX_READ_SIZE,
+        MAX_WRITE_SIZE,
     };
 
     const RESOLVE: ResolveFlags = ResolveFlags::BENEATH
@@ -1255,6 +1358,26 @@ mod confined {
             })
         }
 
+        /// Confined `insert_before`/`insert_after`: anchored insertion into
+        /// a designated file, written through the descriptor it was read from.
+        pub fn insert_text(
+            &self,
+            path: &str,
+            anchor: &str,
+            content: &str,
+            position: InsertPosition,
+        ) -> io::Result<InsertTextOutput> {
+            let (relative, mut file, original) = self.open_designated(path)?;
+            let updated = insert_at_anchor(&original, anchor, content, position)?;
+            Self::replace_contents(&mut file, &updated)?;
+            let file_path = relative.to_string_lossy().into_owned();
+            Ok(InsertTextOutput {
+                operation_diff: make_operation_diff(&file_path, &original, &updated),
+                file_path,
+                success: true,
+            })
+        }
+
         /// Enumerate regular files beneath `base` (workspace-relative),
         /// returning root-relative paths with their mtimes. Symlinks, special
         /// files and mount crossings are never followed or listed.
@@ -1454,6 +1577,15 @@ impl WorkspaceRoot {
     ) -> io::Result<EditFileOutput> {
         Err(Self::unsupported())
     }
+    pub fn insert_text(
+        &self,
+        _path: &str,
+        _anchor: &str,
+        _content: &str,
+        _position: InsertPosition,
+    ) -> io::Result<InsertTextOutput> {
+        Err(Self::unsupported())
+    }
     pub fn glob_search(&self, _pattern: &str, _path: Option<&str>) -> io::Result<GlobSearchOutput> {
         Err(Self::unsupported())
     }
@@ -1489,9 +1621,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        bound_operation_diff, edit_file, expand_braces, glob_search, grep_search,
-        is_symlink_escape, make_operation_diff, read_file, read_file_in_workspace, write_file,
-        GrepSearchInput, MAX_WRITE_SIZE,
+        bound_operation_diff, edit_file, expand_braces, glob_search, grep_search, insert_at_anchor,
+        insert_text, is_symlink_escape, make_operation_diff, read_file, read_file_in_workspace,
+        write_file, GrepSearchInput, InsertPosition, MAX_WRITE_SIZE,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -2259,6 +2391,379 @@ mod tests {
         );
         assert_eq!(bound_operation_diff(two.clone()), expected_bounded(&two));
     }
+
+    // --- anchored insertion ------------------------------------------------
+
+    use super::InsertPosition::{After, Before};
+
+    /// Inserts through the pure transform and checks the one invariant every
+    /// success must satisfy: the result is the original split at the anchor
+    /// boundary with `content` between, so removing exactly those bytes
+    /// restores the original and the anchor sits where it was.
+    fn insert_exactly(
+        original: &str,
+        anchor: &str,
+        content: &str,
+        position: InsertPosition,
+    ) -> String {
+        let updated = insert_at_anchor(original, anchor, content, position).expect("insert");
+        let start = original.find(anchor).expect("anchor");
+        let at = if position == Before {
+            start
+        } else {
+            start + anchor.len()
+        };
+        assert_eq!(
+            updated,
+            format!("{}{content}{}", &original[..at], &original[at..])
+        );
+        assert_eq!(&updated[at..at + content.len()], content);
+        let anchor_at = if position == Before {
+            at + content.len()
+        } else {
+            start
+        };
+        assert_eq!(&updated[anchor_at..anchor_at + anchor.len()], anchor);
+        let mut restored = updated.clone();
+        restored.replace_range(at..at + content.len(), "");
+        assert_eq!(restored, original, "only the content was added");
+        updated
+    }
+
+    /// Runs the file-backed insertion, returning the result and the bytes
+    /// on disk afterwards.
+    fn insert_in_file(
+        name: &str,
+        before: &str,
+        anchor: &str,
+        content: &str,
+        position: InsertPosition,
+    ) -> (std::io::Result<super::InsertTextOutput>, String) {
+        let path = temp_path(name);
+        std::fs::write(&path, before).expect("seed file");
+        let result = insert_text(path.to_str().expect("utf8"), anchor, content, position);
+        let after = std::fs::read_to_string(&path).expect("read file");
+        let _ = std::fs::remove_file(&path);
+        (result, after)
+    }
+
+    #[test]
+    fn insertion_keeps_the_anchor_on_both_sides() {
+        let original = "AAA\nANCHOR\nBBB\n";
+        assert_eq!(
+            insert_exactly(original, "ANCHOR\n", "NEW\n", Before),
+            "AAA\nNEW\nANCHOR\nBBB\n"
+        );
+        assert_eq!(
+            insert_exactly(original, "ANCHOR\n", "NEW\n", After),
+            "AAA\nANCHOR\nNEW\nBBB\n"
+        );
+        // An anchor without its newline sets the boundary inside the line.
+        assert_eq!(
+            insert_exactly(original, "ANCHOR", "\nNEW", After),
+            "AAA\nANCHOR\nNEW\nBBB\n"
+        );
+        assert_eq!(
+            insert_exactly(original, "ANCHOR", "NEW\n", Before),
+            "AAA\nNEW\nANCHOR\nBBB\n"
+        );
+    }
+
+    #[test]
+    fn insertion_refuses_missing_ambiguous_and_empty_requests() {
+        let original = "one\ntwo\none\n";
+        for (anchor, content, kind, message) in [
+            (
+                "three",
+                "x",
+                std::io::ErrorKind::NotFound,
+                "anchor not found in file",
+            ),
+            (
+                "one",
+                "x",
+                std::io::ErrorKind::InvalidInput,
+                "anchor occurs more than once in file; it must occur exactly once",
+            ),
+            (
+                "",
+                "x",
+                std::io::ErrorKind::InvalidInput,
+                "anchor must not be empty",
+            ),
+            (
+                "two",
+                "",
+                std::io::ErrorKind::InvalidInput,
+                "content must not be empty",
+            ),
+            // Exact bytes only: no case folding, trimming or line-ending slack.
+            (
+                "TWO",
+                "x",
+                std::io::ErrorKind::NotFound,
+                "anchor not found in file",
+            ),
+            (
+                " two",
+                "x",
+                std::io::ErrorKind::NotFound,
+                "anchor not found in file",
+            ),
+            (
+                "two\r\n",
+                "x",
+                std::io::ErrorKind::NotFound,
+                "anchor not found in file",
+            ),
+        ] {
+            for position in [Before, After] {
+                let error = insert_at_anchor(original, anchor, content, position)
+                    .expect_err("must be refused");
+                assert_eq!(error.kind(), kind, "{anchor:?}");
+                assert_eq!(error.to_string(), message, "{anchor:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn overlapping_occurrences_make_an_anchor_ambiguous() {
+        for (original, anchor) in [
+            ("aaa", "aa"),
+            ("abcabcabc", "abcabc"),
+            ("ababab", "abab"),
+            ("ééé", "éé"),
+            ("☃☃☃\n", "☃☃"),
+        ] {
+            // Not overlapping-aware, `matches` sees only one occurrence.
+            assert_eq!(original.matches(anchor).count(), 1, "{original:?}");
+            for position in [Before, After] {
+                let error = insert_at_anchor(original, anchor, "N", position)
+                    .expect_err("an overlapping second occurrence is ambiguous");
+                assert!(error.to_string().contains("more than once"), "{error}");
+            }
+        }
+        // NEGATIVE CONTROL: adjacent but distinct text stays unique.
+        insert_exactly("abaXab", "aba", "N", After);
+        insert_exactly("éaé", "éa", "N", Before);
+    }
+
+    #[test]
+    fn inserted_content_is_byte_exact() {
+        let original = "first\nANCHOR\nlast\n";
+        for content in [
+            "    leading spaces\n",
+            "trailing spaces   \n",
+            "\t\ttabs\tinside\n",
+            "\n\n\nblank lines\n\n\n",
+            "no trailing newline",
+            "  \t mixed \t  ",
+            "\r\ncarriage returns stay\r\n",
+            "naïve café ☃ 日本語 🎉\n",
+        ] {
+            for position in [Before, After] {
+                let updated = insert_exactly(original, "ANCHOR\n", content, position);
+                assert_eq!(updated.matches(content).count(), 1, "{content:?}");
+                assert_eq!(updated.len(), original.len() + content.len());
+            }
+        }
+    }
+
+    #[test]
+    fn insertion_respects_utf8_and_newline_boundaries() {
+        // Multibyte anchors, at the very start and the very end.
+        let original = "ünïcödé start\nmiddle ☃\nend 🎉";
+        assert_eq!(
+            insert_exactly(original, "ünïcödé", "→ ", Before),
+            "→ ünïcödé start\nmiddle ☃\nend 🎉"
+        );
+        assert_eq!(
+            insert_exactly(original, "☃", " ❄", After),
+            "ünïcödé start\nmiddle ☃ ❄\nend 🎉"
+        );
+        assert_eq!(
+            insert_exactly(original, "🎉", " ✓", After),
+            "ünïcödé start\nmiddle ☃\nend 🎉 ✓"
+        );
+        // A file without a final newline gains none; neither does content.
+        let unterminated = "a\nb";
+        assert_eq!(insert_exactly(unterminated, "b", "\nc", After), "a\nb\nc");
+        assert_eq!(insert_exactly(unterminated, "b", "c", After), "a\nbc");
+        assert_eq!(insert_exactly(unterminated, "a\n", "z", Before), "za\nb");
+        // An anchor that includes its newline versus one that stops short.
+        let terminated = "x\ny\n";
+        assert_eq!(insert_exactly(terminated, "y\n", "z\n", After), "x\ny\nz\n");
+        assert_eq!(insert_exactly(terminated, "y", "z", After), "x\nyz\n");
+        // CRLF stays CRLF; LF content is not converted.
+        assert_eq!(
+            insert_exactly("a\r\nb\r\n", "b\r\n", "c\n", Before),
+            "a\r\nc\nb\r\n"
+        );
+    }
+
+    #[test]
+    fn insertion_refuses_results_over_the_write_limit() {
+        let original = format!("ANCHOR{}", "x".repeat(MAX_WRITE_SIZE - 8));
+        // Exactly at the limit is allowed...
+        let at_limit = insert_at_anchor(&original, "ANCHOR", "12", Before).expect("at limit");
+        assert_eq!(at_limit.len(), MAX_WRITE_SIZE);
+        // ...one byte more is refused before anything is built.
+        let error = insert_at_anchor(&original, "ANCHOR", "123", After)
+            .expect_err("over the limit must be refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "file would be too large after insertion ({} bytes, max {MAX_WRITE_SIZE} bytes)",
+                MAX_WRITE_SIZE + 1
+            )
+        );
+    }
+
+    #[test]
+    fn insertion_writes_the_file_and_reports_an_additions_only_diff() {
+        let (before_result, before_after) = insert_in_file(
+            "insert-before",
+            "AAA\nANCHOR\nBBB\n",
+            "ANCHOR\n",
+            "NEW\n",
+            Before,
+        );
+        let output = before_result.expect("insert before");
+        assert_eq!(before_after, "AAA\nNEW\nANCHOR\nBBB\n");
+        let path = &output.file_path;
+        assert_eq!(
+            output.operation_diff,
+            format!("--- {path}\n+++ {path}\n@@ -1,3 +1,4 @@\n AAA\n+NEW\n ANCHOR\n BBB\n")
+        );
+        assert!(output.success);
+
+        let (after_result, after_after) = insert_in_file(
+            "insert-after",
+            "AAA\nANCHOR\nBBB\n",
+            "ANCHOR\n",
+            "NEW\n",
+            After,
+        );
+        let output = after_result.expect("insert after");
+        assert_eq!(after_after, "AAA\nANCHOR\nNEW\nBBB\n");
+        let path = &output.file_path;
+        assert_eq!(
+            output.operation_diff,
+            format!("--- {path}\n+++ {path}\n@@ -1,3 +1,4 @@\n AAA\n ANCHOR\n+NEW\n BBB\n")
+        );
+
+        // The serialized result is minimal: path, success, then the diff.
+        let serialized = serde_json::to_string_pretty(&output).expect("serializes");
+        let value: serde_json::Value = serde_json::from_str(&serialized).expect("json");
+        assert_eq!(
+            value.as_object().map(serde_json::Map::len),
+            Some(3),
+            "{serialized}"
+        );
+        assert_eq!(value["success"], true);
+        let at = |key: &str| serialized.find(&format!("\"{key}\":")).expect(key);
+        assert!(at("filePath") < at("success") && at("success") < at("operationDiff"));
+    }
+
+    #[test]
+    fn insertion_diffs_are_truthful_and_bounded() {
+        use std::fmt::Write as _;
+
+        let original = (0..400).fold(String::new(), |mut text, n| {
+            let _ = writeln!(text, "line {n}");
+            text
+        });
+        let cases = [
+            ("line 0\n", "top\n", Before),
+            ("line 399\n", "bottom\n", After),
+            ("line 200\n", "a\nb\n\nc\n", After),
+            ("line 100\n", "line 100\nline 100\n", Before),
+            ("line 7\n", "(", Before),
+        ];
+        for (anchor, content, position) in cases {
+            let updated = insert_exactly(&original, anchor, content, position);
+            let diff = make_operation_diff("f", &original, &updated);
+            assert_eq!(
+                apply_operation_diff(&original, &diff),
+                updated,
+                "{anchor:?}"
+            );
+            let removed = diff
+                .lines()
+                .skip(2)
+                .filter(|line| line.starts_with('-'))
+                .count();
+            if content.ends_with('\n') && anchor.ends_with('\n') {
+                // Line-aligned insertions show additions only.
+                assert_eq!(removed, 0, "{diff}");
+                assert_eq!(
+                    diff.lines().filter(|line| line.starts_with('+')).count(),
+                    1 + content.lines().count(),
+                    "{diff}"
+                );
+            } else {
+                // Inside a line, that one line truthfully changes.
+                assert_eq!(removed, 1, "{diff}");
+            }
+        }
+
+        // A large insertion keeps the reviewed budget and explicit marker.
+        let block = "added\n".repeat(5_000);
+        let updated = insert_exactly(&original, "line 10\n", &block, After);
+        let diff = make_operation_diff("f", &original, &updated);
+        assert!(diff.len() <= OPERATION_DIFF_LIMIT, "{} bytes", diff.len());
+        assert_eq!(diff, expected_bounded(&diff_unbounded(&original, &updated)));
+        assert!(diff.contains("[operation diff truncated — exceeded 16384 bytes; "));
+    }
+
+    /// The complete diff `make_operation_diff` would render without a budget,
+    /// for a single contiguous line-aligned insertion.
+    fn diff_unbounded(original: &str, updated: &str) -> String {
+        let old: Vec<&str> = original.split_inclusive('\n').collect();
+        let new: Vec<&str> = updated.split_inclusive('\n').collect();
+        let prefix = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+        let added = new.len() - old.len();
+        let (start, end) = (prefix.saturating_sub(3), (prefix + 3).min(old.len()));
+        let mut diff = format!(
+            "--- f\n+++ f\n@@ -{},{} +{},{} @@\n",
+            start + 1,
+            end - start,
+            start + 1,
+            end - start + added
+        );
+        for line in &old[start..prefix] {
+            diff.push(' ');
+            diff.push_str(line);
+        }
+        for line in &new[prefix..prefix + added] {
+            diff.push('+');
+            diff.push_str(line);
+        }
+        for line in &old[prefix..end] {
+            diff.push(' ');
+            diff.push_str(line);
+        }
+        diff
+    }
+
+    #[test]
+    fn refused_insertions_leave_the_file_untouched() {
+        let before = "one\ntwo\none\n";
+        for (anchor, content) in [("three", "x"), ("one", "x"), ("", "x"), ("two", "")] {
+            for position in [Before, After] {
+                let (result, after) =
+                    insert_in_file("insert-refused", before, anchor, content, position);
+                assert!(result.is_err(), "{anchor:?}");
+                assert_eq!(after, before, "{anchor:?}");
+            }
+        }
+        let missing = temp_path("insert-missing");
+        let error = insert_text(missing.to_str().expect("utf8"), "a", "b", After)
+            .expect_err("insertion never creates a file");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(!missing.exists());
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -2269,7 +2774,7 @@ mod confined_tests {
 
     use rustix::fs::OFlags;
 
-    use super::{GrepSearchInput, WorkspaceRoot};
+    use super::{GrepSearchInput, InsertPosition, WorkspaceRoot, MAX_WRITE_SIZE};
 
     struct Fixture {
         base: PathBuf,
@@ -2591,5 +3096,192 @@ mod confined_tests {
                 "{shown}[operation diff truncated — exceeded 16384 bytes; 4 more diff lines omitted]\n"
             )
         );
+    }
+
+    // --- anchored insertion ------------------------------------------------
+
+    const CALCULATOR: &str = "def add(a, b):\n    return a - b\n";
+
+    fn calculator(fixture: &Fixture) -> String {
+        fs::read_to_string(fixture.workspace.join("calculator.py")).expect("calculator")
+    }
+
+    #[test]
+    fn confined_insertion_preserves_the_designated_file_and_reports_the_diff() {
+        let fixture = Fixture::new("insert");
+        let root = fixture.root();
+        let before = root
+            .insert_text(
+                "calculator.py",
+                "def add",
+                "import math\n\n\n",
+                InsertPosition::Before,
+            )
+            .expect("designated insertion");
+        assert_eq!(
+            calculator(&fixture),
+            "import math\n\n\ndef add(a, b):\n    return a - b\n"
+        );
+        assert_eq!(before.file_path, "calculator.py");
+        assert!(before.success);
+        assert_eq!(
+            before.operation_diff,
+            "--- calculator.py\n+++ calculator.py\n@@ -1,2 +1,5 @@\n+import math\n+\n+\n def add(a, b):\n     return a - b\n"
+        );
+        let after = root
+            .insert_text(
+                "calculator.py",
+                "    return a - b\n",
+                "\n\ndef sub(a, b):\n    return a - b\n",
+                InsertPosition::After,
+            )
+            .expect("designated insertion");
+        assert_eq!(
+            calculator(&fixture),
+            "import math\n\n\ndef add(a, b):\n    return a - b\n\n\ndef sub(a, b):\n    return a - b\n"
+        );
+        assert!(!after
+            .operation_diff
+            .lines()
+            .skip(2)
+            .any(|line| line.starts_with('-')));
+        assert_eq!(fixture.oracle(), "ORACLE\n");
+    }
+
+    #[test]
+    fn confined_insertion_refuses_undeclared_escaping_and_aliased_targets() {
+        let fixture = Fixture::new("insert-authority");
+        std::os::unix::fs::symlink(
+            fixture.outside.join("sentinel.txt"),
+            fixture.workspace.join("escape.txt"),
+        )
+        .expect("symlink");
+        std::os::unix::fs::symlink(&fixture.outside, fixture.workspace.join("door"))
+            .expect("symlink");
+        let absolute = fixture.outside.join("sentinel.txt");
+        let absolute = absolute.to_str().expect("utf8");
+        let inside = fixture.workspace.join("calculator.py");
+        let inside = inside.to_str().expect("utf8");
+        // Every path names text the anchor matches, so only authority refuses.
+        let root = WorkspaceRoot::bind(
+            &fixture.workspace,
+            &[
+                "calculator.py",
+                "escape.txt",
+                "door/sentinel.txt",
+                "missing.py",
+            ],
+        )
+        .expect("bind");
+        for (path, anchor, reason) in [
+            (
+                "test_calculator.py",
+                "ORACLE",
+                "not a designated writable file",
+            ),
+            ("../outside/sentinel.txt", "OUTSIDE", "`..`"),
+            ("new-dir/../../outside/sentinel.txt", "OUTSIDE", "`..`"),
+            (absolute, "OUTSIDE", "is absolute"),
+            (inside, "def add", "is absolute"),
+            ("escape.txt", "OUTSIDE", "symlink"),
+            ("door/sentinel.txt", "OUTSIDE", "symlink"),
+            ("missing.py", "x", "No such file"),
+        ] {
+            for position in [InsertPosition::Before, InsertPosition::After] {
+                let error = root
+                    .insert_text(path, anchor, "PWNED", position)
+                    .expect_err(path);
+                assert!(error.to_string().contains(reason), "{path}: {error}");
+            }
+        }
+        assert_eq!(fixture.oracle(), "ORACLE\n");
+        assert_eq!(fixture.sentinel(), "OUTSIDE\n");
+        assert_eq!(calculator(&fixture), CALCULATOR);
+        assert!(!fixture.workspace.join("missing.py").exists());
+        assert!(!fixture.workspace.join("new-dir").exists());
+    }
+
+    #[test]
+    fn confined_insertion_refuses_designated_files_swapped_after_binding() {
+        let fixture = Fixture::new("insert-swapped");
+        let root = fixture.root();
+        // A symlink planted in place of the designated file.
+        fs::remove_file(fixture.workspace.join("calculator.py")).expect("remove");
+        std::os::unix::fs::symlink(
+            "test_calculator.py",
+            fixture.workspace.join("calculator.py"),
+        )
+        .expect("symlink");
+        let error = root
+            .insert_text("calculator.py", "ORACLE", "PWNED", InsertPosition::Before)
+            .expect_err("symlinked designated file");
+        assert!(error.to_string().contains("symlink"), "{error}");
+        assert_eq!(fixture.oracle(), "ORACLE\n");
+
+        // A second link to the designated inode, reachable from outside.
+        fs::remove_file(fixture.workspace.join("calculator.py")).expect("remove");
+        fs::write(fixture.workspace.join("calculator.py"), CALCULATOR).expect("restore");
+        fs::hard_link(
+            fixture.workspace.join("calculator.py"),
+            fixture.outside.join("linked.py"),
+        )
+        .expect("hardlink");
+        let error = root
+            .insert_text("calculator.py", "def add", "PWNED", InsertPosition::After)
+            .expect_err("hardlinked designated file");
+        assert!(error.to_string().contains("hard links"), "{error}");
+        assert_eq!(
+            fs::read_to_string(fixture.outside.join("linked.py")).expect("linked"),
+            CALCULATOR
+        );
+
+        // A FIFO in place of the designated file is refused without blocking.
+        fs::remove_file(fixture.workspace.join("calculator.py")).expect("remove");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            fixture.workspace.join("calculator.py"),
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o600),
+            0,
+        )
+        .expect("fifo");
+        let error = root
+            .insert_text("calculator.py", "def add", "PWNED", InsertPosition::Before)
+            .expect_err("fifo");
+        assert!(error.to_string().contains("not a regular file"), "{error}");
+    }
+
+    #[test]
+    fn confined_insertion_refusals_leave_the_designated_file_unchanged() {
+        let fixture = Fixture::new("insert-refusals");
+        fs::write(
+            fixture.workspace.join("calculator.py"),
+            "x = 1\nx = 1\ny = 2\n",
+        )
+        .expect("seed");
+        let root = fixture.root();
+        for (anchor, content, reason) in [
+            ("z = 3", "w = 0\n", "anchor not found in file"),
+            ("x = 1\n", "w = 0\n", "more than once"),
+            ("", "w = 0\n", "anchor must not be empty"),
+            ("y = 2\n", "", "content must not be empty"),
+        ] {
+            for position in [InsertPosition::Before, InsertPosition::After] {
+                let error = root
+                    .insert_text("calculator.py", anchor, content, position)
+                    .expect_err(anchor);
+                assert!(error.to_string().contains(reason), "{anchor:?}: {error}");
+                assert_eq!(calculator(&fixture), "x = 1\nx = 1\ny = 2\n");
+            }
+        }
+
+        // A result one byte over the write limit is refused before writing.
+        let big = format!("ANCHOR{}", "x".repeat(MAX_WRITE_SIZE - 7));
+        fs::write(fixture.workspace.join("calculator.py"), &big).expect("seed big");
+        let error = root
+            .insert_text("calculator.py", "ANCHOR", "12", InsertPosition::After)
+            .expect_err("over the limit");
+        assert!(error.to_string().contains("too large"), "{error}");
+        assert!(calculator(&fixture) == big, "file must be unchanged");
     }
 }
