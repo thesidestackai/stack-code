@@ -100,6 +100,10 @@ pub struct WriteFileOutput {
 pub struct EditFileOutput {
     #[serde(rename = "filePath")]
     pub file_path: String,
+    /// Bounded unified diff of this one edit, before → after. Declared ahead
+    /// of the bulky fields so it is serialized, and read, first.
+    #[serde(rename = "operationDiff", default)]
+    pub operation_diff: String,
     #[serde(rename = "oldString")]
     pub old_string: String,
     #[serde(rename = "newString")]
@@ -297,8 +301,10 @@ pub fn edit_file(
     };
     fs::write(&absolute_path, &updated)?;
 
+    let file_path = absolute_path.to_string_lossy().into_owned();
     Ok(EditFileOutput {
-        file_path: absolute_path.to_string_lossy().into_owned(),
+        operation_diff: make_operation_diff(&file_path, &original_file, &updated),
+        file_path,
         old_string: old_string.to_owned(),
         new_string: new_string.to_owned(),
         original_file: original_file.clone(),
@@ -562,6 +568,252 @@ fn make_patch(original: &str, updated: &str) -> Vec<StructuredPatchHunk> {
     }]
 }
 
+/// Context lines around each change in `operationDiff`: the radius the A2 diff
+/// preview (`a2-plan-runner`) already uses.
+const OPERATION_DIFF_CONTEXT_LINES: usize = 3;
+
+/// Byte budget for `operationDiff`, truncation marker included: the 16 KiB the
+/// bash tool already allows for model-visible output (`bash::MAX_OUTPUT_BYTES`).
+const MAX_OPERATION_DIFF_BYTES: usize = 16_384;
+
+/// Bounds on the line search behind `operationDiff`: edit distance in lines
+/// (its trace needs memory quadratic in it) and total search steps. Past
+/// either, the changed region is reported as one replacement block, which is
+/// still exact, only not minimal.
+const OPERATION_DIFF_MAX_EDIT_DISTANCE: usize = 1_024;
+const OPERATION_DIFF_MAX_SEARCH_STEPS: usize = 10_000_000;
+
+/// One maximal run of changed lines: `old_start..old_end` of the original is
+/// replaced by `new_start..new_end` of the update.
+#[derive(Debug, Clone, Copy)]
+struct ChangedLines {
+    old_start: usize,
+    old_end: usize,
+    new_start: usize,
+    new_end: usize,
+}
+
+/// Renders `operationDiff`: the unified diff of one edit, derived only from the
+/// before/after text the edit already holds. Hunks carry three context lines
+/// and conventional ranges; whatever exceeds [`MAX_OPERATION_DIFF_BYTES`] is
+/// replaced by an explicit marker, never silently dropped.
+fn make_operation_diff(path: &str, original: &str, updated: &str) -> String {
+    let old: Vec<&str> = original.split_inclusive('\n').collect();
+    let new: Vec<&str> = updated.split_inclusive('\n').collect();
+    let context = OPERATION_DIFF_CONTEXT_LINES;
+    let changes = changed_lines(&old, &new);
+
+    let mut diff = BoundedDiff::default();
+    diff.push(&format!("--- {path}\n"));
+    diff.push(&format!("+++ {path}\n"));
+    let mut rest = changes.as_slice();
+    while let Some(&first) = rest.first() {
+        // One hunk spans every change whose unchanged gap fits two contexts.
+        let len = 1 + rest
+            .windows(2)
+            .take_while(|pair| pair[1].old_start - pair[0].old_end <= 2 * context)
+            .count();
+        let (group, tail) = rest.split_at(len);
+        rest = tail;
+        let last = group[len - 1];
+        let old_start = first.old_start.saturating_sub(context);
+        let old_end = (last.old_end + context).min(old.len());
+        let new_start = first.new_start - (first.old_start - old_start);
+        let new_end = last.new_end + (old_end - last.old_end);
+        diff.push(&format!(
+            "@@ -{} +{} @@\n",
+            hunk_range(old_start, old_end),
+            hunk_range(new_start, new_end)
+        ));
+        let mut cursor = old_start;
+        for change in group {
+            diff.lines(' ', &old[cursor..change.old_start]);
+            diff.lines('-', &old[change.old_start..change.old_end]);
+            diff.lines('+', &new[change.new_start..change.new_end]);
+            cursor = change.old_end;
+        }
+        diff.lines(' ', &old[cursor..old_end]);
+    }
+    diff.finish()
+}
+
+/// `start,len` of one side of a hunk; an empty side names the line before it.
+fn hunk_range(start: usize, end: usize) -> String {
+    let len = end - start;
+    format!("{},{len}", if len == 0 { start } else { start + 1 })
+}
+
+/// Maximal runs of changed lines between `old` and `new`. Lines keep their
+/// terminators, so a dropped final newline counts as a change.
+fn changed_lines(old: &[&str], new: &[&str]) -> Vec<ChangedLines> {
+    let prefix = old.iter().zip(new).take_while(|(a, b)| a == b).count();
+    let suffix = old[prefix..]
+        .iter()
+        .rev()
+        .zip(new[prefix..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let (old_mid, new_mid) = (
+        &old[prefix..old.len() - suffix],
+        &new[prefix..new.len() - suffix],
+    );
+    if old_mid.is_empty() && new_mid.is_empty() {
+        return Vec::new();
+    }
+    let whole = ChangedLines {
+        old_start: 0,
+        old_end: old_mid.len(),
+        new_start: 0,
+        new_end: new_mid.len(),
+    };
+    let mut changes = if old_mid.is_empty() || new_mid.is_empty() {
+        vec![whole]
+    } else {
+        shortest_edit(old_mid, new_mid).unwrap_or_else(|| vec![whole])
+    };
+    for change in &mut changes {
+        change.old_start += prefix;
+        change.old_end += prefix;
+        change.new_start += prefix;
+        change.new_end += prefix;
+    }
+    changes
+}
+
+/// Myers' greedy O(ND) search for a shortest line edit script, returned as
+/// maximal changed runs. `None` once the search bounds above are exceeded.
+// Keeps the paper's names (`n`, `m`, `d`, `k`, `v`, `x`, `y`) for review.
+#[allow(clippy::many_single_char_names)]
+fn shortest_edit(old: &[&str], new: &[&str]) -> Option<Vec<ChangedLines>> {
+    let (n, m) = (old.len(), new.len());
+    let max_d = (n + m).min(OPERATION_DIFF_MAX_EDIT_DISTANCE);
+    // `v[offset + k]` is the furthest `x` reached on diagonal `k = x - y`;
+    // `trace[d]` keeps the `v[offset - d - 1..=offset + d + 1]` that step `d`
+    // started from, which is all the walk back needs.
+    let offset = max_d + 1;
+    let mut v = vec![0_usize; 2 * max_d + 3];
+    let mut trace: Vec<Vec<usize>> = Vec::new();
+    let mut steps = 0_usize;
+    let mut distance = None;
+    'search: for d in 0..=max_d {
+        trace.push(v[offset - d - 1..=offset + d + 1].to_vec());
+        for k in (offset - d..=offset + d).step_by(2) {
+            let mut x = if k == offset - d || (k != offset + d && v[k - 1] < v[k + 1]) {
+                v[k + 1]
+            } else {
+                v[k - 1] + 1
+            };
+            let mut y = (x + offset).checked_sub(k)?;
+            while x < n && y < m && old[x] == new[y] {
+                x += 1;
+                y += 1;
+                steps += 1;
+            }
+            steps += 1;
+            if steps > OPERATION_DIFF_MAX_SEARCH_STEPS {
+                return None;
+            }
+            v[k] = x;
+            if x >= n && y >= m {
+                distance = Some(d);
+                break 'search;
+            }
+        }
+    }
+
+    // Walk back from the end, replaying each step's choice to recover its
+    // single insertion (down) or deletion (right); edits arrive in reverse.
+    let distance = distance?;
+    let mut edits = Vec::with_capacity(distance);
+    let (mut x, mut y) = (n, m);
+    for d in (1..=distance).rev() {
+        let at = |k: usize| trace[d][k + d + 1 - offset];
+        let k = offset + x - y;
+        let down = k == offset - d || (k != offset + d && at(k - 1) < at(k + 1));
+        let prev_k = if down { k + 1 } else { k - 1 };
+        let prev_x = at(prev_k);
+        let prev_y = (prev_x + offset).checked_sub(prev_k)?;
+        edits.push(ChangedLines {
+            old_start: prev_x,
+            old_end: prev_x + usize::from(!down),
+            new_start: prev_y,
+            new_end: prev_y + usize::from(down),
+        });
+        (x, y) = (prev_x, prev_y);
+    }
+
+    let mut runs: Vec<ChangedLines> = Vec::new();
+    for edit in edits.into_iter().rev() {
+        match runs.last_mut() {
+            Some(run) if run.old_end == edit.old_start && run.new_end == edit.new_start => {
+                run.old_end = edit.old_end;
+                run.new_end = edit.new_end;
+            }
+            _ => runs.push(edit),
+        }
+    }
+    Some(runs)
+}
+
+/// Diff text capped at [`MAX_OPERATION_DIFF_BYTES`]. The complete diff is
+/// rendered first, so `finish` bounds what it actually is.
+#[derive(Default)]
+struct BoundedDiff {
+    text: String,
+}
+
+impl BoundedDiff {
+    fn push(&mut self, line: &str) {
+        self.text.push_str(line);
+    }
+
+    fn lines(&mut self, tag: char, lines: &[&str]) {
+        for line in lines {
+            self.text.push(tag);
+            self.text.push_str(line);
+            if !line.ends_with('\n') {
+                self.text.push_str("\n\\ No newline at end of file\n");
+            }
+        }
+    }
+
+    fn finish(self) -> String {
+        bound_operation_diff(self.text)
+    }
+}
+
+/// A complete rendered diff within [`MAX_OPERATION_DIFF_BYTES`] is returned
+/// unchanged. A longer one keeps the longest prefix of whole rendered lines
+/// that fits together with a marker giving the exact number of rendered lines
+/// after it, `\ No newline at end of file` annotations included.
+fn bound_operation_diff(diff: String) -> String {
+    if diff.len() <= MAX_OPERATION_DIFF_BYTES {
+        return diff;
+    }
+    let marker = |omitted: usize| {
+        format!(
+            "[operation diff truncated — exceeded {MAX_OPERATION_DIFF_BYTES} bytes; {omitted} more diff lines omitted]\n"
+        )
+    };
+    let total = diff.split_inclusive('\n').count();
+    // Keeping one more line never shortens the result: the line adds at least
+    // a byte and the marker loses at most a digit. So the first line that no
+    // longer fits ends the longest prefix that does.
+    let (mut kept, mut kept_bytes) = (0, 0);
+    for line in diff.split_inclusive('\n') {
+        let omitted_after = total - kept - 1;
+        if kept_bytes + line.len() + marker(omitted_after).len() > MAX_OPERATION_DIFF_BYTES {
+            break;
+        }
+        kept += 1;
+        kept_bytes += line.len();
+    }
+    let mut bounded = diff;
+    bounded.truncate(kept_bytes);
+    bounded.push_str(&marker(total - kept));
+    bounded
+}
+
 fn normalize_path(path: &str) -> io::Result<PathBuf> {
     let candidate = if Path::new(path).is_absolute() {
         PathBuf::from(path)
@@ -714,10 +966,10 @@ mod confined {
     use rustix::io::Errno;
 
     use super::{
-        confinement_denied, expand_braces, fs, grep_files, io, make_patch, text_window,
-        workspace_relative, EditFileOutput, GlobSearchOutput, GrepSearchInput, GrepSearchOutput,
-        Instant, Path, PathBuf, Pattern, ReadFileOutput, Reverse, WriteFileOutput, MAX_READ_SIZE,
-        MAX_WRITE_SIZE,
+        confinement_denied, expand_braces, fs, grep_files, io, make_operation_diff, make_patch,
+        text_window, workspace_relative, EditFileOutput, GlobSearchOutput, GrepSearchInput,
+        GrepSearchOutput, Instant, Path, PathBuf, Pattern, ReadFileOutput, Reverse,
+        WriteFileOutput, MAX_READ_SIZE, MAX_WRITE_SIZE,
     };
 
     const RESOLVE: ResolveFlags = ResolveFlags::BENEATH
@@ -989,8 +1241,10 @@ mod confined {
                 ));
             }
             Self::replace_contents(&mut file, &updated)?;
+            let file_path = relative.to_string_lossy().into_owned();
             Ok(EditFileOutput {
-                file_path: relative.to_string_lossy().into_owned(),
+                operation_diff: make_operation_diff(&file_path, &original, &updated),
+                file_path,
                 old_string: old_string.to_owned(),
                 new_string: new_string.to_owned(),
                 original_file: original.clone(),
@@ -1235,8 +1489,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        edit_file, expand_braces, glob_search, grep_search, is_symlink_escape, read_file,
-        read_file_in_workspace, write_file, GrepSearchInput, MAX_WRITE_SIZE,
+        bound_operation_diff, edit_file, expand_braces, glob_search, grep_search,
+        is_symlink_escape, make_operation_diff, read_file, read_file_in_workspace, write_file,
+        GrepSearchInput, MAX_WRITE_SIZE,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -1416,6 +1671,593 @@ mod tests {
             "should match .rs and .toml but not .txt"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Model-visible byte budget for `operationDiff`, truncation marker included.
+    const OPERATION_DIFF_LIMIT: usize = 16_384;
+
+    /// Runs one real `edit_file` on a fresh file and returns its path, the
+    /// edited bytes and the serialized `operationDiff`.
+    fn edit_and_diff(
+        name: &str,
+        before: &str,
+        old: &str,
+        new: &str,
+        replace_all: bool,
+    ) -> (String, String, String) {
+        let path = temp_path(name);
+        std::fs::write(&path, before).expect("seed file");
+        let path = path.to_string_lossy().into_owned();
+        let output = edit_file(&path, old, new, replace_all).expect("edit should succeed");
+        let after = std::fs::read_to_string(&path).expect("read edited file");
+        let _ = std::fs::remove_file(&path);
+        let serialized = serde_json::to_value(&output).expect("edit output serializes");
+        let diff = serialized["operationDiff"]
+            .as_str()
+            .expect("edit results must carry operationDiff")
+            .to_owned();
+        (output.file_path, after, diff)
+    }
+
+    /// Applies an `operationDiff` to `before`, asserting that every hunk
+    /// header matches its body and that context stays conventional: three
+    /// lines on each side unless the file ends first, disjoint hunks.
+    fn apply_operation_diff(before: &str, diff: &str) -> String {
+        let old: Vec<&str> = before.split_inclusive('\n').collect();
+        let mut lines = diff.split_inclusive('\n').peekable();
+        assert!(lines.next().is_some_and(|line| line.starts_with("--- ")));
+        assert!(lines.next().is_some_and(|line| line.starts_with("+++ ")));
+        let parse = |range: &str| {
+            let (start, len) = range.split_once(',').expect("start,len");
+            let start: usize = start.parse().expect("start");
+            let len: usize = len.parse().expect("len");
+            (if len == 0 { start } else { start - 1 }, len)
+        };
+        let mut out = String::new();
+        let (mut cursor, mut out_lines) = (0, 0);
+        while let Some(header) = lines.next() {
+            let ranges = header
+                .strip_prefix("@@ -")
+                .and_then(|rest| rest.strip_suffix(" @@\n"))
+                .unwrap_or_else(|| panic!("hunk header expected, got {header:?}"));
+            let (old_range, new_range) = ranges.split_once(" +").expect("both ranges");
+            let ((old_first, old_len), (new_first, new_len)) = (parse(old_range), parse(new_range));
+            assert!(
+                old_first > cursor || (cursor == 0 && old_first == 0),
+                "hunks must be ordered, disjoint and separated: {header:?}"
+            );
+            for line in &old[cursor..old_first] {
+                out.push_str(line);
+            }
+            out_lines += old_first - cursor;
+            assert_eq!(new_first, out_lines, "new-side start of {header:?}");
+            cursor = old_first;
+            let (mut seen_old, mut seen_new, mut leading, mut trailing) = (0, 0, 0, 0);
+            let mut changed = false;
+            while seen_old < old_len || seen_new < new_len {
+                let line = lines.next().expect("hunk body shorter than its header");
+                let (tag, text) = line.split_at(1);
+                let mut text = text.to_owned();
+                if lines.peek() == Some(&"\\ No newline at end of file\n") {
+                    lines.next();
+                    assert_eq!(text.pop(), Some('\n'));
+                }
+                match tag {
+                    " " => {
+                        assert_eq!(old[cursor], text);
+                        out.push_str(&text);
+                        cursor += 1;
+                        (seen_old, seen_new, out_lines) =
+                            (seen_old + 1, seen_new + 1, out_lines + 1);
+                        if changed {
+                            trailing += 1;
+                        } else {
+                            leading += 1;
+                        }
+                    }
+                    "-" | "+" => {
+                        assert!(!changed || trailing <= 6, "unsplit gap in {header:?}");
+                        if tag == "-" {
+                            assert_eq!(old[cursor], text);
+                            cursor += 1;
+                            seen_old += 1;
+                        } else {
+                            out.push_str(&text);
+                            seen_new += 1;
+                            out_lines += 1;
+                        }
+                        changed = true;
+                        trailing = 0;
+                    }
+                    _ => panic!("unexpected diff line {line:?}"),
+                }
+            }
+            assert_eq!((seen_old, seen_new), (old_len, new_len), "{header:?}");
+            assert!(changed, "hunk without a change: {header:?}");
+            assert!(
+                leading <= 3 && (leading == 3 || old_first == 0),
+                "{header:?}"
+            );
+            assert!(
+                trailing <= 3 && (trailing == 3 || cursor == old.len()),
+                "{header:?}"
+            );
+        }
+        for line in &old[cursor..] {
+            out.push_str(line);
+        }
+        out
+    }
+
+    #[test]
+    fn edit_result_diff_shows_a_substitution_with_bounded_context() {
+        let before = "one\ntwo\nthree\nfour\nfoo = 1\nsix\nseven\neight\nnine\n";
+        let (path, after, diff) =
+            edit_and_diff("diff-substitution.txt", before, "foo = 1", "foo = 2", false);
+        assert_eq!(
+            after,
+            "one\ntwo\nthree\nfour\nfoo = 2\nsix\nseven\neight\nnine\n"
+        );
+        assert_eq!(
+            diff,
+            format!(
+                "--- {path}\n+++ {path}\n@@ -2,7 +2,7 @@\n two\n three\n four\n-foo = 1\n+foo = 2\n six\n seven\n eight\n"
+            )
+        );
+        assert!(!diff.contains("one\n") && !diff.contains("nine"), "{diff}");
+    }
+
+    #[test]
+    fn edit_result_diff_shows_an_insertion_as_additions_only() {
+        let before = "alpha\nbeta\ngamma\ndelta\nepsilon\n";
+        let (path, after, diff) = edit_and_diff(
+            "diff-insertion.txt",
+            before,
+            "beta\n",
+            "beta\nINSERTED-1\nINSERTED-2\n",
+            false,
+        );
+        assert_eq!(
+            after,
+            "alpha\nbeta\nINSERTED-1\nINSERTED-2\ngamma\ndelta\nepsilon\n"
+        );
+        assert_eq!(
+            diff,
+            format!(
+                "--- {path}\n+++ {path}\n@@ -1,5 +1,7 @@\n alpha\n beta\n+INSERTED-1\n+INSERTED-2\n gamma\n delta\n epsilon\n"
+            )
+        );
+    }
+
+    #[test]
+    fn edit_result_diff_shows_a_deletion_as_removed_lines() {
+        let before = "keep-1\nkeep-2\ndrop-me\nalso-drop\nkeep-3\n";
+        let (path, after, diff) = edit_and_diff(
+            "diff-deletion.txt",
+            before,
+            "drop-me\nalso-drop\n",
+            "",
+            false,
+        );
+        assert_eq!(after, "keep-1\nkeep-2\nkeep-3\n");
+        assert_eq!(
+            diff,
+            format!(
+                "--- {path}\n+++ {path}\n@@ -1,5 +1,3 @@\n keep-1\n keep-2\n-drop-me\n-also-drop\n keep-3\n"
+            )
+        );
+    }
+
+    #[test]
+    fn edit_result_diff_emits_separate_local_hunks() {
+        let before: String = (1..=20)
+            .map(|n| match n {
+                2 => "x = TOKEN\n".to_string(),
+                18 => "y = TOKEN\n".to_string(),
+                _ => format!("line{n:02}\n"),
+            })
+            .collect();
+        let (path, after, diff) = edit_and_diff("diff-hunks.txt", &before, "TOKEN", "VALUE", true);
+        assert_eq!(after, before.replace("TOKEN", "VALUE"));
+        assert_eq!(
+            diff,
+            format!(
+                "--- {path}\n+++ {path}\n\
+                 @@ -1,5 +1,5 @@\n line01\n-x = TOKEN\n+x = VALUE\n line03\n line04\n line05\n\
+                 @@ -15,6 +15,6 @@\n line15\n line16\n line17\n-y = TOKEN\n+y = VALUE\n line19\n line20\n"
+            )
+        );
+        assert!(!diff.contains("line10"), "{diff}");
+    }
+
+    #[test]
+    fn edit_result_diff_keeps_sparse_changes_local_in_a_large_file() {
+        let before: String = (0..3_000)
+            .map(|n| {
+                if n % 600 == 300 {
+                    format!("mark {n} = OLD\n")
+                } else {
+                    format!("filler line {n}\n")
+                }
+            })
+            .collect();
+        let (_, after, diff) = edit_and_diff("diff-sparse.txt", &before, "OLD", "NEW", true);
+        assert_eq!(after, before.replace("OLD", "NEW"));
+        assert_eq!(diff.matches("\n@@ -").count(), 5, "{diff}");
+        assert_eq!(diff.lines().filter(|line| line.starts_with('-')).count(), 6);
+        assert!(diff.len() < 2_048, "{} bytes", diff.len());
+        assert_eq!(apply_operation_diff(&before, &diff), after);
+    }
+
+    #[test]
+    fn edit_result_diff_marks_a_missing_final_newline() {
+        let (path, after, diff) =
+            edit_and_diff("diff-eof.txt", "first\nlast\n", "last\n", "last", false);
+        assert_eq!(after, "first\nlast");
+        assert_eq!(
+            diff,
+            format!(
+                "--- {path}\n+++ {path}\n@@ -1,2 +1,2 @@\n first\n-last\n+last\n\\ No newline at end of file\n"
+            )
+        );
+    }
+
+    #[test]
+    fn edit_result_diff_is_bounded_with_an_explicit_truncation_marker() {
+        use std::fmt::Write as _;
+
+        let before = (0..2_000).fold(String::new(), |mut text, n| {
+            let _ = writeln!(text, "value_{n:04} = OLD");
+            text
+        });
+        let (_, after, diff) = edit_and_diff("diff-truncated.txt", &before, "OLD", "NEW", true);
+        assert_eq!(after, before.replace("OLD", "NEW"));
+        assert!(diff.len() <= OPERATION_DIFF_LIMIT, "{} bytes", diff.len());
+        let (shown, marker) = diff
+            .strip_suffix('\n')
+            .and_then(|body| body.rsplit_once('\n'))
+            .expect("a final marker line");
+        let omitted: usize = marker
+            .strip_prefix("[operation diff truncated — exceeded 16384 bytes; ")
+            .and_then(|rest| rest.strip_suffix(" more diff lines omitted]"))
+            .unwrap_or_else(|| panic!("explicit truncation marker expected, got {marker:?}"))
+            .parse()
+            .expect("omitted line count");
+        // 2 file headers + 1 hunk header + 2 000 removed + 2 000 added lines.
+        assert_eq!(shown.lines().count() + omitted, 4_003);
+        assert!(
+            shown.lines().count() > 100,
+            "the budget is used, not skipped"
+        );
+        // Whatever is shown is whole lines: truncation never cuts one.
+        for line in shown.lines().skip(3) {
+            assert_eq!(line.len(), "-value_0000 = OLD".len(), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn edit_result_diff_stays_exact_past_the_line_search_bound() {
+        let before = "a\n".repeat(1_100);
+        let (_, after, diff) = edit_and_diff("diff-wide.txt", &before, "a", "b", true);
+        assert_eq!(after, "b\n".repeat(1_100));
+        assert!(
+            !diff.contains("[operation diff truncated"),
+            "fits the budget"
+        );
+        assert_eq!(apply_operation_diff(&before, &diff), after);
+    }
+
+    #[test]
+    fn edit_result_diff_round_trips_for_generated_edits() {
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut below = |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            usize::try_from(state % u64::try_from(bound).expect("bound fits u64"))
+                .expect("index fits usize")
+        };
+        let pieces = ["a\n", "b\n", "c\n", "\n", "ab", "a", "c"];
+        for case in 0..400 {
+            let before: String = (0..below(40))
+                .map(|_| pieces[below(pieces.len())])
+                .collect();
+            if before.is_empty() {
+                continue;
+            }
+            let start = below(before.len());
+            let old = &before[start..=start + below(before.len() - start).min(12)];
+            let new: String = (0..below(6)).map(|_| pieces[below(pieces.len())]).collect();
+            if old == new {
+                continue;
+            }
+            let replace_all = below(2) == 0;
+            let (_, after, diff) = edit_and_diff(
+                &format!("diff-roundtrip-{case}.txt"),
+                &before,
+                old,
+                &new,
+                replace_all,
+            );
+            let expected = if replace_all {
+                before.replace(old, &new)
+            } else {
+                before.replacen(old, &new, 1)
+            };
+            assert_eq!(after, expected, "case {case}: edit semantics");
+            assert_eq!(
+                apply_operation_diff(&before, &diff),
+                after,
+                "case {case}: {before:?} {old:?} -> {new:?}\n{diff}"
+            );
+        }
+    }
+
+    /// The final line of an `operationDiff` that leaves `omitted` rendered
+    /// diff lines out.
+    fn truncation_marker(omitted: usize) -> String {
+        format!(
+            "[operation diff truncated — exceeded 16384 bytes; {omitted} more diff lines omitted]\n"
+        )
+    }
+
+    /// What a complete rendered diff must become, worked out independently of
+    /// the code under test: unchanged when it fits the budget; otherwise,
+    /// trying the longest prefix of whole rendered lines first, the first one
+    /// that fits together with the exact marker for the lines it leaves out.
+    fn expected_bounded(full: &str) -> String {
+        if full.len() <= OPERATION_DIFF_LIMIT {
+            return full.to_owned();
+        }
+        let ends: Vec<usize> = full.match_indices('\n').map(|(at, _)| at + 1).collect();
+        // A final segment without a terminator is a rendered line too.
+        let total = full.lines().count();
+        let prefix = |kept: usize| if kept == 0 { 0 } else { ends[kept - 1] };
+        let kept = (0..total)
+            .rev()
+            .find(|&kept| {
+                prefix(kept) + truncation_marker(total - kept).len() <= OPERATION_DIFF_LIMIT
+            })
+            .expect("the marker alone always fits");
+        format!(
+            "{}{}",
+            &full[..prefix(kept)],
+            truncation_marker(total - kept)
+        )
+    }
+
+    /// Complete rendered diff of an edit whose before and after share no
+    /// line: one hunk that removes every old line and adds every new one.
+    fn whole_replacement_diff(path: &str, before: &str, after: &str) -> String {
+        let side = |tag: char, text: &str| -> String {
+            text.split_inclusive('\n')
+                .map(|line| {
+                    if line.ends_with('\n') {
+                        format!("{tag}{line}")
+                    } else {
+                        format!("{tag}{line}\n\\ No newline at end of file\n")
+                    }
+                })
+                .collect()
+        };
+        format!(
+            "--- {path}\n+++ {path}\n@@ -1,{} +1,{} @@\n{}{}",
+            before.lines().count(),
+            after.lines().count(),
+            side('-', before),
+            side('+', after)
+        )
+    }
+
+    /// The lines a truncated `operationDiff` shows, and the number of
+    /// rendered lines its marker says are omitted.
+    fn shown_and_omitted(diff: &str) -> (&str, usize) {
+        let (shown, marker) = diff
+            .rsplit_once("[operation diff truncated — exceeded 16384 bytes; ")
+            .unwrap_or_else(|| panic!("truncation marker expected in {diff:?}"));
+        let omitted = marker
+            .strip_suffix(" more diff lines omitted]\n")
+            .expect("marker ends the diff")
+            .parse()
+            .expect("omitted line count");
+        (shown, omitted)
+    }
+
+    #[test]
+    fn edit_result_diff_within_the_budget_is_complete_and_unmarked() {
+        // (removed line, added line, final newlines, complete diff bytes):
+        // the review's 16 272-byte case, one byte under, exactly at the budget.
+        for (old_len, new_len, newline, complete_len) in [
+            (8_120, 8_120, "\n", 16_272),
+            (8_175, 8_176, "\n", 16_383),
+            (8_176, 8_176, "\n", 16_384),
+            (8_148, 8_148, "", 16_384),
+        ] {
+            let before = format!("{}{newline}", "a".repeat(old_len));
+            let after = format!("{}{newline}", "b".repeat(new_len));
+            let complete = whole_replacement_diff("f", &before, &after);
+            assert_eq!(complete.len(), complete_len);
+            let diff = make_operation_diff("f", &before, &after);
+            assert_eq!(
+                diff, complete,
+                "a {complete_len}-byte diff is returned whole"
+            );
+            assert!(!diff.contains("[operation diff truncated"));
+            assert!(diff.contains(&format!("\n+{}", after.trim_end())));
+        }
+    }
+
+    #[test]
+    fn edit_result_diff_one_byte_over_the_budget_is_marked_exactly() {
+        let before = format!("{}\n", "a".repeat(8_176));
+        let after = format!("{}\n", "b".repeat(8_177));
+        let complete = whole_replacement_diff("f", &before, &after);
+        assert_eq!(complete.len(), OPERATION_DIFF_LIMIT + 1);
+        let diff = make_operation_diff("f", &before, &after);
+        assert_eq!(
+            diff,
+            format!(
+                "--- f\n+++ f\n@@ -1,1 +1,1 @@\n-{before}{}",
+                truncation_marker(1)
+            )
+        );
+        assert_eq!(diff, expected_bounded(&complete));
+
+        // Without final newlines the added line takes its annotation with it.
+        let (before, after) = ("a".repeat(8_148), "b".repeat(8_149));
+        let complete = whole_replacement_diff("f", &before, &after);
+        assert_eq!(complete.len(), OPERATION_DIFF_LIMIT + 1);
+        let diff = make_operation_diff("f", &before, &after);
+        assert_eq!(
+            diff,
+            format!(
+                "--- f\n+++ f\n@@ -1,1 +1,1 @@\n-{before}\n\\ No newline at end of file\n{}",
+                truncation_marker(2)
+            )
+        );
+        assert_eq!(diff, expected_bounded(&complete));
+    }
+
+    #[test]
+    fn edit_result_diff_far_over_the_budget_counts_every_omitted_line() {
+        use std::fmt::Write as _;
+
+        let before = (0..20_000).fold(String::new(), |mut text, n| {
+            let _ = writeln!(text, "row {n:05} = OLD");
+            text
+        });
+        let (path, after, diff) = edit_and_diff("diff-far-over.txt", &before, "OLD", "NEW", true);
+        assert_eq!(after, before.replace("OLD", "NEW"));
+        let complete = whole_replacement_diff(&path, &before, &after);
+        assert!(complete.len() > 40 * OPERATION_DIFF_LIMIT);
+        assert!(diff.len() <= OPERATION_DIFF_LIMIT, "{} bytes", diff.len());
+        assert_eq!(diff, expected_bounded(&complete));
+        let (shown, omitted) = shown_and_omitted(&diff);
+        assert_eq!(shown.lines().count() + omitted, complete.lines().count());
+        assert!(complete.starts_with(shown), "shown lines are a prefix");
+    }
+
+    #[test]
+    fn edit_result_diff_never_cuts_an_oversized_line() {
+        let (long_old, long_new) = ("a".repeat(20_000), "b".repeat(20_000));
+        for (newline, omitted) in [("\n", 2), ("", 4)] {
+            let before = format!("keep 1\nkeep 2\n{long_old}{newline}");
+            let after = format!("keep 1\nkeep 2\n{long_new}{newline}");
+            let annotation = if newline.is_empty() {
+                "\\ No newline at end of file\n"
+            } else {
+                ""
+            };
+            let complete = format!(
+                "--- f\n+++ f\n@@ -1,3 +1,3 @@\n keep 1\n keep 2\n-{long_old}\n{annotation}+{long_new}\n{annotation}"
+            );
+            let diff = make_operation_diff("f", &before, &after);
+            assert_eq!(
+                diff,
+                format!(
+                    "--- f\n+++ f\n@@ -1,3 +1,3 @@\n keep 1\n keep 2\n{}",
+                    truncation_marker(omitted)
+                )
+            );
+            assert_eq!(diff, expected_bounded(&complete));
+            assert_eq!(complete.lines().count(), 5 + omitted);
+        }
+    }
+
+    #[test]
+    fn edit_result_diff_marker_width_follows_the_omitted_count() {
+        // One long removed line, then added "b" lines of which `kept_added`
+        // fit; `tight` sizes the removed line so that prefix plus the exact
+        // marker for `target` omitted lines fills the budget to the byte. A
+        // final oversized added line keeps the complete diff over the budget.
+        let kept_added = 100;
+        for target in [9, 10, 99, 100, 999, 1_000] {
+            for missing_newline in [false, true] {
+                // A missing final newline adds an annotation line to omit.
+                let added = kept_added + target - usize::from(missing_newline);
+                let mut after = "b\n".repeat(added - 1) + &"c".repeat(OPERATION_DIFF_LIMIT);
+                if !missing_newline {
+                    after.push('\n');
+                }
+                let headers = format!("--- f\n+++ f\n@@ -1,1 +1,{added} @@\n");
+                let tight = OPERATION_DIFF_LIMIT
+                    - headers.len()
+                    - truncation_marker(target).len()
+                    - 3 * kept_added
+                    - 2;
+                for long in tight - 2..=tight + 2 {
+                    let before = format!("{}\n", "a".repeat(long));
+                    let complete = whole_replacement_diff("f", &before, &after);
+                    let diff = make_operation_diff("f", &before, &after);
+                    let case = format!("target {target}, eof {missing_newline}, long {long}");
+                    assert!(diff.len() <= OPERATION_DIFF_LIMIT, "{case}");
+                    assert_eq!(diff, expected_bounded(&complete), "{case}");
+                    let (shown, omitted) = shown_and_omitted(&diff);
+                    assert_eq!(
+                        shown.lines().count() + omitted,
+                        complete.lines().count(),
+                        "{case}"
+                    );
+                    if long == tight {
+                        assert_eq!(
+                            (diff.len(), omitted),
+                            (OPERATION_DIFF_LIMIT, target),
+                            "{case}"
+                        );
+                    }
+                    if long == tight + 1 {
+                        assert_eq!(omitted, target + 1, "{case}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn diff_budget_counts_rendered_lines_including_an_unterminated_last_one() {
+        // Within the budget any text comes back unchanged, terminated or not.
+        assert_eq!(
+            bound_operation_diff("--- f\n+++ f\nlast".to_owned()),
+            "--- f\n+++ f\nlast"
+        );
+
+        // Newline-terminated: 8 151 two-byte lines fit beside a 4-digit marker.
+        let terminated = "x\n".repeat(10_000);
+        let bounded = bound_operation_diff(terminated.clone());
+        assert_eq!(
+            bounded,
+            format!("{}{}", "x\n".repeat(8_151), truncation_marker(1_849))
+        );
+        assert_eq!(bounded.len(), OPERATION_DIFF_LIMIT);
+        assert_eq!(bounded, expected_bounded(&terminated));
+
+        // A final segment without a newline is one more rendered line.
+        let unterminated = format!("{}tail", "x\n".repeat(9_000));
+        let bounded = bound_operation_diff(unterminated.clone());
+        assert_eq!(
+            bounded,
+            format!("{}{}", "x\n".repeat(8_151), truncation_marker(850))
+        );
+        assert_eq!(bounded, expected_bounded(&unterminated));
+
+        // One annotation, then two, each counted as a rendered line.
+        let eof = "\\ No newline at end of file\n";
+        let long = "a".repeat(OPERATION_DIFF_LIMIT);
+        let one = format!("--- f\n+++ f\n@@ -1,1 +1,1 @@\n-{long}\n{eof}+b\n");
+        assert_eq!(
+            bound_operation_diff(one.clone()),
+            format!("--- f\n+++ f\n@@ -1,1 +1,1 @@\n{}", truncation_marker(3))
+        );
+        assert_eq!(bound_operation_diff(one.clone()), expected_bounded(&one));
+        let two = format!("--- f\n+++ f\n@@ -1,1 +1,1 @@\n-b\n{eof}+{long}\n{eof}");
+        assert_eq!(
+            bound_operation_diff(two.clone()),
+            format!(
+                "--- f\n+++ f\n@@ -1,1 +1,1 @@\n-b\n{eof}{}",
+                truncation_marker(2)
+            )
+        );
+        assert_eq!(bound_operation_diff(two.clone()), expected_bounded(&two));
     }
 }
 
@@ -1678,5 +2520,76 @@ mod confined_tests {
         assert!(root
             .grep_search(&grep("OUTSIDE", Some("dir-link")))
             .is_err());
+    }
+
+    #[test]
+    fn confined_edit_result_carries_the_operation_diff() {
+        let fixture = Fixture::new("operation-diff");
+        let edit = fixture
+            .root()
+            .edit_file("calculator.py", "return a - b", "return a + b", false)
+            .expect("designated edit");
+        assert_eq!(
+            fs::read_to_string(fixture.workspace.join("calculator.py")).expect("calculator"),
+            "def add(a, b):\n    return a + b\n"
+        );
+        let serialized = serde_json::to_value(&edit).expect("edit output serializes");
+        assert_eq!(
+            serialized["operationDiff"],
+            "--- calculator.py\n+++ calculator.py\n@@ -1,2 +1,2 @@\n def add(a, b):\n-    return a - b\n+    return a + b\n"
+        );
+    }
+
+    /// Replaces the whole of a designated file `f` through the confined edit,
+    /// as the independent review did, and returns the serialized diff.
+    fn confined_whole_file_diff(fixture: &Fixture, before: &str, after: &str) -> String {
+        fs::write(fixture.workspace.join("f"), before).expect("seed f");
+        let edit = WorkspaceRoot::bind(&fixture.workspace, &["f"])
+            .expect("bind")
+            .edit_file("f", before, after, false)
+            .expect("designated edit");
+        assert_eq!(
+            fs::read_to_string(fixture.workspace.join("f")).expect("f"),
+            after
+        );
+        serde_json::to_value(&edit).expect("edit output serializes")["operationDiff"]
+            .as_str()
+            .expect("operationDiff")
+            .to_owned()
+    }
+
+    #[test]
+    fn confined_edit_diff_that_fits_the_budget_is_never_marked_truncated() {
+        let fixture = Fixture::new("diff-under-budget");
+        let before = format!("{}\n", "a".repeat(8_120));
+        let after = format!("{}\n", "b".repeat(8_120));
+        let complete = format!("--- f\n+++ f\n@@ -1,1 +1,1 @@\n-{before}+{after}");
+        assert_eq!(complete.len(), 16_272, "under the 16 384-byte budget");
+        let diff = confined_whole_file_diff(&fixture, &before, &after);
+        assert_eq!(diff, complete);
+        assert!(!diff.contains("[operation diff truncated"));
+        assert!(
+            diff.ends_with(&format!("\n+{after}")),
+            "the addition is kept"
+        );
+    }
+
+    #[test]
+    fn confined_edit_diff_marker_counts_no_newline_annotations() {
+        let fixture = Fixture::new("diff-eof-count");
+        let (before, after) = ("a".repeat(17_000), "b".repeat(17_000));
+        let complete = format!(
+            "--- f\n+++ f\n@@ -1,1 +1,1 @@\n-{before}\n\\ No newline at end of file\n+{after}\n\\ No newline at end of file\n"
+        );
+        assert_eq!((complete.len(), complete.lines().count()), (34_088, 7));
+        let shown = "--- f\n+++ f\n@@ -1,1 +1,1 @@\n";
+        // Removal, its annotation, addition, its annotation.
+        assert_eq!(complete.lines().count() - shown.lines().count(), 4);
+        assert_eq!(
+            confined_whole_file_diff(&fixture, &before, &after),
+            format!(
+                "{shown}[operation diff truncated — exceeded 16384 bytes; 4 more diff lines omitted]\n"
+            )
+        );
     }
 }

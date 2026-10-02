@@ -17936,6 +17936,179 @@ UU conflicted.rs",
     }
 
     #[test]
+    fn edit_file_operation_diff_reaches_the_openai_tool_message() {
+        // Real `edit_file` results carried along the live model path:
+        // tool registry -> `convert_messages` -> OpenAI-compatible
+        // `role:"tool"` message, i.e. exactly what the next turn reads.
+        use std::fmt::Write as _;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("claw-edit-wire-{unique}"));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let small = dir.join("module.py");
+        fs::write(
+            &small,
+            "def keep():\n    return 1\n\n\ndef old_name():\n    return 2\n",
+        )
+        .expect("seed small file");
+        let large = dir.join("values.txt");
+        let large_before = (0..2_000).fold(String::new(), |mut text, n| {
+            let _ = writeln!(text, "value_{n:04} = OLD");
+            text
+        });
+        fs::write(&large, &large_before).expect("seed large file");
+
+        let registry = GlobalToolRegistry::builtin();
+        let small_output = registry
+            .execute(
+                "edit_file",
+                &json!({
+                    "path": small,
+                    "old_string": "def old_name():\n    return 2",
+                    "new_string": "def new_name():\n    return 3",
+                }),
+            )
+            .expect("small edit");
+        let large_output = registry
+            .execute(
+                "edit_file",
+                &json!({ "path": large, "old_string": "OLD", "new_string": "NEW", "replace_all": true }),
+            )
+            .expect("large edit");
+        let _ = fs::remove_dir_all(&dir);
+
+        let to_wire = |id: &str, output: &str| -> String {
+            let messages = vec![ConversationMessage {
+                role: MessageRole::Tool,
+                blocks: vec![ContentBlock::ToolResult {
+                    tool_use_id: id.to_string(),
+                    tool_name: "edit_file".to_string(),
+                    output: output.to_string(),
+                    is_error: false,
+                }],
+                usage: None,
+            }];
+            let converted = super::convert_messages(&messages);
+            let wire = api::translate_message(&converted[0], "local-model");
+            assert_eq!(wire.len(), 1);
+            assert_eq!(wire[0]["role"], "tool");
+            assert_eq!(wire[0]["tool_call_id"], id);
+            wire[0]["content"]
+                .as_str()
+                .expect("string content")
+                .to_string()
+        };
+
+        let small_wire = to_wire("call_small", &small_output);
+        assert_eq!(
+            small_wire, small_output,
+            "edit results reach the model verbatim"
+        );
+        let small_diff = serde_json::from_str::<Value>(&small_wire).expect("json")["operationDiff"]
+            .as_str()
+            .expect("operationDiff must be model-visible")
+            .to_string();
+        assert!(
+            small_diff
+                .contains("\n-def old_name():\n-    return 2\n+def new_name():\n+    return 3\n"),
+            "{small_diff}"
+        );
+        let first = |key: &str| small_wire.find(&format!("\"{key}\":")).expect(key);
+        assert!(first("operationDiff") < first("originalFile"));
+        assert!(first("operationDiff") < first("structuredPatch"));
+
+        let large_wire = to_wire("call_large", &large_output);
+        assert_eq!(
+            large_wire, large_output,
+            "edit results reach the model verbatim"
+        );
+        let large_diff = serde_json::from_str::<Value>(&large_wire).expect("json")["operationDiff"]
+            .as_str()
+            .expect("operationDiff must be model-visible")
+            .to_string();
+        assert!(large_diff.len() <= 16_384, "{} bytes", large_diff.len());
+        assert!(
+            large_diff.contains("\n[operation diff truncated — exceeded 16384 bytes; "),
+            "truncation must be explicit on the wire"
+        );
+        assert!(large_wire.contains("[operation diff truncated"));
+        assert!(large_diff.contains("\n-value_0000 = OLD\n"));
+    }
+
+    #[test]
+    fn edit_file_operation_diff_truncation_claims_stay_factual_on_the_wire() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("claw-edit-budget-{unique}"));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("f");
+        let shown = path.to_string_lossy().into_owned();
+        let headers = format!("--- {shown}\n+++ {shown}\n@@ -1,1 +1,1 @@\n");
+        let registry = GlobalToolRegistry::builtin();
+        let edit_on_the_wire = |before: &str, after: &str| -> (String, String) {
+            fs::write(&path, before).expect("seed file");
+            let output = registry
+                .execute(
+                    "edit_file",
+                    &json!({ "path": path, "old_string": before, "new_string": after }),
+                )
+                .expect("whole-file edit");
+            assert_eq!(fs::read_to_string(&path).expect("edited file"), after);
+            let messages = vec![ConversationMessage {
+                role: MessageRole::Tool,
+                blocks: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_budget".to_string(),
+                    tool_name: "edit_file".to_string(),
+                    output: output.clone(),
+                    is_error: false,
+                }],
+                usage: None,
+            }];
+            let converted = super::convert_messages(&messages);
+            let wire = api::translate_message(&converted[0], "local-model");
+            assert_eq!(wire.len(), 1);
+            assert_eq!(wire[0]["role"], "tool");
+            let content = wire[0]["content"]
+                .as_str()
+                .expect("string content")
+                .to_string();
+            assert_eq!(content, output, "edit results reach the model verbatim");
+            let diff = serde_json::from_str::<Value>(&content).expect("json")["operationDiff"]
+                .as_str()
+                .expect("operationDiff must be model-visible")
+                .to_string();
+            (content, diff)
+        };
+
+        // A complete diff of exactly 16 384 bytes: whole, no marker.
+        let line = (16_384 - headers.len()) / 2 - 2;
+        let before = format!("{}\n", "a".repeat(line));
+        let after = format!("{}\n", "b".repeat(line));
+        let complete = format!("{headers}-{before}+{after}");
+        assert_eq!(complete.len(), 16_384);
+        let (content, diff) = edit_on_the_wire(&before, &after);
+        assert_eq!(diff, complete);
+        assert!(!content.contains("[operation diff truncated"));
+
+        // Over the budget: the marker's count of omitted rendered lines
+        // includes both `\ No newline at end of file` annotations.
+        let (before, after) = ("a".repeat(17_000), "b".repeat(17_000));
+        let (_, diff) = edit_on_the_wire(&before, &after);
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(
+            diff,
+            format!(
+                "{headers}[operation diff truncated — exceeded 16384 bytes; 4 more diff lines omitted]\n"
+            )
+        );
+    }
+
+    #[test]
     fn repl_help_mentions_history_completion_and_multiline() {
         let help = render_repl_help();
         assert!(help.contains("Up/Down"));

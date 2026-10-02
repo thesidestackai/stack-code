@@ -10973,6 +10973,258 @@ printf 'pwsh:%s' "$1"
         assert!(read.contains("do not touch"), "{read}");
     }
 
+    // Shape of the 2026-10-02 North Star edit: asked to add a test, the model
+    // sent the whole existing method as `old_string` and only the new method
+    // as `new_string`, so one test silently replaced another. The names are
+    // synthetic so this fixture never seeds a later task run on this repo.
+    const REPLACED_TEST_BEFORE: &str = r#"import json
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+SCRIPT = ROOT / "scripts" / "render_report.py"
+FIXTURE_DIR = ROOT / "tests" / "fixtures" / "reports"
+
+
+def _run(path: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, str(SCRIPT), str(path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _valid_doc() -> dict:
+    return json.loads((FIXTURE_DIR / "valid-minimal.json").read_text())
+
+
+class RenderValidTests(unittest.TestCase):
+    def test_minimal_report_renders_and_exits_zero(self) -> None:
+        result = _run(FIXTURE_DIR / "valid-minimal.json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("VALID", result.stdout)
+
+    def test_full_report_renders_and_exits_zero(self) -> None:
+        result = _run(FIXTURE_DIR / "valid-full.json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("VALID", result.stdout)
+        # advisory fields are marked, never executed
+        self.assertIn("not executed", result.stdout.lower())
+
+
+class RenderRefusalTests(unittest.TestCase):
+    def test_invalid_input_returns_failure(self) -> None:
+        result = _run(FIXTURE_DIR / "invalid.json")
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_refusal_line_is_displayed(self) -> None:
+        result = _run(FIXTURE_DIR / "refusal.json")
+        self.assertIn("REFUSED", result.stdout)
+
+
+class ReadOnlyBoundaryTests(unittest.TestCase):
+    def test_no_output_file_written(self) -> None:
+        before = sorted(FIXTURE_DIR.iterdir())
+        _run(FIXTURE_DIR / "valid-minimal.json")
+        self.assertEqual(before, sorted(FIXTURE_DIR.iterdir()))
+
+    def test_input_left_unchanged(self) -> None:
+        path = FIXTURE_DIR / "valid-minimal.json"
+        before = path.read_bytes()
+        _run(path)
+        self.assertEqual(before, path.read_bytes())
+
+
+if __name__ == "__main__":
+    unittest.main()
+"#;
+    const REPLACED_TEST_OLD: &str = r#"    def test_full_report_renders_and_exits_zero(self) -> None:
+        result = _run(FIXTURE_DIR / "valid-full.json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("VALID", result.stdout)
+        # advisory fields are marked, never executed
+        self.assertIn("not executed", result.stdout.lower())"#;
+    const REPLACED_TEST_NEW: &str = r#"    def test_item_count_in_heading(self) -> None:
+        doc = _valid_doc()
+        doc["items"].extend([
+            {"item_id": "i2", "description": "Another inert item."}
+        ])
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+            json.dump(doc, fh)
+            tmp = Path(fh.name)
+        try:
+            result = _run(tmp)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Items (2):", result.stdout)
+        finally:
+            tmp.unlink()"#;
+    /// `diff -U3` of the edit above, produced independently by GNU diff.
+    const REPLACED_TEST_HUNK: &str = concat!(
+        "@@ -29,12 +29,20 @@\n",
+        "         self.assertEqual(result.returncode, 0, result.stderr)\n",
+        "         self.assertIn(\"VALID\", result.stdout)\n",
+        " \n",
+        "-    def test_full_report_renders_and_exits_zero(self) -> None:\n",
+        "-        result = _run(FIXTURE_DIR / \"valid-full.json\")\n",
+        "-        self.assertEqual(result.returncode, 0, result.stderr)\n",
+        "-        self.assertIn(\"VALID\", result.stdout)\n",
+        "-        # advisory fields are marked, never executed\n",
+        "-        self.assertIn(\"not executed\", result.stdout.lower())\n",
+        "+    def test_item_count_in_heading(self) -> None:\n",
+        "+        doc = _valid_doc()\n",
+        "+        doc[\"items\"].extend([\n",
+        "+            {\"item_id\": \"i2\", \"description\": \"Another inert item.\"}\n",
+        "+        ])\n",
+        "+        with tempfile.NamedTemporaryFile(\"w\", suffix=\".json\", delete=False) as fh:\n",
+        "+            json.dump(doc, fh)\n",
+        "+            tmp = Path(fh.name)\n",
+        "+        try:\n",
+        "+            result = _run(tmp)\n",
+        "+            self.assertEqual(result.returncode, 0, result.stderr)\n",
+        "+            self.assertIn(\"Items (2):\", result.stdout)\n",
+        "+        finally:\n",
+        "+            tmp.unlink()\n",
+        " \n",
+        " \n",
+        " class RenderRefusalTests(unittest.TestCase):\n",
+    );
+
+    #[test]
+    fn confined_edit_result_leads_with_the_operation_diff_of_a_replaced_test() {
+        const TARGET: &str = "tests/a2_l4/test_pretty_print.py";
+        let ws = GenericWorkspace::new("edit-operation-diff");
+        fs::write(ws.workspace.join(TARGET), REPLACED_TEST_BEFORE).expect("seed test file");
+        let confinement = ws.confinement();
+
+        let visible = run_edit_file_with(
+            edit_input(TARGET, REPLACED_TEST_OLD, REPLACED_TEST_NEW),
+            Some(&confinement),
+        )
+        .expect("the replacement is applied exactly as requested");
+        assert_eq!(
+            ws.read(TARGET),
+            REPLACED_TEST_BEFORE.replacen(REPLACED_TEST_OLD, REPLACED_TEST_NEW, 1)
+        );
+
+        let result: serde_json::Value = serde_json::from_str(&visible).expect("json result");
+        let diff = result["operationDiff"]
+            .as_str()
+            .expect("the model-visible result must carry operationDiff");
+        assert_eq!(
+            diff,
+            format!("--- {TARGET}\n+++ {TARGET}\n{REPLACED_TEST_HUNK}")
+        );
+        assert!(
+            diff.contains("\n-    def test_full_report_renders_and_exits_zero(self) -> None:\n")
+        );
+        assert!(diff.contains("\n+    def test_item_count_in_heading(self) -> None:\n"));
+        for unrelated in [
+            "test_minimal_report_renders_and_exits_zero",
+            "test_invalid_input_returns_failure",
+            "test_refusal_line_is_displayed",
+            "test_no_output_file_written",
+            "test_input_left_unchanged",
+        ] {
+            assert!(
+                !diff.contains(unrelated),
+                "{unrelated} is outside the context"
+            );
+        }
+
+        // Prominence: the diff precedes every bulky field of the serialized text.
+        let at = |key: &str| {
+            visible
+                .find(&format!("\"{key}\":"))
+                .unwrap_or_else(|| panic!("{key} missing from {visible}"))
+        };
+        for bulky in ["oldString", "newString", "originalFile", "structuredPatch"] {
+            assert!(
+                at("operationDiff") < at(bulky),
+                "operationDiff must precede {bulky}"
+            );
+        }
+
+        // Every existing field is still returned exactly as before.
+        assert_eq!(result["filePath"], TARGET);
+        assert_eq!(result["oldString"], REPLACED_TEST_OLD);
+        assert_eq!(result["newString"], REPLACED_TEST_NEW);
+        assert_eq!(result["originalFile"], REPLACED_TEST_BEFORE);
+        assert_eq!(result["userModified"], false);
+        assert_eq!(result["replaceAll"], false);
+        assert_eq!(result["gitDiff"], serde_json::Value::Null);
+        let hunks = result["structuredPatch"]
+            .as_array()
+            .expect("structuredPatch");
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0]["oldStart"], 1);
+        assert_eq!(hunks[0]["oldLines"], 64);
+        assert_eq!(hunks[0]["newStart"], 1);
+        assert_eq!(hunks[0]["newLines"], 72);
+        assert_eq!(hunks[0]["lines"].as_array().map(Vec::len), Some(136));
+    }
+
+    #[test]
+    fn confined_edit_result_marks_operation_diff_truncation_only_when_it_happens() {
+        const TARGET: &str = "tests/a2_l4/test_pretty_print.py";
+        let headers = format!("--- {TARGET}\n+++ {TARGET}\n@@ -1,1 +1,1 @@\n");
+        let ws = GenericWorkspace::new("edit-operation-diff-budget");
+        let confinement = ws.confinement();
+        let edit = |before: &str, after: &str| -> String {
+            fs::write(ws.workspace.join(TARGET), before).expect("seed test file");
+            let visible = run_edit_file_with(edit_input(TARGET, before, after), Some(&confinement))
+                .expect("whole-file replacement is applied");
+            assert_eq!(ws.read(TARGET), after);
+            // The diff is the second serialized field, right after filePath.
+            let at = |key: &str| {
+                visible
+                    .find(&format!("\"{key}\":"))
+                    .unwrap_or_else(|| panic!("{key} missing from {visible}"))
+            };
+            for later in [
+                "oldString",
+                "newString",
+                "originalFile",
+                "structuredPatch",
+                "userModified",
+                "replaceAll",
+                "gitDiff",
+            ] {
+                assert!(at("filePath") < at("operationDiff") && at("operationDiff") < at(later));
+            }
+            let result: serde_json::Value = serde_json::from_str(&visible).expect("json result");
+            result["operationDiff"]
+                .as_str()
+                .expect("the model-visible result must carry operationDiff")
+                .to_string()
+        };
+
+        // A complete diff of exactly 16 384 bytes reaches the model whole.
+        let line = (16_384 - headers.len()) / 2 - 2;
+        let (before, after) = (
+            format!("{}\n", "a".repeat(line)),
+            format!("{}\n", "b".repeat(line)),
+        );
+        let complete = format!("{headers}-{before}+{after}");
+        assert_eq!(complete.len(), 16_384);
+        let diff = edit(&before, &after);
+        assert_eq!(diff, complete);
+        assert!(!diff.contains("[operation diff truncated"));
+
+        // Past the budget the marker counts every omitted rendered line,
+        // `\ No newline at end of file` annotations included.
+        let (before, after) = ("a".repeat(17_000), "b".repeat(17_000));
+        assert_eq!(
+            edit(&before, &after),
+            format!(
+                "{headers}[operation diff truncated — exceeded 16384 bytes; 4 more diff lines omitted]\n"
+            )
+        );
+    }
+
     #[test]
     fn generic_confinement_rejects_invalid_writable_declarations() {
         let ws = GenericWorkspace::new("invalid");
