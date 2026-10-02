@@ -1,10 +1,11 @@
-//! Contained execution for the controlled smoke.
+//! Contained execution for workspace confinement.
 //!
-//! Exactly one approved command is run, mapped to a fixed argv, inside a
-//! Bubblewrap sandbox (`/usr/bin/bwrap`): fresh user, mount, PID, IPC, UTS and
-//! network namespaces, no capabilities, no further user namespaces, a
-//! synthetic read-only root, the bound workspace mounted read-only at `/work`,
-//! a private `/tmp` and a read-only empty `HOME`.
+//! Exactly one approved command (the controlled smoke's built-in command or an
+//! operator declaration, see [`ApprovedCommand`]) is run, mapped to a fixed
+//! argv, inside a Bubblewrap sandbox (`/usr/bin/bwrap`): fresh user, mount,
+//! PID, IPC, UTS and network namespaces, no capabilities, no further user
+//! namespaces, a synthetic read-only root, the bound workspace mounted
+//! read-only at `/work`, a private `/tmp` and a read-only empty `HOME`.
 //!
 //! Lifetime is part of the boundary. The supervisor binds the sandbox's PID
 //! namespace init (the process Bubblewrap blocks on `--block-fd`) through a
@@ -19,30 +20,91 @@
 //!
 //! There is no fallback: when the sandbox cannot be established, nothing runs.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use crate::file_ops::WorkspaceRoot;
 
-/// A command the controlled smoke is allowed to run, mapped to a trusted argv.
+/// A command contained execution may run, mapped to a trusted argv.
+///
+/// Entries come only from the controlled smoke's built-in table
+/// ([`approved_command`]) or from an operator declaration validated by
+/// [`ApprovedCommand::declared`].
 #[derive(Debug, PartialEq, Eq)]
 pub struct ApprovedCommand {
-    command: &'static str,
-    argv: &'static [&'static str],
+    command: Cow<'static, str>,
+    argv: Cow<'static, [Cow<'static, str>]>,
 }
 
+/// The program every approved command names: the sandbox always execs
+/// `/usr/bin/python3`, whatever argv[0] says.
+const APPROVED_PROGRAM: &str = "python3";
+
+/// Characters a declared command may contain besides ASCII letters and
+/// digits. None of them is special to a POSIX shell, so reading a declaration
+/// as shell words or as space-separated argv gives the same tokens.
+const DECLARED_COMMAND_PUNCTUATION: &str = " _-./=:,+@%";
+
 impl ApprovedCommand {
+    /// Validate an operator-declared command and map it to its argv.
+    ///
+    /// The declaration is the exact string a `bash` request must equal to run
+    /// it. It is never given to a shell: it is split on single spaces into the
+    /// argv the sandbox execs. It is refused unless that split is unambiguous
+    /// (tokens separated by exactly one space, no leading or trailing space,
+    /// only ASCII letters, digits and [`DECLARED_COMMAND_PUNCTUATION`], so no
+    /// quoting, globbing, chaining or redirection) and unless the first token
+    /// is `python3`, the only program contained execution runs.
+    pub fn declared(command: &str) -> Result<Self, String> {
+        if command.is_empty() {
+            return Err("declared command is empty".to_string());
+        }
+        if let Some(character) = command.chars().find(|character| {
+            !character.is_ascii_alphanumeric() && !DECLARED_COMMAND_PUNCTUATION.contains(*character)
+        }) {
+            return Err(format!(
+                "declared command {command:?} contains {character:?}; quoting and shell syntax are not supported"
+            ));
+        }
+        let argv = command.split(' ').collect::<Vec<_>>();
+        if argv.iter().any(|token| token.is_empty()) {
+            return Err(format!(
+                "declared command {command:?} must separate its arguments with single spaces and have no leading or trailing space"
+            ));
+        }
+        if argv[0] != APPROVED_PROGRAM {
+            return Err(format!(
+                "declared command {command:?} must start with `{APPROVED_PROGRAM}`, the only program contained execution runs"
+            ));
+        }
+        Ok(Self {
+            command: Cow::Owned(command.to_string()),
+            argv: argv
+                .into_iter()
+                .map(|token| Cow::Owned(token.to_string()))
+                .collect(),
+        })
+    }
+
     /// The exact command string that selects this entry.
     #[must_use]
-    pub fn command(&self) -> &'static str {
-        self.command
+    pub fn command(&self) -> &str {
+        &self.command
     }
 }
 
 const APPROVED_COMMANDS: &[ApprovedCommand] = &[ApprovedCommand {
-    command: "python3 -B -m unittest -v test_calculator",
-    argv: &["python3", "-B", "-m", "unittest", "-v", "test_calculator"],
+    command: Cow::Borrowed("python3 -B -m unittest -v test_calculator"),
+    argv: Cow::Borrowed(&[
+        Cow::Borrowed("python3"),
+        Cow::Borrowed("-B"),
+        Cow::Borrowed("-m"),
+        Cow::Borrowed("unittest"),
+        Cow::Borrowed("-v"),
+        Cow::Borrowed("test_calculator"),
+    ]),
 }];
 
 /// Look up an approved command by exact string equality. No normalization:
@@ -147,7 +209,7 @@ impl std::error::Error for ContainmentError {}
 /// A request to run an approved command against a bound workspace.
 pub struct ContainedRequest<'a> {
     pub root: &'a WorkspaceRoot,
-    pub command: &'static ApprovedCommand,
+    pub command: &'a ApprovedCommand,
     pub timeout: Duration,
     /// Set to `true` from another thread to cancel; the run still settles.
     pub cancel: Option<&'a AtomicBool>,
@@ -598,9 +660,15 @@ except BaseException as error:
             )));
         }
 
+        let argv = request
+            .command
+            .argv
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<&str>>();
         let mut command = Command::new(&spec.bwrap);
         command
-            .args(spec.args(request.command.argv))
+            .args(spec.args(&argv))
             .env_clear()
             .envs(SANDBOX_ENV.iter().copied())
             .current_dir(Path::new("/"))
@@ -803,8 +871,8 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use super::{
-        approved_command, run_contained, run_with_launcher, ContainedOutcome, ContainedRequest,
-        ContainedTermination, ContainmentError,
+        approved_command, run_contained, run_with_launcher, ApprovedCommand, ContainedOutcome,
+        ContainedRequest, ContainedTermination, ContainmentError,
     };
     use crate::file_ops::WorkspaceRoot;
 
@@ -939,6 +1007,110 @@ mod tests {
         ] {
             assert!(approved_command(near_miss).is_none(), "{near_miss:?}");
         }
+    }
+
+    const DECLARED: &str = "python3 -B -m unittest discover -v -s . -p test_calculator.py";
+
+    fn argv(command: &ApprovedCommand) -> Vec<&str> {
+        command.argv.iter().map(AsRef::as_ref).collect()
+    }
+
+    #[test]
+    fn a_declared_command_maps_to_its_space_separated_argv() {
+        let declared = ApprovedCommand::declared(DECLARED).expect("a plain python3 command");
+        assert_eq!(declared.command(), DECLARED);
+        assert_eq!(
+            argv(&declared),
+            [
+                "python3",
+                "-B",
+                "-m",
+                "unittest",
+                "discover",
+                "-v",
+                "-s",
+                ".",
+                "-p",
+                "test_calculator.py"
+            ]
+        );
+        // The built-in smoke entry keeps its fixed argv.
+        assert_eq!(
+            argv(approved_command(SMOKE).expect("approved")),
+            ["python3", "-B", "-m", "unittest", "-v", "test_calculator"]
+        );
+        // A declaration is not added to the built-in table.
+        assert!(approved_command(DECLARED).is_none());
+    }
+
+    #[test]
+    fn shell_syntax_in_a_declared_command_is_refused() {
+        for (declared, character) in [
+            ("python3 -B x; touch y", ';'),
+            ("python3 -B x && y", '&'),
+            ("python3 -B x || y", '|'),
+            ("python3 -B x &", '&'),
+            ("python3 -B x | tee y", '|'),
+            ("python3 -B x > out", '>'),
+            ("python3 -B x < in", '<'),
+            ("python3 -c 'print(1)'", '\''),
+            ("python3 -c \"print(1)\"", '"'),
+            ("python3 -B $(id)", '$'),
+            ("python3 -B `id`", '`'),
+            ("python3 -B test_*.py", '*'),
+            ("python3 -B ~/x.py", '~'),
+            ("python3 -B x\\ y", '\\'),
+            ("python3 -B x#y", '#'),
+            ("python3\t-B x", '\t'),
+            ("python3 -B x\n", '\n'),
+        ] {
+            let error = ApprovedCommand::declared(declared).expect_err("shell syntax is refused");
+            assert!(
+                error.contains(&format!("contains {character:?}")),
+                "{declared:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_spacing_or_another_program_is_refused() {
+        for (declared, reason) in [
+            ("", "is empty"),
+            (" python3 -B x", "single spaces"),
+            ("python3 -B x ", "single spaces"),
+            ("python3  -B x", "single spaces"),
+            ("env X=1 python3 -B x", "must start with `python3`"),
+            ("X=1 python3 -B x", "must start with `python3`"),
+            ("bash -c x", "must start with `python3`"),
+            ("sh -c x", "must start with `python3`"),
+            ("/usr/bin/python3 -B x", "must start with `python3`"),
+            ("python -B x", "must start with `python3`"),
+            ("python3.12 -B x", "must start with `python3`"),
+            ("pytest -q", "must start with `python3`"),
+        ] {
+            let error = ApprovedCommand::declared(declared).expect_err("must be refused");
+            assert!(error.contains(reason), "{declared:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_declared_command_runs_its_argv_inside_the_sandbox() {
+        if !sandbox_ready() {
+            return;
+        }
+        let fixture = Fixture::new("declared", ADD);
+        let root = fixture.root();
+        let declared = ApprovedCommand::declared(DECLARED).expect("declarable");
+        let outcome = run_contained(&ContainedRequest {
+            root: &root,
+            command: &declared,
+            timeout: Duration::from_secs(30),
+            cancel: None,
+        })
+        .expect("the declared command should run");
+        assert_eq!(exited(&outcome), Some(0), "{outcome:?}");
+        assert!(outcome.stderr.contains("Ran 3 tests"), "{outcome:?}");
+        assert_eq!(outcome.settlement.residual_processes, 0);
     }
 
     #[test]

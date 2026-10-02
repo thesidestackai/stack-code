@@ -201,6 +201,8 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--allowed-tools",
     "--data-dir",
     "--workspace-confine",
+    "--workspace-confine-write",
+    "--workspace-confine-bash-command",
     "--resume",
     "--acp",
     "-acp",
@@ -352,12 +354,13 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
-    let (filtered_args, data_dir, confine_root) = extract_process_flags(&args)?;
+    let (filtered_args, data_dir, confine_root, confine_writable, confine_commands) =
+        extract_process_flags(&args)?;
     // Install confinement BEFORE parsing the action: parsing can already
     // build the runtime tool registry (`--allowedTools`), and that build must
     // see the confinement so it does not start hooks, plugins or MCP servers.
     if let Some(root) = confine_root {
-        let confinement = tools::WorkspaceConfinement::new(&root, tools::CONFINED_BASH_TIMEOUT_MS)?;
+        let confinement = build_workspace_confinement(&root, &confine_writable, &confine_commands)?;
         tools::set_workspace_confinement(confinement)?;
     }
     let action = parse_args_core(
@@ -3922,20 +3925,158 @@ fn parse_full_invocation_with_terminal(
     stdin_is_tty: bool,
     stdout_is_tty: bool,
 ) -> Result<(CliAction, Option<PathBuf>, Option<PathBuf>), String> {
-    let (filtered_args, data_dir, confine_root) = extract_process_flags(args)?;
+    let (filtered_args, data_dir, confine_root, _, _) = extract_process_flags(args)?;
     let action = parse_args_core(&filtered_args, stdin_is_tty, stdout_is_tty)?;
     Ok((action, data_dir, confine_root))
 }
 
-/// Remaining action arguments, `--data-dir`, and `--workspace-confine` root.
-type ProcessFlags = (Vec<String>, Option<PathBuf>, Option<PathBuf>);
+/// Remaining action arguments, `--data-dir`, `--workspace-confine` root, and
+/// the `--workspace-confine-write` and `--workspace-confine-bash-command`
+/// declarations, each in command-line order.
+type ProcessFlags = (
+    Vec<String>,
+    Option<PathBuf>,
+    Option<PathBuf>,
+    Vec<String>,
+    Vec<String>,
+);
 
-/// Strip the process-level flags (`--data-dir`, `--workspace-confine`) and
+/// Strip the process-level flags (`--data-dir`, `--workspace-confine`,
+/// `--workspace-confine-write`, `--workspace-confine-bash-command`) and
 /// return the remaining arguments for action parsing.
 fn extract_process_flags(args: &[String]) -> Result<ProcessFlags, String> {
     let (filtered_args, data_dir) = extract_data_dir(args)?;
+    let (filtered_args, confine_writable) = extract_workspace_confine_writes(&filtered_args)?;
+    let (filtered_args, confine_commands) =
+        extract_workspace_confine_bash_commands(&filtered_args)?;
     let (filtered_args, confine_root) = extract_workspace_confine(&filtered_args)?;
-    Ok((filtered_args, data_dir, confine_root))
+    if confine_root.is_none() && !confine_writable.is_empty() {
+        return Err("--workspace-confine-write requires --workspace-confine".to_string());
+    }
+    if confine_root.is_none() && !confine_commands.is_empty() {
+        return Err("--workspace-confine-bash-command requires --workspace-confine".to_string());
+    }
+    Ok((
+        filtered_args,
+        data_dir,
+        confine_root,
+        confine_writable,
+        confine_commands,
+    ))
+}
+
+/// Extract each `--workspace-confine-write PATH` or
+/// `--workspace-confine-write=PATH`.
+///
+/// Each names one existing workspace-relative file that confined writes and
+/// edits may modify. The flag repeats and declarations keep their order. Only
+/// a missing or empty value is refused here; the paths themselves are
+/// validated when the confinement is bound, before any action is parsed.
+fn extract_workspace_confine_writes(args: &[String]) -> Result<(Vec<String>, Vec<String>), String> {
+    let mut filtered = Vec::with_capacity(args.len());
+    let mut writable = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--workspace-confine-write" => {
+                let value = args
+                    .get(index + 1)
+                    .filter(|value| !value.is_empty() && !value.starts_with('-'))
+                    .ok_or_else(|| "missing value for --workspace-confine-write".to_string())?;
+                writable.push(value.clone());
+                index += 2;
+            }
+            flag if flag.starts_with("--workspace-confine-write=") => {
+                let value = &flag["--workspace-confine-write=".len()..];
+                if value.is_empty() {
+                    return Err("missing value for --workspace-confine-write".to_string());
+                }
+                writable.push(value.to_string());
+                index += 1;
+            }
+            _ => {
+                filtered.push(args[index].clone());
+                index += 1;
+            }
+        }
+    }
+    Ok((filtered, writable))
+}
+
+/// Extract each `--workspace-confine-bash-command COMMAND` or
+/// `--workspace-confine-bash-command=COMMAND`.
+///
+/// Each declares one exact command confined `bash` may run. The flag repeats
+/// and declarations keep their order. Arguments after `prompt` or `-p` are
+/// prompt text, and prompt text never declares a command, so a declaration
+/// found there is refused. Otherwise only a missing or empty value is refused
+/// here; the commands themselves are validated when the confinement is
+/// bound, before any action is parsed.
+fn extract_workspace_confine_bash_commands(
+    args: &[String],
+) -> Result<(Vec<String>, Vec<String>), String> {
+    let mut filtered = Vec::with_capacity(args.len());
+    let mut commands = Vec::new();
+    let mut prompt_text = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if prompt_text
+            && (arg == "--workspace-confine-bash-command"
+                || arg.starts_with("--workspace-confine-bash-command="))
+        {
+            return Err("--workspace-confine-bash-command must come before the prompt".to_string());
+        }
+        match arg {
+            "--workspace-confine-bash-command" => {
+                let value = args
+                    .get(index + 1)
+                    .filter(|value| !value.is_empty() && !value.starts_with('-'))
+                    .ok_or_else(|| {
+                        "missing value for --workspace-confine-bash-command".to_string()
+                    })?;
+                commands.push(value.clone());
+                index += 2;
+            }
+            flag if flag.starts_with("--workspace-confine-bash-command=") => {
+                let value = &flag["--workspace-confine-bash-command=".len()..];
+                if value.is_empty() {
+                    return Err("missing value for --workspace-confine-bash-command".to_string());
+                }
+                commands.push(value.to_string());
+                index += 1;
+            }
+            other => {
+                prompt_text |= matches!(other, "prompt" | "-p");
+                filtered.push(args[index].clone());
+                index += 1;
+            }
+        }
+    }
+    Ok((filtered, commands))
+}
+
+/// Bind the process confinement for `root`.
+///
+/// Any operator declaration (a writable file or a bash command) selects the
+/// generic policy, under which only declared files are writable and only
+/// declared commands run; with none, the controlled calculator smoke keeps
+/// its fixture policy and built-in command. Either way an invalid root or
+/// declaration is an error here, before any action runs.
+fn build_workspace_confinement(
+    root: &Path,
+    writable: &[String],
+    commands: &[String],
+) -> Result<tools::WorkspaceConfinement, String> {
+    if writable.is_empty() && commands.is_empty() {
+        return tools::WorkspaceConfinement::controlled_smoke(
+            root,
+            tools::CONFINED_BASH_TIMEOUT_MS,
+        );
+    }
+    let writable = writable.iter().map(String::as_str).collect::<Vec<_>>();
+    let commands = commands.iter().map(String::as_str).collect::<Vec<_>>();
+    tools::WorkspaceConfinement::new(root, &writable, &commands, tools::CONFINED_BASH_TIMEOUT_MS)
 }
 
 /// Extract `--workspace-confine` or `--workspace-confine=PATH`.
@@ -13665,7 +13806,15 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  --workspace-confine[=PATH] Controlled-smoke confinement of PATH (default: cwd): file tools bound beneath it, writes only to calculator.py, bash only the approved unittest command in a Bubblewrap sandbox; hooks, plugins and MCP servers disabled"
+        "  --workspace-confine[=PATH] Confine to PATH (default: cwd): file tools bound beneath it, writes only to declared files, bash only declared commands in a Bubblewrap sandbox with the workspace read-only (with nothing declared: calculator.py and its unittest command); hooks, plugins and MCP servers disabled"
+    )?;
+    writeln!(
+        out,
+        "  --workspace-confine-write PATH  Declare an existing workspace-relative file writable under --workspace-confine (repeatable)"
+    )?;
+    writeln!(
+        out,
+        "  --workspace-confine-bash-command CMD  Declare an exact python3 command bash may run under --workspace-confine (repeatable; matched exactly, never run by a shell; must come before the prompt)"
     )?;
     writeln!(
         out,
@@ -17787,6 +17936,285 @@ UU conflicted.rs",
     }
 
     #[test]
+    fn edit_file_operation_diff_reaches_the_openai_tool_message() {
+        // Real `edit_file` results carried along the live model path:
+        // tool registry -> `convert_messages` -> OpenAI-compatible
+        // `role:"tool"` message, i.e. exactly what the next turn reads.
+        use std::fmt::Write as _;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("claw-edit-wire-{unique}"));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let small = dir.join("module.py");
+        fs::write(
+            &small,
+            "def keep():\n    return 1\n\n\ndef old_name():\n    return 2\n",
+        )
+        .expect("seed small file");
+        let large = dir.join("values.txt");
+        let large_before = (0..2_000).fold(String::new(), |mut text, n| {
+            let _ = writeln!(text, "value_{n:04} = OLD");
+            text
+        });
+        fs::write(&large, &large_before).expect("seed large file");
+
+        let registry = GlobalToolRegistry::builtin();
+        let small_output = registry
+            .execute(
+                "edit_file",
+                &json!({
+                    "path": small,
+                    "old_string": "def old_name():\n    return 2",
+                    "new_string": "def new_name():\n    return 3",
+                }),
+            )
+            .expect("small edit");
+        let large_output = registry
+            .execute(
+                "edit_file",
+                &json!({ "path": large, "old_string": "OLD", "new_string": "NEW", "replace_all": true }),
+            )
+            .expect("large edit");
+        let _ = fs::remove_dir_all(&dir);
+
+        let to_wire = |id: &str, output: &str| -> String {
+            let messages = vec![ConversationMessage {
+                role: MessageRole::Tool,
+                blocks: vec![ContentBlock::ToolResult {
+                    tool_use_id: id.to_string(),
+                    tool_name: "edit_file".to_string(),
+                    output: output.to_string(),
+                    is_error: false,
+                }],
+                usage: None,
+            }];
+            let converted = super::convert_messages(&messages);
+            let wire = api::translate_message(&converted[0], "local-model");
+            assert_eq!(wire.len(), 1);
+            assert_eq!(wire[0]["role"], "tool");
+            assert_eq!(wire[0]["tool_call_id"], id);
+            wire[0]["content"]
+                .as_str()
+                .expect("string content")
+                .to_string()
+        };
+
+        let small_wire = to_wire("call_small", &small_output);
+        assert_eq!(
+            small_wire, small_output,
+            "edit results reach the model verbatim"
+        );
+        let small_diff = serde_json::from_str::<Value>(&small_wire).expect("json")["operationDiff"]
+            .as_str()
+            .expect("operationDiff must be model-visible")
+            .to_string();
+        assert!(
+            small_diff
+                .contains("\n-def old_name():\n-    return 2\n+def new_name():\n+    return 3\n"),
+            "{small_diff}"
+        );
+        let first = |key: &str| small_wire.find(&format!("\"{key}\":")).expect(key);
+        assert!(first("operationDiff") < first("originalFile"));
+        assert!(first("operationDiff") < first("structuredPatch"));
+
+        let large_wire = to_wire("call_large", &large_output);
+        assert_eq!(
+            large_wire, large_output,
+            "edit results reach the model verbatim"
+        );
+        let large_diff = serde_json::from_str::<Value>(&large_wire).expect("json")["operationDiff"]
+            .as_str()
+            .expect("operationDiff must be model-visible")
+            .to_string();
+        assert!(large_diff.len() <= 16_384, "{} bytes", large_diff.len());
+        assert!(
+            large_diff.contains("\n[operation diff truncated — exceeded 16384 bytes; "),
+            "truncation must be explicit on the wire"
+        );
+        assert!(large_wire.contains("[operation diff truncated"));
+        assert!(large_diff.contains("\n-value_0000 = OLD\n"));
+    }
+
+    #[test]
+    fn edit_file_operation_diff_truncation_claims_stay_factual_on_the_wire() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("claw-edit-budget-{unique}"));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("f");
+        let shown = path.to_string_lossy().into_owned();
+        let headers = format!("--- {shown}\n+++ {shown}\n@@ -1,1 +1,1 @@\n");
+        let registry = GlobalToolRegistry::builtin();
+        let edit_on_the_wire = |before: &str, after: &str| -> (String, String) {
+            fs::write(&path, before).expect("seed file");
+            let output = registry
+                .execute(
+                    "edit_file",
+                    &json!({ "path": path, "old_string": before, "new_string": after }),
+                )
+                .expect("whole-file edit");
+            assert_eq!(fs::read_to_string(&path).expect("edited file"), after);
+            let messages = vec![ConversationMessage {
+                role: MessageRole::Tool,
+                blocks: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_budget".to_string(),
+                    tool_name: "edit_file".to_string(),
+                    output: output.clone(),
+                    is_error: false,
+                }],
+                usage: None,
+            }];
+            let converted = super::convert_messages(&messages);
+            let wire = api::translate_message(&converted[0], "local-model");
+            assert_eq!(wire.len(), 1);
+            assert_eq!(wire[0]["role"], "tool");
+            let content = wire[0]["content"]
+                .as_str()
+                .expect("string content")
+                .to_string();
+            assert_eq!(content, output, "edit results reach the model verbatim");
+            let diff = serde_json::from_str::<Value>(&content).expect("json")["operationDiff"]
+                .as_str()
+                .expect("operationDiff must be model-visible")
+                .to_string();
+            (content, diff)
+        };
+
+        // A complete diff of exactly 16 384 bytes: whole, no marker.
+        let line = (16_384 - headers.len()) / 2 - 2;
+        let before = format!("{}\n", "a".repeat(line));
+        let after = format!("{}\n", "b".repeat(line));
+        let complete = format!("{headers}-{before}+{after}");
+        assert_eq!(complete.len(), 16_384);
+        let (content, diff) = edit_on_the_wire(&before, &after);
+        assert_eq!(diff, complete);
+        assert!(!content.contains("[operation diff truncated"));
+
+        // Over the budget: the marker's count of omitted rendered lines
+        // includes both `\ No newline at end of file` annotations.
+        let (before, after) = ("a".repeat(17_000), "b".repeat(17_000));
+        let (_, diff) = edit_on_the_wire(&before, &after);
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(
+            diff,
+            format!(
+                "{headers}[operation diff truncated — exceeded 16384 bytes; 4 more diff lines omitted]\n"
+            )
+        );
+    }
+
+    #[test]
+    fn insertion_operation_diff_reaches_the_openai_tool_message() {
+        // Real `insert_before` / `insert_after` results carried along the
+        // live model path: tool registry -> `convert_messages` ->
+        // OpenAI-compatible `role:"tool"` message, i.e. what the next turn
+        // reads. The fixture has a method/class boundary; names are unrelated.
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("claw-insert-wire-{unique}"));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("test_shapes.py");
+        let original = "import unittest\n\n\nclass SquareTests(unittest.TestCase):\n    def test_area(self):\n        self.assertEqual(4, 2 * 2)\n\n\nclass CircleTests(unittest.TestCase):\n    def test_radius(self):\n        self.assertEqual(1, 1)\n";
+        fs::write(&path, original).expect("seed file");
+        let shown = fs::canonicalize(&path)
+            .expect("canonical path")
+            .to_string_lossy()
+            .into_owned();
+
+        let registry = GlobalToolRegistry::builtin();
+        let added = "    def test_side(self):\n        self.assertEqual(2, 4 // 2)\n\n\n";
+        let before_output = registry
+            .execute(
+                "insert_before",
+                &json!({ "path": path, "anchor": "class CircleTests(unittest.TestCase):", "content": added }),
+            )
+            .expect("insert_before");
+        let after_output = registry
+            .execute(
+                "insert_after",
+                &json!({ "path": path, "anchor": "import unittest\n", "content": "import math\n" }),
+            )
+            .expect("insert_after");
+        let expected = original
+            .replacen("import unittest\n", "import unittest\nimport math\n", 1)
+            .replacen("class CircleTests", &format!("{added}class CircleTests"), 1);
+        assert_eq!(fs::read_to_string(&path).expect("file"), expected);
+        let large_output = registry
+            .execute(
+                "insert_after",
+                &json!({ "path": path, "anchor": "import math\n", "content": "X = 0\n".repeat(4_000) }),
+            )
+            .expect("large insert_after");
+        let _ = fs::remove_dir_all(&dir);
+
+        let to_wire = |id: &str, tool: &str, output: &str| -> Value {
+            let messages = vec![ConversationMessage {
+                role: MessageRole::Tool,
+                blocks: vec![ContentBlock::ToolResult {
+                    tool_use_id: id.to_string(),
+                    tool_name: tool.to_string(),
+                    output: output.to_string(),
+                    is_error: false,
+                }],
+                usage: None,
+            }];
+            let converted = super::convert_messages(&messages);
+            let wire = api::translate_message(&converted[0], "local-model");
+            assert_eq!(wire.len(), 1);
+            assert_eq!(wire[0]["role"], "tool");
+            assert_eq!(wire[0]["tool_call_id"], id);
+            let content = wire[0]["content"].as_str().expect("string content");
+            assert_eq!(
+                content, output,
+                "insertion results reach the model verbatim"
+            );
+            let result: Value = serde_json::from_str(content).expect("json");
+            assert_eq!(result["success"], true);
+            assert_eq!(result["filePath"], shown.as_str());
+            assert!(content.find("\"filePath\":") < content.find("\"operationDiff\":"));
+            result
+        };
+        let diff_of = |result: &Value| -> String {
+            result["operationDiff"]
+                .as_str()
+                .expect("operationDiff must be model-visible")
+                .to_string()
+        };
+        let removed = |diff: &str| {
+            diff.lines()
+                .skip(2)
+                .filter(|line| line.starts_with('-'))
+                .count()
+        };
+
+        let before_diff = diff_of(&to_wire("call_before", "insert_before", &before_output));
+        assert_eq!(
+            before_diff,
+            format!(
+                "--- {shown}\n+++ {shown}\n@@ -6,6 +6,10 @@\n         self.assertEqual(4, 2 * 2)\n \n \n+    def test_side(self):\n+        self.assertEqual(2, 4 // 2)\n+\n+\n class CircleTests(unittest.TestCase):\n     def test_radius(self):\n         self.assertEqual(1, 1)\n"
+            )
+        );
+        let after_diff = diff_of(&to_wire("call_after", "insert_after", &after_output));
+        assert_eq!(removed(&after_diff), 0, "{after_diff}");
+        assert!(after_diff.contains("\n import unittest\n+import math\n \n"));
+
+        let large_diff = diff_of(&to_wire("call_large", "insert_after", &large_output));
+        assert_eq!(removed(&large_diff), 0);
+        assert!(large_diff.len() <= 16_384, "{} bytes", large_diff.len());
+        assert!(
+            large_diff.contains("\n[operation diff truncated — exceeded 16384 bytes; "),
+            "truncation must be explicit on the wire"
+        );
+    }
+
+    #[test]
     fn repl_help_mentions_history_completion_and_multiline() {
         let help = render_repl_help();
         assert!(help.contains("Up/Down"));
@@ -19003,6 +19431,336 @@ UU conflicted.rs",
             "a bare flag always confines to the current directory"
         );
         let _ = fs::remove_dir_all(cwd);
+    }
+
+    // ---- CLI_START seam: operator-declared writable files ----
+
+    fn extract_confined(args: &[&str]) -> Result<super::ProcessFlags, String> {
+        super::extract_process_flags(&confine_args(args))
+    }
+
+    #[test]
+    fn workspace_confine_write_is_repeatable_in_declaration_order() {
+        let (filtered, _, root, writable, _) = extract_confined(&[
+            "--workspace-confine=/tmp/work",
+            "--workspace-confine-write",
+            "scripts/pretty_print_planner_output.py",
+            "--workspace-confine-write=tests/a2_l4/test_pretty_print_planner_output.py",
+            "prompt",
+            "repair",
+        ])
+        .expect("repeated writable declarations should parse");
+        assert_eq!(root, Some(PathBuf::from("/tmp/work")));
+        assert_eq!(
+            writable,
+            vec![
+                "scripts/pretty_print_planner_output.py".to_string(),
+                "tests/a2_l4/test_pretty_print_planner_output.py".to_string(),
+            ]
+        );
+        assert_eq!(
+            filtered,
+            confine_args(&["prompt", "repair"]),
+            "process-only flags must not reach the action parser"
+        );
+    }
+
+    #[test]
+    fn workspace_confine_write_requires_a_non_empty_value() {
+        for args in [
+            &["--workspace-confine", "--workspace-confine-write"][..],
+            &[
+                "--workspace-confine",
+                "--workspace-confine-write",
+                "--model",
+                "x",
+            ][..],
+            &["--workspace-confine", "--workspace-confine-write", ""][..],
+            &["--workspace-confine", "--workspace-confine-write="][..],
+        ] {
+            let error =
+                extract_confined(args).expect_err("a missing writable path must be refused");
+            assert_eq!(
+                error, "missing value for --workspace-confine-write",
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_confine_write_without_confinement_is_refused() {
+        for args in [
+            &["--workspace-confine-write", "scripts/a.py", "status"][..],
+            &["--workspace-confine-write=scripts/a.py", "prompt", "x"][..],
+        ] {
+            let error = extract_confined(args).expect_err("writes without a root must be refused");
+            assert_eq!(
+                error, "--workspace-confine-write requires --workspace-confine",
+                "{args:?}"
+            );
+            parse_confined(args).expect_err("the full parser must refuse it too");
+        }
+    }
+
+    #[test]
+    fn bare_workspace_confine_with_writes_keeps_the_prompt_action() {
+        let cwd = temp_dir();
+        fs::create_dir_all(&cwd).expect("cwd");
+        let (action, root) = with_current_dir(&cwd, || {
+            parse_confined(&[
+                "--workspace-confine",
+                "--workspace-confine-write",
+                "a.py",
+                "prompt",
+                "repair",
+            ])
+        })
+        .expect("bare flag with a writable declaration should parse");
+        assert_eq!(root, Some(fs::canonicalize(&cwd).expect("canonical cwd")));
+        assert!(
+            matches!(&action, CliAction::Prompt { prompt, .. } if prompt == "repair"),
+            "the action and prompt must survive, got {action:?}"
+        );
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn declared_writable_files_confine_a_workspace_without_the_calculator_fixture() {
+        let workspace = temp_dir();
+        fs::create_dir_all(workspace.join("scripts")).expect("scripts");
+        fs::create_dir_all(workspace.join("tests")).expect("tests");
+        fs::write(workspace.join("scripts/a.py"), "a\n").expect("a");
+        fs::write(workspace.join("tests/b.py"), "b\n").expect("b");
+        fs::write(workspace.join("README.md"), "readme\n").expect("readme");
+
+        let confinement = super::build_workspace_confinement(
+            &workspace,
+            &["scripts/a.py".to_string(), "tests/b.py".to_string()],
+            &[],
+        )
+        .expect("declared files must confine a workspace without the calculator fixture");
+        for declared in ["scripts/a.py", "tests/b.py"] {
+            confinement
+                .root()
+                .write_file(declared, "changed\n")
+                .expect("a declared file is writable");
+        }
+        confinement
+            .root()
+            .write_file("README.md", "pwned\n")
+            .expect_err("an unlisted file is not writable");
+        assert_eq!(
+            fs::read_to_string(workspace.join("README.md")).expect("readme"),
+            "readme\n"
+        );
+
+        // NEGATIVE CONTROL: without declarations the controlled smoke is
+        // selected, and it still refuses a workspace lacking its fixture.
+        let error = super::build_workspace_confinement(&workspace, &[], &[])
+            .expect_err("the controlled smoke still requires its fixture");
+        assert!(error.contains("controlled fixture rejected"), "{error}");
+
+        let outside = workspace.join("..").join("claw-outside-declared");
+        for invalid in [
+            "../outside.py",
+            "/etc/hostname",
+            "missing.py",
+            outside.to_str().expect("utf8"),
+        ] {
+            super::build_workspace_confinement(&workspace, &[invalid.to_string()], &[])
+                .expect_err("an invalid declaration must fail closed");
+        }
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    // ---- Command-policy seam: operator-declared bash commands ----
+
+    const NORTH_STAR_TEST: &str =
+        "python3 -B -m unittest discover -v -s tests/a2_l4 -p test_pretty_print_planner_output.py";
+    const SMOKE_COMMAND: &str = "python3 -B -m unittest -v test_calculator";
+
+    #[test]
+    fn workspace_confine_bash_command_is_repeatable_in_declaration_order() {
+        let (filtered, _, root, writable, commands) = extract_confined(&[
+            "--workspace-confine=/tmp/work",
+            "--workspace-confine-bash-command",
+            NORTH_STAR_TEST,
+            "--workspace-confine-write",
+            "scripts/a.py",
+            "--workspace-confine-bash-command=python3 -B -m py_compile scripts/a.py",
+            "prompt",
+            "repair",
+        ])
+        .expect("repeated command declarations should parse");
+        assert_eq!(root, Some(PathBuf::from("/tmp/work")));
+        assert_eq!(writable, vec!["scripts/a.py".to_string()]);
+        assert_eq!(
+            commands,
+            vec![
+                NORTH_STAR_TEST.to_string(),
+                "python3 -B -m py_compile scripts/a.py".to_string(),
+            ]
+        );
+        assert_eq!(
+            filtered,
+            confine_args(&["prompt", "repair"]),
+            "process-only flags must not reach the action parser"
+        );
+    }
+
+    #[test]
+    fn workspace_confine_bash_command_requires_a_non_empty_value() {
+        for args in [
+            &["--workspace-confine", "--workspace-confine-bash-command"][..],
+            &[
+                "--workspace-confine",
+                "--workspace-confine-bash-command",
+                "--model",
+                "x",
+            ][..],
+            &[
+                "--workspace-confine",
+                "--workspace-confine-bash-command",
+                "",
+            ][..],
+            &["--workspace-confine", "--workspace-confine-bash-command="][..],
+        ] {
+            let error = extract_confined(args).expect_err("a missing command must be refused");
+            assert_eq!(
+                error, "missing value for --workspace-confine-bash-command",
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_confine_bash_command_without_confinement_is_refused() {
+        for args in [
+            &[
+                "--workspace-confine-bash-command",
+                NORTH_STAR_TEST,
+                "status",
+            ][..],
+            &[
+                "--workspace-confine-bash-command=python3 -B x",
+                "prompt",
+                "x",
+            ][..],
+        ] {
+            let error =
+                extract_confined(args).expect_err("commands without a root must be refused");
+            assert_eq!(
+                error, "--workspace-confine-bash-command requires --workspace-confine",
+                "{args:?}"
+            );
+            parse_confined(args).expect_err("the full parser must refuse it too");
+        }
+    }
+
+    #[test]
+    fn prompt_text_never_declares_a_bash_command() {
+        // A prompt naming a command, or the flag itself, mid-text is prompt
+        // text and nothing else.
+        let mention =
+            format!("run {NORTH_STAR_TEST} --workspace-confine-bash-command=python3 -B -m evil");
+        let (filtered, _, _, _, commands) =
+            extract_confined(&["--workspace-confine=/tmp/work", "prompt", mention.as_str()])
+                .expect("a prompt mentioning a command should parse");
+        assert!(commands.is_empty(), "{commands:?}");
+        assert_eq!(filtered, confine_args(&["prompt", mention.as_str()]));
+
+        // A declaration-shaped argument after `prompt` or `-p` is refused,
+        // never taken as operator authority.
+        for args in [
+            &[
+                "--workspace-confine=/tmp/work",
+                "prompt",
+                "--workspace-confine-bash-command=python3 -B -m evil",
+            ][..],
+            &[
+                "--workspace-confine=/tmp/work",
+                "prompt",
+                "repair",
+                "--workspace-confine-bash-command",
+                "python3 -B -m evil",
+            ][..],
+            &[
+                "--workspace-confine=/tmp/work",
+                "-p",
+                "--workspace-confine-bash-command=python3 -B -m evil",
+            ][..],
+        ] {
+            let error = extract_confined(args).expect_err("prompt text must not declare");
+            assert_eq!(
+                error, "--workspace-confine-bash-command must come before the prompt",
+                "{args:?}"
+            );
+            parse_confined(args).expect_err("the full parser must refuse it too");
+        }
+
+        // NEGATIVE CONTROL: the same declaration before the prompt counts.
+        let (_, _, _, _, commands) = extract_confined(&[
+            "--workspace-confine=/tmp/work",
+            "--workspace-confine-bash-command=python3 -B -m evil",
+            "prompt",
+            "repair",
+        ])
+        .expect("a declaration before the prompt should parse");
+        assert_eq!(commands, vec!["python3 -B -m evil".to_string()]);
+    }
+
+    #[test]
+    fn declared_bash_commands_select_the_generic_policy() {
+        let workspace = temp_dir();
+        fs::create_dir_all(workspace.join("scripts")).expect("scripts");
+        fs::write(workspace.join("scripts/a.py"), "a\n").expect("a");
+        let declared = [NORTH_STAR_TEST.to_string()];
+        let writable = ["scripts/a.py".to_string()];
+
+        // Commands alone select the generic policy (no calculator fixture):
+        // only the declared command is approved and nothing is writable.
+        let confinement = super::build_workspace_confinement(&workspace, &[], &declared)
+            .expect("declared commands alone must confine a workspace");
+        assert!(confinement.approved_command(NORTH_STAR_TEST).is_some());
+        assert!(confinement.approved_command(SMOKE_COMMAND).is_none());
+        confinement
+            .root()
+            .write_file("scripts/a.py", "pwned\n")
+            .expect_err("nothing is writable without a writable declaration");
+
+        // Both kinds of declaration apply together.
+        let confinement = super::build_workspace_confinement(&workspace, &writable, &declared)
+            .expect("writes and commands together must confine a workspace");
+        assert!(confinement.approved_command(NORTH_STAR_TEST).is_some());
+        confinement
+            .root()
+            .write_file("scripts/a.py", "changed\n")
+            .expect("a declared file is writable");
+
+        // NEGATIVE CONTROL: writes alone approve no command, not even the
+        // controlled smoke's.
+        let confinement = super::build_workspace_confinement(&workspace, &writable, &[])
+            .expect("writes alone must confine a workspace");
+        assert!(confinement.approved_command(NORTH_STAR_TEST).is_none());
+        assert!(confinement.approved_command(SMOKE_COMMAND).is_none());
+
+        for invalid in [
+            format!("{NORTH_STAR_TEST}; touch README.md"),
+            "bash -c true".to_string(),
+            "python3 -c 'print(1)'".to_string(),
+        ] {
+            let error = super::build_workspace_confinement(
+                &workspace,
+                &writable,
+                std::slice::from_ref(&invalid),
+            )
+            .expect_err("an invalid command declaration must fail closed");
+            assert!(
+                error.contains("declared bash command rejected"),
+                "{invalid}: {error}"
+            );
+        }
+        let _ = fs::remove_dir_all(workspace);
     }
 
     // ---- PR #183 review repair: no external integrations while confined (P1) ----
