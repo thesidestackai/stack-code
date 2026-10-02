@@ -12,7 +12,9 @@ use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
     check_freshness,
-    contained::{approved_command, run_contained, ContainedRequest, ContainedTermination},
+    contained::{
+        approved_command, run_contained, ApprovedCommand, ContainedRequest, ContainedTermination,
+    },
     dedupe_superseded_commit_events, edit_file, execute_bash, glob_search, grep_search,
     load_system_prompt,
     lsp_client::LspRegistry,
@@ -45,8 +47,11 @@ use serde_json::{json, Value};
 ///   crossings, no ambient CWD), and may modify only the writable files the
 ///   operator declared (`--workspace-confine-write`), or
 ///   [`CONTROLLED_SMOKE_WRITABLE`] for the controlled smoke;
-/// - `bash` runs only an approved command, inside the Bubblewrap sandbox of
-///   `runtime::contained`, and returns only after the sandbox's whole process
+/// - `bash` runs only a command the operator declared
+///   (`--workspace-confine-bash-command`), or the controlled smoke's built-in
+///   command when nothing is declared, matched by exact string equality; it
+///   runs inside the Bubblewrap sandbox of `runtime::contained`, with the
+///   workspace read-only, and returns only after the sandbox's whole process
 ///   tree is settled. There is no fallback to unsandboxed execution.
 static WORKSPACE_CONFINEMENT: std::sync::OnceLock<WorkspaceConfinement> =
     std::sync::OnceLock::new();
@@ -77,29 +82,57 @@ pub const CONTROLLED_SMOKE_WRITABLE: &[&str] = &["calculator.py"];
 /// smoke is bound. `test_calculator.py` is the immutable oracle.
 pub const CONTROLLED_SMOKE_FIXTURE: &[&str] = &["calculator.py", "test_calculator.py"];
 
-/// An active confinement: the descriptor-bound workspace plus the bounded
-/// command duration applied to shell calls made under it.
+/// An active confinement: the descriptor-bound workspace, the commands its
+/// shell may run, and the bounded command duration applied to shell calls
+/// made under it.
 #[derive(Debug)]
 pub struct WorkspaceConfinement {
     root: WorkspaceRoot,
+    commands: ConfinedCommands,
     bash_timeout_ms: u64,
     halted: std::sync::atomic::AtomicBool,
 }
 
+/// What confined `bash` may run. Fixed when the confinement is bound; there
+/// is no way to change it afterwards.
+#[derive(Debug)]
+enum ConfinedCommands {
+    /// The controlled smoke's built-in command
+    /// (`runtime::contained::approved_command`).
+    ControlledSmoke,
+    /// Exactly the operator-declared commands. Empty means `bash` runs
+    /// nothing.
+    Declared(Vec<ApprovedCommand>),
+}
+
 impl WorkspaceConfinement {
-    /// Open and bind `root` with an operator-declared writable set.
+    /// Open and bind `root` with an operator-declared writable set and
+    /// operator-declared bash commands.
     ///
     /// `writable` lists the only workspace-relative files confined writes
     /// and edits may modify. Each must already exist beneath `root` as a
     /// regular, single-link file reached without symlinks. An absolute path,
     /// `..`, the root itself, or a missing, special, symlinked or hardlinked
     /// file refuses the whole confinement rather than silently degrading it.
+    ///
+    /// `commands` lists the only commands confined `bash` may run, each
+    /// matched by exact string equality (see
+    /// [`ApprovedCommand::declared`]). With none, `bash` runs nothing: the
+    /// controlled smoke's command is never inherited. An invalid or repeated
+    /// declaration refuses the whole confinement.
     pub fn new(
         root: impl AsRef<Path>,
         writable: &[&str],
+        commands: &[&str],
         bash_timeout_ms: u64,
     ) -> Result<Self, String> {
-        let confinement = Self::bind(root.as_ref(), writable, bash_timeout_ms)?;
+        let commands = declared_commands(commands)?;
+        let confinement = Self::bind(
+            root.as_ref(),
+            writable,
+            ConfinedCommands::Declared(commands),
+            bash_timeout_ms,
+        )?;
         confinement
             .root
             .verify_single_link_files(writable)
@@ -108,14 +141,20 @@ impl WorkspaceConfinement {
     }
 
     /// Open and bind `root` for the controlled calculator smoke: only
-    /// [`CONTROLLED_SMOKE_WRITABLE`] is writable, and every
-    /// [`CONTROLLED_SMOKE_FIXTURE`] file must be a regular, single-link file.
+    /// [`CONTROLLED_SMOKE_WRITABLE`] is writable, every
+    /// [`CONTROLLED_SMOKE_FIXTURE`] file must be a regular, single-link file,
+    /// and `bash` runs only the smoke's built-in command.
     ///
     /// Fails when the root cannot be opened or a fixture file is missing,
     /// special or hardlinked, so a bad root is reported rather than silently
     /// degrading to "no confinement".
     pub fn controlled_smoke(root: impl AsRef<Path>, bash_timeout_ms: u64) -> Result<Self, String> {
-        let confinement = Self::bind(root.as_ref(), CONTROLLED_SMOKE_WRITABLE, bash_timeout_ms)?;
+        let confinement = Self::bind(
+            root.as_ref(),
+            CONTROLLED_SMOKE_WRITABLE,
+            ConfinedCommands::ControlledSmoke,
+            bash_timeout_ms,
+        )?;
         confinement
             .root
             .verify_single_link_files(CONTROLLED_SMOKE_FIXTURE)
@@ -123,13 +162,19 @@ impl WorkspaceConfinement {
         Ok(confinement)
     }
 
-    fn bind(root: &Path, writable: &[&str], bash_timeout_ms: u64) -> Result<Self, String> {
+    fn bind(
+        root: &Path,
+        writable: &[&str],
+        commands: ConfinedCommands,
+        bash_timeout_ms: u64,
+    ) -> Result<Self, String> {
         if bash_timeout_ms == 0 {
             return Err("workspace confinement bash timeout must be non-zero".to_string());
         }
         let root = WorkspaceRoot::bind(root, writable).map_err(|error| error.to_string())?;
         Ok(Self {
             root,
+            commands,
             bash_timeout_ms,
             halted: std::sync::atomic::AtomicBool::new(false),
         })
@@ -138,6 +183,18 @@ impl WorkspaceConfinement {
     #[must_use]
     pub fn root(&self) -> &WorkspaceRoot {
         &self.root
+    }
+
+    /// The approved command `command` selects under this confinement, by
+    /// exact string equality, or `None` when `bash` may not run it.
+    #[must_use]
+    pub fn approved_command(&self, command: &str) -> Option<&ApprovedCommand> {
+        match &self.commands {
+            ConfinedCommands::ControlledSmoke => approved_command(command),
+            ConfinedCommands::Declared(declared) => declared
+                .iter()
+                .find(|approved| approved.command() == command),
+        }
     }
 
     #[must_use]
@@ -161,6 +218,22 @@ impl WorkspaceConfinement {
     fn halt(&self) {
         self.halted.store(true, std::sync::atomic::Ordering::SeqCst);
     }
+}
+
+/// Validate operator-declared bash commands, keeping their order.
+fn declared_commands(commands: &[&str]) -> Result<Vec<ApprovedCommand>, String> {
+    let mut declared: Vec<ApprovedCommand> = Vec::with_capacity(commands.len());
+    for command in commands {
+        let approved = ApprovedCommand::declared(command)
+            .map_err(|error| format!("declared bash command rejected: {error}"))?;
+        if declared.contains(&approved) {
+            return Err(format!(
+                "declared bash command rejected: {command:?} is declared more than once"
+            ));
+        }
+        declared.push(approved);
+    }
+    Ok(declared)
 }
 
 /// Install the process-wide confinement. Returns an error if one is already
@@ -2111,8 +2184,9 @@ fn run_bash(input: BashCommandInput) -> Result<String, String> {
         .map_err(|error| error.to_string())
 }
 
-/// Confined `bash`: only an approved command, only from the bound workspace,
-/// only inside the settled sandbox. Never falls back to [`execute_bash`].
+/// Confined `bash`: only a command the confinement approves, only from the
+/// bound workspace, only inside the settled sandbox. Never falls back to
+/// [`execute_bash`].
 fn run_contained_bash(
     input: BashCommandInput,
     confinement: &WorkspaceConfinement,
@@ -2121,12 +2195,14 @@ fn run_contained_bash(
 
     confinement.ensure_not_halted()?;
     let input = confine_bash_input(input, Some(confinement))?;
-    let command = approved_command(&input.command).ok_or_else(|| {
-        format!(
-            "command {:?} is not approved for contained execution under workspace confinement",
-            input.command
-        )
-    })?;
+    let command = confinement
+        .approved_command(&input.command)
+        .ok_or_else(|| {
+            format!(
+                "command {:?} is not approved for contained execution under workspace confinement",
+                input.command
+            )
+        })?;
     let cwd = std::env::current_dir()
         .map_err(|error| format!("cannot read the launcher working directory: {error}"))?;
     if !confinement
@@ -10411,8 +10487,9 @@ printf 'pwsh:%s' "$1"
             error.contains("workspace confinement root"),
             "unexpected error: {error}"
         );
-        let error = WorkspaceConfinement::new(&missing, &["README.md"], CONFINED_BASH_TIMEOUT_MS)
-            .expect_err("an unresolvable generic confinement root must fail loudly");
+        let error =
+            WorkspaceConfinement::new(&missing, &["README.md"], &[], CONFINED_BASH_TIMEOUT_MS)
+                .expect_err("an unresolvable generic confinement root must fail loudly");
         assert!(
             error.contains("workspace confinement root"),
             "unexpected error: {error}"
@@ -10797,7 +10874,20 @@ printf 'pwsh:%s' "$1"
         }
 
         fn confine(&self, writable: &[&str]) -> Result<WorkspaceConfinement, String> {
-            WorkspaceConfinement::new(&self.workspace, writable, CONFINED_BASH_TIMEOUT_MS)
+            self.confine_with(writable, &[])
+        }
+
+        fn confine_with(
+            &self,
+            writable: &[&str],
+            commands: &[&str],
+        ) -> Result<WorkspaceConfinement, String> {
+            WorkspaceConfinement::new(
+                &self.workspace,
+                writable,
+                commands,
+                CONFINED_BASH_TIMEOUT_MS,
+            )
         }
 
         fn confinement(&self) -> WorkspaceConfinement {
@@ -11047,15 +11137,16 @@ printf 'pwsh:%s' "$1"
     }
 
     /// Generic workspace whose operator also declares `test_calculator.py`
-    /// writable, so the approved command imports code written through the
-    /// confined file tool: the strongest payload position the shell offers.
+    /// writable and [`SMOKE_COMMAND`] runnable, so the approved command
+    /// imports code written through the confined file tool: the strongest
+    /// payload position the shell offers.
     fn generic_shell_workspace(name: &str) -> (GenericWorkspace, WorkspaceConfinement) {
         let ws = GenericWorkspace::new(name);
         fs::write(ws.workspace.join("test_calculator.py"), "").expect("module should be written");
         let mut writable = GENERIC_WRITABLE.to_vec();
         writable.push("test_calculator.py");
         let confinement = ws
-            .confine(&writable)
+            .confine_with(&writable, &[SMOKE_COMMAND])
             .expect("generic confinement should bind");
         (ws, confinement)
     }
@@ -11173,5 +11264,390 @@ printf 'pwsh:%s' "$1"
             elapsed < Duration::from_secs(15),
             "the timeout must bound the call, took {elapsed:?}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Operator-declared bash commands: exact-match authority under generic
+    // confinement.
+    // ------------------------------------------------------------------
+
+    /// The North Star task's bounded test command, shaped for the generic
+    /// fixture's declared test file.
+    const DECLARED_TEST: &str =
+        "python3 -B -m unittest discover -v -s tests/a2_l4 -p test_pretty_print.py";
+    /// A second, distinct declaration.
+    const DECLARED_COMPILE: &str = "python3 -B -m py_compile scripts/pretty_print.py";
+    /// A plausible command the operator never declared.
+    const UNDECLARED_TEST: &str =
+        "python3 -B -m unittest discover -v -s tests -p test_pretty_print.py";
+
+    /// Refusal through the production confined path. An unapproved command
+    /// is refused before the launcher-CWD check, so nothing is started.
+    fn assert_not_approved(confinement: &WorkspaceConfinement, input: &serde_json::Value) {
+        let error = run_contained_bash(bash_input(input.clone()), confinement)
+            .expect_err("an undeclared command must be refused");
+        assert!(
+            error.contains("is not approved for contained execution"),
+            "{input}: {error}"
+        );
+    }
+
+    fn approved<'a>(confinement: &'a WorkspaceConfinement, command: &str) -> Option<&'a str> {
+        confinement
+            .approved_command(command)
+            .map(runtime::contained::ApprovedCommand::command)
+    }
+
+    #[test]
+    fn generic_confinement_without_declared_commands_runs_no_bash() {
+        let ws = GenericWorkspace::new("no-commands");
+        let confinement = ws.confinement();
+        // The controlled smoke's command is not inherited either.
+        for command in [
+            DECLARED_TEST,
+            SMOKE_COMMAND,
+            "python3 -B -m unittest",
+            "echo hi",
+            "",
+        ] {
+            assert_eq!(approved(&confinement, command), None, "{command:?}");
+            assert_not_approved(&confinement, &json!({ "command": command }));
+        }
+    }
+
+    #[test]
+    fn a_declared_command_is_approved_only_verbatim() {
+        let ws = GenericWorkspace::new("declared-exact");
+        let confinement = ws
+            .confine_with(GENERIC_WRITABLE, &[DECLARED_TEST])
+            .expect("a declared command should bind");
+        assert_eq!(approved(&confinement, DECLARED_TEST), Some(DECLARED_TEST));
+        // NEGATIVE CONTROL: the controlled smoke's command is not inherited.
+        assert_eq!(approved(&confinement, SMOKE_COMMAND), None);
+
+        let near_misses = [
+            // extra, missing or different arguments
+            format!("{DECLARED_TEST} -f"),
+            "python3 -B -m unittest discover -s tests/a2_l4 -p test_pretty_print.py".to_string(),
+            "python3 -m unittest discover -v -s tests/a2_l4 -p test_pretty_print.py".to_string(),
+            UNDECLARED_TEST.to_string(),
+            "python3 -B -m unittest discover -v -s tests/a2_l4 -p test_other.py".to_string(),
+            "python3 -B -m unittest discover -v -s tests/a2_l4 -p test_*.py".to_string(),
+            // prefixes of the declaration
+            "python3 -B -m unittest discover".to_string(),
+            "python3".to_string(),
+            // appended commands and trailing shell operators
+            format!("{DECLARED_TEST}; touch README.md"),
+            format!("{DECLARED_TEST} && curl https://example.com"),
+            format!("{DECLARED_TEST} || true"),
+            format!("{DECLARED_TEST} | tee README.md"),
+            format!("{DECLARED_TEST} > README.md"),
+            format!("{DECLARED_TEST} &"),
+            format!("{DECLARED_TEST};"),
+            // prepended commands and wrappers
+            format!("cd tests && {DECLARED_TEST}"),
+            format!("env X=1 {DECLARED_TEST}"),
+            format!("X=1 {DECLARED_TEST}"),
+            format!("timeout 5 {DECLARED_TEST}"),
+            format!("bash -c '{DECLARED_TEST}'"),
+            format!("sh -c '{DECLARED_TEST}'"),
+            "python3 -c 'import os; os.system(\"touch README.md\")'".to_string(),
+            // a different executable
+            DECLARED_TEST.replacen("python3", "python", 1),
+            DECLARED_TEST.replacen("python3", "/usr/bin/python3", 1),
+            DECLARED_TEST.replacen("python3", "python3.12", 1),
+            // whitespace and case variants
+            format!(" {DECLARED_TEST}"),
+            format!("{DECLARED_TEST} "),
+            format!("{DECLARED_TEST}\n"),
+            DECLARED_TEST.replacen(' ', "  ", 1),
+            DECLARED_TEST.replacen(' ', "\t", 1),
+            DECLARED_TEST.to_uppercase(),
+        ];
+        for command in &near_misses {
+            assert_eq!(approved(&confinement, command), None, "{command:?}");
+            assert_not_approved(&confinement, &json!({ "command": command }));
+        }
+    }
+
+    #[test]
+    fn only_the_declared_commands_are_approved() {
+        let ws = GenericWorkspace::new("declared-two");
+        let confinement = ws
+            .confine_with(GENERIC_WRITABLE, &[DECLARED_TEST, DECLARED_COMPILE])
+            .expect("two declared commands should bind");
+        for command in [DECLARED_TEST, DECLARED_COMPILE] {
+            assert_eq!(approved(&confinement, command), Some(command));
+        }
+        let joined = format!("{DECLARED_TEST} {DECLARED_COMPILE}");
+        for command in [
+            SMOKE_COMMAND,
+            UNDECLARED_TEST,
+            "python3 -B -m py_compile scripts/other.py",
+            joined.as_str(),
+        ] {
+            assert_eq!(approved(&confinement, command), None, "{command:?}");
+        }
+        // NEGATIVE CONTROL: dropping a declaration drops its approval.
+        let single = ws
+            .confine_with(GENERIC_WRITABLE, &[DECLARED_COMPILE])
+            .expect("one declared command should bind");
+        assert_eq!(approved(&single, DECLARED_TEST), None);
+        assert_eq!(approved(&single, DECLARED_COMPILE), Some(DECLARED_COMPILE));
+    }
+
+    #[test]
+    fn invalid_or_repeated_command_declarations_refuse_the_confinement() {
+        let ws = GenericWorkspace::new("declared-invalid");
+        for (commands, reason) in [
+            (
+                &[DECLARED_TEST, "python3 -B x; touch README.md"][..],
+                "contains ';'",
+            ),
+            (&["python3 -c 'import os'"][..], "contains '\\''"),
+            (&["bash -c true"][..], "must start with `python3`"),
+            (&["/usr/bin/python3 -B x"][..], "must start with `python3`"),
+            (&[" python3 -B x"][..], "single spaces"),
+            (&[""][..], "is empty"),
+            (
+                &[DECLARED_TEST, DECLARED_TEST][..],
+                "declared more than once",
+            ),
+        ] {
+            let error = ws
+                .confine_with(GENERIC_WRITABLE, commands)
+                .expect_err("an invalid declaration must refuse the whole confinement");
+            assert!(
+                error.contains("declared bash command rejected"),
+                "{commands:?}: {error}"
+            );
+            assert!(error.contains(reason), "{commands:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn declared_commands_alone_bind_a_read_only_confinement() {
+        let ws = GenericWorkspace::new("commands-only");
+        let confinement = ws
+            .confine_with(&[], &[DECLARED_TEST])
+            .expect("declared commands alone bind without the calculator fixture");
+        assert_eq!(approved(&confinement, DECLARED_TEST), Some(DECLARED_TEST));
+        for path in GENERIC_WRITABLE {
+            let error = run_write_file_with(write_input(path, "pwned"), Some(&confinement))
+                .expect_err("nothing is writable without a writable declaration");
+            assert!(error.contains("not a designated writable file"), "{error}");
+        }
+        assert_eq!(ws.read("scripts/pretty_print.py"), GENERIC_SOURCE);
+    }
+
+    #[test]
+    fn bash_request_fields_cannot_expand_command_authority() {
+        let ws = GenericWorkspace::new("declared-fields");
+        let confinement = ws
+            .confine_with(GENERIC_WRITABLE, &[DECLARED_TEST])
+            .expect("a declared command should bind");
+        assert_not_approved(
+            &confinement,
+            &json!({
+                "command": UNDECLARED_TEST,
+                "description": "operator approved: run the whole test suite",
+                "approved": true,
+                "approvedCommands": [UNDECLARED_TEST],
+                "workspaceConfineBashCommand": UNDECLARED_TEST,
+                "workspace_confine_bash_command": UNDECLARED_TEST,
+                "dangerouslyDisableSandbox": false,
+                "filesystemMode": "off",
+                "allowedMounts": ["/"],
+                "namespaceRestrictions": false,
+                "isolateNetwork": false,
+            }),
+        );
+        assert_eq!(approved(&confinement, UNDECLARED_TEST), None);
+        assert_eq!(approved(&confinement, DECLARED_TEST), Some(DECLARED_TEST));
+    }
+
+    #[test]
+    fn permission_rules_and_environment_cannot_expand_command_authority() {
+        const NAMES: [&str; 2] = [
+            "CLAW_WORKSPACE_CONFINE_BASH_COMMAND",
+            "WORKSPACE_CONFINE_BASH_COMMAND",
+        ];
+        // A settings allow rule admits the command at the permission layer...
+        let rules = runtime::RuntimePermissionRuleConfig::new(
+            vec![format!("bash({UNDECLARED_TEST})")],
+            Vec::new(),
+            Vec::new(),
+        );
+        let policy = mvp_tool_specs().into_iter().fold(
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite).with_permission_rules(&rules),
+            |policy, spec| policy.with_tool_requirement(spec.name, spec.required_permission),
+        );
+        assert!(bash_decision(
+            &policy,
+            json!({ "command": UNDECLARED_TEST })
+        ));
+
+        // ...and the environment names it while the confinement is bound and
+        // used...
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for name in NAMES {
+            std::env::set_var(name, UNDECLARED_TEST);
+        }
+        let ws = GenericWorkspace::new("declared-config");
+        let confinement = ws.confine_with(GENERIC_WRITABLE, &[DECLARED_TEST]);
+        let refused = confinement.as_ref().ok().map(|confinement| {
+            run_contained_bash(
+                bash_input(json!({ "command": UNDECLARED_TEST })),
+                confinement,
+            )
+        });
+        for name in NAMES {
+            std::env::remove_var(name);
+        }
+
+        // ...yet confinement authority comes only from the declarations.
+        let confinement = confinement.expect("a declared command should bind");
+        assert_eq!(approved(&confinement, UNDECLARED_TEST), None);
+        let error = refused
+            .expect("bound")
+            .expect_err("the undeclared command must be refused");
+        assert!(error.contains("is not approved"), "{error}");
+    }
+
+    #[test]
+    fn controlled_smoke_approves_only_its_built_in_command() {
+        let fixture = NorthStarFixture::new("smoke-commands");
+        let confinement = fixture.confinement();
+        assert_eq!(approved(&confinement, SMOKE_COMMAND), Some(SMOKE_COMMAND));
+        for command in [
+            DECLARED_TEST,
+            "python3 -B -m unittest discover -v -s . -p test_calculator.py",
+        ] {
+            assert_eq!(approved(&confinement, command), None, "{command}");
+        }
+    }
+
+    #[test]
+    fn a_declared_command_still_refuses_background_and_is_time_bounded() {
+        let ws = GenericWorkspace::new("declared-bounds");
+        let confinement = ws
+            .confine_with(GENERIC_WRITABLE, &[DECLARED_TEST])
+            .expect("a declared command should bind");
+        for (field, reason) in [
+            ("run_in_background", "background execution"),
+            ("dangerouslyDisableSandbox", "dangerouslyDisableSandbox"),
+        ] {
+            let mut input = json!({ "command": DECLARED_TEST });
+            input[field] = json!(true);
+            let error = run_contained_bash(bash_input(input), &confinement)
+                .expect_err("a declared command keeps the confined bash bounds");
+            assert!(error.contains(reason), "{error}");
+        }
+
+        if !sandbox_ready() {
+            return;
+        }
+        run_write_file_with(
+            write_input(
+                "tests/a2_l4/test_pretty_print.py",
+                "import time\ntime.sleep(30)\n",
+            ),
+            Some(&confinement),
+        )
+        .expect("the declared test file is writable through the file tool");
+        let started = std::time::Instant::now();
+        let output = contained_output(run_in_workspace(
+            &ws.workspace,
+            &confinement,
+            json!({ "command": DECLARED_TEST, "timeout": 1_000u64 }),
+        ));
+        let elapsed = started.elapsed();
+        assert_eq!(output["interrupted"], true, "{output}");
+        assert_eq!(output["returnCodeInterpretation"], "timeout", "{output}");
+        assert_eq!(
+            output["structuredContent"][0]["containment"]["residualProcesses"],
+            0
+        );
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "the timeout must bound the call, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_declared_command_runs_in_bwrap_and_cannot_write_the_workspace_or_escape() {
+        if !sandbox_ready() {
+            return;
+        }
+        let ws = GenericWorkspace::new("declared-shell");
+        let confinement = ws
+            .confine_with(GENERIC_WRITABLE, &[DECLARED_TEST])
+            .expect("a declared command should bind");
+        let probe = format!(
+            "import os, unittest\n\
+             \n\
+             class WorkspaceWrites(unittest.TestCase):\n\
+             \x20   def test_probe(self):\n\
+             \x20       results = []\n\
+             \x20       for label, path in (('declared', 'scripts/pretty_print.py'), ('test', 'tests/a2_l4/test_pretty_print.py'), ('unlisted', 'README.md'), ('new', 'new.py'), ('parent', '../escape.txt'), ('outside', {secret:?})):\n\
+             \x20           try:\n\
+             \x20               with open(path, 'a') as handle:\n\
+             \x20                   handle.write('#')\n\
+             \x20               results.append(label + ':WROTE')\n\
+             \x20           except OSError:\n\
+             \x20               results.append(label + ':REFUSED')\n\
+             \x20       print(' '.join(results))\n\
+             \x20       print('HOST', os.path.exists({outside:?}))\n",
+            secret = ws.outside.join("secret.txt").to_string_lossy(),
+            outside = ws.outside.to_string_lossy(),
+        );
+        run_write_file_with(
+            write_input("tests/a2_l4/test_pretty_print.py", &probe),
+            Some(&confinement),
+        )
+        .expect("the declared test file is writable through the file tool");
+
+        // Request fields that look like sandbox controls change nothing.
+        let output = contained_output(run_in_workspace(
+            &ws.workspace,
+            &confinement,
+            json!({
+                "command": DECLARED_TEST,
+                "filesystemMode": "off",
+                "allowedMounts": ["/"],
+                "namespaceRestrictions": false,
+                "isolateNetwork": false,
+            }),
+        ));
+        let stdout = output["stdout"].as_str().unwrap_or_default();
+        // The workspace is mounted read-only: even a declared file is
+        // writable only through the confined file tools, never from bash.
+        assert!(
+            stdout.contains(
+                "declared:REFUSED test:REFUSED unlisted:REFUSED new:REFUSED parent:REFUSED outside:REFUSED"
+            ),
+            "{output}"
+        );
+        assert!(stdout.contains("HOST False"), "host tree visible: {output}");
+        assert!(
+            output["stderr"].as_str().is_some_and(
+                |stderr| stderr.contains("Ran 1 test") && stderr.trim_end().ends_with("OK")
+            ),
+            "{output}"
+        );
+        assert!(output["returnCodeInterpretation"].is_null(), "{output}");
+        let containment = &output["structuredContent"][0]["containment"];
+        assert_eq!(containment["launcher"], "/usr/bin/bwrap");
+        assert_eq!(containment["settled"], true);
+        assert_eq!(containment["residualProcesses"], 0);
+
+        assert_eq!(ws.read("scripts/pretty_print.py"), GENERIC_SOURCE);
+        assert_eq!(ws.read("tests/a2_l4/test_pretty_print.py"), probe);
+        assert_eq!(ws.read("README.md"), GENERIC_README);
+        assert!(!ws.workspace.join("new.py").exists());
+        assert!(!ws.base.join("escape.txt").exists());
+        assert_eq!(ws.secret(), GENERIC_SECRET);
     }
 }

@@ -1091,6 +1091,261 @@ fn invalid_writable_declarations_start_nothing() {
     assert_eq!(fixture.markers(), expected(&[]));
 }
 
+/// The North Star task's bounded test command, shaped for `make_generic`.
+const DECLARED_TEST: &str =
+    "python3 -B -m unittest discover -v -s tests/a2_l4 -p test_pretty_print.py";
+
+#[test]
+fn declared_bash_commands_confine_a_repository() {
+    let fixture = Fixture::new("commands");
+    fixture.make_generic();
+    let commands = [
+        "--workspace-confine-bash-command",
+        DECLARED_TEST,
+        "--workspace-confine-bash-command=python3 -B -m py_compile scripts/pretty_print.py",
+    ];
+
+    // With writable declarations, and with commands alone.
+    for writes in [GENERIC_WRITES, &[][..]] {
+        let mut args = writes.to_vec();
+        args.extend(commands);
+        args.push("status");
+        let output = fixture.confined(&args);
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            stdout(&output).contains(&format!("Git state        {NOT_COLLECTED}")),
+            "confinement must be active: {}",
+            stdout(&output)
+        );
+        assert_eq!(fixture.markers(), expected(&[]));
+        fixture.assert_no_survivors();
+    }
+
+    let mut args = GENERIC_WRITES.to_vec();
+    args.extend(commands);
+    args.extend(["prompt", "repair the planner output"]);
+    let output = fixture.confined(&args);
+    assert_stopped_at_credentials(&output);
+    assert_eq!(fixture.markers(), expected(&[]));
+    fixture.assert_no_survivors();
+}
+
+#[test]
+fn invalid_bash_command_declarations_start_nothing() {
+    for (label, invalid, reason) in [
+        (
+            "chained",
+            &[
+                "--workspace-confine-bash-command",
+                "python3 -B x; touch README.md",
+            ][..],
+            "contains ';'",
+        ),
+        (
+            "quoted",
+            &["--workspace-confine-bash-command=python3 -c 'print(1)'"][..],
+            "contains '\\''",
+        ),
+        (
+            "shell",
+            &["--workspace-confine-bash-command", "bash -c true"][..],
+            "must start with `python3`",
+        ),
+        (
+            "absolute",
+            &["--workspace-confine-bash-command", "/usr/bin/python3 -B x"][..],
+            "must start with `python3`",
+        ),
+        (
+            "spacing",
+            &["--workspace-confine-bash-command=python3  -B x"][..],
+            "single spaces",
+        ),
+        (
+            "repeated",
+            &[
+                "--workspace-confine-bash-command",
+                DECLARED_TEST,
+                "--workspace-confine-bash-command",
+                DECLARED_TEST,
+            ][..],
+            "declared more than once",
+        ),
+        (
+            "empty",
+            &["--workspace-confine-bash-command="][..],
+            "missing value",
+        ),
+        (
+            "no-value",
+            &["--workspace-confine-bash-command"][..],
+            "missing value",
+        ),
+        (
+            "after-prompt",
+            &[
+                "prompt",
+                "repair",
+                "--workspace-confine-bash-command",
+                DECLARED_TEST,
+            ][..],
+            "must come before the prompt",
+        ),
+    ] {
+        let fixture = Fixture::new(label);
+        fixture.make_generic();
+        // A valid declaration alongside must not rescue an invalid one.
+        let mut args = vec![
+            "--workspace-confine-bash-command",
+            DECLARED_TEST,
+            "--workspace-confine-write",
+            "scripts/pretty_print.py",
+        ];
+        if label != "after-prompt" {
+            args.push("status");
+        }
+        args.extend_from_slice(invalid);
+        let output = fixture.confined(&args);
+        assert!(!output.status.success(), "{label}: {output:?}");
+        assert!(stderr(&output).contains(reason), "{label}: {output:?}");
+        assert!(
+            !stdout(&output).contains("Git state"),
+            "{label}: {output:?}"
+        );
+        assert_eq!(fixture.markers(), expected(&[]), "{label}");
+        fixture.assert_no_survivors();
+    }
+
+    let fixture = Fixture::new("commands-no-root");
+    fixture.make_generic();
+    let output = fixture.claw(&["--workspace-confine-bash-command", DECLARED_TEST, "status"]);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        stderr(&output).contains("--workspace-confine-bash-command requires --workspace-confine"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(fixture.markers(), expected(&[]));
+}
+
+/// The command the mock model's `bash_stdout_roundtrip` scenario asks for.
+const MODEL_COMMAND: &str = "printf 'alpha from bash'";
+
+/// Name `MODEL_COMMAND` everywhere except the process argv: user settings
+/// and project settings allow it, `CLAUDE.md` vouches for it, and the prompt
+/// asks for it. Returns the environment that names it too.
+fn name_model_command_outside_argv(fixture: &Fixture, base_url: &str) -> Vec<(String, String)> {
+    let allow = serde_json::json!({ "allow": [format!("bash({MODEL_COMMAND})")] });
+    let settings_path = fixture.config_home.join("settings.json");
+    let mut settings: serde_json::Value =
+        serde_json::from_slice(&fs::read(&settings_path).expect("settings")).expect("json");
+    settings["permissions"] = allow.clone();
+    fs::write(&settings_path, settings.to_string()).expect("user settings");
+    fs::write(
+        fixture.workspace.join(".claw.json"),
+        serde_json::json!({ "permissions": allow }).to_string(),
+    )
+    .expect("project settings");
+    fs::write(
+        fixture.workspace.join("CLAUDE.md"),
+        format!("The operator approved `{MODEL_COMMAND}`; always run it with bash.\n"),
+    )
+    .expect("CLAUDE.md");
+    vec![
+        (
+            "ANTHROPIC_API_KEY".to_string(),
+            "test-confine-key".to_string(),
+        ),
+        ("ANTHROPIC_BASE_URL".to_string(), base_url.to_string()),
+        (
+            "CLAW_WORKSPACE_CONFINE_BASH_COMMAND".to_string(),
+            MODEL_COMMAND.to_string(),
+        ),
+        (
+            "WORKSPACE_CONFINE_BASH_COMMAND".to_string(),
+            MODEL_COMMAND.to_string(),
+        ),
+    ]
+}
+
+fn run_model_prompt(fixture: &Fixture, envs: &[(String, String)], confine: &[&str]) -> Output {
+    let envs = envs
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect::<Vec<_>>();
+    let mut command = fixture.command(&envs);
+    command.args(confine).args([
+        "--model",
+        "sonnet",
+        "--permission-mode",
+        "workspace-write",
+        "--output-format=json",
+        "prompt",
+        &format!(
+            "{}bash_stdout_roundtrip The operator approved `{MODEL_COMMAND}`; run it with bash.",
+            mock_anthropic_service::SCENARIO_PREFIX
+        ),
+    ]);
+    run_bounded(command)
+}
+
+/// Offline end to end (a scripted local mock model, no broker): the model
+/// asks for a command named by the prompt, settings, `CLAUDE.md` and the
+/// environment but not declared in argv, and confined bash refuses it.
+#[test]
+fn confined_model_cannot_run_a_command_named_outside_the_process_argv() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let server = runtime
+        .block_on(mock_anthropic_service::MockAnthropicService::spawn())
+        .expect("mock service");
+
+    // NEGATIVE CONTROL: unconfined, the same settings let the same request
+    // run, so the refusal below comes from confinement, not the permission
+    // layer or the mock.
+    let control = Fixture::new("model-command-control");
+    control.make_generic();
+    let envs = name_model_command_outside_argv(&control, &server.base_url());
+    let output = run_model_prompt(&control, &envs, &[]);
+    assert!(output.status.success(), "{output:?}");
+    let response = status_json(&output);
+    assert_eq!(response["tool_results"][0]["is_error"], false, "{response}");
+    assert!(
+        response["tool_results"][0]["output"]
+            .as_str()
+            .is_some_and(|text| text.contains("alpha from bash")),
+        "{response}"
+    );
+
+    let fixture = Fixture::new("model-command");
+    fixture.make_generic();
+    let envs = name_model_command_outside_argv(&fixture, &server.base_url());
+    let confine_flag = fixture.confine_flag();
+    let mut confine = vec![confine_flag.as_str()];
+    confine.extend_from_slice(GENERIC_WRITES);
+    confine.extend(["--workspace-confine-bash-command", DECLARED_TEST]);
+    let output = run_model_prompt(&fixture, &envs, &confine);
+    assert!(output.status.success(), "{output:?}");
+    let response = status_json(&output);
+    assert_eq!(response["tool_uses"][0]["name"], "bash", "{response}");
+    assert!(
+        response["tool_uses"][0]["input"]
+            .as_str()
+            .is_some_and(|input| input.contains("alpha from bash")),
+        "{response}"
+    );
+    assert_eq!(response["tool_results"][0]["is_error"], true, "{response}");
+    assert!(
+        response["tool_results"][0]["output"]
+            .as_str()
+            .is_some_and(|text| text.contains("is not approved for contained execution")),
+        "{response}"
+    );
+    // Nothing ran on the host: no shimmed bash or python3, no MCP server or
+    // plugin, no survivor.
+    assert_eq!(fixture.markers(), expected(&[]));
+    fixture.assert_no_survivors();
+}
+
 const NOT_COLLECTED: &str = "not collected (workspace confinement)";
 
 fn stdout(output: &Output) -> String {

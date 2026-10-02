@@ -202,6 +202,7 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--data-dir",
     "--workspace-confine",
     "--workspace-confine-write",
+    "--workspace-confine-bash-command",
     "--resume",
     "--acp",
     "-acp",
@@ -353,12 +354,13 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
-    let (filtered_args, data_dir, confine_root, confine_writable) = extract_process_flags(&args)?;
+    let (filtered_args, data_dir, confine_root, confine_writable, confine_commands) =
+        extract_process_flags(&args)?;
     // Install confinement BEFORE parsing the action: parsing can already
     // build the runtime tool registry (`--allowedTools`), and that build must
     // see the confinement so it does not start hooks, plugins or MCP servers.
     if let Some(root) = confine_root {
-        let confinement = build_workspace_confinement(&root, &confine_writable)?;
+        let confinement = build_workspace_confinement(&root, &confine_writable, &confine_commands)?;
         tools::set_workspace_confinement(confinement)?;
     }
     let action = parse_args_core(
@@ -3923,26 +3925,44 @@ fn parse_full_invocation_with_terminal(
     stdin_is_tty: bool,
     stdout_is_tty: bool,
 ) -> Result<(CliAction, Option<PathBuf>, Option<PathBuf>), String> {
-    let (filtered_args, data_dir, confine_root, _) = extract_process_flags(args)?;
+    let (filtered_args, data_dir, confine_root, _, _) = extract_process_flags(args)?;
     let action = parse_args_core(&filtered_args, stdin_is_tty, stdout_is_tty)?;
     Ok((action, data_dir, confine_root))
 }
 
 /// Remaining action arguments, `--data-dir`, `--workspace-confine` root, and
-/// the `--workspace-confine-write` declarations in command-line order.
-type ProcessFlags = (Vec<String>, Option<PathBuf>, Option<PathBuf>, Vec<String>);
+/// the `--workspace-confine-write` and `--workspace-confine-bash-command`
+/// declarations, each in command-line order.
+type ProcessFlags = (
+    Vec<String>,
+    Option<PathBuf>,
+    Option<PathBuf>,
+    Vec<String>,
+    Vec<String>,
+);
 
 /// Strip the process-level flags (`--data-dir`, `--workspace-confine`,
-/// `--workspace-confine-write`) and return the remaining arguments for
-/// action parsing.
+/// `--workspace-confine-write`, `--workspace-confine-bash-command`) and
+/// return the remaining arguments for action parsing.
 fn extract_process_flags(args: &[String]) -> Result<ProcessFlags, String> {
     let (filtered_args, data_dir) = extract_data_dir(args)?;
     let (filtered_args, confine_writable) = extract_workspace_confine_writes(&filtered_args)?;
+    let (filtered_args, confine_commands) =
+        extract_workspace_confine_bash_commands(&filtered_args)?;
     let (filtered_args, confine_root) = extract_workspace_confine(&filtered_args)?;
     if confine_root.is_none() && !confine_writable.is_empty() {
         return Err("--workspace-confine-write requires --workspace-confine".to_string());
     }
-    Ok((filtered_args, data_dir, confine_root, confine_writable))
+    if confine_root.is_none() && !confine_commands.is_empty() {
+        return Err("--workspace-confine-bash-command requires --workspace-confine".to_string());
+    }
+    Ok((
+        filtered_args,
+        data_dir,
+        confine_root,
+        confine_writable,
+        confine_commands,
+    ))
 }
 
 /// Extract each `--workspace-confine-write PATH` or
@@ -3983,23 +4003,80 @@ fn extract_workspace_confine_writes(args: &[String]) -> Result<(Vec<String>, Vec
     Ok((filtered, writable))
 }
 
+/// Extract each `--workspace-confine-bash-command COMMAND` or
+/// `--workspace-confine-bash-command=COMMAND`.
+///
+/// Each declares one exact command confined `bash` may run. The flag repeats
+/// and declarations keep their order. Arguments after `prompt` or `-p` are
+/// prompt text, and prompt text never declares a command, so a declaration
+/// found there is refused. Otherwise only a missing or empty value is refused
+/// here; the commands themselves are validated when the confinement is
+/// bound, before any action is parsed.
+fn extract_workspace_confine_bash_commands(
+    args: &[String],
+) -> Result<(Vec<String>, Vec<String>), String> {
+    let mut filtered = Vec::with_capacity(args.len());
+    let mut commands = Vec::new();
+    let mut prompt_text = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if prompt_text
+            && (arg == "--workspace-confine-bash-command"
+                || arg.starts_with("--workspace-confine-bash-command="))
+        {
+            return Err("--workspace-confine-bash-command must come before the prompt".to_string());
+        }
+        match arg {
+            "--workspace-confine-bash-command" => {
+                let value = args
+                    .get(index + 1)
+                    .filter(|value| !value.is_empty() && !value.starts_with('-'))
+                    .ok_or_else(|| {
+                        "missing value for --workspace-confine-bash-command".to_string()
+                    })?;
+                commands.push(value.clone());
+                index += 2;
+            }
+            flag if flag.starts_with("--workspace-confine-bash-command=") => {
+                let value = &flag["--workspace-confine-bash-command=".len()..];
+                if value.is_empty() {
+                    return Err("missing value for --workspace-confine-bash-command".to_string());
+                }
+                commands.push(value.to_string());
+                index += 1;
+            }
+            other => {
+                prompt_text |= matches!(other, "prompt" | "-p");
+                filtered.push(args[index].clone());
+                index += 1;
+            }
+        }
+    }
+    Ok((filtered, commands))
+}
+
 /// Bind the process confinement for `root`.
 ///
-/// Operator-declared writable files select the generic policy; with none,
-/// the controlled calculator smoke keeps its fixture policy. Either way an
-/// invalid root or declaration is an error here, before any action runs.
+/// Any operator declaration (a writable file or a bash command) selects the
+/// generic policy, under which only declared files are writable and only
+/// declared commands run; with none, the controlled calculator smoke keeps
+/// its fixture policy and built-in command. Either way an invalid root or
+/// declaration is an error here, before any action runs.
 fn build_workspace_confinement(
     root: &Path,
     writable: &[String],
+    commands: &[String],
 ) -> Result<tools::WorkspaceConfinement, String> {
-    if writable.is_empty() {
+    if writable.is_empty() && commands.is_empty() {
         return tools::WorkspaceConfinement::controlled_smoke(
             root,
             tools::CONFINED_BASH_TIMEOUT_MS,
         );
     }
     let writable = writable.iter().map(String::as_str).collect::<Vec<_>>();
-    tools::WorkspaceConfinement::new(root, &writable, tools::CONFINED_BASH_TIMEOUT_MS)
+    let commands = commands.iter().map(String::as_str).collect::<Vec<_>>();
+    tools::WorkspaceConfinement::new(root, &writable, &commands, tools::CONFINED_BASH_TIMEOUT_MS)
 }
 
 /// Extract `--workspace-confine` or `--workspace-confine=PATH`.
@@ -13729,11 +13806,15 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  --workspace-confine[=PATH] Confine to PATH (default: cwd): file tools bound beneath it, writes only to declared files (calculator.py when none are declared), bash only the approved unittest command in a Bubblewrap sandbox; hooks, plugins and MCP servers disabled"
+        "  --workspace-confine[=PATH] Confine to PATH (default: cwd): file tools bound beneath it, writes only to declared files, bash only declared commands in a Bubblewrap sandbox with the workspace read-only (with nothing declared: calculator.py and its unittest command); hooks, plugins and MCP servers disabled"
     )?;
     writeln!(
         out,
         "  --workspace-confine-write PATH  Declare an existing workspace-relative file writable under --workspace-confine (repeatable)"
+    )?;
+    writeln!(
+        out,
+        "  --workspace-confine-bash-command CMD  Declare an exact python3 command bash may run under --workspace-confine (repeatable; matched exactly, never run by a shell; must come before the prompt)"
     )?;
     writeln!(
         out,
@@ -19081,7 +19162,7 @@ UU conflicted.rs",
 
     #[test]
     fn workspace_confine_write_is_repeatable_in_declaration_order() {
-        let (filtered, _, root, writable) = extract_confined(&[
+        let (filtered, _, root, writable, _) = extract_confined(&[
             "--workspace-confine=/tmp/work",
             "--workspace-confine-write",
             "scripts/pretty_print_planner_output.py",
@@ -19176,6 +19257,7 @@ UU conflicted.rs",
         let confinement = super::build_workspace_confinement(
             &workspace,
             &["scripts/a.py".to_string(), "tests/b.py".to_string()],
+            &[],
         )
         .expect("declared files must confine a workspace without the calculator fixture");
         for declared in ["scripts/a.py", "tests/b.py"] {
@@ -19195,7 +19277,7 @@ UU conflicted.rs",
 
         // NEGATIVE CONTROL: without declarations the controlled smoke is
         // selected, and it still refuses a workspace lacking its fixture.
-        let error = super::build_workspace_confinement(&workspace, &[])
+        let error = super::build_workspace_confinement(&workspace, &[], &[])
             .expect_err("the controlled smoke still requires its fixture");
         assert!(error.contains("controlled fixture rejected"), "{error}");
 
@@ -19206,8 +19288,198 @@ UU conflicted.rs",
             "missing.py",
             outside.to_str().expect("utf8"),
         ] {
-            super::build_workspace_confinement(&workspace, &[invalid.to_string()])
+            super::build_workspace_confinement(&workspace, &[invalid.to_string()], &[])
                 .expect_err("an invalid declaration must fail closed");
+        }
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    // ---- Command-policy seam: operator-declared bash commands ----
+
+    const NORTH_STAR_TEST: &str =
+        "python3 -B -m unittest discover -v -s tests/a2_l4 -p test_pretty_print_planner_output.py";
+    const SMOKE_COMMAND: &str = "python3 -B -m unittest -v test_calculator";
+
+    #[test]
+    fn workspace_confine_bash_command_is_repeatable_in_declaration_order() {
+        let (filtered, _, root, writable, commands) = extract_confined(&[
+            "--workspace-confine=/tmp/work",
+            "--workspace-confine-bash-command",
+            NORTH_STAR_TEST,
+            "--workspace-confine-write",
+            "scripts/a.py",
+            "--workspace-confine-bash-command=python3 -B -m py_compile scripts/a.py",
+            "prompt",
+            "repair",
+        ])
+        .expect("repeated command declarations should parse");
+        assert_eq!(root, Some(PathBuf::from("/tmp/work")));
+        assert_eq!(writable, vec!["scripts/a.py".to_string()]);
+        assert_eq!(
+            commands,
+            vec![
+                NORTH_STAR_TEST.to_string(),
+                "python3 -B -m py_compile scripts/a.py".to_string(),
+            ]
+        );
+        assert_eq!(
+            filtered,
+            confine_args(&["prompt", "repair"]),
+            "process-only flags must not reach the action parser"
+        );
+    }
+
+    #[test]
+    fn workspace_confine_bash_command_requires_a_non_empty_value() {
+        for args in [
+            &["--workspace-confine", "--workspace-confine-bash-command"][..],
+            &[
+                "--workspace-confine",
+                "--workspace-confine-bash-command",
+                "--model",
+                "x",
+            ][..],
+            &[
+                "--workspace-confine",
+                "--workspace-confine-bash-command",
+                "",
+            ][..],
+            &["--workspace-confine", "--workspace-confine-bash-command="][..],
+        ] {
+            let error = extract_confined(args).expect_err("a missing command must be refused");
+            assert_eq!(
+                error, "missing value for --workspace-confine-bash-command",
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_confine_bash_command_without_confinement_is_refused() {
+        for args in [
+            &[
+                "--workspace-confine-bash-command",
+                NORTH_STAR_TEST,
+                "status",
+            ][..],
+            &[
+                "--workspace-confine-bash-command=python3 -B x",
+                "prompt",
+                "x",
+            ][..],
+        ] {
+            let error =
+                extract_confined(args).expect_err("commands without a root must be refused");
+            assert_eq!(
+                error, "--workspace-confine-bash-command requires --workspace-confine",
+                "{args:?}"
+            );
+            parse_confined(args).expect_err("the full parser must refuse it too");
+        }
+    }
+
+    #[test]
+    fn prompt_text_never_declares_a_bash_command() {
+        // A prompt naming a command, or the flag itself, mid-text is prompt
+        // text and nothing else.
+        let mention =
+            format!("run {NORTH_STAR_TEST} --workspace-confine-bash-command=python3 -B -m evil");
+        let (filtered, _, _, _, commands) =
+            extract_confined(&["--workspace-confine=/tmp/work", "prompt", mention.as_str()])
+                .expect("a prompt mentioning a command should parse");
+        assert!(commands.is_empty(), "{commands:?}");
+        assert_eq!(filtered, confine_args(&["prompt", mention.as_str()]));
+
+        // A declaration-shaped argument after `prompt` or `-p` is refused,
+        // never taken as operator authority.
+        for args in [
+            &[
+                "--workspace-confine=/tmp/work",
+                "prompt",
+                "--workspace-confine-bash-command=python3 -B -m evil",
+            ][..],
+            &[
+                "--workspace-confine=/tmp/work",
+                "prompt",
+                "repair",
+                "--workspace-confine-bash-command",
+                "python3 -B -m evil",
+            ][..],
+            &[
+                "--workspace-confine=/tmp/work",
+                "-p",
+                "--workspace-confine-bash-command=python3 -B -m evil",
+            ][..],
+        ] {
+            let error = extract_confined(args).expect_err("prompt text must not declare");
+            assert_eq!(
+                error, "--workspace-confine-bash-command must come before the prompt",
+                "{args:?}"
+            );
+            parse_confined(args).expect_err("the full parser must refuse it too");
+        }
+
+        // NEGATIVE CONTROL: the same declaration before the prompt counts.
+        let (_, _, _, _, commands) = extract_confined(&[
+            "--workspace-confine=/tmp/work",
+            "--workspace-confine-bash-command=python3 -B -m evil",
+            "prompt",
+            "repair",
+        ])
+        .expect("a declaration before the prompt should parse");
+        assert_eq!(commands, vec!["python3 -B -m evil".to_string()]);
+    }
+
+    #[test]
+    fn declared_bash_commands_select_the_generic_policy() {
+        let workspace = temp_dir();
+        fs::create_dir_all(workspace.join("scripts")).expect("scripts");
+        fs::write(workspace.join("scripts/a.py"), "a\n").expect("a");
+        let declared = [NORTH_STAR_TEST.to_string()];
+        let writable = ["scripts/a.py".to_string()];
+
+        // Commands alone select the generic policy (no calculator fixture):
+        // only the declared command is approved and nothing is writable.
+        let confinement = super::build_workspace_confinement(&workspace, &[], &declared)
+            .expect("declared commands alone must confine a workspace");
+        assert!(confinement.approved_command(NORTH_STAR_TEST).is_some());
+        assert!(confinement.approved_command(SMOKE_COMMAND).is_none());
+        confinement
+            .root()
+            .write_file("scripts/a.py", "pwned\n")
+            .expect_err("nothing is writable without a writable declaration");
+
+        // Both kinds of declaration apply together.
+        let confinement = super::build_workspace_confinement(&workspace, &writable, &declared)
+            .expect("writes and commands together must confine a workspace");
+        assert!(confinement.approved_command(NORTH_STAR_TEST).is_some());
+        confinement
+            .root()
+            .write_file("scripts/a.py", "changed\n")
+            .expect("a declared file is writable");
+
+        // NEGATIVE CONTROL: writes alone approve no command, not even the
+        // controlled smoke's.
+        let confinement = super::build_workspace_confinement(&workspace, &writable, &[])
+            .expect("writes alone must confine a workspace");
+        assert!(confinement.approved_command(NORTH_STAR_TEST).is_none());
+        assert!(confinement.approved_command(SMOKE_COMMAND).is_none());
+
+        for invalid in [
+            format!("{NORTH_STAR_TEST}; touch README.md"),
+            "bash -c true".to_string(),
+            "python3 -c 'print(1)'".to_string(),
+        ] {
+            let error = super::build_workspace_confinement(
+                &workspace,
+                &writable,
+                std::slice::from_ref(&invalid),
+            )
+            .expect_err("an invalid command declaration must fail closed");
+            assert!(
+                error.contains("declared bash command rejected"),
+                "{invalid}: {error}"
+            );
         }
         let _ = fs::remove_dir_all(workspace);
     }
