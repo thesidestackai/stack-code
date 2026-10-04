@@ -1057,13 +1057,14 @@ fn invalid_writable_declarations_start_nothing() {
     ] {
         let fixture = Fixture::new(label);
         fixture.make_generic();
-        // A valid declaration alongside must not rescue an invalid one.
-        let mut args = vec![
-            "--workspace-confine-write",
-            "scripts/pretty_print.py",
-            "status",
-        ];
+        // A valid declaration alongside must not rescue an invalid one. Both
+        // precede `status`, in the option region; a value-less flag stays last
+        // so `status` does not become its value.
+        let mut args = vec!["--workspace-confine-write", "scripts/pretty_print.py"];
         args.extend_from_slice(invalid);
+        if label != "no-value" {
+            args.push("status");
+        }
         let output = fixture.confined(&args);
         assert!(!output.status.success(), "{label}: {output:?}");
         assert!(stderr(&output).contains(reason), "{label}: {output:?}");
@@ -1194,17 +1195,19 @@ fn invalid_bash_command_declarations_start_nothing() {
     ] {
         let fixture = Fixture::new(label);
         fixture.make_generic();
-        // A valid declaration alongside must not rescue an invalid one.
+        // A valid declaration alongside must not rescue an invalid one. Both
+        // precede `status`, in the option region; a value-less flag stays last
+        // so `status` does not become its value.
         let mut args = vec![
             "--workspace-confine-bash-command",
             DECLARED_TEST,
             "--workspace-confine-write",
             "scripts/pretty_print.py",
         ];
-        if label != "after-prompt" {
+        args.extend_from_slice(invalid);
+        if !matches!(label, "after-prompt" | "no-value") {
             args.push("status");
         }
-        args.extend_from_slice(invalid);
         let output = fixture.confined(&args);
         assert!(!output.status.success(), "{label}: {output:?}");
         assert!(stderr(&output).contains(reason), "{label}: {output:?}");
@@ -1226,6 +1229,272 @@ fn invalid_bash_command_declarations_start_nothing() {
         stderr(&output)
     );
     assert_eq!(fixture.markers(), expected(&[]));
+}
+
+#[test]
+fn declarations_after_the_option_region_start_nothing() {
+    for (label, tail, flag) in [
+        (
+            "bare-write-equals",
+            &[
+                "fix",
+                "it",
+                "--workspace-confine-write=scripts/pretty_print.py",
+            ][..],
+            "--workspace-confine-write",
+        ),
+        (
+            "bare-write-split",
+            &[
+                "fix",
+                "it",
+                "--workspace-confine-write",
+                "scripts/pretty_print.py",
+            ][..],
+            "--workspace-confine-write",
+        ),
+        (
+            "bare-command-split",
+            &[
+                "fix",
+                "it",
+                "--workspace-confine-bash-command",
+                DECLARED_TEST,
+            ][..],
+            "--workspace-confine-bash-command",
+        ),
+        (
+            "bare-command-equals",
+            &[
+                "fix",
+                "it",
+                "--workspace-confine-bash-command=python3 -B -m py_compile scripts/pretty_print.py",
+            ][..],
+            "--workspace-confine-bash-command",
+        ),
+        (
+            "prompt-write",
+            &[
+                "prompt",
+                "repair",
+                "--workspace-confine-write",
+                "scripts/pretty_print.py",
+            ][..],
+            "--workspace-confine-write",
+        ),
+        (
+            "dash-p-write",
+            &[
+                "-p",
+                "repair",
+                "--workspace-confine-write=scripts/pretty_print.py",
+            ][..],
+            "--workspace-confine-write",
+        ),
+        (
+            "status-write",
+            &[
+                "status",
+                "--workspace-confine-write",
+                "scripts/pretty_print.py",
+            ][..],
+            "--workspace-confine-write",
+        ),
+    ] {
+        let fixture = Fixture::new(label);
+        fixture.make_generic();
+        let output = fixture.confined(tail);
+        assert!(!output.status.success(), "{label}: {output:?}");
+        assert!(
+            stderr(&output).contains(&format!("{flag} must come before the prompt or subcommand")),
+            "{label}: {}",
+            stderr(&output)
+        );
+        assert!(
+            !stdout(&output).contains("Git state"),
+            "{label}: {output:?}"
+        );
+        assert_eq!(fixture.markers(), expected(&[]), "{label}");
+        fixture.assert_no_survivors();
+    }
+
+    // NEGATIVE CONTROL: the same declaration in the option region binds, and
+    // the bare prompt reaches the provider credential check.
+    let fixture = Fixture::new("option-region");
+    fixture.make_generic();
+    let output = fixture.confined(&[
+        "--workspace-confine-write",
+        "scripts/pretty_print.py",
+        "fix",
+        "it",
+    ]);
+    assert_stopped_at_credentials(&output);
+    assert_eq!(fixture.markers(), expected(&[]));
+    fixture.assert_no_survivors();
+}
+
+/// What binding refuses a declaration of `scripts/missing.py` with.
+const UNBOUND_DECLARATION: &str = "No such file";
+
+#[test]
+fn an_invocation_that_does_not_parse_binds_no_confinement() {
+    // The confinement an invocation declares is bound only once the whole
+    // invocation has parsed. Each of these declares a writable file that does
+    // not exist, which binding refuses by name. The invocation does not parse
+    // either, and that is what it is refused for: binding was never reached.
+    for (label, tail, reason) in [
+        (
+            "output-format",
+            &["--output-format", "yaml", "status"][..],
+            "unsupported value for --output-format",
+        ),
+        (
+            "permission-mode",
+            &["--permission-mode", "admin", "status"][..],
+            "unsupported permission mode 'admin'",
+        ),
+        (
+            "reasoning-effort",
+            &["--reasoning-effort", "max", "status"][..],
+            "invalid value for --reasoning-effort",
+        ),
+        (
+            "model-syntax",
+            &["--model", "bad model", "status"][..],
+            "invalid model syntax",
+        ),
+        ("model-value", &["--model"][..], "missing value for --model"),
+        (
+            "base-commit-value",
+            &["--base-commit"][..],
+            "missing value for --base-commit",
+        ),
+        (
+            "tools-value",
+            &["--allowedTools"][..],
+            "missing value for --allowedTools",
+        ),
+        (
+            "empty-prompt",
+            &["prompt"][..],
+            "prompt subcommand requires a prompt string",
+        ),
+        ("empty-dash-p", &["-p"][..], "-p requires a prompt string"),
+        (
+            "status-suffix",
+            &["status", "--json"][..],
+            "unrecognized argument `--json` for subcommand `status`",
+        ),
+        (
+            "plan-subcommand",
+            &["plan", "walk"][..],
+            "unsupported `claw plan` subcommand: walk",
+        ),
+        (
+            "plan-permission-mode",
+            &["--permission-mode", "read-only", "plan", "run", "p.yaml"][..],
+            "--permission-mode is not supported by `claw plan run`",
+        ),
+        (
+            "task-arguments",
+            &["task", "run"][..],
+            "Usage: `claw task run <task.json>`",
+        ),
+        (
+            "resume-tail",
+            &["--resume", "latest", "not-a-slash-command"][..],
+            "--resume trailing arguments must be slash commands",
+        ),
+        (
+            "diff-arguments",
+            &["diff", "extra"][..],
+            "unexpected extra arguments after `claw diff`",
+        ),
+        (
+            "acp-arguments",
+            &["acp", "bogus"][..],
+            "unsupported ACP invocation",
+        ),
+        ("removed-surface", &["login"][..], "has been removed"),
+    ] {
+        let fixture = Fixture::new(label);
+        fixture.make_generic();
+        let mut args = vec!["--workspace-confine-write", "scripts/missing.py"];
+        args.extend_from_slice(tail);
+        let output = fixture.confined(&args);
+        assert!(!output.status.success(), "{label}: {output:?}");
+        assert!(stderr(&output).contains(reason), "{label}: {output:?}");
+        assert!(
+            !stderr(&output).contains(UNBOUND_DECLARATION),
+            "{label}: the confinement was bound before the invocation parsed: {}",
+            stderr(&output)
+        );
+        assert_eq!(fixture.markers(), expected(&[]), "{label}");
+        fixture.assert_no_survivors();
+    }
+
+    // NEGATIVE CONTROL: the same declaration on an invocation that parses is
+    // refused when it is bound.
+    let fixture = Fixture::new("parses");
+    fixture.make_generic();
+    let output = fixture.confined(&["--workspace-confine-write", "scripts/missing.py", "status"]);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        stderr(&output).contains(UNBOUND_DECLARATION),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(fixture.markers(), expected(&[]));
+}
+
+#[test]
+fn an_invocation_that_does_not_parse_builds_no_tool_registry() {
+    // Resolving `--allowedTools` builds the runtime tool registry, which
+    // without confinement spawns the configured MCP server. An invocation
+    // that does not parse is refused before that build, confined or not.
+    for (label, tail, reason) in [
+        (
+            "empty-prompt",
+            &["prompt"][..],
+            "prompt subcommand requires a prompt string",
+        ),
+        (
+            "status-suffix",
+            &["status", "--json"][..],
+            "unrecognized argument `--json` for subcommand `status`",
+        ),
+        (
+            "task-arguments",
+            &["task", "run"][..],
+            "Usage: `claw task run <task.json>`",
+        ),
+    ] {
+        for confined in [false, true] {
+            let fixture = Fixture::new(label);
+            let mut args = vec!["--allowedTools", "read_file"];
+            args.extend_from_slice(tail);
+            let output = if confined {
+                fixture.confined(&args)
+            } else {
+                fixture.claw(&args)
+            };
+            assert!(!output.status.success(), "{label}: {output:?}");
+            assert!(stderr(&output).contains(reason), "{label}: {output:?}");
+            assert_eq!(
+                fixture.markers(),
+                expected(&[]),
+                "{label} confined={confined}"
+            );
+            fixture.assert_no_survivors();
+        }
+    }
+
+    // NEGATIVE CONTROL: an invocation that parses resolves its tools, and
+    // without confinement that build spawns the MCP server.
+    let fixture = Fixture::new("parses-tools");
+    let output = fixture.claw(&["--allowedTools", "read_file", "status"]);
+    assert!(output.status.success(), "{output:?}");
+    assert_contains_markers(&fixture, &["mcp-spawned"], "unconfined status");
 }
 
 /// The command the mock model's `bash_stdout_roundtrip` scenario asks for.
