@@ -201,6 +201,8 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--allowed-tools",
     "--data-dir",
     "--workspace-confine",
+    "--workspace-confine-write",
+    "--workspace-confine-bash-command",
     "--resume",
     "--acp",
     "-acp",
@@ -211,6 +213,9 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
 ];
 
 type AllowedToolSet = BTreeSet<String>;
+/// What `--allowedTools` values resolve to: a tool allow-list, or no
+/// restriction when there are none.
+type ResolvedAllowedTools = Result<Option<AllowedToolSet>, String>;
 type RuntimePluginStateBuildOutput = (
     Option<Arc<Mutex<RuntimeMcpState>>>,
     Vec<RuntimeToolDefinition>,
@@ -352,18 +357,16 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
-    let (filtered_args, data_dir, confine_root) = extract_process_flags(&args)?;
-    // Install confinement BEFORE parsing the action: parsing can already
-    // build the runtime tool registry (`--allowedTools`), and that build must
-    // see the confinement so it does not start hooks, plugins or MCP servers.
-    if let Some(root) = confine_root {
-        let confinement = tools::WorkspaceConfinement::new(&root, tools::CONFINED_BASH_TIMEOUT_MS)?;
-        tools::set_workspace_confinement(confinement)?;
-    }
-    let action = parse_args_core(
-        &filtered_args,
+    // The whole invocation is parsed before the confinement it declares is
+    // installed, and the confinement is installed before the tool registry
+    // is built: see `prepare_invocation_in`.
+    let (action, data_dir) = prepare_invocation_in(
+        LEADING_GRAMMAR,
+        &args,
         std::io::stdin().is_terminal(),
         std::io::stdout().is_terminal(),
+        install_workspace_confinement,
+        normalize_allowed_tools,
     )?;
     match action {
         CliAction::DumpManifests {
@@ -3824,6 +3827,19 @@ enum CliAction {
     },
 }
 
+impl CliAction {
+    /// The tool allow-list of an action that runs tools.
+    fn allowed_tools_mut(&mut self) -> Option<&mut Option<AllowedToolSet>> {
+        match self {
+            Self::Prompt { allowed_tools, .. } | Self::Repl { allowed_tools, .. } => {
+                Some(allowed_tools)
+            }
+            Self::ResumeRepl { context, .. } => Some(&mut context.allowed_tools),
+            _ => None,
+        }
+    }
+}
+
 /// A2-L1b CLI report-format selector. Separate enum from `CliOutputFormat`
 /// because the report markers form a stable operator-facing contract that
 /// is independent of the existing `--output-format` text/json toggle.
@@ -3922,100 +3938,698 @@ fn parse_full_invocation_with_terminal(
     stdin_is_tty: bool,
     stdout_is_tty: bool,
 ) -> Result<(CliAction, Option<PathBuf>, Option<PathBuf>), String> {
-    let (filtered_args, data_dir, confine_root) = extract_process_flags(args)?;
-    let action = parse_args_core(&filtered_args, stdin_is_tty, stdout_is_tty)?;
+    let invocation = validate_invocation(LEADING_GRAMMAR, args, stdin_is_tty, stdout_is_tty)?;
+    let confine_root = invocation
+        .confinement
+        .as_ref()
+        .map(|request| request.root.clone());
+    // Report what the invocation declares; install nothing.
+    let (action, data_dir) = invocation.bind(|_| Ok(()), normalize_allowed_tools)?;
     Ok((action, data_dir, confine_root))
 }
 
-/// Remaining action arguments, `--data-dir`, and `--workspace-confine` root.
-type ProcessFlags = (Vec<String>, Option<PathBuf>, Option<PathBuf>);
-
-/// Strip the process-level flags (`--data-dir`, `--workspace-confine`) and
-/// return the remaining arguments for action parsing.
-fn extract_process_flags(args: &[String]) -> Result<ProcessFlags, String> {
-    let (filtered_args, data_dir) = extract_data_dir(args)?;
-    let (filtered_args, confine_root) = extract_workspace_confine(&filtered_args)?;
-    Ok((filtered_args, data_dir, confine_root))
-}
-
-/// Extract `--workspace-confine` or `--workspace-confine=PATH`.
+/// The workspace confinement an invocation declares: the `--workspace-confine`
+/// root and the `--workspace-confine-write` and
+/// `--workspace-confine-bash-command` declarations, in command-line order.
 ///
-/// A bare `--workspace-confine` confines to the current working directory,
-/// which is the workspace the CLI already treats as its root, and consumes no
-/// following argument, so it can precede a positional action or prompt. An
-/// explicit root is given only as `--workspace-confine=PATH`. The flag may
-/// appear once: a second occurrence would leave the confinement root
-/// ambiguous, so it is rejected rather than resolved by position.
-fn extract_workspace_confine(args: &[String]) -> Result<(Vec<String>, Option<PathBuf>), String> {
-    let mut filtered = Vec::with_capacity(args.len());
-    let mut root = None;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--workspace-confine" => {
-                if root.is_some() {
-                    return Err("--workspace-confine may be given only once".to_string());
-                }
-                root = Some(env::current_dir().map_err(|error| error.to_string())?);
-                index += 1;
-            }
-            flag if flag.starts_with("--workspace-confine=") => {
-                if root.is_some() {
-                    return Err("--workspace-confine may be given only once".to_string());
-                }
-                let value = &flag["--workspace-confine=".len()..];
-                if value.is_empty() {
-                    return Err("missing value for --workspace-confine".to_string());
-                }
-                root = Some(PathBuf::from(value));
-                index += 1;
-            }
-            _ => {
-                filtered.push(args[index].clone());
-                index += 1;
-            }
-        }
-    }
-    Ok((filtered, root))
+/// A description only. Nothing is opened, checked or bound until it is
+/// installed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfinementRequest {
+    root: PathBuf,
+    writable: Vec<String>,
+    commands: Vec<String>,
 }
 
-fn extract_data_dir(args: &[String]) -> Result<(Vec<String>, Option<PathBuf>), String> {
-    let mut filtered = Vec::with_capacity(args.len());
+/// An invocation that parsed in full, with nothing it declares installed.
+///
+/// The action is complete except for its tool allow-list. Resolving
+/// `--allowedTools` builds the runtime tool registry, and that build must see
+/// the confinement, so it waits for [`ValidatedInvocation::bind`]. Until then
+/// the action allows no tool at all where the invocation named some.
+#[derive(Debug)]
+struct ValidatedInvocation {
+    action: CliAction,
+    /// The `--allowedTools` values the action parser asked to have resolved;
+    /// empty when it asked for none.
+    allowed_tool_values: Vec<String>,
+    data_dir: Option<PathBuf>,
+    confinement: Option<ConfinementRequest>,
+}
+
+impl ValidatedInvocation {
+    /// Install the confinement the invocation declares, then resolve its tool
+    /// allow-list, and return the action with its `--data-dir`.
+    ///
+    /// `install` comes first: `resolve_tools` builds the runtime tool
+    /// registry, and that build must see the confinement so it does not start
+    /// hooks, plugins or MCP servers.
+    fn bind(
+        self,
+        install: impl FnOnce(&ConfinementRequest) -> Result<(), String>,
+        resolve_tools: impl FnOnce(&[String]) -> ResolvedAllowedTools,
+    ) -> Result<(CliAction, Option<PathBuf>), String> {
+        let Self {
+            mut action,
+            allowed_tool_values,
+            data_dir,
+            confinement,
+        } = self;
+        if let Some(request) = &confinement {
+            install(request)?;
+        }
+        if !allowed_tool_values.is_empty() {
+            let resolved = resolve_tools(&allowed_tool_values)?;
+            if let Some(allowed_tools) = action.allowed_tools_mut() {
+                *allowed_tools = resolved;
+            }
+        }
+        Ok((action, data_dir))
+    }
+}
+
+/// Parse the whole invocation by `grammar`: the process flags, then the
+/// action from the arguments extraction kept.
+///
+/// Nothing is installed and no tool registry is built here, so an invocation
+/// that is refused leaves the process as it was. The confinement it declares
+/// is only described, by a [`ConfinementRequest`], and only once the action
+/// has parsed.
+fn validate_invocation(
+    grammar: OptionGrammar,
+    args: &[String],
+    stdin_is_tty: bool,
+    stdout_is_tty: bool,
+) -> Result<ValidatedInvocation, String> {
+    let (filtered_args, data_dir, confine_root, writable, commands) =
+        extract_process_flags_in(grammar, args)?;
+    let mut allowed_tool_values = Vec::new();
+    let action = parse_args_core_in(
+        grammar,
+        &filtered_args,
+        stdin_is_tty,
+        stdout_is_tty,
+        &mut |values| {
+            allowed_tool_values = values.to_vec();
+            Ok(unresolved_allowed_tools(values))
+        },
+    )?;
+    Ok(ValidatedInvocation {
+        action,
+        allowed_tool_values,
+        data_dir,
+        confinement: confine_root.map(|root| ConfinementRequest {
+            root,
+            writable,
+            commands,
+        }),
+    })
+}
+
+/// The tool allow-list an action carries until its `--allowedTools` values
+/// are resolved: no restriction where the invocation asked for none, and
+/// otherwise no tool at all, so an action that was never bound runs none.
+fn unresolved_allowed_tools(values: &[String]) -> Option<AllowedToolSet> {
+    (!values.is_empty()).then(AllowedToolSet::new)
+}
+
+/// The action `args` asks for and its `--data-dir`, prepared in the one order
+/// the process uses:
+///
+/// 1. the whole invocation is parsed ([`validate_invocation`]);
+/// 2. `install` installs the confinement it declares;
+/// 3. `resolve_tools` resolves its `--allowedTools`, building the tool
+///    registry.
+///
+/// An invocation that does not parse stops at the first step: the authority
+/// it declares is never bound, and no tool registry is built for it.
+fn prepare_invocation_in(
+    grammar: OptionGrammar,
+    args: &[String],
+    stdin_is_tty: bool,
+    stdout_is_tty: bool,
+    install: impl FnOnce(&ConfinementRequest) -> Result<(), String>,
+    resolve_tools: impl FnOnce(&[String]) -> ResolvedAllowedTools,
+) -> Result<(CliAction, Option<PathBuf>), String> {
+    validate_invocation(grammar, args, stdin_is_tty, stdout_is_tty)?.bind(install, resolve_tools)
+}
+
+/// Bind the confinement `request` declares and install it for the process.
+///
+/// The only caller of [`tools::set_workspace_confinement`]. A request is made
+/// only by [`validate_invocation`], for an invocation that parsed in full.
+fn install_workspace_confinement(request: &ConfinementRequest) -> Result<(), String> {
+    let confinement =
+        build_workspace_confinement(&request.root, &request.writable, &request.commands)?;
+    tools::set_workspace_confinement(confinement)
+}
+
+/// Remaining action arguments, `--data-dir`, `--workspace-confine` root, and
+/// the `--workspace-confine-write` and `--workspace-confine-bash-command`
+/// declarations, each in command-line order.
+type ProcessFlags = (
+    Vec<String>,
+    Option<PathBuf>,
+    Option<PathBuf>,
+    Vec<String>,
+    Vec<String>,
+);
+
+/// Strip the process-level flags (`--data-dir`, `--workspace-confine`,
+/// `--workspace-confine-write`, `--workspace-confine-bash-command`) and
+/// return the remaining arguments for action parsing.
+///
+/// Process flags are read only from the option region (see
+/// [`split_option_region`]). Everything after it is action or prompt text,
+/// and that text never declares process authority, so a process flag found
+/// there is refused rather than read or silently left in the prompt.
+fn extract_process_flags(args: &[String]) -> Result<ProcessFlags, String> {
+    extract_process_flags_in(LEADING_GRAMMAR, args)
+}
+
+/// [`extract_process_flags`] reading the arguments by `grammar`.
+fn extract_process_flags_in(
+    grammar: OptionGrammar,
+    args: &[String],
+) -> Result<ProcessFlags, String> {
+    let (options, action) = split_option_region(grammar, args)?;
+    if let Some(flag) = action.iter().find_map(|arg| grammar.process_flag(arg)) {
+        return Err(format!("{flag} must come before the prompt or subcommand"));
+    }
+    let mut kept = Vec::new();
     let mut data_dir = None;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--data-dir" => {
-                let value = args
-                    .get(index + 1)
-                    .filter(|value| !value.starts_with('-'))
-                    .ok_or_else(|| "missing value for --data-dir".to_string())?;
+    let mut confine_root = None;
+    let mut confine_writable = Vec::new();
+    let mut confine_commands = Vec::new();
+    for unit in options {
+        let flag = unit.name;
+        let missing = || format!("missing value for {flag}");
+        // The argument after a process flag is its value only if it is not
+        // itself an option.
+        let value = unit
+            .value
+            .filter(|value| !(unit.separate() && value.starts_with('-')));
+        match unit.option {
+            LeadingOption::DataDir => {
+                let value = value
+                    .filter(|value| unit.separate() || !value.is_empty())
+                    .ok_or_else(missing)?;
                 data_dir = Some(PathBuf::from(value));
-                index += 2;
             }
-            flag if flag.starts_with("--data-dir=") => {
-                let value = &flag[11..];
-                if value.is_empty() {
-                    return Err("missing value for --data-dir".to_string());
+            // A bare `--workspace-confine` confines to the current working
+            // directory, which is the workspace the CLI already treats as its
+            // root, and takes no separate value, so it can precede a
+            // positional action or prompt. An explicit root is given only as
+            // `--workspace-confine=PATH`. A second occurrence would leave the
+            // root ambiguous, so it is rejected rather than resolved by
+            // position.
+            LeadingOption::WorkspaceConfine => {
+                if confine_root.is_some() {
+                    return Err("--workspace-confine may be given only once".to_string());
                 }
-                data_dir = Some(PathBuf::from(value));
-                index += 1;
+                confine_root = Some(match unit.value {
+                    None => env::current_dir().map_err(|error| error.to_string())?,
+                    Some(_) if unit.separate() => return Err(unexpected_value(flag)),
+                    Some("") => return Err(missing()),
+                    Some(value) => PathBuf::from(value),
+                });
             }
-            _ => {
-                filtered.push(args[index].clone());
-                index += 1;
+            // Each declaration names one existing workspace-relative file
+            // confined writes and edits may modify, or one exact command
+            // confined `bash` may run. Both repeat and keep their order. Only
+            // a missing or empty value is refused here; the declarations are
+            // validated when the confinement is bound, once the whole
+            // invocation has parsed and before any action runs.
+            LeadingOption::WorkspaceConfineWrite | LeadingOption::WorkspaceConfineBashCommand => {
+                let value = value
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(missing)?
+                    .to_string();
+                if unit.option == LeadingOption::WorkspaceConfineWrite {
+                    confine_writable.push(value);
+                } else {
+                    confine_commands.push(value);
+                }
             }
+            _ => kept.push(unit),
         }
     }
-    Ok((filtered, data_dir))
+    if confine_root.is_none() && !confine_writable.is_empty() {
+        return Err("--workspace-confine-write requires --workspace-confine".to_string());
+    }
+    if confine_root.is_none() && !confine_commands.is_empty() {
+        return Err("--workspace-confine-bash-command requires --workspace-confine".to_string());
+    }
+    Ok((
+        action_args(grammar, &kept, action)?,
+        data_dir,
+        confine_root,
+        confine_writable,
+        confine_commands,
+    ))
 }
 
-#[allow(clippy::too_many_lines)]
+/// The arguments left for the action parser: the option units extraction
+/// kept, then the action.
+///
+/// The action parser reads these arguments by `grammar` again, without the
+/// process flags that stood between them. It must find each kept unit exactly
+/// as the option region read it, or an argument would be an option's value in
+/// one reading and something else in the other. Arguments that do not read
+/// back the same are refused.
+fn action_args(
+    grammar: OptionGrammar,
+    kept: &[OptionUnit],
+    action: &[String],
+) -> Result<Vec<String>, String> {
+    let mut args = Vec::new();
+    for unit in kept {
+        args.extend_from_slice(unit.args);
+    }
+    args.extend_from_slice(action);
+    let mut unread = args.as_slice();
+    for unit in kept {
+        match grammar.next_unit(unread) {
+            Some((ArgUnit::Option(read), rest)) if read == *unit => unread = rest,
+            _ => return Err(format!("ambiguous arguments after {}", unit.name)),
+        }
+    }
+    Ok(args)
+}
+
+/// A leading option, named for what it sets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LeadingOption {
+    DataDir,
+    WorkspaceConfine,
+    WorkspaceConfineWrite,
+    WorkspaceConfineBashCommand,
+    Help,
+    Version,
+    Model,
+    OutputFormat,
+    PermissionMode,
+    DangerouslySkipPermissions,
+    Compact,
+    BaseCommit,
+    ReasoningEffort,
+    AllowBroadCwd,
+    Print,
+    AllowedTools,
+}
+
+impl LeadingOption {
+    /// Whether the option is a process flag: read from the option region
+    /// before any action is parsed, and never part of an action.
+    fn is_process_flag(self) -> bool {
+        matches!(
+            self,
+            Self::DataDir
+                | Self::WorkspaceConfine
+                | Self::WorkspaceConfineWrite
+                | Self::WorkspaceConfineBashCommand
+        )
+    }
+
+    /// Whether the option widens what an action may do: its tool allow-list,
+    /// its permission mode, or running from a very broad directory without
+    /// asking.
+    ///
+    /// Such an option is read only from the option region. After it, the
+    /// arguments it would span are words of the action (see
+    /// [`parse_args_core_in`]). Every option is listed, so a new one cannot
+    /// be added without deciding which it is.
+    fn is_runtime_authority(self) -> bool {
+        match self {
+            Self::PermissionMode
+            | Self::DangerouslySkipPermissions
+            | Self::AllowBroadCwd
+            | Self::AllowedTools => true,
+            Self::DataDir
+            | Self::WorkspaceConfine
+            | Self::WorkspaceConfineWrite
+            | Self::WorkspaceConfineBashCommand
+            | Self::Help
+            | Self::Version
+            | Self::Model
+            | Self::OutputFormat
+            | Self::Compact
+            | Self::BaseCommit
+            | Self::ReasoningEffort
+            | Self::Print => false,
+        }
+    }
+}
+
+/// How a leading option takes its value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OptionArity {
+    /// `OPTION` only.
+    NoValue,
+    /// `OPTION` or `OPTION=VALUE`. The argument after it is never its value.
+    InlineValue,
+    /// `OPTION VALUE` or `OPTION=VALUE`. The argument after it is its value
+    /// whatever that argument spells (`--model prompt`, `--base-commit -p`).
+    Value,
+}
+
+/// One spelling of a leading option and how it takes its value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OptionSpec {
+    name: &'static str,
+    option: LeadingOption,
+    arity: OptionArity,
+}
+
+/// Every leading option: the process flags and the options of the action
+/// parser.
+///
+/// This is the only definition of how many arguments an option spans. The
+/// option region ([`split_option_region`]) and the action parser
+/// (`parse_args_core`) both take their argument units from it through
+/// [`OptionGrammar::next_unit`], so they cannot disagree about whether an
+/// argument is an option's value or an option of its own.
+const LEADING_OPTIONS: &[OptionSpec] = &[
+    OptionSpec {
+        name: "--data-dir",
+        option: LeadingOption::DataDir,
+        arity: OptionArity::Value,
+    },
+    OptionSpec {
+        name: "--workspace-confine",
+        option: LeadingOption::WorkspaceConfine,
+        arity: OptionArity::InlineValue,
+    },
+    OptionSpec {
+        name: "--workspace-confine-write",
+        option: LeadingOption::WorkspaceConfineWrite,
+        arity: OptionArity::Value,
+    },
+    OptionSpec {
+        name: "--workspace-confine-bash-command",
+        option: LeadingOption::WorkspaceConfineBashCommand,
+        arity: OptionArity::Value,
+    },
+    OptionSpec {
+        name: "--help",
+        option: LeadingOption::Help,
+        arity: OptionArity::NoValue,
+    },
+    OptionSpec {
+        name: "-h",
+        option: LeadingOption::Help,
+        arity: OptionArity::NoValue,
+    },
+    OptionSpec {
+        name: "--version",
+        option: LeadingOption::Version,
+        arity: OptionArity::NoValue,
+    },
+    OptionSpec {
+        name: "-V",
+        option: LeadingOption::Version,
+        arity: OptionArity::NoValue,
+    },
+    OptionSpec {
+        name: "--model",
+        option: LeadingOption::Model,
+        arity: OptionArity::Value,
+    },
+    OptionSpec {
+        name: "--output-format",
+        option: LeadingOption::OutputFormat,
+        arity: OptionArity::Value,
+    },
+    OptionSpec {
+        name: "--permission-mode",
+        option: LeadingOption::PermissionMode,
+        arity: OptionArity::Value,
+    },
+    OptionSpec {
+        name: "--dangerously-skip-permissions",
+        option: LeadingOption::DangerouslySkipPermissions,
+        arity: OptionArity::NoValue,
+    },
+    OptionSpec {
+        name: "--compact",
+        option: LeadingOption::Compact,
+        arity: OptionArity::NoValue,
+    },
+    OptionSpec {
+        name: "--base-commit",
+        option: LeadingOption::BaseCommit,
+        arity: OptionArity::Value,
+    },
+    OptionSpec {
+        name: "--reasoning-effort",
+        option: LeadingOption::ReasoningEffort,
+        arity: OptionArity::Value,
+    },
+    OptionSpec {
+        name: "--allow-broad-cwd",
+        option: LeadingOption::AllowBroadCwd,
+        arity: OptionArity::NoValue,
+    },
+    OptionSpec {
+        name: "--print",
+        option: LeadingOption::Print,
+        arity: OptionArity::NoValue,
+    },
+    OptionSpec {
+        name: "--allowedTools",
+        option: LeadingOption::AllowedTools,
+        arity: OptionArity::Value,
+    },
+    OptionSpec {
+        name: "--allowed-tools",
+        option: LeadingOption::AllowedTools,
+        arity: OptionArity::Value,
+    },
+];
+
+/// A leading option as it was given: the option, and its value if it has one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OptionUnit<'a> {
+    option: LeadingOption,
+    /// The option as its specification spells it.
+    name: &'static str,
+    /// `VALUE` of `OPTION=VALUE`, or the argument after the option.
+    value: Option<&'a str>,
+    /// The arguments the unit spans: the option, then its value when that is
+    /// the argument after it.
+    args: &'a [String],
+}
+
+impl OptionUnit<'_> {
+    /// Whether the value is the argument after the option.
+    fn separate(&self) -> bool {
+        self.args.len() > 1
+    }
+}
+
+/// One unit of an invocation's arguments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArgUnit<'a> {
+    Option(OptionUnit<'a>),
+    /// `-p`: every argument after it is the prompt.
+    ShortPrompt,
+    /// `--resume`, or `--resume=REFERENCE` with its reference.
+    Resume(Option<&'a str>),
+    /// `--acp` or `-acp`.
+    Acp,
+    /// Any other argument: a positional, or an option that is not known.
+    Word(&'a str),
+}
+
+/// The leading options an invocation is read by.
+#[derive(Clone, Copy)]
+struct OptionGrammar<'g>(&'g [OptionSpec]);
+
+const LEADING_GRAMMAR: OptionGrammar<'static> = OptionGrammar(LEADING_OPTIONS);
+
+impl OptionGrammar<'_> {
+    /// The option `arg` names as `OPTION` or `OPTION=VALUE`, with that value.
+    fn named(self, arg: &str) -> Option<(OptionSpec, Option<&str>)> {
+        let (name, inline) = match arg.split_once('=') {
+            Some((name, value)) => (name, Some(value)),
+            None => (arg, None),
+        };
+        let spec = self.0.iter().find(|spec| spec.name == name)?;
+        Some((*spec, inline))
+    }
+
+    /// The process flag `arg` names, if any, in whichever form.
+    fn process_flag(self, arg: &str) -> Option<&'static str> {
+        self.named(arg)
+            .filter(|(spec, _)| spec.option.is_process_flag())
+            .map(|(spec, _)| spec.name)
+    }
+
+    /// The unit `args` starts with and the arguments after it, or `None` when
+    /// there are no arguments.
+    ///
+    /// Nothing else decides how many arguments an option spans. Only an
+    /// option whose arity is [`OptionArity::Value`], given without `=`, takes
+    /// the argument after it, and an option whose arity is
+    /// [`OptionArity::NoValue`] has no `OPTION=VALUE` form.
+    fn next_unit(self, args: &[String]) -> Option<(ArgUnit<'_>, &[String])> {
+        let (arg, rest) = args.split_first()?;
+        let unit = match arg.as_str() {
+            "-p" => ArgUnit::ShortPrompt,
+            "--acp" | "-acp" => ArgUnit::Acp,
+            "--resume" => ArgUnit::Resume(None),
+            arg => match (arg.strip_prefix("--resume="), self.named(arg)) {
+                (Some(reference), _) => ArgUnit::Resume(Some(reference)),
+                (None, Some((spec, inline)))
+                    if spec.arity != OptionArity::NoValue || inline.is_none() =>
+                {
+                    let separate = match (spec.arity, inline) {
+                        (OptionArity::Value, None) => rest.first().map(String::as_str),
+                        _ => None,
+                    };
+                    let (unit, rest) = args.split_at(1 + usize::from(separate.is_some()));
+                    let option = OptionUnit {
+                        option: spec.option,
+                        name: spec.name,
+                        value: inline.or(separate),
+                        args: unit,
+                    };
+                    return Some((ArgUnit::Option(option), rest));
+                }
+                _ => ArgUnit::Word(arg),
+            },
+        };
+        Some((unit, rest))
+    }
+}
+
+fn unexpected_value(option: &str) -> String {
+    format!("unexpected value for {option}")
+}
+
+/// Split `args` into the leading option region, one unit per option, and the
+/// action or prompt arguments after it.
+///
+/// The option region is the only place process authority can be declared,
+/// and the only place the action parser reads runtime authority. It
+/// ends at the first argument that starts an action or prompt: a positional
+/// (a subcommand or a bare prompt), `-p`, `--resume`, `--resume=...`, `--acp`
+/// or `-acp`. An option `grammar` does not know is refused: it may take a
+/// value that cannot be seen here, and that value must never be read as a
+/// process flag.
+fn split_option_region<'a>(
+    grammar: OptionGrammar,
+    args: &'a [String],
+) -> Result<(Vec<OptionUnit<'a>>, &'a [String]), String> {
+    let mut options = Vec::new();
+    let mut action = args;
+    while let Some((unit, rest)) = grammar.next_unit(action) {
+        match unit {
+            ArgUnit::Option(option) => options.push(option),
+            ArgUnit::Word(word) if word.starts_with('-') => {
+                return Err(format_unknown_option(word));
+            }
+            _ => break,
+        }
+        action = rest;
+    }
+    Ok((options, action))
+}
+
+/// Bind the process confinement for `root`.
+///
+/// Any operator declaration (a writable file or a bash command) selects the
+/// generic policy, under which only declared files are writable and only
+/// declared commands run; with none, the controlled calculator smoke keeps
+/// its fixture policy and built-in command. Either way an invalid root or
+/// declaration is an error here, before any action runs.
+fn build_workspace_confinement(
+    root: &Path,
+    writable: &[String],
+    commands: &[String],
+) -> Result<tools::WorkspaceConfinement, String> {
+    if writable.is_empty() && commands.is_empty() {
+        return tools::WorkspaceConfinement::controlled_smoke(
+            root,
+            tools::CONFINED_BASH_TIMEOUT_MS,
+        );
+    }
+    let writable = writable.iter().map(String::as_str).collect::<Vec<_>>();
+    let commands = commands.iter().map(String::as_str).collect::<Vec<_>>();
+    tools::WorkspaceConfinement::new(root, &writable, &commands, tools::CONFINED_BASH_TIMEOUT_MS)
+}
+
+/// The action parser alone, resolving `--allowedTools` at once. The process
+/// does not parse this way: see [`prepare_invocation_in`].
+#[cfg(test)]
 fn parse_args_core(
     args: &[String],
     stdin_is_tty: bool,
     stdout_is_tty: bool,
 ) -> Result<CliAction, String> {
+    parse_args_core_in(
+        LEADING_GRAMMAR,
+        args,
+        stdin_is_tty,
+        stdout_is_tty,
+        &mut normalize_allowed_tools,
+    )
+}
+
+/// The action `args` asks for, read by `grammar`.
+///
+/// The action's tool allow-list comes from `resolve_allowed_tools`, which is
+/// given the `--allowedTools` values at most once, and not at all for help
+/// and version. Nothing else here builds a tool registry or reads the
+/// process confinement.
+///
+/// The options that widen what an action may do
+/// ([`LeadingOption::is_runtime_authority`]) are read only from the option
+/// region, the one [`split_option_region`] also gives the process flags.
+/// After it they are words of the action. Where the action is a prompt given
+/// as words those words are prompt text, exactly as given. Any other action
+/// is refused, so they are neither read as authority nor dropped.
+fn parse_args_core_in(
+    grammar: OptionGrammar,
+    args: &[String],
+    stdin_is_tty: bool,
+    stdout_is_tty: bool,
+    resolve_allowed_tools: &mut dyn FnMut(&[String]) -> ResolvedAllowedTools,
+) -> Result<CliAction, String> {
+    let mut authority_words = None;
+    let action = parse_action_in(
+        grammar,
+        args,
+        stdin_is_tty,
+        stdout_is_tty,
+        resolve_allowed_tools,
+        &mut authority_words,
+    )?;
+    match authority_words {
+        Some(option) => Err(format!(
+            "{option} must come before the prompt or subcommand"
+        )),
+        None => Ok(action),
+    }
+}
+
+/// [`parse_args_core_in`] without its refusal.
+///
+/// `authority_words` is left naming the first runtime-authority option found
+/// after the option region, unless the action took its words as prompt text.
+#[allow(clippy::too_many_lines)]
+fn parse_action_in(
+    grammar: OptionGrammar,
+    args: &[String],
+    stdin_is_tty: bool,
+    stdout_is_tty: bool,
+    resolve_allowed_tools: &mut dyn FnMut(&[String]) -> ResolvedAllowedTools,
+    authority_words: &mut Option<&'static str>,
+) -> Result<CliAction, String> {
+    // Where the action begins. Both this parser and the process flags take
+    // the option region from `split_option_region`.
+    let (_, action) = split_option_region(grammar, args)?;
+    let option_region = args.len() - action.len();
     let mut model = DEFAULT_MODEL.to_string();
     // #148: when user passes --model/--model=, capture the raw input so we
     // can attribute source: "flag" later. None means no flag was supplied.
@@ -4030,119 +4644,27 @@ fn parse_args_core(
     let mut reasoning_effort: Option<String> = None;
     let mut allow_broad_cwd = false;
     let mut rest: Vec<String> = Vec::new();
-    let mut index = 0;
 
-    while index < args.len() {
-        match args[index].as_str() {
-            "--help" | "-h" if rest.is_empty() => {
-                wants_help = true;
-                index += 1;
+    // Every unit comes from `grammar`, which also splits the option region,
+    // so this loop never decides how many arguments an option spans: it reads
+    // only the value the unit carries.
+    let mut remaining = args;
+    while let Some((unit, after)) = grammar.next_unit(remaining) {
+        let in_option_region = args.len() - remaining.len() < option_region;
+        let arg = remaining[0].as_str();
+        remaining = after;
+        let unit = match unit {
+            // After the option region a runtime-authority option sets
+            // nothing. The arguments it spans stay words of the action.
+            ArgUnit::Option(unit) if !in_option_region && unit.option.is_runtime_authority() => {
+                authority_words.get_or_insert(unit.name);
+                rest.extend_from_slice(unit.args);
+                continue;
             }
-            "--help" | "-h"
-                if !rest.is_empty()
-                    && matches!(rest[0].as_str(), "prompt" | "commit" | "pr" | "issue") =>
-            {
-                // `--help` following a subcommand that would otherwise forward
-                // the arg to the API (e.g. `claw prompt --help`) should show
-                // top-level help instead. Subcommands that consume their own
-                // args (agents, mcp, plugins, skills) and local help-topic
-                // subcommands (status, sandbox, doctor, init, state, export,
-                // version, system-prompt, dump-manifests, bootstrap-plan) must
-                // NOT be intercepted here — they handle --help in their own
-                // dispatch paths via parse_local_help_action(). See #141.
-                wants_help = true;
-                index += 1;
-            }
-            "--version" | "-V" => {
-                wants_version = true;
-                index += 1;
-            }
-            "--model" => {
-                let value = args
-                    .get(index + 1)
-                    .ok_or_else(|| "missing value for --model".to_string())?;
-                validate_model_syntax(value)?;
-                model = resolve_model_alias_with_config(value);
-                model_flag_raw = Some(value.clone()); // #148
-                index += 2;
-            }
-            flag if flag.starts_with("--model=") => {
-                let value = &flag[8..];
-                validate_model_syntax(value)?;
-                model = resolve_model_alias_with_config(value);
-                model_flag_raw = Some(value.to_string()); // #148
-                index += 1;
-            }
-            "--output-format" => {
-                let value = args
-                    .get(index + 1)
-                    .ok_or_else(|| "missing value for --output-format".to_string())?;
-                output_format = CliOutputFormat::parse(value)?;
-                index += 2;
-            }
-            "--permission-mode" => {
-                let value = args
-                    .get(index + 1)
-                    .ok_or_else(|| "missing value for --permission-mode".to_string())?;
-                permission_mode_override = Some(parse_permission_mode_arg(value)?);
-                index += 2;
-            }
-            flag if flag.starts_with("--output-format=") => {
-                output_format = CliOutputFormat::parse(&flag[16..])?;
-                index += 1;
-            }
-            flag if flag.starts_with("--permission-mode=") => {
-                permission_mode_override = Some(parse_permission_mode_arg(&flag[18..])?);
-                index += 1;
-            }
-            "--dangerously-skip-permissions" => {
-                permission_mode_override = Some(PermissionMode::DangerFullAccess);
-                index += 1;
-            }
-            "--compact" => {
-                compact = true;
-                index += 1;
-            }
-            "--base-commit" => {
-                let value = args
-                    .get(index + 1)
-                    .ok_or_else(|| "missing value for --base-commit".to_string())?;
-                base_commit = Some(value.clone());
-                index += 2;
-            }
-            flag if flag.starts_with("--base-commit=") => {
-                base_commit = Some(flag[14..].to_string());
-                index += 1;
-            }
-            "--reasoning-effort" => {
-                let value = args
-                    .get(index + 1)
-                    .ok_or_else(|| "missing value for --reasoning-effort".to_string())?;
-                if !matches!(value.as_str(), "low" | "medium" | "high") {
-                    return Err(format!(
-                        "invalid value for --reasoning-effort: '{value}'; must be low, medium, or high"
-                    ));
-                }
-                reasoning_effort = Some(value.clone());
-                index += 2;
-            }
-            flag if flag.starts_with("--reasoning-effort=") => {
-                let value = &flag[19..];
-                if !matches!(value, "low" | "medium" | "high") {
-                    return Err(format!(
-                        "invalid value for --reasoning-effort: '{value}'; must be low, medium, or high"
-                    ));
-                }
-                reasoning_effort = Some(value.to_string());
-                index += 1;
-            }
-            "--allow-broad-cwd" => {
-                allow_broad_cwd = true;
-                index += 1;
-            }
-            "-p" => {
+            ArgUnit::Option(unit) => unit,
+            ArgUnit::ShortPrompt => {
                 // Claw Code compat: -p "prompt" = one-shot prompt
-                let prompt = args[index + 1..].join(" ");
+                let prompt = remaining.join(" ");
                 if prompt.trim().is_empty() {
                     return Err("-p requires a prompt string".to_string());
                 }
@@ -4150,7 +4672,7 @@ fn parse_args_core(
                     prompt,
                     model: resolve_model_alias_with_config(&model),
                     output_format,
-                    allowed_tools: normalize_allowed_tools(&allowed_tool_values)?,
+                    allowed_tools: resolve_allowed_tools(&allowed_tool_values)?,
                     permission_mode: permission_mode_override
                         .unwrap_or_else(default_permission_mode),
                     compact,
@@ -4159,46 +4681,86 @@ fn parse_args_core(
                     allow_broad_cwd,
                 });
             }
-            "--print" => {
+            ArgUnit::Resume(reference) if rest.is_empty() => {
+                rest.push("--resume".to_string());
+                rest.extend(reference.map(str::to_string));
+                continue;
+            }
+            ArgUnit::Acp => {
+                rest.push("acp".to_string());
+                continue;
+            }
+            ArgUnit::Resume(_) | ArgUnit::Word(_) => {
+                if rest.is_empty() && arg.starts_with('-') {
+                    return Err(format_unknown_option(arg));
+                }
+                rest.push(arg.to_string());
+                continue;
+            }
+        };
+        match (unit.option, unit.value) {
+            (LeadingOption::Help, None) => {
+                // `--help` following a subcommand that would otherwise forward
+                // the arg to the API (e.g. `claw prompt --help`) should show
+                // top-level help instead. Subcommands that consume their own
+                // args (agents, mcp, plugins, skills) and local help-topic
+                // subcommands (status, sandbox, doctor, init, state, export,
+                // version, system-prompt, dump-manifests, bootstrap-plan) must
+                // NOT be intercepted here — they handle --help in their own
+                // dispatch paths via parse_local_help_action(). See #141.
+                if rest.is_empty()
+                    || matches!(rest[0].as_str(), "prompt" | "commit" | "pr" | "issue")
+                {
+                    wants_help = true;
+                } else {
+                    rest.push(arg.to_string());
+                }
+            }
+            (LeadingOption::Version, None) => wants_version = true,
+            (LeadingOption::Model, Some(value)) => {
+                validate_model_syntax(value)?;
+                model = resolve_model_alias_with_config(value);
+                model_flag_raw = Some(value.to_string()); // #148
+            }
+            (LeadingOption::OutputFormat, Some(value)) => {
+                output_format = CliOutputFormat::parse(value)?;
+            }
+            (LeadingOption::PermissionMode, Some(value)) => {
+                permission_mode_override = Some(parse_permission_mode_arg(value)?);
+            }
+            (LeadingOption::DangerouslySkipPermissions, None) => {
+                permission_mode_override = Some(PermissionMode::DangerFullAccess);
+            }
+            (LeadingOption::Compact, None) => compact = true,
+            (LeadingOption::BaseCommit, Some(value)) => base_commit = Some(value.to_string()),
+            (LeadingOption::ReasoningEffort, Some(value)) => {
+                if !matches!(value, "low" | "medium" | "high") {
+                    return Err(format!(
+                        "invalid value for --reasoning-effort: '{value}'; must be low, medium, or high"
+                    ));
+                }
+                reasoning_effort = Some(value.to_string());
+            }
+            (LeadingOption::AllowBroadCwd, None) => allow_broad_cwd = true,
+            (LeadingOption::Print, None) => {
                 // Claw Code compat: --print makes output non-interactive
                 output_format = CliOutputFormat::Text;
-                index += 1;
             }
-            "--resume" if rest.is_empty() => {
-                rest.push("--resume".to_string());
-                index += 1;
+            (LeadingOption::AllowedTools, Some(value)) => {
+                allowed_tool_values.push(value.to_string());
             }
-            flag if rest.is_empty() && flag.starts_with("--resume=") => {
-                rest.push("--resume".to_string());
-                rest.push(flag[9..].to_string());
-                index += 1;
+            (LeadingOption::AllowedTools, None) => {
+                return Err("missing value for --allowedTools".to_string());
             }
-            "--acp" | "-acp" => {
-                rest.push("acp".to_string());
-                index += 1;
+            // Process flags are read and removed before the action is parsed,
+            // and refused after the option region, so one here was never
+            // read. It is not action text either.
+            (option, _) if option.is_process_flag() => {
+                return Err(format_unknown_option(arg));
             }
-            "--allowedTools" | "--allowed-tools" => {
-                let value = args
-                    .get(index + 1)
-                    .ok_or_else(|| "missing value for --allowedTools".to_string())?;
-                allowed_tool_values.push(value.clone());
-                index += 2;
-            }
-            flag if flag.starts_with("--allowedTools=") => {
-                allowed_tool_values.push(flag[15..].to_string());
-                index += 1;
-            }
-            flag if flag.starts_with("--allowed-tools=") => {
-                allowed_tool_values.push(flag[16..].to_string());
-                index += 1;
-            }
-            other if rest.is_empty() && other.starts_with('-') => {
-                return Err(format_unknown_option(other))
-            }
-            other => {
-                rest.push(other.to_string());
-                index += 1;
-            }
+            // The unit does not have the shape the option's meaning needs.
+            (_, None) => return Err(format!("missing value for {}", unit.name)),
+            (_, Some(_)) => return Err(unexpected_value(unit.name)),
         }
     }
 
@@ -4210,7 +4772,7 @@ fn parse_args_core(
         return Ok(CliAction::Version { output_format });
     }
 
-    let allowed_tools = normalize_allowed_tools(&allowed_tool_values)?;
+    let allowed_tools = resolve_allowed_tools(&allowed_tool_values)?;
 
     if rest.is_empty() {
         let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
@@ -4405,6 +4967,9 @@ fn parse_args_core(
             if prompt.trim().is_empty() {
                 return Err("prompt subcommand requires a prompt string".to_string());
             }
+            // The words after `prompt` are the prompt, authority words
+            // included.
+            *authority_words = None;
             Ok(CliAction::Prompt {
                 prompt,
                 model,
@@ -4455,6 +5020,8 @@ fn parse_args_core(
                         .to_string(),
                 );
             }
+            // Every word is the prompt, authority words included.
+            *authority_words = None;
             Ok(CliAction::Prompt {
                 prompt: joined,
                 model,
@@ -5444,7 +6011,7 @@ fn config_alias_for_current_dir(alias: &str) -> Option<String> {
     config.aliases().get(alias).cloned()
 }
 
-fn normalize_allowed_tools(values: &[String]) -> Result<Option<AllowedToolSet>, String> {
+fn normalize_allowed_tools(values: &[String]) -> ResolvedAllowedTools {
     if values.is_empty() {
         return Ok(None);
     }
@@ -13665,7 +14232,15 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  --workspace-confine[=PATH] Controlled-smoke confinement of PATH (default: cwd): file tools bound beneath it, writes only to calculator.py, bash only the approved unittest command in a Bubblewrap sandbox; hooks, plugins and MCP servers disabled"
+        "  --workspace-confine[=PATH] Confine to PATH (default: cwd): file tools bound beneath it, writes only to declared files, bash only declared commands in a Bubblewrap sandbox with the workspace read-only (with nothing declared: calculator.py and its unittest command); hooks, plugins and MCP servers disabled"
+    )?;
+    writeln!(
+        out,
+        "  --workspace-confine-write PATH  Declare an existing workspace-relative file writable under --workspace-confine (repeatable; must come before the prompt or subcommand)"
+    )?;
+    writeln!(
+        out,
+        "  --workspace-confine-bash-command CMD  Declare an exact python3 command bash may run under --workspace-confine (repeatable; matched exactly, never run by a shell; must come before the prompt or subcommand)"
     )?;
     writeln!(
         out,
@@ -13675,6 +14250,15 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(
         out,
         "  --version, -V              Print version and build information locally"
+    )?;
+    writeln!(out)?;
+    writeln!(
+        out,
+        "  --permission-mode, --dangerously-skip-permissions, --allowedTools and --allow-broad-cwd"
+    )?;
+    writeln!(
+        out,
+        "  must come before the prompt or subcommand. After a prompt has begun they are prompt text."
     )?;
     writeln!(out)?;
     writeln!(out, "Interactive slash commands:")?;
@@ -14796,6 +15380,9 @@ mod tests {
 
     #[test]
     fn rejects_unknown_allowed_tools() {
+        // Parsing `--allowedTools` builds the tool registry from the cwd and
+        // config home, which other tests change under this lock.
+        let _guard = env_lock();
         let error = parse_args(&["--allowedTools".to_string(), "teleport".to_string()])
             .expect_err("tool should be rejected");
         assert!(error.contains("unsupported tool in --allowedTools: teleport"));
@@ -14822,6 +15409,9 @@ mod tests {
 
     #[test]
     fn removed_login_and_logout_subcommands_error_helpfully() {
+        // The default permission mode comes from the environment and the
+        // cwd's config, which other tests change under this lock.
+        let _guard = env_lock();
         let login = parse_args(&["login".to_string()]).expect_err("login should be removed");
         assert!(login.contains("ANTHROPIC_API_KEY"));
         let logout = parse_args(&["logout".to_string()]).expect_err("logout should be removed");
@@ -15831,6 +16421,9 @@ mod tests {
 
     #[test]
     fn parses_direct_agents_mcp_and_skills_slash_commands() {
+        // The default permission mode comes from the environment and the
+        // cwd's config, which other tests change under this lock.
+        let _guard = env_lock();
         assert_eq!(
             parse_args(&["/agents".to_string()]).expect("/agents should parse"),
             CliAction::Agents {
@@ -16025,6 +16618,9 @@ mod tests {
 
     #[test]
     fn prompt_subcommand_allows_literal_typo_word() {
+        // The default permission mode comes from the environment and the
+        // cwd's config, which other tests change under this lock.
+        let _guard = env_lock();
         assert_eq!(
             parse_args(&["prompt".to_string(), "doctorr".to_string()])
                 .expect("explicit prompt subcommand should allow literal typo word"),
@@ -17239,8 +17835,8 @@ UU conflicted.rs",
                 "latest".to_string(),
             ],
             vec![
-                "export".to_string(),
                 format!("--data-dir={}", data_dir.display()),
+                "export".to_string(),
                 "--session".to_string(),
                 "latest".to_string(),
             ],
@@ -17783,6 +18379,285 @@ UU conflicted.rs",
         assert!(
             !flat.contains('{') && !flat.contains('}'),
             "flat content must not contain JSON braces; got {flat:?}"
+        );
+    }
+
+    #[test]
+    fn edit_file_operation_diff_reaches_the_openai_tool_message() {
+        // Real `edit_file` results carried along the live model path:
+        // tool registry -> `convert_messages` -> OpenAI-compatible
+        // `role:"tool"` message, i.e. exactly what the next turn reads.
+        use std::fmt::Write as _;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("claw-edit-wire-{unique}"));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let small = dir.join("module.py");
+        fs::write(
+            &small,
+            "def keep():\n    return 1\n\n\ndef old_name():\n    return 2\n",
+        )
+        .expect("seed small file");
+        let large = dir.join("values.txt");
+        let large_before = (0..2_000).fold(String::new(), |mut text, n| {
+            let _ = writeln!(text, "value_{n:04} = OLD");
+            text
+        });
+        fs::write(&large, &large_before).expect("seed large file");
+
+        let registry = GlobalToolRegistry::builtin();
+        let small_output = registry
+            .execute(
+                "edit_file",
+                &json!({
+                    "path": small,
+                    "old_string": "def old_name():\n    return 2",
+                    "new_string": "def new_name():\n    return 3",
+                }),
+            )
+            .expect("small edit");
+        let large_output = registry
+            .execute(
+                "edit_file",
+                &json!({ "path": large, "old_string": "OLD", "new_string": "NEW", "replace_all": true }),
+            )
+            .expect("large edit");
+        let _ = fs::remove_dir_all(&dir);
+
+        let to_wire = |id: &str, output: &str| -> String {
+            let messages = vec![ConversationMessage {
+                role: MessageRole::Tool,
+                blocks: vec![ContentBlock::ToolResult {
+                    tool_use_id: id.to_string(),
+                    tool_name: "edit_file".to_string(),
+                    output: output.to_string(),
+                    is_error: false,
+                }],
+                usage: None,
+            }];
+            let converted = super::convert_messages(&messages);
+            let wire = api::translate_message(&converted[0], "local-model");
+            assert_eq!(wire.len(), 1);
+            assert_eq!(wire[0]["role"], "tool");
+            assert_eq!(wire[0]["tool_call_id"], id);
+            wire[0]["content"]
+                .as_str()
+                .expect("string content")
+                .to_string()
+        };
+
+        let small_wire = to_wire("call_small", &small_output);
+        assert_eq!(
+            small_wire, small_output,
+            "edit results reach the model verbatim"
+        );
+        let small_diff = serde_json::from_str::<Value>(&small_wire).expect("json")["operationDiff"]
+            .as_str()
+            .expect("operationDiff must be model-visible")
+            .to_string();
+        assert!(
+            small_diff
+                .contains("\n-def old_name():\n-    return 2\n+def new_name():\n+    return 3\n"),
+            "{small_diff}"
+        );
+        let first = |key: &str| small_wire.find(&format!("\"{key}\":")).expect(key);
+        assert!(first("operationDiff") < first("originalFile"));
+        assert!(first("operationDiff") < first("structuredPatch"));
+
+        let large_wire = to_wire("call_large", &large_output);
+        assert_eq!(
+            large_wire, large_output,
+            "edit results reach the model verbatim"
+        );
+        let large_diff = serde_json::from_str::<Value>(&large_wire).expect("json")["operationDiff"]
+            .as_str()
+            .expect("operationDiff must be model-visible")
+            .to_string();
+        assert!(large_diff.len() <= 16_384, "{} bytes", large_diff.len());
+        assert!(
+            large_diff.contains("\n[operation diff truncated — exceeded 16384 bytes; "),
+            "truncation must be explicit on the wire"
+        );
+        assert!(large_wire.contains("[operation diff truncated"));
+        assert!(large_diff.contains("\n-value_0000 = OLD\n"));
+    }
+
+    #[test]
+    fn edit_file_operation_diff_truncation_claims_stay_factual_on_the_wire() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("claw-edit-budget-{unique}"));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("f");
+        let shown = path.to_string_lossy().into_owned();
+        let headers = format!("--- {shown}\n+++ {shown}\n@@ -1,1 +1,1 @@\n");
+        let registry = GlobalToolRegistry::builtin();
+        let edit_on_the_wire = |before: &str, after: &str| -> (String, String) {
+            fs::write(&path, before).expect("seed file");
+            let output = registry
+                .execute(
+                    "edit_file",
+                    &json!({ "path": path, "old_string": before, "new_string": after }),
+                )
+                .expect("whole-file edit");
+            assert_eq!(fs::read_to_string(&path).expect("edited file"), after);
+            let messages = vec![ConversationMessage {
+                role: MessageRole::Tool,
+                blocks: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_budget".to_string(),
+                    tool_name: "edit_file".to_string(),
+                    output: output.clone(),
+                    is_error: false,
+                }],
+                usage: None,
+            }];
+            let converted = super::convert_messages(&messages);
+            let wire = api::translate_message(&converted[0], "local-model");
+            assert_eq!(wire.len(), 1);
+            assert_eq!(wire[0]["role"], "tool");
+            let content = wire[0]["content"]
+                .as_str()
+                .expect("string content")
+                .to_string();
+            assert_eq!(content, output, "edit results reach the model verbatim");
+            let diff = serde_json::from_str::<Value>(&content).expect("json")["operationDiff"]
+                .as_str()
+                .expect("operationDiff must be model-visible")
+                .to_string();
+            (content, diff)
+        };
+
+        // A complete diff of exactly 16 384 bytes: whole, no marker.
+        let line = (16_384 - headers.len()) / 2 - 2;
+        let before = format!("{}\n", "a".repeat(line));
+        let after = format!("{}\n", "b".repeat(line));
+        let complete = format!("{headers}-{before}+{after}");
+        assert_eq!(complete.len(), 16_384);
+        let (content, diff) = edit_on_the_wire(&before, &after);
+        assert_eq!(diff, complete);
+        assert!(!content.contains("[operation diff truncated"));
+
+        // Over the budget: the marker's count of omitted rendered lines
+        // includes both `\ No newline at end of file` annotations.
+        let (before, after) = ("a".repeat(17_000), "b".repeat(17_000));
+        let (_, diff) = edit_on_the_wire(&before, &after);
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(
+            diff,
+            format!(
+                "{headers}[operation diff truncated — exceeded 16384 bytes; 4 more diff lines omitted]\n"
+            )
+        );
+    }
+
+    #[test]
+    fn insertion_operation_diff_reaches_the_openai_tool_message() {
+        // Real `insert_before` / `insert_after` results carried along the
+        // live model path: tool registry -> `convert_messages` ->
+        // OpenAI-compatible `role:"tool"` message, i.e. what the next turn
+        // reads. The fixture has a method/class boundary; names are unrelated.
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("claw-insert-wire-{unique}"));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("test_shapes.py");
+        let original = "import unittest\n\n\nclass SquareTests(unittest.TestCase):\n    def test_area(self):\n        self.assertEqual(4, 2 * 2)\n\n\nclass CircleTests(unittest.TestCase):\n    def test_radius(self):\n        self.assertEqual(1, 1)\n";
+        fs::write(&path, original).expect("seed file");
+        let shown = fs::canonicalize(&path)
+            .expect("canonical path")
+            .to_string_lossy()
+            .into_owned();
+
+        let registry = GlobalToolRegistry::builtin();
+        let added = "    def test_side(self):\n        self.assertEqual(2, 4 // 2)\n\n\n";
+        let before_output = registry
+            .execute(
+                "insert_before",
+                &json!({ "path": path, "anchor": "class CircleTests(unittest.TestCase):", "content": added }),
+            )
+            .expect("insert_before");
+        let after_output = registry
+            .execute(
+                "insert_after",
+                &json!({ "path": path, "anchor": "import unittest\n", "content": "import math\n" }),
+            )
+            .expect("insert_after");
+        let expected = original
+            .replacen("import unittest\n", "import unittest\nimport math\n", 1)
+            .replacen("class CircleTests", &format!("{added}class CircleTests"), 1);
+        assert_eq!(fs::read_to_string(&path).expect("file"), expected);
+        let large_output = registry
+            .execute(
+                "insert_after",
+                &json!({ "path": path, "anchor": "import math\n", "content": "X = 0\n".repeat(4_000) }),
+            )
+            .expect("large insert_after");
+        let _ = fs::remove_dir_all(&dir);
+
+        let to_wire = |id: &str, tool: &str, output: &str| -> Value {
+            let messages = vec![ConversationMessage {
+                role: MessageRole::Tool,
+                blocks: vec![ContentBlock::ToolResult {
+                    tool_use_id: id.to_string(),
+                    tool_name: tool.to_string(),
+                    output: output.to_string(),
+                    is_error: false,
+                }],
+                usage: None,
+            }];
+            let converted = super::convert_messages(&messages);
+            let wire = api::translate_message(&converted[0], "local-model");
+            assert_eq!(wire.len(), 1);
+            assert_eq!(wire[0]["role"], "tool");
+            assert_eq!(wire[0]["tool_call_id"], id);
+            let content = wire[0]["content"].as_str().expect("string content");
+            assert_eq!(
+                content, output,
+                "insertion results reach the model verbatim"
+            );
+            let result: Value = serde_json::from_str(content).expect("json");
+            assert_eq!(result["success"], true);
+            assert_eq!(result["filePath"], shown.as_str());
+            assert!(content.find("\"filePath\":") < content.find("\"operationDiff\":"));
+            result
+        };
+        let diff_of = |result: &Value| -> String {
+            result["operationDiff"]
+                .as_str()
+                .expect("operationDiff must be model-visible")
+                .to_string()
+        };
+        let removed = |diff: &str| {
+            diff.lines()
+                .skip(2)
+                .filter(|line| line.starts_with('-'))
+                .count()
+        };
+
+        let before_diff = diff_of(&to_wire("call_before", "insert_before", &before_output));
+        assert_eq!(
+            before_diff,
+            format!(
+                "--- {shown}\n+++ {shown}\n@@ -6,6 +6,10 @@\n         self.assertEqual(4, 2 * 2)\n \n \n+    def test_side(self):\n+        self.assertEqual(2, 4 // 2)\n+\n+\n class CircleTests(unittest.TestCase):\n     def test_radius(self):\n         self.assertEqual(1, 1)\n"
+            )
+        );
+        let after_diff = diff_of(&to_wire("call_after", "insert_after", &after_output));
+        assert_eq!(removed(&after_diff), 0, "{after_diff}");
+        assert!(after_diff.contains("\n import unittest\n+import math\n \n"));
+
+        let large_diff = diff_of(&to_wire("call_large", "insert_after", &large_output));
+        assert_eq!(removed(&large_diff), 0);
+        assert!(large_diff.len() <= 16_384, "{} bytes", large_diff.len());
+        assert!(
+            large_diff.contains("\n[operation diff truncated — exceeded 16384 bytes; "),
+            "truncation must be explicit on the wire"
         );
     }
 
@@ -18970,7 +19845,7 @@ UU conflicted.rs",
             ["--workspace-confine=/x", "--workspace-confine=/y"],
             ["--workspace-confine", "--workspace-confine"],
         ] {
-            let error = super::extract_workspace_confine(&confine_args(&args))
+            let error = super::extract_process_flags(&confine_args(&args))
                 .expect_err("a repeated confinement root is ambiguous");
             assert_eq!(
                 error, "--workspace-confine may be given only once",
@@ -18983,8 +19858,8 @@ UU conflicted.rs",
     fn bare_workspace_confine_never_consumes_a_separated_path() {
         let cwd = temp_dir();
         fs::create_dir_all(&cwd).expect("cwd");
-        let (filtered, root) = with_current_dir(&cwd, || {
-            super::extract_workspace_confine(&confine_args(&[
+        let (filtered, _, root, _, _) = with_current_dir(&cwd, || {
+            super::extract_process_flags(&confine_args(&[
                 "--workspace-confine",
                 "/tmp/work",
                 "prompt",
@@ -19003,6 +19878,3183 @@ UU conflicted.rs",
             "a bare flag always confines to the current directory"
         );
         let _ = fs::remove_dir_all(cwd);
+    }
+
+    // ---- CLI_START seam: operator-declared writable files ----
+
+    fn extract_confined(args: &[&str]) -> Result<super::ProcessFlags, String> {
+        super::extract_process_flags(&confine_args(args))
+    }
+
+    #[test]
+    fn workspace_confine_write_is_repeatable_in_declaration_order() {
+        let (filtered, _, root, writable, _) = extract_confined(&[
+            "--workspace-confine=/tmp/work",
+            "--workspace-confine-write",
+            "scripts/pretty_print_planner_output.py",
+            "--workspace-confine-write=tests/a2_l4/test_pretty_print_planner_output.py",
+            "prompt",
+            "repair",
+        ])
+        .expect("repeated writable declarations should parse");
+        assert_eq!(root, Some(PathBuf::from("/tmp/work")));
+        assert_eq!(
+            writable,
+            vec![
+                "scripts/pretty_print_planner_output.py".to_string(),
+                "tests/a2_l4/test_pretty_print_planner_output.py".to_string(),
+            ]
+        );
+        assert_eq!(
+            filtered,
+            confine_args(&["prompt", "repair"]),
+            "process-only flags must not reach the action parser"
+        );
+    }
+
+    #[test]
+    fn workspace_confine_write_requires_a_non_empty_value() {
+        for args in [
+            &["--workspace-confine", "--workspace-confine-write"][..],
+            &[
+                "--workspace-confine",
+                "--workspace-confine-write",
+                "--model",
+                "x",
+            ][..],
+            &["--workspace-confine", "--workspace-confine-write", ""][..],
+            &["--workspace-confine", "--workspace-confine-write="][..],
+        ] {
+            let error =
+                extract_confined(args).expect_err("a missing writable path must be refused");
+            assert_eq!(
+                error, "missing value for --workspace-confine-write",
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_confine_write_without_confinement_is_refused() {
+        for args in [
+            &["--workspace-confine-write", "scripts/a.py", "status"][..],
+            &["--workspace-confine-write=scripts/a.py", "prompt", "x"][..],
+        ] {
+            let error = extract_confined(args).expect_err("writes without a root must be refused");
+            assert_eq!(
+                error, "--workspace-confine-write requires --workspace-confine",
+                "{args:?}"
+            );
+            parse_confined(args).expect_err("the full parser must refuse it too");
+        }
+    }
+
+    #[test]
+    fn bare_workspace_confine_with_writes_keeps_the_prompt_action() {
+        let cwd = temp_dir();
+        fs::create_dir_all(&cwd).expect("cwd");
+        let (action, root) = with_current_dir(&cwd, || {
+            parse_confined(&[
+                "--workspace-confine",
+                "--workspace-confine-write",
+                "a.py",
+                "prompt",
+                "repair",
+            ])
+        })
+        .expect("bare flag with a writable declaration should parse");
+        assert_eq!(root, Some(fs::canonicalize(&cwd).expect("canonical cwd")));
+        assert!(
+            matches!(&action, CliAction::Prompt { prompt, .. } if prompt == "repair"),
+            "the action and prompt must survive, got {action:?}"
+        );
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn declared_writable_files_confine_a_workspace_without_the_calculator_fixture() {
+        let workspace = temp_dir();
+        fs::create_dir_all(workspace.join("scripts")).expect("scripts");
+        fs::create_dir_all(workspace.join("tests")).expect("tests");
+        fs::write(workspace.join("scripts/a.py"), "a\n").expect("a");
+        fs::write(workspace.join("tests/b.py"), "b\n").expect("b");
+        fs::write(workspace.join("README.md"), "readme\n").expect("readme");
+
+        let confinement = super::build_workspace_confinement(
+            &workspace,
+            &["scripts/a.py".to_string(), "tests/b.py".to_string()],
+            &[],
+        )
+        .expect("declared files must confine a workspace without the calculator fixture");
+        for declared in ["scripts/a.py", "tests/b.py"] {
+            confinement
+                .root()
+                .write_file(declared, "changed\n")
+                .expect("a declared file is writable");
+        }
+        confinement
+            .root()
+            .write_file("README.md", "pwned\n")
+            .expect_err("an unlisted file is not writable");
+        assert_eq!(
+            fs::read_to_string(workspace.join("README.md")).expect("readme"),
+            "readme\n"
+        );
+
+        // NEGATIVE CONTROL: without declarations the controlled smoke is
+        // selected, and it still refuses a workspace lacking its fixture.
+        let error = super::build_workspace_confinement(&workspace, &[], &[])
+            .expect_err("the controlled smoke still requires its fixture");
+        assert!(error.contains("controlled fixture rejected"), "{error}");
+
+        let outside = workspace.join("..").join("claw-outside-declared");
+        for invalid in [
+            "../outside.py",
+            "/etc/hostname",
+            "missing.py",
+            outside.to_str().expect("utf8"),
+        ] {
+            super::build_workspace_confinement(&workspace, &[invalid.to_string()], &[])
+                .expect_err("an invalid declaration must fail closed");
+        }
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    // ---- Command-policy seam: operator-declared bash commands ----
+
+    const NORTH_STAR_TEST: &str =
+        "python3 -B -m unittest discover -v -s tests/a2_l4 -p test_pretty_print_planner_output.py";
+    const SMOKE_COMMAND: &str = "python3 -B -m unittest -v test_calculator";
+
+    #[test]
+    fn workspace_confine_bash_command_is_repeatable_in_declaration_order() {
+        let (filtered, _, root, writable, commands) = extract_confined(&[
+            "--workspace-confine=/tmp/work",
+            "--workspace-confine-bash-command",
+            NORTH_STAR_TEST,
+            "--workspace-confine-write",
+            "scripts/a.py",
+            "--workspace-confine-bash-command=python3 -B -m py_compile scripts/a.py",
+            "prompt",
+            "repair",
+        ])
+        .expect("repeated command declarations should parse");
+        assert_eq!(root, Some(PathBuf::from("/tmp/work")));
+        assert_eq!(writable, vec!["scripts/a.py".to_string()]);
+        assert_eq!(
+            commands,
+            vec![
+                NORTH_STAR_TEST.to_string(),
+                "python3 -B -m py_compile scripts/a.py".to_string(),
+            ]
+        );
+        assert_eq!(
+            filtered,
+            confine_args(&["prompt", "repair"]),
+            "process-only flags must not reach the action parser"
+        );
+    }
+
+    #[test]
+    fn workspace_confine_bash_command_requires_a_non_empty_value() {
+        for args in [
+            &["--workspace-confine", "--workspace-confine-bash-command"][..],
+            &[
+                "--workspace-confine",
+                "--workspace-confine-bash-command",
+                "--model",
+                "x",
+            ][..],
+            &[
+                "--workspace-confine",
+                "--workspace-confine-bash-command",
+                "",
+            ][..],
+            &["--workspace-confine", "--workspace-confine-bash-command="][..],
+        ] {
+            let error = extract_confined(args).expect_err("a missing command must be refused");
+            assert_eq!(
+                error, "missing value for --workspace-confine-bash-command",
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_confine_bash_command_without_confinement_is_refused() {
+        for args in [
+            &[
+                "--workspace-confine-bash-command",
+                NORTH_STAR_TEST,
+                "status",
+            ][..],
+            &[
+                "--workspace-confine-bash-command=python3 -B x",
+                "prompt",
+                "x",
+            ][..],
+        ] {
+            let error =
+                extract_confined(args).expect_err("commands without a root must be refused");
+            assert_eq!(
+                error, "--workspace-confine-bash-command requires --workspace-confine",
+                "{args:?}"
+            );
+            parse_confined(args).expect_err("the full parser must refuse it too");
+        }
+    }
+
+    #[test]
+    fn prompt_text_never_declares_a_bash_command() {
+        // A prompt naming a command, or the flag itself, mid-text is prompt
+        // text and nothing else.
+        let mention =
+            format!("run {NORTH_STAR_TEST} --workspace-confine-bash-command=python3 -B -m evil");
+        let (filtered, _, _, _, commands) =
+            extract_confined(&["--workspace-confine=/tmp/work", "prompt", mention.as_str()])
+                .expect("a prompt mentioning a command should parse");
+        assert!(commands.is_empty(), "{commands:?}");
+        assert_eq!(filtered, confine_args(&["prompt", mention.as_str()]));
+
+        // A declaration-shaped argument after `prompt` or `-p` is refused,
+        // never taken as operator authority.
+        for args in [
+            &[
+                "--workspace-confine=/tmp/work",
+                "prompt",
+                "--workspace-confine-bash-command=python3 -B -m evil",
+            ][..],
+            &[
+                "--workspace-confine=/tmp/work",
+                "prompt",
+                "repair",
+                "--workspace-confine-bash-command",
+                "python3 -B -m evil",
+            ][..],
+            &[
+                "--workspace-confine=/tmp/work",
+                "-p",
+                "--workspace-confine-bash-command=python3 -B -m evil",
+            ][..],
+        ] {
+            let error = extract_confined(args).expect_err("prompt text must not declare");
+            assert_eq!(
+                error, "--workspace-confine-bash-command must come before the prompt or subcommand",
+                "{args:?}"
+            );
+            parse_confined(args).expect_err("the full parser must refuse it too");
+        }
+
+        // NEGATIVE CONTROL: the same declaration before the prompt counts.
+        let (_, _, _, _, commands) = extract_confined(&[
+            "--workspace-confine=/tmp/work",
+            "--workspace-confine-bash-command=python3 -B -m evil",
+            "prompt",
+            "repair",
+        ])
+        .expect("a declaration before the prompt should parse");
+        assert_eq!(commands, vec!["python3 -B -m evil".to_string()]);
+    }
+
+    #[test]
+    fn declared_bash_commands_select_the_generic_policy() {
+        let workspace = temp_dir();
+        fs::create_dir_all(workspace.join("scripts")).expect("scripts");
+        fs::write(workspace.join("scripts/a.py"), "a\n").expect("a");
+        let declared = [NORTH_STAR_TEST.to_string()];
+        let writable = ["scripts/a.py".to_string()];
+
+        // Commands alone select the generic policy (no calculator fixture):
+        // only the declared command is approved and nothing is writable.
+        let confinement = super::build_workspace_confinement(&workspace, &[], &declared)
+            .expect("declared commands alone must confine a workspace");
+        assert!(confinement.approved_command(NORTH_STAR_TEST).is_some());
+        assert!(confinement.approved_command(SMOKE_COMMAND).is_none());
+        confinement
+            .root()
+            .write_file("scripts/a.py", "pwned\n")
+            .expect_err("nothing is writable without a writable declaration");
+
+        // Both kinds of declaration apply together.
+        let confinement = super::build_workspace_confinement(&workspace, &writable, &declared)
+            .expect("writes and commands together must confine a workspace");
+        assert!(confinement.approved_command(NORTH_STAR_TEST).is_some());
+        confinement
+            .root()
+            .write_file("scripts/a.py", "changed\n")
+            .expect("a declared file is writable");
+
+        // NEGATIVE CONTROL: writes alone approve no command, not even the
+        // controlled smoke's.
+        let confinement = super::build_workspace_confinement(&workspace, &writable, &[])
+            .expect("writes alone must confine a workspace");
+        assert!(confinement.approved_command(NORTH_STAR_TEST).is_none());
+        assert!(confinement.approved_command(SMOKE_COMMAND).is_none());
+
+        for invalid in [
+            format!("{NORTH_STAR_TEST}; touch README.md"),
+            "bash -c true".to_string(),
+            "python3 -c 'print(1)'".to_string(),
+        ] {
+            let error = super::build_workspace_confinement(
+                &workspace,
+                &writable,
+                std::slice::from_ref(&invalid),
+            )
+            .expect_err("an invalid command declaration must fail closed");
+            assert!(
+                error.contains("declared bash command rejected"),
+                "{invalid}: {error}"
+            );
+        }
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    // ---- PR #184 review repair: process flags only in the option region (P1) ----
+
+    const BOUNDARY_COMMAND: &str = "python3 -B -m unittest";
+
+    /// A bare prompt, the `prompt` subcommand, and `-p`.
+    const PROMPT_SHAPES: [&[&str]; 3] = [&["fix", "it"], &["prompt", "repair"], &["-p", "repair"]];
+
+    fn after_option_region(flag: &str) -> String {
+        format!("{flag} must come before the prompt or subcommand")
+    }
+
+    /// A workspace holding the real files the declarations below name, so a
+    /// refusal is the boundary's and never a missing file's.
+    fn boundary_workspace() -> PathBuf {
+        let workspace = temp_dir();
+        fs::create_dir_all(workspace.join("scripts")).expect("scripts");
+        fs::write(workspace.join("README.md"), "readme\n").expect("readme");
+        fs::write(workspace.join("scripts/a.py"), "a\n").expect("a");
+        workspace
+    }
+
+    fn boundary_args(parts: &[&[&str]]) -> Vec<String> {
+        parts.iter().flat_map(|part| confine_args(part)).collect()
+    }
+
+    /// `args` names `flag` after the option region, where it is action or
+    /// prompt text. Nothing may be declared from there: extraction and the
+    /// full parser both refuse the whole invocation, naming the flag.
+    fn assert_declares_nothing_after_options(args: &[String], flag: &str) {
+        match super::extract_process_flags(args) {
+            Ok((filtered, data_dir, root, writable, commands)) => panic!(
+                "{args:?} declared process authority: root={root:?} writable={writable:?} \
+                 commands={commands:?} data_dir={data_dir:?} filtered={filtered:?}"
+            ),
+            Err(error) => assert_eq!(error, after_option_region(flag), "{args:?}"),
+        }
+        super::parse_full_invocation_with_terminal(args, true, true)
+            .expect_err("the full parser must refuse it too");
+    }
+
+    /// The same declaration in the option region of a bare prompt binds, so a
+    /// refusal of it after the prompt is the boundary's.
+    fn bind_before_bare_prompt(
+        workspace: &Path,
+        declaration: &[&str],
+    ) -> tools::WorkspaceConfinement {
+        let confine = format!("--workspace-confine={}", workspace.display());
+        let args = boundary_args(&[&[confine.as_str()], declaration, &["fix", "it"]]);
+        let (filtered, _, root, writable, commands) = super::extract_process_flags(&args)
+            .expect("a declaration before the prompt should parse");
+        assert_eq!(filtered, confine_args(&["fix", "it"]), "{args:?}");
+        super::build_workspace_confinement(&root.expect("root"), &writable, &commands)
+            .expect("the declaration names a real file or a valid command")
+    }
+
+    #[test]
+    fn bare_prompt_writable_equals_declares_nothing() {
+        let workspace = boundary_workspace();
+        let confine = format!("--workspace-confine={}", workspace.display());
+        let declaration = &["--workspace-confine-write=README.md"][..];
+        assert_declares_nothing_after_options(
+            &boundary_args(&[&[confine.as_str(), "fix", "it"], declaration]),
+            "--workspace-confine-write",
+        );
+        bind_before_bare_prompt(&workspace, declaration)
+            .root()
+            .write_file("README.md", "changed\n")
+            .expect("README.md is writable when declared before the prompt");
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn bare_prompt_writable_split_declares_nothing() {
+        let workspace = boundary_workspace();
+        let confine = format!("--workspace-confine={}", workspace.display());
+        let declaration = &["--workspace-confine-write", "README.md"][..];
+        assert_declares_nothing_after_options(
+            &boundary_args(&[&[confine.as_str(), "fix", "it"], declaration]),
+            "--workspace-confine-write",
+        );
+        bind_before_bare_prompt(&workspace, declaration)
+            .root()
+            .write_file("README.md", "changed\n")
+            .expect("README.md is writable when declared before the prompt");
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn bare_prompt_bash_command_declares_nothing() {
+        let workspace = boundary_workspace();
+        let confine = format!("--workspace-confine={}", workspace.display());
+        let equals = format!("--workspace-confine-bash-command={BOUNDARY_COMMAND}");
+        for declaration in [
+            &["--workspace-confine-bash-command", BOUNDARY_COMMAND][..],
+            &[equals.as_str()][..],
+        ] {
+            assert_declares_nothing_after_options(
+                &boundary_args(&[&[confine.as_str(), "fix", "it"], declaration]),
+                "--workspace-confine-bash-command",
+            );
+            assert!(
+                bind_before_bare_prompt(&workspace, declaration)
+                    .approved_command(BOUNDARY_COMMAND)
+                    .is_some(),
+                "the command is approved when declared before the prompt"
+            );
+        }
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn prompt_subcommand_writable_declaration_declares_nothing() {
+        for declaration in [
+            &["--workspace-confine-write", "README.md"][..],
+            &["--workspace-confine-write=README.md"][..],
+        ] {
+            assert_declares_nothing_after_options(
+                &boundary_args(&[
+                    &["--workspace-confine=/tmp/work", "prompt", "repair"],
+                    declaration,
+                ]),
+                "--workspace-confine-write",
+            );
+        }
+    }
+
+    #[test]
+    fn dash_p_writable_declaration_declares_nothing() {
+        for declaration in [
+            &["--workspace-confine-write", "README.md"][..],
+            &["--workspace-confine-write=README.md"][..],
+        ] {
+            assert_declares_nothing_after_options(
+                &boundary_args(&[
+                    &["--workspace-confine=/tmp/work", "-p", "repair"],
+                    declaration,
+                ]),
+                "--workspace-confine-write",
+            );
+        }
+    }
+
+    #[test]
+    fn a_declaration_in_the_option_region_does_not_admit_one_after_it() {
+        // A valid declaration before the prompt must not rescue a second one
+        // in the prompt text: the whole invocation is refused.
+        let before_command = format!("--workspace-confine-bash-command={BOUNDARY_COMMAND}");
+        for prompt in PROMPT_SHAPES {
+            for (flag, before, after) in [
+                (
+                    "--workspace-confine-write",
+                    &["--workspace-confine-write", "scripts/a.py"][..],
+                    &["--workspace-confine-write", "README.md"][..],
+                ),
+                (
+                    "--workspace-confine-write",
+                    &["--workspace-confine-write=scripts/a.py"][..],
+                    &["--workspace-confine-write=README.md"][..],
+                ),
+                (
+                    "--workspace-confine-bash-command",
+                    &["--workspace-confine-bash-command", BOUNDARY_COMMAND][..],
+                    &["--workspace-confine-bash-command", "python3 -B -m evil"][..],
+                ),
+                (
+                    "--workspace-confine-bash-command",
+                    &[before_command.as_str()][..],
+                    &["--workspace-confine-bash-command=python3 -B -m evil"][..],
+                ),
+            ] {
+                assert_declares_nothing_after_options(
+                    &boundary_args(&[&["--workspace-confine=/tmp/work"], before, prompt, after]),
+                    flag,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prompt_text_never_sets_the_confinement_root() {
+        let cwd = temp_dir();
+        fs::create_dir_all(&cwd).expect("cwd");
+        with_current_dir(&cwd, || {
+            for prompt in PROMPT_SHAPES {
+                for tail in [
+                    &["--workspace-confine=/elsewhere"][..],
+                    &["--workspace-confine"][..],
+                ] {
+                    // Without a root in the option region, the tail must not
+                    // confine; with one, it must neither replace nor repeat it.
+                    for leading in [&[][..], &["--workspace-confine=/tmp/work"][..]] {
+                        assert_declares_nothing_after_options(
+                            &boundary_args(&[leading, prompt, tail]),
+                            "--workspace-confine",
+                        );
+                    }
+                }
+            }
+        });
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn prompt_text_never_sets_the_data_dir() {
+        for prompt in PROMPT_SHAPES {
+            for tail in [
+                &["--data-dir", "/elsewhere"][..],
+                &["--data-dir=/elsewhere"][..],
+            ] {
+                assert_declares_nothing_after_options(
+                    &boundary_args(&[prompt, tail]),
+                    "--data-dir",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_prompt_argument_mentioning_a_flag_stays_prompt_text() {
+        // One argument that merely contains a flag is a word of the prompt,
+        // never a declaration.
+        let mention = "repair --workspace-confine-write=README.md --data-dir=/elsewhere";
+        for prompt in [
+            &[mention][..],
+            &["prompt", mention][..],
+            &["-p", mention][..],
+        ] {
+            let (filtered, data_dir, _, writable, commands) =
+                super::extract_process_flags(&boundary_args(&[
+                    &["--workspace-confine=/tmp/work"],
+                    prompt,
+                ]))
+                .expect("a prompt mentioning a flag should parse");
+            assert_eq!(filtered, confine_args(prompt));
+            assert_eq!(data_dir, None);
+            assert!(writable.is_empty() && commands.is_empty(), "{prompt:?}");
+        }
+    }
+
+    #[test]
+    fn option_values_never_start_the_prompt() {
+        // The value of a recognized option is consumed with it, whatever it
+        // spells, so the declarations after it are still in the option region.
+        let command = format!("--workspace-confine-bash-command={BOUNDARY_COMMAND}");
+        for (option, value) in [
+            ("--model", "prompt"),
+            ("--model", "-p"),
+            ("--base-commit", "prompt"),
+            ("--base-commit", "-p"),
+            ("--output-format", "text"),
+            ("--permission-mode", "prompt"),
+            ("--reasoning-effort", "-p"),
+            ("--allowedTools", "prompt"),
+            ("--allowed-tools", "-p"),
+            ("--data-dir", "prompt"),
+            ("--workspace-confine-write", "prompt"),
+        ] {
+            let args = boundary_args(&[
+                &["--workspace-confine=/tmp/work", option, value],
+                &["--workspace-confine-write=README.md", command.as_str()],
+                &["prompt", "repair"],
+            ]);
+            let (filtered, data_dir, root, writable, commands) =
+                super::extract_process_flags(&args)
+                    .unwrap_or_else(|error| panic!("{args:?}: {error}"));
+            assert_eq!(root, Some(PathBuf::from("/tmp/work")), "{args:?}");
+            assert_eq!(commands, confine_args(&[BOUNDARY_COMMAND]), "{args:?}");
+            match option {
+                "--data-dir" => {
+                    assert_eq!(data_dir, Some(PathBuf::from(value)));
+                    assert_eq!(writable, confine_args(&["README.md"]));
+                    assert_eq!(filtered, confine_args(&["prompt", "repair"]));
+                }
+                "--workspace-confine-write" => {
+                    assert_eq!(writable, confine_args(&[value, "README.md"]));
+                    assert_eq!(filtered, confine_args(&["prompt", "repair"]));
+                }
+                _ => {
+                    assert_eq!(writable, confine_args(&["README.md"]), "{args:?}");
+                    assert_eq!(filtered, confine_args(&[option, value, "prompt", "repair"]));
+                }
+            }
+        }
+
+        // The action parser agrees: the value is the option's, and the prompt
+        // is what follows `prompt`.
+        for value in ["prompt", "-p"] {
+            let (action, _) = parse_confined(&[
+                "--workspace-confine=/tmp/work",
+                "--base-commit",
+                value,
+                "--workspace-confine-write=README.md",
+                "prompt",
+                "repair",
+            ])
+            .expect("a value spelled like a prompt marker should parse");
+            assert!(
+                matches!(&action, CliAction::Prompt { prompt, base_commit, .. }
+                    if prompt == "repair" && base_commit.as_deref() == Some(value)),
+                "{action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_option_value_never_declares_process_authority() {
+        // The action parser takes the argument after `--base-commit` as its
+        // value whatever it spells, so it never also declares a process flag.
+        let command = format!("--workspace-confine-bash-command={BOUNDARY_COMMAND}");
+        for value in [
+            "--workspace-confine-write=README.md",
+            command.as_str(),
+            "--workspace-confine=/elsewhere",
+            "--data-dir=/elsewhere",
+        ] {
+            let args = confine_args(&[
+                "--workspace-confine=/tmp/work",
+                "--base-commit",
+                value,
+                "prompt",
+                "repair",
+            ]);
+            let (filtered, data_dir, root, writable, commands) =
+                super::extract_process_flags(&args)
+                    .unwrap_or_else(|error| panic!("{args:?}: {error}"));
+            assert_eq!(root, Some(PathBuf::from("/tmp/work")), "{value}");
+            assert_eq!(data_dir, None, "{value}");
+            assert!(writable.is_empty() && commands.is_empty(), "{value}");
+            assert_eq!(
+                filtered,
+                confine_args(&["--base-commit", value, "prompt", "repair"])
+            );
+        }
+    }
+
+    /// Arguments that declare process authority when read as options, each
+    /// after the option region it needs.
+    const AUTHORITY_GRANTS: [(&[&str], &[&str]); 8] = [
+        (&[], &["--workspace-confine=/elsewhere"]),
+        (&[], &["--workspace-confine"]),
+        (&[], &["--data-dir=/elsewhere"]),
+        (&[], &["--data-dir", "/elsewhere"]),
+        (
+            &["--workspace-confine=/tmp/work"],
+            &["--workspace-confine-write=README.md"],
+        ),
+        (
+            &["--workspace-confine=/tmp/work"],
+            &["--workspace-confine-write", "README.md"],
+        ),
+        (
+            &["--workspace-confine=/tmp/work"],
+            &["--workspace-confine-bash-command=python3 -B -m unittest"],
+        ),
+        (
+            &["--workspace-confine=/tmp/work"],
+            &["--workspace-confine-bash-command", BOUNDARY_COMMAND],
+        ),
+    ];
+
+    /// `extracted` must be the refusal of `option` as unknown, with nothing
+    /// declared.
+    fn assert_refused_as_unknown(
+        extracted: Result<super::ProcessFlags, String>,
+        args: &[String],
+        option: &str,
+    ) {
+        match extracted {
+            Ok((filtered, data_dir, root, writable, commands)) => panic!(
+                "{args:?} was classified past {option}: root={root:?} writable={writable:?} \
+                 commands={commands:?} data_dir={data_dir:?} filtered={filtered:?}"
+            ),
+            Err(error) => assert_eq!(error, super::format_unknown_option(option), "{args:?}"),
+        }
+    }
+
+    /// `args` gives the unknown option `option` in the option region:
+    /// extraction and the full parser both refuse it before any process flag
+    /// is read.
+    fn assert_unknown_option_refused(args: &[String], option: &str) {
+        assert_refused_as_unknown(super::extract_process_flags(args), args, option);
+        assert_eq!(
+            super::parse_full_invocation_with_terminal(args, true, true).map(|_| ()),
+            Err(super::format_unknown_option(option)),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_leading_option_is_refused_before_any_process_flag() {
+        // An option the classifier does not know may take a value it cannot
+        // see, so neither the argument after it nor anything later may be
+        // read as a declaration: the invocation is refused.
+        for unknown in ["--future-flag", "--future-flag=1", "-x"] {
+            for (region, grant) in AUTHORITY_GRANTS {
+                for between in [&[][..], &["value"][..]] {
+                    assert_unknown_option_refused(
+                        &boundary_args(&[
+                            region,
+                            &[unknown],
+                            between,
+                            grant,
+                            &["prompt", "repair"],
+                        ]),
+                        unknown,
+                    );
+                }
+            }
+        }
+        // A valid option before it does not change that.
+        assert_unknown_option_refused(
+            &confine_args(&[
+                "--workspace-confine=/tmp/work",
+                "--model",
+                "sonnet",
+                "--workspace-confine-write=scripts/a.py",
+                "--future-flag",
+                "--workspace-confine-write=README.md",
+                "prompt",
+                "repair",
+            ]),
+            "--future-flag",
+        );
+    }
+
+    #[test]
+    fn an_unknown_option_before_the_prompt_is_refused() {
+        for action in [
+            &["prompt", "repair"][..],
+            &["fix", "it"][..],
+            &["-p", "repair"][..],
+            &["status"][..],
+            &[][..],
+        ] {
+            assert_unknown_option_refused(
+                &boundary_args(&[&["--workspace-confine=/tmp/work", "--future-flag"], action]),
+                "--future-flag",
+            );
+        }
+    }
+
+    #[test]
+    fn option_shaped_text_after_the_option_region_is_left_to_the_action() {
+        // The region ends at the action; what follows is never classified, so
+        // an unknown option there is the action parser's, as before.
+        for action in [
+            &["prompt", "repair", "--future-flag"][..],
+            &["fix", "--future-flag", "it"][..],
+            &["-p", "repair", "--future-flag"][..],
+            &["status", "--future-flag"][..],
+            &["--resume", "latest", "--future-flag"][..],
+        ] {
+            let args = boundary_args(&[&["--workspace-confine=/tmp/work"], action]);
+            let (filtered, _, root, writable, commands) = super::extract_process_flags(&args)
+                .unwrap_or_else(|error| panic!("{args:?}: {error}"));
+            assert_eq!(root, Some(PathBuf::from("/tmp/work")), "{action:?}");
+            assert!(writable.is_empty() && commands.is_empty(), "{action:?}");
+            assert_eq!(filtered, confine_args(action));
+        }
+    }
+
+    /// Extract under [`super::LEADING_OPTIONS`] with `option` forgotten.
+    fn extract_forgetting(option: &str, args: &[String]) -> Result<super::ProcessFlags, String> {
+        let known = super::LEADING_OPTIONS
+            .iter()
+            .copied()
+            .filter(|spec| spec.name != option)
+            .collect::<Vec<_>>();
+        super::extract_process_flags_in(super::OptionGrammar(&known), args)
+    }
+
+    #[test]
+    fn forgetting_base_commit_refuses_instead_of_granting_a_write() {
+        // The action parser takes the argument after `--base-commit` as its
+        // value. A classifier that forgot that must not read the value as a
+        // declaration and make README.md writable.
+        let workspace = boundary_workspace();
+        let confine = format!("--workspace-confine={}", workspace.display());
+        let command = format!("--workspace-confine-bash-command={BOUNDARY_COMMAND}");
+        let args = confine_args(&[
+            confine.as_str(),
+            command.as_str(),
+            "--base-commit",
+            "--workspace-confine-write=README.md",
+            "prompt",
+            "repair",
+        ]);
+        let core = super::parse_args_core(
+            &confine_args(&["--base-commit", "prompt", "repair"]),
+            true,
+            true,
+        );
+        assert!(
+            matches!(&core, Ok(CliAction::Prompt { prompt, base_commit, .. })
+                if prompt == "repair" && base_commit.as_deref() == Some("prompt")),
+            "{core:?}"
+        );
+
+        // NEGATIVE CONTROL: the full grammar gives the value to the option.
+        let (_, _, root, writable, commands) =
+            super::extract_process_flags(&args).expect("the value belongs to --base-commit");
+        assert!(writable.is_empty(), "{writable:?}");
+        super::build_workspace_confinement(&root.expect("root"), &writable, &commands)
+            .expect("binds")
+            .root()
+            .write_file("README.md", "changed\n")
+            .expect_err("README.md is not writable");
+
+        assert_refused_as_unknown(
+            extract_forgetting("--base-commit", &args),
+            &args,
+            "--base-commit",
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("README.md")).expect("readme"),
+            "readme\n"
+        );
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn forgetting_model_refuses_instead_of_reading_its_value_as_a_declaration() {
+        for grant in [
+            &["--workspace-confine-write=README.md"][..],
+            &["--workspace-confine-bash-command", BOUNDARY_COMMAND][..],
+        ] {
+            let args = boundary_args(&[
+                &["--workspace-confine=/tmp/work", "--model"],
+                grant,
+                &["prompt", "repair"],
+            ]);
+            // NEGATIVE CONTROL: the full grammar gives `--model` its value.
+            let (filtered, _, _, writable, commands) = super::extract_process_flags(&args)
+                .unwrap_or_else(|error| panic!("{args:?}: {error}"));
+            assert!(writable.is_empty() && commands.is_empty(), "{args:?}");
+            assert_eq!(filtered, args[1..].to_vec());
+
+            assert_refused_as_unknown(extract_forgetting("--model", &args), &args, "--model");
+        }
+    }
+
+    #[test]
+    fn forgetting_any_option_refuses_instead_of_widening() {
+        // The property behind the two tests above, for every leading option,
+        // whatever its arity and whatever follows it.
+        for option in super::LEADING_OPTIONS.iter().map(|spec| spec.name) {
+            for (region, grant) in AUTHORITY_GRANTS {
+                let args = boundary_args(&[region, &[option], grant, &["prompt", "repair"]]);
+                // NEGATIVE CONTROL: the full grammar knows the option.
+                assert_ne!(
+                    super::extract_process_flags(&args).map(|_| ()),
+                    Err(super::format_unknown_option(option)),
+                    "{args:?}"
+                );
+                // Forgotten, it is unknown in every form, from its first use.
+                let unknown = args
+                    .iter()
+                    .find(|arg| arg.split('=').next() == Some(option))
+                    .expect("the option is given");
+                assert_refused_as_unknown(extract_forgetting(option, &args), &args, unknown);
+            }
+        }
+    }
+
+    #[test]
+    fn forgetting_a_no_value_option_refuses_it() {
+        for option in ["--compact", "--allow-broad-cwd"] {
+            let args = confine_args(&[
+                "--workspace-confine=/tmp/work",
+                option,
+                "--workspace-confine-write=README.md",
+                "prompt",
+                "repair",
+            ]);
+            // NEGATIVE CONTROL: known, it takes no value, so the declaration
+            // after it is in the option region.
+            let (_, _, _, writable, _) = super::extract_process_flags(&args)
+                .unwrap_or_else(|error| panic!("{args:?}: {error}"));
+            assert_eq!(writable, confine_args(&["README.md"]));
+
+            assert_refused_as_unknown(extract_forgetting(option, &args), &args, option);
+        }
+    }
+
+    /// The option unit `args` starts with under the leading grammar: how many
+    /// arguments it spans, and its value.
+    fn leading_unit(args: &[&str]) -> Option<(usize, Option<String>)> {
+        let args = confine_args(args);
+        match super::LEADING_GRAMMAR.next_unit(&args)? {
+            (super::ArgUnit::Option(unit), rest) => {
+                assert_eq!(unit.args.len() + rest.len(), args.len(), "{args:?}");
+                Some((unit.args.len(), unit.value.map(str::to_string)))
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn the_leading_grammar_is_the_current_leading_grammar() {
+        use super::ArgUnit;
+        use super::OptionArity::{InlineValue, NoValue, Value};
+
+        // Every leading option of the action parser and every process flag,
+        // by how it takes its value.
+        let expected = [
+            ("--data-dir", Value),
+            ("--workspace-confine", InlineValue),
+            ("--workspace-confine-write", Value),
+            ("--workspace-confine-bash-command", Value),
+            ("--help", NoValue),
+            ("-h", NoValue),
+            ("--version", NoValue),
+            ("-V", NoValue),
+            ("--model", Value),
+            ("--output-format", Value),
+            ("--permission-mode", Value),
+            ("--dangerously-skip-permissions", NoValue),
+            ("--compact", NoValue),
+            ("--base-commit", Value),
+            ("--reasoning-effort", Value),
+            ("--allow-broad-cwd", NoValue),
+            ("--print", NoValue),
+            ("--allowedTools", Value),
+            ("--allowed-tools", Value),
+        ];
+        let known = super::LEADING_OPTIONS
+            .iter()
+            .map(|spec| (spec.name, spec.arity))
+            .collect::<Vec<_>>();
+        assert_eq!(known, expected);
+
+        // The arguments each spans and the value it carries: alone, before an
+        // argument spelled like the start of a prompt, and as `OPTION=VALUE`.
+        let value = |value: &str| Some(value.to_string());
+        for (option, arity) in expected {
+            let inline = format!("{option}=v");
+            let (followed, with_equals) = match arity {
+                NoValue => (Some((1, None)), None),
+                InlineValue => (Some((1, None)), Some((1, value("v")))),
+                Value => (Some((2, value("-p"))), Some((1, value("v")))),
+            };
+            assert_eq!(leading_unit(&[option]), Some((1, None)), "{option}");
+            assert_eq!(leading_unit(&[option, "-p", "x"]), followed, "{option}");
+            assert_eq!(leading_unit(&[&inline, "-p"]), with_equals, "{inline}");
+        }
+
+        // Everything else is an argument of its own.
+        for (arg, unit) in [
+            ("-p", ArgUnit::ShortPrompt),
+            ("--resume", ArgUnit::Resume(None)),
+            ("--resume=latest", ArgUnit::Resume(Some("latest"))),
+            ("--resume=", ArgUnit::Resume(Some(""))),
+            ("--acp", ArgUnit::Acp),
+            ("-acp", ArgUnit::Acp),
+            ("--future-flag", ArgUnit::Word("--future-flag")),
+            ("--future-flag=1", ArgUnit::Word("--future-flag=1")),
+            ("--modelx=v", ArgUnit::Word("--modelx=v")),
+            ("-x", ArgUnit::Word("-x")),
+            ("-", ArgUnit::Word("-")),
+            ("--", ArgUnit::Word("--")),
+            ("status", ArgUnit::Word("status")),
+            ("", ArgUnit::Word("")),
+        ] {
+            let args = confine_args(&[arg, "--model", "x"]);
+            assert_eq!(
+                super::LEADING_GRAMMAR.next_unit(&args),
+                Some((unit, &args[1..])),
+                "{arg}"
+            );
+        }
+        assert_eq!(super::LEADING_GRAMMAR.next_unit(&[]), None);
+    }
+
+    #[test]
+    fn the_action_parser_reads_each_option_by_the_leading_grammar() {
+        // In the action parser an option after a no-value option is an option,
+        // and one after a value option is its value. A sentinel option there
+        // shows which, and that the parser knows the option.
+        // Parsing `--allowedTools` builds the tool registry from the cwd and
+        // config home, which other tests change under this lock.
+        let _guard = env_lock();
+        let sentinel = "--lane-sentinel";
+        for spec in super::LEADING_OPTIONS {
+            let option = spec.name;
+            if spec.option.is_process_flag() {
+                // Read before the action parser, by the extraction above.
+                continue;
+            }
+            let takes_value = spec.arity == super::OptionArity::Value;
+            let parsed = super::parse_args_core(
+                &confine_args(&[option, sentinel, "prompt", "repair"]),
+                true,
+                true,
+            )
+            .map(|_| ());
+            assert_ne!(
+                parsed,
+                Err(super::format_unknown_option(option)),
+                "{option}"
+            );
+            assert_eq!(
+                parsed == Err(super::format_unknown_option(sentinel)),
+                !takes_value,
+                "{option}: {parsed:?}"
+            );
+            if takes_value {
+                let inline = format!("{option}={sentinel}");
+                let parsed = super::parse_args_core(
+                    &confine_args(&[inline.as_str(), "prompt", "repair"]),
+                    true,
+                    true,
+                )
+                .map(|_| ());
+                assert_ne!(
+                    parsed,
+                    Err(super::format_unknown_option(&inline)),
+                    "{inline}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_action_parser_refuses_a_process_flag() {
+        // Extraction removes every process flag from the option region and
+        // refuses one after it, so the action parser is never given one. Given
+        // one anyway, it refuses it rather than reading it as action text.
+        for (_, grant) in AUTHORITY_GRANTS {
+            for before in [&[][..], &["prompt", "repair"][..]] {
+                let args = boundary_args(&[before, grant]);
+                assert_eq!(
+                    super::parse_args_core(&args, true, true),
+                    Err(super::format_unknown_option(grant[0])),
+                    "{args:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_action_parser_reads_the_units_the_option_region_kept() {
+        // Extraction hands the action parser arguments rather than units. It
+        // removes whole units only, so the arguments it keeps read back as
+        // the same units, whatever was removed between them, and no valid
+        // invocation is refused as ambiguous.
+        let command = format!("--workspace-confine-bash-command={BOUNDARY_COMMAND}");
+        for options in [
+            &["--model", "--data-dir=/elsewhere", "--compact"][..],
+            &["--data-dir", "/state", "--base-commit", "-p"][..],
+            &[
+                "--base-commit",
+                "--workspace-confine-write",
+                "--data-dir",
+                "/state",
+            ][..],
+            &[
+                "--workspace-confine-write",
+                "README.md",
+                "--model",
+                "prompt",
+            ][..],
+            &[
+                "--print",
+                command.as_str(),
+                "--allowed-tools",
+                command.as_str(),
+            ][..],
+            &["--data-dir=/state", "--model"][..],
+        ] {
+            for action in PROMPT_SHAPES.into_iter().chain([&[][..]]) {
+                if options.ends_with(&["--model"]) && !action.is_empty() {
+                    // `--model` would take the action's first argument.
+                    continue;
+                }
+                let args = boundary_args(&[&["--workspace-confine=/tmp/work"], options, action]);
+                let (units, tail) = super::split_option_region(super::LEADING_GRAMMAR, &args)
+                    .unwrap_or_else(|error| panic!("{args:?}: {error}"));
+                let kept = units
+                    .into_iter()
+                    .filter(|unit| !unit.option.is_process_flag())
+                    .collect::<Vec<_>>();
+                let (filtered, ..) = super::extract_process_flags(&args)
+                    .unwrap_or_else(|error| panic!("{args:?}: {error}"));
+                let (reread, reread_tail) =
+                    super::split_option_region(super::LEADING_GRAMMAR, &filtered)
+                        .unwrap_or_else(|error| panic!("{filtered:?}: {error}"));
+                assert_eq!(reread, kept, "{args:?}");
+                assert_eq!(reread_tail, tail, "{args:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn kept_units_that_do_not_read_back_the_same_are_refused() {
+        // Had the option region read `--base-commit` without its value, the
+        // action parser would take the prompt's first word as that value. The
+        // arguments are handed over only if they read back as they were read.
+        let args = confine_args(&["--base-commit", "prompt", "repair"]);
+        let unit = |value, len| super::OptionUnit {
+            option: super::LeadingOption::BaseCommit,
+            name: "--base-commit",
+            value,
+            args: &args[..len],
+        };
+        assert_eq!(
+            super::action_args(super::LEADING_GRAMMAR, &[unit(None, 1)], &args[1..]),
+            Err("ambiguous arguments after --base-commit".to_string())
+        );
+        // NEGATIVE CONTROL: read with its value, it reads back the same.
+        assert_eq!(
+            super::action_args(
+                super::LEADING_GRAMMAR,
+                &[unit(Some("prompt"), 2)],
+                &args[2..]
+            ),
+            Ok(args.clone())
+        );
+    }
+
+    // ---- one definition of option arity ----
+
+    /// The leading grammar with the option at `index` given `arity`: a
+    /// specification that has drifted from what the option means.
+    fn drifted(index: usize, arity: super::OptionArity) -> Vec<super::OptionSpec> {
+        let mut specs = super::LEADING_OPTIONS.to_vec();
+        specs[index].arity = arity;
+        specs
+    }
+
+    fn drifted_option(option: &str, arity: super::OptionArity) -> Vec<super::OptionSpec> {
+        let index = super::LEADING_OPTIONS
+            .iter()
+            .position(|spec| spec.name == option)
+            .expect("a leading option");
+        drifted(index, arity)
+    }
+
+    /// The whole invocation read by `specs`: the process flags, then the
+    /// action from the arguments extraction kept.
+    fn parse_by(
+        specs: &[super::OptionSpec],
+        args: &[String],
+    ) -> Result<(super::ProcessFlags, CliAction), String> {
+        let grammar = super::OptionGrammar(specs);
+        let flags = super::extract_process_flags_in(grammar, args)?;
+        let action = super::parse_args_core_in(
+            grammar,
+            &flags.0,
+            true,
+            true,
+            &mut super::normalize_allowed_tools,
+        )?;
+        Ok((flags, action))
+    }
+
+    #[test]
+    fn a_wrong_arity_for_base_commit_refuses_instead_of_granting_a_write() {
+        // `--base-commit` takes the argument after it. Were its specification
+        // to say it does not, the option region would read that argument as a
+        // declaration making README.md writable. The action parser reads the
+        // same specification, finds `--base-commit` without its value, and
+        // refuses, so the declaration grants nothing.
+        use super::OptionArity::{InlineValue, NoValue};
+        let workspace = boundary_workspace();
+        let confine = format!("--workspace-confine={}", workspace.display());
+        let command = format!("--workspace-confine-bash-command={BOUNDARY_COMMAND}");
+        let declaration = "--workspace-confine-write=README.md";
+        let args = confine_args(&[
+            confine.as_str(),
+            command.as_str(),
+            "--base-commit",
+            declaration,
+            "prompt",
+            "repair",
+        ]);
+
+        // NEGATIVE CONTROL: by the leading grammar the argument is the
+        // option's value, and README.md is not writable.
+        let ((_, _, root, writable, commands), action) =
+            parse_by(super::LEADING_OPTIONS, &args).expect("the value belongs to --base-commit");
+        assert!(writable.is_empty(), "{writable:?}");
+        assert!(
+            matches!(&action, CliAction::Prompt { prompt, base_commit, .. }
+                if prompt == "repair" && base_commit.as_deref() == Some(declaration)),
+            "{action:?}"
+        );
+        super::build_workspace_confinement(&root.expect("root"), &writable, &commands)
+            .expect("binds")
+            .root()
+            .write_file("README.md", "changed\n")
+            .expect_err("README.md is not writable");
+
+        for arity in [NoValue, InlineValue] {
+            let specs = drifted_option("--base-commit", arity);
+            // The option region follows the drifted specification...
+            let (filtered, _, _, writable, _) =
+                super::extract_process_flags_in(super::OptionGrammar(&specs), &args)
+                    .expect("the declaration is in the option region");
+            assert_eq!(writable, confine_args(&["README.md"]), "{arity:?}");
+            assert_eq!(
+                filtered,
+                confine_args(&["--base-commit", "prompt", "repair"])
+            );
+            // ...and so does the action parser, which takes no value from
+            // the prompt in its place.
+            assert_eq!(
+                parse_by(&specs, &args),
+                Err("missing value for --base-commit".to_string()),
+                "{arity:?}"
+            );
+            // In the order `run()` uses, that refusal comes before the
+            // declaration is bound: no writer for README.md ever exists.
+            let prepared = prepare_by(&specs, &args);
+            assert_eq!(
+                prepared.result,
+                Err("missing value for --base-commit".to_string()),
+                "{arity:?}"
+            );
+            prepared.assert_refused_with_nothing_installed(&format!("--base-commit as {arity:?}"));
+        }
+        assert_eq!(
+            fs::read_to_string(workspace.join("README.md")).expect("readme"),
+            "readme\n"
+        );
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn a_wrong_arity_for_model_refuses_instead_of_granting_a_write() {
+        // The same for `--model`. By the leading grammar the declaration is
+        // the model's value and is refused as a model name. Were the
+        // specification to say `--model` takes no value, the option region
+        // would read the declaration, and the action parser would refuse
+        // `--model` without its value before the declaration is bound.
+        use super::OptionArity::{InlineValue, NoValue};
+        let _guard = env_lock();
+        let workspace = boundary_workspace();
+        let confine = format!("--workspace-confine={}", workspace.display());
+        let command = format!("--workspace-confine-bash-command={BOUNDARY_COMMAND}");
+        let args = confine_args(&[
+            confine.as_str(),
+            command.as_str(),
+            "--model",
+            "--workspace-confine-write=README.md",
+            "prompt",
+            "repair",
+        ]);
+
+        // NEGATIVE CONTROL: by the leading grammar nothing is declared
+        // writable, and the invocation is refused for its model.
+        let (_, _, _, writable, _) =
+            super::extract_process_flags(&args).expect("the value belongs to --model");
+        assert!(writable.is_empty(), "{writable:?}");
+        let prepared = prepare_by(super::LEADING_OPTIONS, &args);
+        let error = prepared.result.as_ref().expect_err("not a model name");
+        assert!(error.contains("invalid model syntax"), "{error}");
+        prepared.assert_refused_with_nothing_installed("--model by the leading grammar");
+
+        for arity in [NoValue, InlineValue] {
+            let specs = drifted_option("--model", arity);
+            let (filtered, _, _, writable, _) =
+                super::extract_process_flags_in(super::OptionGrammar(&specs), &args)
+                    .expect("the declaration is in the option region");
+            assert_eq!(writable, confine_args(&["README.md"]), "{arity:?}");
+            assert_eq!(filtered, confine_args(&["--model", "prompt", "repair"]));
+            let prepared = prepare_by(&specs, &args);
+            assert_eq!(
+                prepared.result,
+                Err("missing value for --model".to_string()),
+                "{arity:?}"
+            );
+            prepared.assert_refused_with_nothing_installed(&format!("--model as {arity:?}"));
+        }
+        assert_eq!(
+            fs::read_to_string(workspace.join("README.md")).expect("readme"),
+            "readme\n"
+        );
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn a_wrong_arity_never_grants_what_the_option_would_have_taken() {
+        // The same for every option that takes the argument after it
+        // (`--model`, `--allowedTools`, the process flags themselves), with
+        // every declaration in that argument's place.
+        use super::OptionArity::{InlineValue, NoValue, Value};
+        let _guard = env_lock();
+        let takes_value = super::LEADING_OPTIONS
+            .iter()
+            .enumerate()
+            .filter(|(_, spec)| spec.arity == Value);
+        for (index, spec) in takes_value {
+            for arity in [NoValue, InlineValue] {
+                let specs = drifted(index, arity);
+                for (region, grant) in AUTHORITY_GRANTS {
+                    let args = boundary_args(&[region, &[spec.name], grant, &["prompt", "repair"]]);
+                    let parsed = parse_by(&specs, &args);
+                    assert!(
+                        parsed.is_err(),
+                        "{args:?} with {} as {arity:?}: {parsed:?}",
+                        spec.name
+                    );
+                    prepare_by(&specs, &args).assert_refused_with_nothing_installed(&format!(
+                        "{args:?} with {} as {arity:?}",
+                        spec.name
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_drifted_arity_refuses_or_changes_nothing() {
+        // Every option, given each arity it does not have, in every form,
+        // before and after every declaration, before every action shape. Read
+        // by the drifted specification the invocation is refused or is
+        // exactly what the leading grammar makes it: never another authority
+        // and never another action. An option region and an action parser
+        // that counted an option's arguments separately could not hold this.
+        use super::OptionArity::{InlineValue, NoValue, Value};
+        let _guard = env_lock();
+        let cwd = temp_dir();
+        fs::create_dir_all(&cwd).expect("cwd");
+        with_current_dir(&cwd, || {
+            for (index, spec) in super::LEADING_OPTIONS.iter().enumerate() {
+                let inline = format!("{}=v", spec.name);
+                let forms = [
+                    &[spec.name][..],
+                    &[spec.name, "v"][..],
+                    &[inline.as_str()][..],
+                ];
+                for arity in [NoValue, InlineValue, Value] {
+                    if arity == spec.arity {
+                        continue;
+                    }
+                    let specs = drifted(index, arity);
+                    for (region, grant) in AUTHORITY_GRANTS {
+                        for option in forms {
+                            for action in PROMPT_SHAPES.into_iter().chain([&["status"][..]]) {
+                                for args in [
+                                    boundary_args(&[region, option, grant, action]),
+                                    boundary_args(&[region, grant, option, action]),
+                                ] {
+                                    let drifted = parse_by(&specs, &args);
+                                    assert!(
+                                        drifted.is_err()
+                                            || drifted == parse_by(super::LEADING_OPTIONS, &args),
+                                        "{args:?} with {} as {arity:?}: {drifted:?}",
+                                        spec.name
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn every_current_leading_option_still_parses_before_a_prompt() {
+        // `--allowedTools` reads the cwd and config home; see above.
+        let _guard = env_lock();
+        let command = format!("--workspace-confine-bash-command={BOUNDARY_COMMAND}");
+        for leading in [
+            &["--data-dir", "/state"][..],
+            &["--data-dir=/state"][..],
+            &["--workspace-confine"][..],
+            &["--workspace-confine=/tmp/work"][..],
+            &[
+                "--workspace-confine=/tmp/work",
+                "--workspace-confine-write",
+                "README.md",
+            ][..],
+            &[
+                "--workspace-confine=/tmp/work",
+                "--workspace-confine-write=README.md",
+            ][..],
+            &[
+                "--workspace-confine=/tmp/work",
+                "--workspace-confine-bash-command",
+                BOUNDARY_COMMAND,
+            ][..],
+            &["--workspace-confine=/tmp/work", command.as_str()][..],
+            &["--model", "sonnet"][..],
+            &["--model=sonnet"][..],
+            &["--output-format", "json"][..],
+            &["--output-format=json"][..],
+            &["--permission-mode", "read-only"][..],
+            &["--permission-mode=read-only"][..],
+            &["--dangerously-skip-permissions"][..],
+            &["--compact"][..],
+            &["--base-commit", "abc123"][..],
+            &["--base-commit=abc123"][..],
+            &["--reasoning-effort", "low"][..],
+            &["--reasoning-effort=low"][..],
+            &["--allow-broad-cwd"][..],
+            &["--print"][..],
+            &["--allowedTools", "read_file"][..],
+            &["--allowedTools=read_file"][..],
+            &["--allowed-tools", "read_file"][..],
+            &["--allowed-tools=read_file"][..],
+        ] {
+            let args = boundary_args(&[leading, &["prompt", "repair"]]);
+            let (action, _, _) = super::parse_full_invocation_with_terminal(&args, true, true)
+                .unwrap_or_else(|error| panic!("{args:?}: {error}"));
+            assert!(
+                matches!(&action, CliAction::Prompt { prompt, .. } if prompt == "repair"),
+                "{args:?}: {action:?}"
+            );
+        }
+        for option in ["--help", "-h", "--version", "-V"] {
+            let (action, _, _) =
+                super::parse_full_invocation_with_terminal(&confine_args(&[option]), true, true)
+                    .unwrap_or_else(|error| panic!("{option}: {error}"));
+            assert!(
+                matches!(action, CliAction::Help { .. } | CliAction::Version { .. }),
+                "{option}: {action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn process_flags_after_a_subcommand_are_refused() {
+        let command = format!("--workspace-confine-bash-command={BOUNDARY_COMMAND}");
+        for action in [
+            &["status"][..],
+            &["plan", "run", "plan.json"][..],
+            &["task", "list"][..],
+            &["skills", "list"][..],
+            &["export", "--session", "latest"][..],
+            &["config"][..],
+        ] {
+            for (flag, tail) in [
+                ("--data-dir", &["--data-dir", "/state"][..]),
+                ("--data-dir", &["--data-dir=/state"][..]),
+                (
+                    "--workspace-confine",
+                    &["--workspace-confine=/elsewhere"][..],
+                ),
+                (
+                    "--workspace-confine-write",
+                    &["--workspace-confine-write", "README.md"][..],
+                ),
+                (
+                    "--workspace-confine-write",
+                    &["--workspace-confine-write=README.md"][..],
+                ),
+                (
+                    "--workspace-confine-bash-command",
+                    &["--workspace-confine-bash-command", BOUNDARY_COMMAND][..],
+                ),
+                ("--workspace-confine-bash-command", &[command.as_str()][..]),
+            ] {
+                assert_declares_nothing_after_options(
+                    &boundary_args(&[&["--workspace-confine=/tmp/work"], action, tail]),
+                    flag,
+                );
+            }
+        }
+
+        // NEGATIVE CONTROL: before the subcommand the same flags count.
+        let (filtered, data_dir, root, writable, _) = extract_confined(&[
+            "--workspace-confine=/tmp/work",
+            "--data-dir=/state",
+            "--workspace-confine-write",
+            "README.md",
+            "export",
+            "--session",
+            "latest",
+        ])
+        .expect("process flags before the subcommand should parse");
+        assert_eq!(root, Some(PathBuf::from("/tmp/work")));
+        assert_eq!(data_dir, Some(PathBuf::from("/state")));
+        assert_eq!(writable, confine_args(&["README.md"]));
+        assert_eq!(filtered, confine_args(&["export", "--session", "latest"]));
+    }
+
+    #[test]
+    fn process_flags_inside_a_resume_or_acp_action_are_refused() {
+        // `--resume` and `--acp` start an action just as a subcommand does.
+        for action in [
+            &["--resume", "latest", "/status"][..],
+            &["--resume=latest"][..],
+            &["--acp"][..],
+            &["-acp"][..],
+        ] {
+            for (flag, tail) in [
+                ("--data-dir", &["--data-dir", "/state"][..]),
+                (
+                    "--workspace-confine-write",
+                    &["--workspace-confine-write=README.md"][..],
+                ),
+                (
+                    "--workspace-confine-bash-command",
+                    &["--workspace-confine-bash-command", BOUNDARY_COMMAND][..],
+                ),
+            ] {
+                assert_declares_nothing_after_options(
+                    &boundary_args(&[&["--workspace-confine=/tmp/work"], action, tail]),
+                    flag,
+                );
+            }
+
+            // NEGATIVE CONTROL: before the action the same flags count, and
+            // the action reaches the action parser unchanged.
+            let args = boundary_args(&[
+                &[
+                    "--workspace-confine=/tmp/work",
+                    "--data-dir",
+                    "/state",
+                    "--workspace-confine-write=README.md",
+                ],
+                action,
+            ]);
+            let (filtered, data_dir, _, writable, _) = super::extract_process_flags(&args)
+                .unwrap_or_else(|error| panic!("{args:?}: {error}"));
+            assert_eq!(data_dir, Some(PathBuf::from("/state")), "{action:?}");
+            assert_eq!(writable, confine_args(&["README.md"]), "{action:?}");
+            assert_eq!(filtered, confine_args(action));
+        }
+    }
+
+    #[test]
+    fn option_region_declarations_keep_their_order_before_every_action_shape() {
+        for action in PROMPT_SHAPES.into_iter().chain([&["status"][..]]) {
+            let args = boundary_args(&[
+                &[
+                    "--workspace-confine=/tmp/work",
+                    "--workspace-confine-write",
+                    "scripts/a.py",
+                    "--workspace-confine-bash-command",
+                    BOUNDARY_COMMAND,
+                    "--workspace-confine-write=tests/b.py",
+                    "--model",
+                    "sonnet",
+                    "--workspace-confine-bash-command=python3 -B -m py_compile scripts/a.py",
+                    "--workspace-confine-write",
+                    "README.md",
+                    "--data-dir",
+                    "/state",
+                ],
+                action,
+            ]);
+            let (filtered, data_dir, root, writable, commands) =
+                super::extract_process_flags(&args)
+                    .unwrap_or_else(|error| panic!("{args:?}: {error}"));
+            assert_eq!(root, Some(PathBuf::from("/tmp/work")), "{action:?}");
+            assert_eq!(data_dir, Some(PathBuf::from("/state")), "{action:?}");
+            assert_eq!(
+                writable,
+                confine_args(&["scripts/a.py", "tests/b.py", "README.md"]),
+                "{action:?}"
+            );
+            assert_eq!(
+                commands,
+                confine_args(&[BOUNDARY_COMMAND, "python3 -B -m py_compile scripts/a.py"]),
+                "{action:?}"
+            );
+            assert_eq!(filtered, boundary_args(&[&["--model", "sonnet"], action]));
+        }
+    }
+
+    #[test]
+    fn north_star_run3_argv_binds_exactly_its_process_authority() {
+        // Run #3's argv, model-free: every process flag precedes `prompt`,
+        // and the declared command carries its own `-p` inside one argument.
+        let prompt = "Repair the planner output heading.\n\nThen add one test; run it with -p.";
+        let args = confine_args(&[
+            "--workspace-confine=/work/north-star",
+            "--workspace-confine-write",
+            "scripts/pretty_print_planner_output.py",
+            "--workspace-confine-write",
+            "tests/a2_l4/test_pretty_print_planner_output.py",
+            "--workspace-confine-bash-command",
+            NORTH_STAR_TEST,
+            "--data-dir=/evidence/data",
+            "--permission-mode",
+            "workspace-write",
+            "--model",
+            "coder",
+            "--allowedTools",
+            "read_file,edit_file,insert_before,insert_after,bash",
+            "--output-format",
+            "json",
+            "prompt",
+            prompt,
+        ]);
+        let (filtered, data_dir, root, writable, commands) =
+            super::extract_process_flags(&args).expect("the North Star argv should parse");
+        assert_eq!(root, Some(PathBuf::from("/work/north-star")));
+        assert_eq!(data_dir, Some(PathBuf::from("/evidence/data")));
+        assert_eq!(
+            writable,
+            confine_args(&[
+                "scripts/pretty_print_planner_output.py",
+                "tests/a2_l4/test_pretty_print_planner_output.py",
+            ])
+        );
+        assert_eq!(commands, confine_args(&[NORTH_STAR_TEST]));
+        assert_eq!(filtered, args[8..].to_vec());
+
+        let _guard = env_lock();
+        std::env::set_var("RUSTY_CLAUDE_MODEL_ALIAS__CODER", "devstral-small-2:latest");
+        let action = super::parse_args_core(&filtered, true, true);
+        std::env::remove_var("RUSTY_CLAUDE_MODEL_ALIAS__CODER");
+        assert_eq!(
+            action.expect("the North Star action should parse"),
+            CliAction::Prompt {
+                prompt: prompt.to_string(),
+                model: "devstral-small-2:latest".to_string(),
+                output_format: CliOutputFormat::Json,
+                allowed_tools: super::normalize_allowed_tools(&[
+                    "read_file,edit_file,insert_before,insert_after,bash".to_string()
+                ])
+                .expect("tools"),
+                permission_mode: PermissionMode::WorkspaceWrite,
+                compact: false,
+                base_commit: None,
+                reasoning_effort: None,
+                allow_broad_cwd: false,
+            }
+        );
+    }
+
+    /// `args` splits into the option region `options`, one entry per option,
+    /// and the action or prompt arguments `action`.
+    fn assert_option_region(args: &[&str], options: &[&[&str]], action: &[&str]) {
+        let args = confine_args(args);
+        let (parsed_options, parsed_action) =
+            super::split_option_region(super::LEADING_GRAMMAR, &args)
+                .unwrap_or_else(|error| panic!("{args:?}: {error}"));
+        let parsed_options: Vec<Vec<String>> = parsed_options
+            .iter()
+            .map(|option| option.args.to_vec())
+            .collect();
+        let options: Vec<Vec<String>> = options.iter().map(|option| confine_args(option)).collect();
+        assert_eq!(parsed_options, options, "{args:?}");
+        assert_eq!(parsed_action, confine_args(action).as_slice(), "{args:?}");
+    }
+
+    #[test]
+    fn the_option_region_ends_at_the_first_action_or_prompt() {
+        assert_option_region(&[], &[], &[]);
+        assert_option_region(
+            &["--model", "prompt", "fix"],
+            &[&["--model", "prompt"]],
+            &["fix"],
+        );
+        assert_option_region(&["--data-dir", "-p", "x"], &[&["--data-dir", "-p"]], &["x"]);
+        assert_option_region(&["--model"], &[&["--model"]], &[]);
+        assert_option_region(
+            &["--workspace-confine", "/tmp/work", "x"],
+            &[&["--workspace-confine"]],
+            &["/tmp/work", "x"],
+        );
+        assert_option_region(&["--help", "-p", "x"], &[&["--help"]], &["-p", "x"]);
+        assert_option_region(
+            &["--compact", "--resume", "x"],
+            &[&["--compact"]],
+            &["--resume", "x"],
+        );
+        assert_option_region(
+            &["--resume=latest", "--model", "x"],
+            &[],
+            &["--resume=latest", "--model", "x"],
+        );
+        assert_option_region(&["--acp", "serve"], &[], &["--acp", "serve"]);
+        assert_option_region(&["-acp"], &[], &["-acp"]);
+        assert_eq!(
+            super::split_option_region(super::LEADING_GRAMMAR, &confine_args(&["--bogus", "x"])),
+            Err(super::format_unknown_option("--bogus"))
+        );
+        assert_option_region(
+            &["--output-format=json", ""],
+            &[&["--output-format=json"]],
+            &[""],
+        );
+    }
+
+    // ---- PR #184 review repair: nothing is installed until the invocation parses (P1) ----
+
+    /// What the order `run()` uses made of an invocation. `install` bound the
+    /// real confinement, kept here where the process would hold it, and
+    /// `resolve_tools` stood for the tool registry build.
+    struct Prepared {
+        result: Result<(CliAction, Option<PathBuf>), String>,
+        /// `install` and `registry`, in the order they ran.
+        order: Vec<&'static str>,
+        /// What `install` was asked to install.
+        requests: Vec<super::ConfinementRequest>,
+        /// The confinement the process would hold.
+        installed: Option<tools::WorkspaceConfinement>,
+    }
+
+    impl Prepared {
+        /// The invocation was refused with nothing installed for it: no
+        /// confinement asked for, none bound, and no tool registry built.
+        fn assert_refused_with_nothing_installed(&self, context: &str) {
+            let error = self.result.as_ref().expect_err(context);
+            if let Some(confinement) = &self.installed {
+                let write = confinement.root().write_file("README.md", "changed\n");
+                panic!(
+                    "{context}: refused ({error}) with its confinement installed; \
+                     writing README.md through it: {write:?}"
+                );
+            }
+            assert!(
+                self.installed_nothing(),
+                "{context}: refused ({error}) after {:?} of {:?}",
+                self.order,
+                self.requests
+            );
+        }
+
+        /// No confinement was asked for or bound, and no tool registry built.
+        fn installed_nothing(&self) -> bool {
+            self.order.is_empty() && self.requests.is_empty() && self.installed.is_none()
+        }
+    }
+
+    /// `args` read by `specs` through `prepare_invocation_in`, as `run()`
+    /// reads them.
+    fn prepare_by(specs: &[super::OptionSpec], args: &[String]) -> Prepared {
+        use std::cell::RefCell;
+        let order = RefCell::new(Vec::new());
+        let requests = RefCell::new(Vec::new());
+        let installed = RefCell::new(None);
+        let result = super::prepare_invocation_in(
+            super::OptionGrammar(specs),
+            args,
+            true,
+            true,
+            |request| {
+                order.borrow_mut().push("install");
+                requests.borrow_mut().push(request.clone());
+                let confinement = super::build_workspace_confinement(
+                    &request.root,
+                    &request.writable,
+                    &request.commands,
+                )?;
+                *installed.borrow_mut() = Some(confinement);
+                Ok(())
+            },
+            |values| {
+                // No values, no registry: see `normalize_allowed_tools`.
+                if !values.is_empty() {
+                    order.borrow_mut().push("registry");
+                }
+                super::GlobalToolRegistry::builtin().normalize_allowed_tools(values)
+            },
+        );
+        Prepared {
+            result,
+            order: order.into_inner(),
+            requests: requests.into_inner(),
+            installed: installed.into_inner(),
+        }
+    }
+
+    /// A confined invocation over `workspace` that declares README.md
+    /// writable and one command, then `tail`.
+    fn declaring(workspace: &Path, tail: &[&str]) -> Vec<String> {
+        let mut args = vec![
+            format!("--workspace-confine={}", workspace.display()),
+            "--workspace-confine-write=README.md".to_string(),
+            format!("--workspace-confine-bash-command={BOUNDARY_COMMAND}"),
+        ];
+        args.extend(confine_args(tail));
+        args
+    }
+
+    /// What each of these, after a valid confinement declaration, is refused
+    /// for. None of them parses.
+    const NOT_PARSING: &[(&[&str], &str)] = &[
+        (
+            &["--no-such-flag", "prompt", "repair"],
+            "unknown option: --no-such-flag",
+        ),
+        (&["--model"], "missing value for --model"),
+        (
+            &["--model", "bad model", "prompt", "repair"],
+            "invalid model syntax",
+        ),
+        (
+            &["--model=", "prompt", "repair"],
+            "model string cannot be empty",
+        ),
+        (&["--base-commit"], "missing value for --base-commit"),
+        (
+            &["--output-format", "yaml", "prompt", "repair"],
+            "unsupported value for --output-format",
+        ),
+        (&["--output-format"], "missing value for --output-format"),
+        (
+            &["--permission-mode", "admin", "prompt", "repair"],
+            "unsupported permission mode 'admin'",
+        ),
+        (
+            &["--reasoning-effort", "max", "prompt", "repair"],
+            "invalid value for --reasoning-effort",
+        ),
+        (&["--allowedTools"], "missing value for --allowedTools"),
+        (&["prompt"], "prompt subcommand requires a prompt string"),
+        (&["-p"], "-p requires a prompt string"),
+        (&[""], "empty prompt"),
+        (
+            &["status", "--json"],
+            "unrecognized argument `--json` for subcommand `status`",
+        ),
+        (
+            &["help", "extra"],
+            "unrecognized argument `extra` for subcommand `help`",
+        ),
+        (&["plan"], "`claw plan` is a slash command"),
+        (
+            &["plan", "walk"],
+            "unsupported `claw plan` subcommand: walk",
+        ),
+        (
+            &["--permission-mode", "read-only", "plan", "run", "p.yaml"],
+            "--permission-mode is not supported by `claw plan run`",
+        ),
+        (
+            &["--allowedTools", "read_file", "plan", "run", "p.yaml"],
+            "--allowed-tools / --allowedTools is not supported by `claw plan run`",
+        ),
+        (&["task"], "missing `claw task` subcommand"),
+        (&["task", "run"], "Usage: `claw task run <task.json>`"),
+        (
+            &["task", "walk", "t.json"],
+            "unsupported `claw task` subcommand: walk",
+        ),
+        (
+            &["--resume", "latest", "not-a-slash-command"],
+            "--resume trailing arguments must be slash commands",
+        ),
+        (
+            &["plugins", "a", "b", "c"],
+            "unexpected extra arguments after `claw plugins a b`",
+        ),
+        (
+            &["config", "a", "b"],
+            "unexpected extra arguments after `claw config a`",
+        ),
+        (
+            &["diff", "extra"],
+            "unexpected extra arguments after `claw diff`",
+        ),
+        (&["login"], "has been removed"),
+        (&["acp", "bogus"], "unsupported ACP invocation"),
+        (
+            &["/no-such-slash-command"],
+            "unknown slash command outside the REPL",
+        ),
+        // Refused with `--allowedTools` given: resolving it would build
+        // the tool registry.
+        (
+            &["--allowedTools", "read_file", "prompt"],
+            "prompt subcommand requires a prompt string",
+        ),
+        (
+            &["--allowedTools", "read_file", "status", "--json"],
+            "unrecognized argument `--json` for subcommand `status`",
+        ),
+        (
+            &["--allowed-tools=read_file", "task", "run"],
+            "Usage: `claw task run <task.json>`",
+        ),
+        // Refused by the option region itself.
+        (
+            &["prompt", "repair", "--workspace-confine-write=scripts/a.py"],
+            "--workspace-confine-write must come before the prompt or subcommand",
+        ),
+        (
+            &["--workspace-confine", "prompt", "repair"],
+            "--workspace-confine may be given only once",
+        ),
+    ];
+
+    #[test]
+    fn an_invocation_that_does_not_parse_installs_nothing() {
+        // Each of these declares a valid confinement and then does not parse.
+        // None has its confinement bound or installed, and none has a tool
+        // registry built.
+        let _guard = env_lock();
+        let workspace = boundary_workspace();
+        for (tail, reason) in NOT_PARSING {
+            let args = declaring(&workspace, tail);
+            let prepared = prepare_by(super::LEADING_OPTIONS, &args);
+            let error = prepared.result.as_ref().expect_err("must not parse");
+            assert!(error.contains(reason), "{tail:?}: {error}");
+            prepared.assert_refused_with_nothing_installed(&format!("{tail:?}"));
+        }
+
+        // Without a confinement there is nothing to install, and still no
+        // tool registry is built for an invocation that does not parse.
+        for tail in [
+            &["--allowedTools", "read_file", "prompt"][..],
+            &["--allowedTools", "read_file", "status", "--json"][..],
+        ] {
+            prepare_by(super::LEADING_OPTIONS, &confine_args(tail))
+                .assert_refused_with_nothing_installed(&format!("unconfined {tail:?}"));
+        }
+        assert_eq!(
+            fs::read_to_string(workspace.join("README.md")).expect("readme"),
+            "readme\n"
+        );
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn an_invocation_that_parses_installs_exactly_what_it_declares() {
+        // Every declaration set, before every action shape: the confinement
+        // is asked for once, whole, and what is bound admits exactly the
+        // declared files and command.
+        let _guard = env_lock();
+        let workspace = boundary_workspace();
+        let confine = format!("--workspace-confine={}", workspace.display());
+        let command = format!("--workspace-confine-bash-command={BOUNDARY_COMMAND}");
+        for (declared, writable, commands) in [
+            (
+                &["--workspace-confine-write=README.md"][..],
+                &["README.md"][..],
+                &[][..],
+            ),
+            (
+                &[
+                    "--workspace-confine-write",
+                    "scripts/a.py",
+                    "--workspace-confine-write=README.md",
+                ][..],
+                &["scripts/a.py", "README.md"][..],
+                &[][..],
+            ),
+            (&[command.as_str()][..], &[][..], &[BOUNDARY_COMMAND][..]),
+            (
+                &["--workspace-confine-write=README.md", command.as_str()][..],
+                &["README.md"][..],
+                &[BOUNDARY_COMMAND][..],
+            ),
+        ] {
+            for action in PROMPT_SHAPES.into_iter().chain([&["status"][..]]) {
+                let args = boundary_args(&[&[confine.as_str()], declared, action]);
+                let prepared = prepare_by(super::LEADING_OPTIONS, &args);
+                if let Err(error) = &prepared.result {
+                    panic!("{args:?}: {error}");
+                }
+                assert_eq!(prepared.order, ["install"], "{args:?}");
+                assert_eq!(
+                    prepared.requests,
+                    [super::ConfinementRequest {
+                        root: workspace.clone(),
+                        writable: confine_args(writable),
+                        commands: confine_args(commands),
+                    }],
+                    "{args:?}"
+                );
+                let confinement = prepared.installed.as_ref().expect("installed");
+                for (file, content) in [("README.md", "readme\n"), ("scripts/a.py", "a\n")] {
+                    assert_eq!(
+                        confinement.root().write_file(file, content).is_ok(),
+                        writable.contains(&file),
+                        "{args:?}: {file}"
+                    );
+                }
+                assert_eq!(
+                    confinement.approved_command(BOUNDARY_COMMAND).is_some(),
+                    !commands.is_empty(),
+                    "{args:?}"
+                );
+                assert!(
+                    confinement.approved_command(SMOKE_COMMAND).is_none(),
+                    "{args:?}"
+                );
+            }
+        }
+
+        // `--data-dir` is carried with the action and installs nothing.
+        let args = boundary_args(&[
+            &["--data-dir=/state", confine.as_str()],
+            &["--workspace-confine-write=README.md", "prompt", "repair"],
+        ]);
+        let prepared = prepare_by(super::LEADING_OPTIONS, &args);
+        let (_, data_dir) = prepared.result.as_ref().expect("parses");
+        assert_eq!(data_dir, &Some(PathBuf::from("/state")));
+        assert_eq!(prepared.order, ["install"]);
+        let prepared = prepare_by(
+            super::LEADING_OPTIONS,
+            &confine_args(&["--data-dir=/state", "prompt", "repair"]),
+        );
+        let (_, data_dir) = prepared.result.as_ref().expect("parses");
+        assert_eq!(data_dir, &Some(PathBuf::from("/state")));
+        assert!(prepared.order.is_empty() && prepared.installed.is_none());
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn a_workspace_root_alone_installs_the_controlled_smoke() {
+        // No declaration: the root alone selects the controlled smoke, given
+        // as `--workspace-confine=PATH` or as the bare flag over the cwd.
+        let _guard = env_lock();
+        let workspace = temp_dir();
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::write(workspace.join("calculator.py"), "def add(a, b):\n").expect("calculator");
+        fs::write(workspace.join("test_calculator.py"), "import unittest\n").expect("oracle");
+        let root = fs::canonicalize(&workspace).expect("canonical workspace");
+        let explicit = format!("--workspace-confine={}", root.display());
+        for flag in [explicit.as_str(), "--workspace-confine"] {
+            let args = confine_args(&[flag, "prompt", "repair"]);
+            let prepared =
+                with_current_dir(&workspace, || prepare_by(super::LEADING_OPTIONS, &args));
+            if let Err(error) = &prepared.result {
+                panic!("{flag}: {error}");
+            }
+            assert_eq!(prepared.order, ["install"], "{flag}");
+            assert_eq!(
+                prepared.requests,
+                [super::ConfinementRequest {
+                    root: root.clone(),
+                    writable: Vec::new(),
+                    commands: Vec::new(),
+                }],
+                "{flag}"
+            );
+            let confinement = prepared.installed.as_ref().expect("installed");
+            assert!(
+                confinement.approved_command(SMOKE_COMMAND).is_some(),
+                "{flag}"
+            );
+            confinement
+                .root()
+                .write_file("calculator.py", "def add(a, b):\n")
+                .expect("the smoke's file is writable");
+            confinement
+                .root()
+                .write_file("test_calculator.py", "import unittest\n")
+                .expect_err("the oracle is not writable");
+        }
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn the_tool_registry_is_built_only_after_the_confinement_is_installed() {
+        // Resolving `--allowedTools` builds the tool registry, and that build
+        // must see the confinement. So it comes after the install, and both
+        // come after the whole invocation has parsed.
+        let _guard = env_lock();
+        let workspace = boundary_workspace();
+        let args = declaring(
+            &workspace,
+            &["--allowedTools", "read_file,bash", "prompt", "repair"],
+        );
+        let prepared = prepare_by(super::LEADING_OPTIONS, &args);
+        let (action, _) = prepared.result.as_ref().expect("parses");
+        assert_eq!(prepared.order, ["install", "registry"]);
+        assert!(prepared.installed.is_some());
+        assert!(
+            matches!(action, CliAction::Prompt { allowed_tools: Some(allowed), .. }
+                if allowed.iter().map(String::as_str).eq(["bash", "read_file"])),
+            "{action:?}"
+        );
+
+        // A tool name is known only to the registry, so an unknown one is
+        // refused there: after the install, never by building a registry
+        // before it.
+        let args = declaring(
+            &workspace,
+            &["--allowedTools", "no_such_tool", "prompt", "repair"],
+        );
+        let prepared = prepare_by(super::LEADING_OPTIONS, &args);
+        let error = prepared.result.as_ref().expect_err("unknown tool");
+        assert!(
+            error.contains("unsupported tool in --allowedTools: no_such_tool"),
+            "{error}"
+        );
+        assert_eq!(prepared.order, ["install", "registry"]);
+
+        // A confinement that cannot be bound refuses the invocation there:
+        // no registry is built, and nothing runs unconfined instead.
+        let confine = format!("--workspace-confine={}", workspace.display());
+        let args = confine_args(&[
+            confine.as_str(),
+            "--workspace-confine-write=scripts/missing.py",
+            "--allowedTools",
+            "read_file",
+            "prompt",
+            "repair",
+        ]);
+        let prepared = prepare_by(super::LEADING_OPTIONS, &args);
+        let error = prepared.result.as_ref().expect_err("cannot be bound");
+        assert!(error.contains("scripts/missing.py"), "{error}");
+        assert_eq!(prepared.order, ["install"]);
+        assert!(prepared.installed.is_none());
+
+        // Without a confinement only the registry is built.
+        let prepared = prepare_by(
+            super::LEADING_OPTIONS,
+            &confine_args(&["--allowedTools", "read_file", "prompt", "repair"]),
+        );
+        assert!(prepared.result.is_ok(), "{:?}", prepared.result);
+        assert_eq!(prepared.order, ["registry"]);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn the_action_bound_is_the_action_that_parsed() {
+        // The arguments are parsed once, before anything is installed, and
+        // that action is the one bound. Reading them again after the install
+        // would see whatever installing changed: here, what a model alias
+        // stands for. The alias is this test's own, so no other test reads
+        // it.
+        const ALIAS: &str = "RUSTY_CLAUDE_MODEL_ALIAS__HANDOFFPROBE";
+        let _guard = env_lock();
+        let workspace = boundary_workspace();
+        std::env::set_var(ALIAS, "anthropic/parsed-before-install");
+
+        let args = declaring(&workspace, &["--model", "handoffprobe", "prompt", "repair"]);
+        let result = super::prepare_invocation_in(
+            super::LEADING_GRAMMAR,
+            &args,
+            true,
+            true,
+            |_| {
+                std::env::set_var(ALIAS, "anthropic/read-after-install");
+                Ok(())
+            },
+            |_| Ok(None),
+        );
+
+        std::env::remove_var(ALIAS);
+        let _ = fs::remove_dir_all(workspace);
+        let (action, _) = result.expect("parses");
+        assert!(
+            matches!(&action, CliAction::Prompt { model, .. }
+                if model == "anthropic/parsed-before-install"),
+            "{action:?}"
+        );
+    }
+
+    #[test]
+    fn north_star_run3_argv_installs_exactly_its_process_authority() {
+        // Run #3's argv through the order `run()` uses, over a real
+        // workspace: the same action as before, with its confinement
+        // installed whole before its tools are resolved.
+        let _guard = env_lock();
+        let workspace = temp_dir();
+        fs::create_dir_all(workspace.join("scripts")).expect("scripts");
+        fs::create_dir_all(workspace.join("tests/a2_l4")).expect("tests");
+        let source = "scripts/pretty_print_planner_output.py";
+        let test = "tests/a2_l4/test_pretty_print_planner_output.py";
+        for file in [source, test, "README.md"] {
+            fs::write(workspace.join(file), "x\n").expect("file");
+        }
+        let prompt = "Repair the planner output heading.\n\nThen add one test; run it with -p.";
+        let confine = format!("--workspace-confine={}", workspace.display());
+        let tools = "read_file,edit_file,insert_before,insert_after,bash";
+        let args = confine_args(&[
+            confine.as_str(),
+            "--workspace-confine-write",
+            source,
+            "--workspace-confine-write",
+            test,
+            "--workspace-confine-bash-command",
+            NORTH_STAR_TEST,
+            "--data-dir=/evidence/data",
+            "--permission-mode",
+            "workspace-write",
+            "--model",
+            "coder",
+            "--allowedTools",
+            tools,
+            "--output-format",
+            "json",
+            "prompt",
+            prompt,
+        ]);
+
+        std::env::set_var("RUSTY_CLAUDE_MODEL_ALIAS__CODER", "devstral-small-2:latest");
+        let prepared = prepare_by(super::LEADING_OPTIONS, &args);
+        std::env::remove_var("RUSTY_CLAUDE_MODEL_ALIAS__CODER");
+
+        assert_eq!(
+            prepared.result,
+            Ok((
+                CliAction::Prompt {
+                    prompt: prompt.to_string(),
+                    model: "devstral-small-2:latest".to_string(),
+                    output_format: CliOutputFormat::Json,
+                    allowed_tools: Some(
+                        tools
+                            .split(',')
+                            .map(str::to_string)
+                            .collect::<super::AllowedToolSet>()
+                    ),
+                    permission_mode: PermissionMode::WorkspaceWrite,
+                    compact: false,
+                    base_commit: None,
+                    reasoning_effort: None,
+                    allow_broad_cwd: false,
+                },
+                Some(PathBuf::from("/evidence/data")),
+            ))
+        );
+        assert_eq!(prepared.order, ["install", "registry"]);
+        assert_eq!(
+            prepared.requests,
+            [super::ConfinementRequest {
+                root: workspace.clone(),
+                writable: confine_args(&[source, test]),
+                commands: confine_args(&[NORTH_STAR_TEST]),
+            }]
+        );
+        let confinement = prepared.installed.as_ref().expect("installed");
+        for file in [source, test] {
+            confinement
+                .root()
+                .write_file(file, "x\n")
+                .expect("a declared file is writable");
+        }
+        confinement
+            .root()
+            .write_file("README.md", "x\n")
+            .expect_err("an unlisted file is not writable");
+        assert!(confinement.approved_command(NORTH_STAR_TEST).is_some());
+        assert!(confinement.approved_command(SMOKE_COMMAND).is_none());
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn a_drifted_arity_installs_nothing_or_what_the_leading_grammar_installs() {
+        // `a_drifted_arity_refuses_or_changes_nothing`, in the order `run()`
+        // uses, where a refusal counts only if it comes before the install.
+        // Read by a drifted specification, an invocation is refused with
+        // nothing installed, or it asks for exactly the confinement and ends
+        // exactly as it does by the leading grammar.
+        use super::OptionArity::{InlineValue, NoValue, Value};
+        let _guard = env_lock();
+        let workspace = boundary_workspace();
+        let root = workspace.display().to_string();
+        let cwd = temp_dir();
+        fs::create_dir_all(&cwd).expect("cwd");
+        with_current_dir(&cwd, || {
+            for (index, spec) in super::LEADING_OPTIONS.iter().enumerate() {
+                let inline = format!("{}=v", spec.name);
+                let forms = [
+                    &[spec.name][..],
+                    &[spec.name, "v"][..],
+                    &[inline.as_str()][..],
+                ];
+                for arity in [NoValue, InlineValue, Value] {
+                    if arity == spec.arity {
+                        continue;
+                    }
+                    let specs = drifted(index, arity);
+                    for (region, grant) in AUTHORITY_GRANTS {
+                        for option in forms {
+                            for action in PROMPT_SHAPES.into_iter().chain([&["status"][..]]) {
+                                for args in [
+                                    boundary_args(&[region, option, grant, action]),
+                                    boundary_args(&[region, grant, option, action]),
+                                ] {
+                                    // Over a real workspace, so that what is
+                                    // asked for would be bound.
+                                    let args: Vec<String> = args
+                                        .iter()
+                                        .map(|arg| arg.replace("/tmp/work", &root))
+                                        .collect();
+                                    let drifted = prepare_by(&specs, &args);
+                                    if drifted.result.is_err() && drifted.installed_nothing() {
+                                        continue;
+                                    }
+                                    let leading = prepare_by(super::LEADING_OPTIONS, &args);
+                                    assert!(
+                                        drifted.result == leading.result
+                                            && drifted.order == leading.order
+                                            && drifted.requests == leading.requests,
+                                        "{args:?} with {} as {arity:?}: {:?} after {:?} of {:?}",
+                                        spec.name,
+                                        drifted.result,
+                                        drifted.order,
+                                        drifted.requests
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        assert_eq!(
+            fs::read_to_string(workspace.join("README.md")).expect("readme"),
+            "readme\n"
+        );
+        for dir in [workspace, cwd] {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    /// The tool allow-list `action` carries, if it is one that runs tools.
+    fn tool_allow_list(action: &CliAction) -> Option<&Option<super::AllowedToolSet>> {
+        match action {
+            CliAction::Prompt { allowed_tools, .. } | CliAction::Repl { allowed_tools, .. } => {
+                Some(allowed_tools)
+            }
+            CliAction::ResumeRepl { context, .. } => Some(&context.allowed_tools),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn every_action_that_runs_tools_is_bound_to_the_resolved_allow_list() {
+        // An action parses with its `--allowedTools` unresolved, and until it
+        // is bound it allows no tool at all. Binding gives every action that
+        // runs tools the resolved list.
+        let _guard = env_lock();
+        let resolved: super::AllowedToolSet = ["bash", "read_file"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        for action in [
+            &["fix", "it"][..],
+            &["prompt", "repair"][..],
+            &["-p", "repair"][..],
+            &["skills", "review"][..],
+            &["/skills", "review"][..],
+            &["--resume", "latest"][..],
+        ] {
+            let args = boundary_args(&[&["--allowedTools", "read_file,bash"], action]);
+            let validated = super::validate_invocation(super::LEADING_GRAMMAR, &args, true, true)
+                .unwrap_or_else(|error| panic!("{args:?}: {error}"));
+            assert_eq!(
+                validated.allowed_tool_values,
+                confine_args(&["read_file,bash"]),
+                "{args:?}"
+            );
+            assert_eq!(
+                tool_allow_list(&validated.action),
+                Some(&Some(super::AllowedToolSet::new())),
+                "{args:?}: not bound yet"
+            );
+
+            let prepared = prepare_by(super::LEADING_OPTIONS, &args);
+            let (bound, _) = prepared.result.as_ref().expect("parses");
+            assert_eq!(
+                tool_allow_list(bound),
+                Some(&Some(resolved.clone())),
+                "{args:?}"
+            );
+            assert_eq!(prepared.order, ["registry"], "{args:?}");
+        }
+
+        // The REPL, bound directly: parsing an empty command line reads the
+        // real stdin.
+        let repl = |allowed_tools| CliAction::Repl {
+            model: DEFAULT_MODEL.to_string(),
+            allowed_tools,
+            permission_mode: PermissionMode::ReadOnly,
+            base_commit: None,
+            reasoning_effort: None,
+            allow_broad_cwd: false,
+        };
+        let values = confine_args(&["read_file,bash"]);
+        let validated = super::ValidatedInvocation {
+            action: repl(super::unresolved_allowed_tools(&values)),
+            allowed_tool_values: values,
+            data_dir: None,
+            confinement: None,
+        };
+        assert_eq!(
+            validated.bind(
+                |_| Ok(()),
+                |values| super::GlobalToolRegistry::builtin().normalize_allowed_tools(values)
+            ),
+            Ok((repl(Some(resolved.clone())), None))
+        );
+
+        // An action that runs no tools has its values resolved all the same,
+        // so an unknown tool is still refused.
+        let args = confine_args(&["--allowedTools", "read_file", "status"]);
+        let prepared = prepare_by(super::LEADING_OPTIONS, &args);
+        assert!(
+            matches!(prepared.result, Ok((CliAction::Status { .. }, None))),
+            "{:?}",
+            prepared.result
+        );
+        assert_eq!(prepared.order, ["registry"]);
+
+        // Help and version never resolved them, and still build no registry.
+        for flag in ["--help", "--version"] {
+            let args = confine_args(&["--allowedTools", "no_such_tool", flag]);
+            let validated = super::validate_invocation(super::LEADING_GRAMMAR, &args, true, true)
+                .unwrap_or_else(|error| panic!("{args:?}: {error}"));
+            assert!(validated.allowed_tool_values.is_empty(), "{args:?}");
+            let prepared = prepare_by(super::LEADING_OPTIONS, &args);
+            assert!(prepared.result.is_ok(), "{args:?}: {:?}", prepared.result);
+            assert!(prepared.installed_nothing(), "{args:?}");
+        }
+    }
+
+    /// The source of the production function whose signature starts with
+    /// `signature`, up to its closing brace.
+    fn production_fn<'a>(production: &'a str, signature: &str) -> &'a str {
+        let start = production
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} must exist"));
+        let end = production[start..]
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("{signature} must end"));
+        &production[start..start + end]
+    }
+
+    #[test]
+    fn run_prepares_every_invocation_in_the_order_these_tests_drive() {
+        // The tests above drive `prepare_invocation_in`. They speak for the
+        // process only while `run()` prepares its invocation through that
+        // function and nothing else installs a confinement.
+        const SELF_SRC: &str = include_str!("main.rs");
+        let production = SELF_SRC
+            .split("\nmod tests {")
+            .next()
+            .expect("production source");
+        let code_lines_naming = |name: &str| {
+            production
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//") && line.contains(name))
+                .count()
+        };
+
+        let run = production_fn(production, "fn run() -> ");
+        assert!(
+            run.contains("prepare_invocation_in("),
+            "run() must prepare its invocation through prepare_invocation_in"
+        );
+        assert!(
+            run.contains("install_workspace_confinement,"),
+            "run() must hand prepare_invocation_in the process installer"
+        );
+        for bypass in [
+            "extract_process_flags",
+            "parse_args_core",
+            "build_workspace_confinement",
+            "set_workspace_confinement",
+        ] {
+            assert!(!run.contains(bypass), "run() must not call {bypass} itself");
+        }
+
+        // One installer, which is the only caller of the process-wide
+        // install, and `run()` is the only one to name it.
+        let installer = production_fn(production, "fn install_workspace_confinement(");
+        assert!(installer.contains("tools::set_workspace_confinement("));
+        assert_eq!(code_lines_naming("set_workspace_confinement("), 1);
+        assert_eq!(code_lines_naming("install_workspace_confinement"), 2);
+    }
+
+    // ---- PR #184 review repair: runtime authority only in the option region ----
+
+    /// Each runtime-authority option as it can follow an action, in both
+    /// spellings and both forms. Each asks for more than the option regions
+    /// of the tests below grant.
+    const AUTHORITY_WORDS: [&[&str]; 8] = [
+        &["--allowedTools", "write_file,bash"],
+        &["--allowedTools=write_file,bash"],
+        &["--allowed-tools", "write_file,bash"],
+        &["--allowed-tools=write_file,bash"],
+        &["--permission-mode", "danger-full-access"],
+        &["--permission-mode=danger-full-access"],
+        &["--dangerously-skip-permissions"],
+        &["--allow-broad-cwd"],
+    ];
+
+    /// The action `args` is prepared to, in the order `run()` prepares it.
+    fn prepared_action(args: &[String]) -> Result<CliAction, String> {
+        prepare_by(super::LEADING_OPTIONS, args)
+            .result
+            .map(|(action, _)| action)
+    }
+
+    /// The prompt `args` is prepared to.
+    fn prepared_prompt(args: &[String]) -> (CliAction, String) {
+        match prepared_action(args) {
+            Ok(action) => match &action {
+                CliAction::Prompt { prompt, .. } => {
+                    let prompt = prompt.clone();
+                    (action, prompt)
+                }
+                other => panic!("{args:?} is not a prompt: {other:?}"),
+            },
+            Err(error) => panic!("{args:?} should parse: {error}"),
+        }
+    }
+
+    /// The tool allow-list and permission mode `action` runs tools under.
+    fn runtime_authority(action: &CliAction) -> (Option<super::AllowedToolSet>, PermissionMode) {
+        match action {
+            CliAction::Prompt {
+                allowed_tools,
+                permission_mode,
+                ..
+            }
+            | CliAction::Repl {
+                allowed_tools,
+                permission_mode,
+                ..
+            } => (allowed_tools.clone(), *permission_mode),
+            CliAction::ResumeRepl { context, .. } => {
+                (context.allowed_tools.clone(), context.permission_mode)
+            }
+            other => panic!("{other:?} runs no tools"),
+        }
+    }
+
+    /// Whether `action` may run from a very broad directory without asking:
+    /// what `run()` hands the broad-directory guard.
+    fn allows_broad_cwd(action: &CliAction) -> bool {
+        match action {
+            CliAction::Prompt {
+                allow_broad_cwd, ..
+            }
+            | CliAction::Repl {
+                allow_broad_cwd, ..
+            } => *allow_broad_cwd,
+            CliAction::ResumeRepl { context, .. } => context.allow_broad_cwd,
+            other => panic!("{other:?} runs no tools"),
+        }
+    }
+
+    /// Whether a model working under `action` gets to run `tool`, asked of
+    /// what enforces it: the tools offered to the model, the executor's
+    /// allow-list, and the permission policy.
+    fn runs_tool(action: &CliAction, tool: &str) -> bool {
+        let (allowed_tools, permission_mode) = runtime_authority(action);
+        let registry = GlobalToolRegistry::builtin();
+        let offered = registry
+            .definitions(allowed_tools.as_ref())
+            .iter()
+            .any(|definition| definition.name == tool);
+        // An empty input never reaches the tool: the allow-list refuses it
+        // or, past the allow-list, it is invalid input.
+        let mut executor =
+            super::CliToolExecutor::new(allowed_tools, false, registry.clone(), None);
+        let listed = match runtime::ToolExecutor::execute(&mut executor, tool, "{}") {
+            Ok(_) => true,
+            Err(error) => !error.to_string().contains("--allowedTools"),
+        };
+        let policy = super::permission_policy(
+            permission_mode,
+            &runtime::RuntimeFeatureConfig::default(),
+            &registry,
+        )
+        .expect("permission policy should build");
+        let permitted = matches!(
+            policy.authorize(tool, "{}", None),
+            runtime::PermissionOutcome::Allow
+        );
+        offered && listed && permitted
+    }
+
+    fn tool_set(tools: &[&str]) -> Option<super::AllowedToolSet> {
+        Some(tools.iter().map(ToString::to_string).collect())
+    }
+
+    #[test]
+    fn words_after_a_prompt_cannot_widen_the_tool_allow_list() {
+        // The option region allows one tool and grants every permission, so
+        // a tool runs exactly when the allow-list names it.
+        let _guard = env_lock();
+        let leading = [
+            "--allowedTools",
+            "read_file",
+            "--permission-mode",
+            "danger-full-access",
+        ];
+        for prompt in PROMPT_SHAPES {
+            for words in &AUTHORITY_WORDS[..4] {
+                let args = boundary_args(&[&leading, prompt, words]);
+                let (action, _) = prepared_prompt(&args);
+                assert_eq!(
+                    runtime_authority(&action).0,
+                    tool_set(&["read_file"]),
+                    "{args:?}"
+                );
+                assert!(runs_tool(&action, "read_file"), "{args:?}");
+                for tool in ["write_file", "bash"] {
+                    assert!(
+                        !runs_tool(&action, tool),
+                        "{args:?} lets a model run {tool}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn words_after_a_prompt_cannot_narrow_the_tool_allow_list_either() {
+        // Prompt text is not authority in either direction: what the option
+        // region allows is what the action allows.
+        let _guard = env_lock();
+        for prompt in PROMPT_SHAPES {
+            for words in [
+                &["--allowedTools", "read_file"][..],
+                &["--allowed-tools=read_file"][..],
+            ] {
+                let leading = [
+                    "--allowedTools=read_file,write_file",
+                    "--permission-mode=workspace-write",
+                ];
+                let args = boundary_args(&[&leading, prompt, words]);
+                let (action, _) = prepared_prompt(&args);
+                assert_eq!(
+                    runtime_authority(&action).0,
+                    tool_set(&["read_file", "write_file"]),
+                    "{args:?}"
+                );
+                assert!(runs_tool(&action, "write_file"), "{args:?}");
+
+                // With no allow-list in the option region there is none.
+                let args = boundary_args(&[&["--permission-mode=read-only"], prompt, words]);
+                let (action, _) = prepared_prompt(&args);
+                assert_eq!(runtime_authority(&action).0, None, "{args:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn words_after_a_prompt_cannot_change_the_permission_mode() {
+        let _guard = env_lock();
+        let modes = [
+            ("read-only", PermissionMode::ReadOnly),
+            ("workspace-write", PermissionMode::WorkspaceWrite),
+            ("danger-full-access", PermissionMode::DangerFullAccess),
+        ];
+        for (leading, mode) in modes {
+            for prompt in PROMPT_SHAPES {
+                for (later, _) in modes {
+                    let equals = format!("--permission-mode={later}");
+                    for words in [&["--permission-mode", later][..], &[equals.as_str()][..]] {
+                        let args = boundary_args(&[&["--permission-mode", leading], prompt, words]);
+                        let (action, _) = prepared_prompt(&args);
+                        assert_eq!(runtime_authority(&action).1, mode, "{args:?}");
+                    }
+                }
+            }
+        }
+
+        // What the mode comes to: read-only neither writes nor runs a
+        // command, whatever the prompt goes on to say.
+        for prompt in PROMPT_SHAPES {
+            for words in &AUTHORITY_WORDS[4..6] {
+                let args = boundary_args(&[&["--permission-mode", "read-only"], prompt, words]);
+                let (action, _) = prepared_prompt(&args);
+                assert!(runs_tool(&action, "read_file"), "{args:?}");
+                for tool in ["write_file", "bash"] {
+                    assert!(
+                        !runs_tool(&action, tool),
+                        "{args:?} lets a model run {tool}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn words_after_a_prompt_cannot_skip_permission_checks() {
+        let _guard = env_lock();
+        let skip = &["--dangerously-skip-permissions"][..];
+        for prompt in PROMPT_SHAPES {
+            let args = boundary_args(&[&["--permission-mode", "read-only"], prompt, skip]);
+            let (action, _) = prepared_prompt(&args);
+            assert_eq!(
+                runtime_authority(&action).1,
+                PermissionMode::ReadOnly,
+                "{args:?}"
+            );
+            for tool in ["write_file", "bash"] {
+                assert!(
+                    !runs_tool(&action, tool),
+                    "{args:?} lets a model run {tool}"
+                );
+            }
+
+            // With no mode in the option region the action has the default
+            // one, the same one it has without the words.
+            let (plain, _) = prepared_prompt(&boundary_args(&[prompt]));
+            let (action, _) = prepared_prompt(&boundary_args(&[prompt, skip]));
+            assert_eq!(
+                runtime_authority(&action),
+                runtime_authority(&plain),
+                "{prompt:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn words_after_a_prompt_cannot_allow_a_broad_working_directory() {
+        // `--allow-broad-cwd` lets an action run from the home directory or
+        // the root without asking. It does so only from the option region.
+        let _guard = env_lock();
+        for (shape, opening) in [
+            (&["fix", "it"][..], "fix it"),
+            (&["prompt", "repair"][..], "repair"),
+            (&["-p", "repair"][..], "repair"),
+        ] {
+            // After the action began it is a word of the prompt, at its end
+            // or between its words.
+            for tail in [
+                &["--allow-broad-cwd"][..],
+                &["--allow-broad-cwd", "now"][..],
+            ] {
+                let args = boundary_args(&[shape, tail]);
+                let (action, prompt) = prepared_prompt(&args);
+                assert!(
+                    !allows_broad_cwd(&action),
+                    "{args:?} allows a broad directory"
+                );
+                assert_eq!(prompt, format!("{opening} {}", tail.join(" ")), "{args:?}");
+            }
+
+            // In the option region it allows one, whatever the prompt goes
+            // on to say.
+            for words in [&[][..]].into_iter().chain(AUTHORITY_WORDS) {
+                let args = boundary_args(&[&["--allow-broad-cwd"], shape, words]);
+                let (action, _) = prepared_prompt(&args);
+                assert!(allows_broad_cwd(&action), "{args:?}");
+            }
+        }
+
+        // An interactive resume takes it from the option region too.
+        let resume = confine_args(&["--allow-broad-cwd", "--resume", "latest"]);
+        let action = prepared_action(&resume).expect("a resume after its options should parse");
+        assert!(allows_broad_cwd(&action), "{resume:?}");
+
+        // The value slot of another option is that option's, as before.
+        let (action, prompt) = prepared_prompt(&confine_args(&[
+            "repair",
+            "--base-commit",
+            "--allow-broad-cwd",
+        ]));
+        assert_eq!(prompt, "repair");
+        assert!(!allows_broad_cwd(&action));
+    }
+
+    #[test]
+    fn runtime_authority_in_the_option_region_keeps_its_meaning() {
+        // Allow-lists add up across both spellings and both forms, and the
+        // last permission option wins. Nothing after the action changes
+        // either. Each case is an option region, the tools it lists (none
+        // when it names no allow-list) and the mode it sets.
+        let _guard = env_lock();
+        let cases: [(&[&str], &[&str], PermissionMode); 6] = [
+            (
+                &[
+                    "--allowedTools",
+                    "read_file",
+                    "--allowed-tools=bash",
+                    "--permission-mode",
+                    "read-only",
+                    "--permission-mode=workspace-write",
+                ],
+                &["bash", "read_file"],
+                PermissionMode::WorkspaceWrite,
+            ),
+            (
+                &[
+                    "--allowed-tools",
+                    "read_file,write_file",
+                    "--allowedTools=bash",
+                    "--dangerously-skip-permissions",
+                ],
+                &["bash", "read_file", "write_file"],
+                PermissionMode::DangerFullAccess,
+            ),
+            (
+                &[
+                    "--dangerously-skip-permissions",
+                    "--permission-mode",
+                    "read-only",
+                ],
+                &[],
+                PermissionMode::ReadOnly,
+            ),
+            (
+                &[
+                    "--permission-mode=read-only",
+                    "--dangerously-skip-permissions",
+                ],
+                &[],
+                PermissionMode::DangerFullAccess,
+            ),
+            (
+                &[
+                    "--permission-mode",
+                    "danger-full-access",
+                    "--permission-mode=read-only",
+                ],
+                &[],
+                PermissionMode::ReadOnly,
+            ),
+            (
+                &["--allowedTools=read_file", "--permission-mode=read-only"],
+                &["read_file"],
+                PermissionMode::ReadOnly,
+            ),
+        ];
+        for (leading, tools, mode) in cases {
+            let allow_list = if tools.is_empty() {
+                None
+            } else {
+                tool_set(tools)
+            };
+            let authority = (allow_list, mode);
+            for prompt in PROMPT_SHAPES {
+                for words in [&[][..]].into_iter().chain(AUTHORITY_WORDS) {
+                    let args = boundary_args(&[leading, prompt, words]);
+                    let (action, _) = prepared_prompt(&args);
+                    assert_eq!(runtime_authority(&action), authority, "{args:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn authority_words_after_a_prompt_stay_in_its_text() {
+        // The words are neither read as options nor dropped: the prompt is
+        // every word after the action began, as given.
+        let _guard = env_lock();
+        for (shape, opening) in [
+            (&["fix", "it"][..], "fix it"),
+            (&["prompt", "repair"][..], "repair"),
+            (&["-p", "repair"][..], "repair"),
+        ] {
+            for words in AUTHORITY_WORDS {
+                let args =
+                    boundary_args(&[&["--allowedTools", "read_file"], shape, words, &["now"]]);
+                let (_, prompt) = prepared_prompt(&args);
+                assert_eq!(
+                    prompt,
+                    format!("{opening} {} now", words.join(" ")),
+                    "{args:?}"
+                );
+            }
+            let every = AUTHORITY_WORDS.concat();
+            let (_, prompt) = prepared_prompt(&boundary_args(&[shape, &every]));
+            assert_eq!(
+                prompt,
+                format!("{opening} {}", every.join(" ")),
+                "{shape:?}"
+            );
+        }
+
+        // Authority words alone after `prompt` are its text too.
+        let (_, prompt) = prepared_prompt(&confine_args(&[
+            "prompt",
+            "--dangerously-skip-permissions",
+            "--allowedTools=bash",
+        ]));
+        assert_eq!(prompt, "--dangerously-skip-permissions --allowedTools=bash");
+    }
+
+    #[test]
+    fn the_arguments_an_authority_word_spans_stay_together() {
+        // After the action began an authority option still spans the
+        // arguments the grammar gives it, so its value is never read as a
+        // prompt terminal, a model, or help.
+        let _guard = env_lock();
+        let (plain, _) = prepared_prompt(&confine_args(&["repair"]));
+        for (args, text) in [
+            (
+                &["fix", "--allowedTools", "-p", "now"][..],
+                "fix --allowedTools -p now",
+            ),
+            (
+                &["fix", "--allowed-tools", "--model", "sonnet"][..],
+                "fix --allowed-tools --model sonnet",
+            ),
+            (
+                &["fix", "--permission-mode", "--compact", "now"][..],
+                "fix --permission-mode --compact now",
+            ),
+            (
+                &["prompt", "repair", "--permission-mode", "--help"][..],
+                "repair --permission-mode --help",
+            ),
+            (
+                &["fix", "--permission-mode", "--dangerously-skip-permissions"][..],
+                "fix --permission-mode --dangerously-skip-permissions",
+            ),
+        ] {
+            let (action, prompt) = prepared_prompt(&confine_args(args));
+            assert_eq!(prompt, text, "{args:?}");
+            let CliAction::Prompt { model, compact, .. } = &action else {
+                unreachable!()
+            };
+            let CliAction::Prompt {
+                model: plain_model, ..
+            } = &plain
+            else {
+                unreachable!()
+            };
+            assert_eq!((model, *compact), (plain_model, false), "{args:?}");
+            assert_eq!(
+                runtime_authority(&action),
+                runtime_authority(&plain),
+                "{args:?}"
+            );
+        }
+
+        // The value slot of another option is that option's, as before.
+        let (action, prompt) = prepared_prompt(&confine_args(&[
+            "repair",
+            "--base-commit",
+            "--dangerously-skip-permissions",
+        ]));
+        assert_eq!(prompt, "repair");
+        assert_eq!(runtime_authority(&action), runtime_authority(&plain));
+        assert!(matches!(
+            &action,
+            CliAction::Prompt { base_commit: Some(commit), .. }
+                if commit == "--dangerously-skip-permissions"
+        ));
+    }
+
+    /// Actions that are not a prompt given as words.
+    const NOT_WORD_PROMPTS: &[&[&str]] = &[
+        &["--resume"],
+        &["--resume", "latest"],
+        &["--resume=latest"],
+        &["--resume", "latest", "/status"],
+        &["--acp"],
+        &["-acp"],
+        &["acp", "serve"],
+        &["status"],
+        &["doctor"],
+        &["help"],
+        &["version"],
+        &["export"],
+        &["skills"],
+        &["skills", "myskill", "go"],
+        &["/skills", "myskill"],
+        &["agents"],
+        &["mcp"],
+        &["plugins"],
+        &["config"],
+        &["diff"],
+        &["init"],
+        &["bootstrap-plan"],
+        &["system-prompt"],
+        &["dump-manifests"],
+        &["plan", "run", "plan.json"],
+        &["task", "run", "task.json"],
+        &["prompt", "repair", "--help"],
+        &["fix", "it", "--version"],
+    ];
+
+    #[test]
+    fn authority_words_outside_a_prompt_are_refused() {
+        // Only a prompt has text for the words to be. Every other action is
+        // refused, before anything it declares is installed.
+        let _guard = env_lock();
+        let workspace = boundary_workspace();
+        for action in NOT_WORD_PROMPTS {
+            for words in AUTHORITY_WORDS {
+                let args = declaring(&workspace, &[*action, words].concat());
+                prepare_by(super::LEADING_OPTIONS, &args)
+                    .assert_refused_with_nothing_installed(&format!("{action:?} {words:?}"));
+            }
+        }
+
+        // Words before a `-p` are not its prompt either.
+        for words in AUTHORITY_WORDS {
+            let args = declaring(
+                &workspace,
+                &[&["fix"][..], words, &["-p", "now"][..]].concat(),
+            );
+            prepare_by(super::LEADING_OPTIONS, &args)
+                .assert_refused_with_nothing_installed(&format!("{words:?} before -p"));
+        }
+
+        // Where the action itself would have taken the words or left them
+        // unread, the refusal names the option.
+        for action in [
+            &["skills", "myskill", "go"][..],
+            &["/skills", "myskill"][..],
+            &["agents"][..],
+            &["init"][..],
+            &["--resume", "latest", "/status"][..],
+            &["prompt", "repair", "--help"][..],
+        ] {
+            for words in AUTHORITY_WORDS {
+                let args = boundary_args(&[action, words]);
+                let name = words[0].split('=').next().expect("name");
+                assert_eq!(
+                    prepared_action(&args),
+                    Err(after_option_region(name)),
+                    "{args:?}"
+                );
+            }
+        }
+        assert_eq!(
+            fs::read_to_string(workspace.join("README.md")).expect("readme"),
+            "readme\n"
+        );
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn a_resumed_session_takes_its_authority_from_the_option_region_only() {
+        // An interactive resume runs tools. Its authority is the option
+        // region's, and the same words after `--resume` are refused.
+        let _guard = env_lock();
+        for resume in [
+            &["--resume"][..],
+            &["--resume", "latest"][..],
+            &["--resume=latest"][..],
+        ] {
+            let leading = [
+                "--allowedTools",
+                "read_file",
+                "--permission-mode",
+                "read-only",
+            ];
+            let action = prepared_action(&boundary_args(&[&leading, resume]))
+                .expect("a resume after its options should parse");
+            assert_eq!(
+                runtime_authority(&action),
+                (tool_set(&["read_file"]), PermissionMode::ReadOnly),
+                "{resume:?}"
+            );
+            for words in AUTHORITY_WORDS {
+                let args = boundary_args(&[&leading, resume, words]);
+                if let Ok(action) = prepared_action(&args) {
+                    panic!("{args:?} resumes under {:?}", runtime_authority(&action));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_action_carries_exactly_the_authority_of_its_option_region() {
+        // Every sequence of up to three of these argument groups, read
+        // whole and read again with everything after its option region
+        // replaced by one plain word. The option region is the one
+        // `split_option_region` gives the process flags, and the two
+        // readings always run tools under the same authority.
+        let _guard = env_lock();
+        let atoms: [&[&str]; 15] = [
+            &["--allowedTools", "read_file"],
+            &["--allowed-tools=bash"],
+            &["--permission-mode", "workspace-write"],
+            &["--permission-mode=read-only"],
+            &["--dangerously-skip-permissions"],
+            &["--allow-broad-cwd"],
+            &["--model", "sonnet"],
+            &["--compact"],
+            &["--base-commit"],
+            &["--output-format", "json"],
+            &["fix"],
+            &["prompt"],
+            &["-p"],
+            &["repair"],
+            &["--resume"],
+        ];
+        let mut sequences: Vec<Vec<&[&str]>> = Vec::new();
+        for first in atoms {
+            sequences.push(vec![first]);
+            for second in atoms {
+                sequences.push(vec![first, second]);
+                for third in atoms {
+                    sequences.push(vec![first, second, third]);
+                }
+            }
+        }
+        let mut compared = 0;
+        for sequence in sequences {
+            let args = boundary_args(&sequence);
+            let Ok((options, action)) = super::split_option_region(super::LEADING_GRAMMAR, &args)
+            else {
+                continue;
+            };
+            if action.is_empty() {
+                // No action at all: the REPL, which reads the real stdin.
+                continue;
+            }
+            let Ok(whole) = prepared_action(&args) else {
+                continue;
+            };
+            if !matches!(
+                whole,
+                CliAction::Prompt { .. } | CliAction::ResumeRepl { .. }
+            ) {
+                continue;
+            }
+            let mut region = options
+                .iter()
+                .flat_map(|unit| unit.args.to_vec())
+                .collect::<Vec<_>>();
+            region.push("repair".to_string());
+            let alone = prepared_action(&region)
+                .unwrap_or_else(|error| panic!("{region:?} of {args:?}: {error}"));
+            assert_eq!(
+                (runtime_authority(&whole), allows_broad_cwd(&whole)),
+                (runtime_authority(&alone), allows_broad_cwd(&alone)),
+                "{args:?}"
+            );
+            compared += 1;
+        }
+        assert!(compared > 1000, "compared only {compared}");
+    }
+
+    #[test]
+    fn the_action_parser_takes_its_option_region_from_the_shared_split() {
+        // The tests above hold the two readings together by what they do.
+        // This holds them together by construction: the action parser asks
+        // `split_option_region` where the action begins, and decides in one
+        // place what a runtime-authority option after it is.
+        const SELF_SRC: &str = include_str!("main.rs");
+        let production = SELF_SRC
+            .split("\nmod tests {")
+            .next()
+            .expect("production source");
+        let parser = production_fn(production, "fn parse_action_in(");
+        assert!(parser.contains("split_option_region(grammar, args)?"));
+        assert_eq!(parser.matches("is_runtime_authority()").count(), 1);
+        assert!(parser.contains("!in_option_region && unit.option.is_runtime_authority()"));
+    }
+
+    #[test]
+    fn the_runtime_authority_options_are_the_tool_permission_and_directory_options() {
+        // Every spelling of the four options, and nothing else.
+        let authority = super::LEADING_OPTIONS
+            .iter()
+            .filter(|spec| spec.option.is_runtime_authority())
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            authority,
+            [
+                "--permission-mode",
+                "--dangerously-skip-permissions",
+                "--allow-broad-cwd",
+                "--allowedTools",
+                "--allowed-tools",
+            ]
+        );
     }
 
     // ---- PR #183 review repair: no external integrations while confined (P1) ----

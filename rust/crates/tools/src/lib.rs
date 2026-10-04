@@ -12,9 +12,11 @@ use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
     check_freshness,
-    contained::{approved_command, run_contained, ContainedRequest, ContainedTermination},
+    contained::{
+        approved_command, run_contained, ApprovedCommand, ContainedRequest, ContainedTermination,
+    },
     dedupe_superseded_commit_events, edit_file, execute_bash, glob_search, grep_search,
-    load_system_prompt,
+    insert_text, load_system_prompt,
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
@@ -25,10 +27,10 @@ use runtime::{
     worker_boot::{WorkerReadySnapshot, WorkerRegistry, WorkerTaskReceipt},
     write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
     BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime,
-    GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventName,
-    LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole, PermissionMode,
-    PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError, Session, TaskPacket,
-    ToolError, ToolExecutor, WorkspaceRoot,
+    GrepSearchInput, InsertPosition, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
+    LaneEventName, LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole,
+    PermissionMode, PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError,
+    Session, TaskPacket, ToolError, ToolExecutor, WorkspaceRoot,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -42,10 +44,14 @@ use serde_json::{json, Value};
 /// - only [`CONFINED_TOOLS`] may run;
 /// - file tools resolve workspace-relative paths through the descriptor-bound
 ///   [`WorkspaceRoot`] (`openat2` beneath the root, no symlinks, no mount
-///   crossings, no ambient CWD), and may modify only
-///   [`CONTROLLED_SMOKE_WRITABLE`];
-/// - `bash` runs only an approved command, inside the Bubblewrap sandbox of
-///   `runtime::contained`, and returns only after the sandbox's whole process
+///   crossings, no ambient CWD), and may modify only the writable files the
+///   operator declared (`--workspace-confine-write`), or
+///   [`CONTROLLED_SMOKE_WRITABLE`] for the controlled smoke;
+/// - `bash` runs only a command the operator declared
+///   (`--workspace-confine-bash-command`), or the controlled smoke's built-in
+///   command when nothing is declared, matched by exact string equality; it
+///   runs inside the Bubblewrap sandbox of `runtime::contained`, with the
+///   workspace read-only, and returns only after the sandbox's whole process
 ///   tree is settled. There is no fallback to unsandboxed execution.
 static WORKSPACE_CONFINEMENT: std::sync::OnceLock<WorkspaceConfinement> =
     std::sync::OnceLock::new();
@@ -63,43 +69,114 @@ pub const CONFINED_TOOLS: &[&str] = &[
     "read_file",
     "write_file",
     "edit_file",
+    "insert_before",
+    "insert_after",
     "glob_search",
     "grep_search",
     "bash",
 ];
 
-/// The only workspace files confined writes and edits may modify.
+/// The only workspace files the controlled smoke's confined writes and edits
+/// may modify; see [`WorkspaceConfinement::controlled_smoke`].
 pub const CONTROLLED_SMOKE_WRITABLE: &[&str] = &["calculator.py"];
 
-/// Fixture files that must be regular, single-link files when confinement is
-/// bound. `test_calculator.py` is the immutable oracle.
+/// Fixture files that must be regular, single-link files when the controlled
+/// smoke is bound. `test_calculator.py` is the immutable oracle.
 pub const CONTROLLED_SMOKE_FIXTURE: &[&str] = &["calculator.py", "test_calculator.py"];
 
-/// An active confinement: the descriptor-bound workspace plus the bounded
-/// command duration applied to shell calls made under it.
+/// An active confinement: the descriptor-bound workspace, the commands its
+/// shell may run, and the bounded command duration applied to shell calls
+/// made under it.
 #[derive(Debug)]
 pub struct WorkspaceConfinement {
     root: WorkspaceRoot,
+    commands: ConfinedCommands,
     bash_timeout_ms: u64,
     halted: std::sync::atomic::AtomicBool,
 }
 
+/// What confined `bash` may run. Fixed when the confinement is bound; there
+/// is no way to change it afterwards.
+#[derive(Debug)]
+enum ConfinedCommands {
+    /// The controlled smoke's built-in command
+    /// (`runtime::contained::approved_command`).
+    ControlledSmoke,
+    /// Exactly the operator-declared commands. Empty means `bash` runs
+    /// nothing.
+    Declared(Vec<ApprovedCommand>),
+}
+
 impl WorkspaceConfinement {
-    /// Open and bind `root`, then validate the controlled fixture.
+    /// Open and bind `root` with an operator-declared writable set and
+    /// operator-declared bash commands.
     ///
-    /// Fails when the root cannot be opened or a designated fixture file is
-    /// missing, special or hardlinked, so a bad root is reported rather than
-    /// silently degrading to "no confinement".
-    pub fn new(root: impl AsRef<Path>, bash_timeout_ms: u64) -> Result<Self, String> {
+    /// `writable` lists the only workspace-relative files confined writes
+    /// and edits may modify. Each must already exist beneath `root` as a
+    /// regular, single-link file reached without symlinks. An absolute path,
+    /// `..`, the root itself, or a missing, special, symlinked or hardlinked
+    /// file refuses the whole confinement rather than silently degrading it.
+    ///
+    /// `commands` lists the only commands confined `bash` may run, each
+    /// matched by exact string equality (see
+    /// [`ApprovedCommand::declared`]). With none, `bash` runs nothing: the
+    /// controlled smoke's command is never inherited. An invalid or repeated
+    /// declaration refuses the whole confinement.
+    pub fn new(
+        root: impl AsRef<Path>,
+        writable: &[&str],
+        commands: &[&str],
+        bash_timeout_ms: u64,
+    ) -> Result<Self, String> {
+        let commands = declared_commands(commands)?;
+        let confinement = Self::bind(
+            root.as_ref(),
+            writable,
+            ConfinedCommands::Declared(commands),
+            bash_timeout_ms,
+        )?;
+        confinement
+            .root
+            .verify_single_link_files(writable)
+            .map_err(|error| format!("declared writable file rejected: {error}"))?;
+        Ok(confinement)
+    }
+
+    /// Open and bind `root` for the controlled calculator smoke: only
+    /// [`CONTROLLED_SMOKE_WRITABLE`] is writable, every
+    /// [`CONTROLLED_SMOKE_FIXTURE`] file must be a regular, single-link file,
+    /// and `bash` runs only the smoke's built-in command.
+    ///
+    /// Fails when the root cannot be opened or a fixture file is missing,
+    /// special or hardlinked, so a bad root is reported rather than silently
+    /// degrading to "no confinement".
+    pub fn controlled_smoke(root: impl AsRef<Path>, bash_timeout_ms: u64) -> Result<Self, String> {
+        let confinement = Self::bind(
+            root.as_ref(),
+            CONTROLLED_SMOKE_WRITABLE,
+            ConfinedCommands::ControlledSmoke,
+            bash_timeout_ms,
+        )?;
+        confinement
+            .root
+            .verify_single_link_files(CONTROLLED_SMOKE_FIXTURE)
+            .map_err(|error| format!("controlled fixture rejected: {error}"))?;
+        Ok(confinement)
+    }
+
+    fn bind(
+        root: &Path,
+        writable: &[&str],
+        commands: ConfinedCommands,
+        bash_timeout_ms: u64,
+    ) -> Result<Self, String> {
         if bash_timeout_ms == 0 {
             return Err("workspace confinement bash timeout must be non-zero".to_string());
         }
-        let root = WorkspaceRoot::bind(root.as_ref(), CONTROLLED_SMOKE_WRITABLE)
-            .map_err(|error| error.to_string())?;
-        root.verify_single_link_files(CONTROLLED_SMOKE_FIXTURE)
-            .map_err(|error| format!("controlled fixture rejected: {error}"))?;
+        let root = WorkspaceRoot::bind(root, writable).map_err(|error| error.to_string())?;
         Ok(Self {
             root,
+            commands,
             bash_timeout_ms,
             halted: std::sync::atomic::AtomicBool::new(false),
         })
@@ -108,6 +185,18 @@ impl WorkspaceConfinement {
     #[must_use]
     pub fn root(&self) -> &WorkspaceRoot {
         &self.root
+    }
+
+    /// The approved command `command` selects under this confinement, by
+    /// exact string equality, or `None` when `bash` may not run it.
+    #[must_use]
+    pub fn approved_command(&self, command: &str) -> Option<&ApprovedCommand> {
+        match &self.commands {
+            ConfinedCommands::ControlledSmoke => approved_command(command),
+            ConfinedCommands::Declared(declared) => declared
+                .iter()
+                .find(|approved| approved.command() == command),
+        }
     }
 
     #[must_use]
@@ -131,6 +220,22 @@ impl WorkspaceConfinement {
     fn halt(&self) {
         self.halted.store(true, std::sync::atomic::Ordering::SeqCst);
     }
+}
+
+/// Validate operator-declared bash commands, keeping their order.
+fn declared_commands(commands: &[&str]) -> Result<Vec<ApprovedCommand>, String> {
+    let mut declared: Vec<ApprovedCommand> = Vec::with_capacity(commands.len());
+    for command in commands {
+        let approved = ApprovedCommand::declared(command)
+            .map_err(|error| format!("declared bash command rejected: {error}"))?;
+        if declared.contains(&approved) {
+            return Err(format!(
+                "declared bash command rejected: {command:?} is declared more than once"
+            ));
+        }
+        declared.push(approved);
+    }
+    Ok(declared)
 }
 
 /// Install the process-wide confinement. Returns an error if one is already
@@ -612,6 +717,28 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "required": ["path", "old_string", "new_string"],
                 "additionalProperties": false
             }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "insert_before",
+            description: "Insert new text into an existing workspace file immediately before \
+                an anchor, replacing nothing. `anchor` is exact existing text that must occur \
+                exactly once in the file; it and every other existing byte stay unchanged. \
+                `content` is inserted exactly as given, so include any newlines and indentation \
+                it needs. Use this instead of edit_file when adding new text while preserving \
+                the anchor unchanged.",
+            input_schema: insert_text_schema(),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "insert_after",
+            description: "Insert new text into an existing workspace file immediately after \
+                an anchor, replacing nothing. `anchor` is exact existing text that must occur \
+                exactly once in the file; it and every other existing byte stay unchanged. \
+                `content` is inserted exactly as given, so include any newlines and indentation \
+                it needs. Use this instead of edit_file when adding new text while preserving \
+                the anchor unchanged.",
+            input_schema: insert_text_schema(),
             required_permission: PermissionMode::WorkspaceWrite,
         },
         ToolSpec {
@@ -1335,6 +1462,20 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
     ]
 }
 
+/// Input schema shared by `insert_before` and `insert_after`.
+fn insert_text_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "path": { "type": "string" },
+            "anchor": { "type": "string" },
+            "content": { "type": "string" }
+        },
+        "required": ["path", "anchor", "content"],
+        "additionalProperties": false
+    })
+}
+
 /// Check permission before executing a tool. Returns Err with denial reason if blocked.
 pub fn enforce_permission_check(
     enforcer: &PermissionEnforcer,
@@ -1354,6 +1495,7 @@ pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
     execute_tool_with_enforcer(None, name, input)
 }
 
+#[allow(clippy::too_many_lines)]
 fn execute_tool_with_enforcer(
     enforcer: Option<&PermissionEnforcer>,
     name: &str,
@@ -1379,6 +1521,16 @@ fn execute_tool_with_enforcer(
         "edit_file" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
             from_value::<EditFileInput>(input).and_then(run_edit_file)
+        }
+        "insert_before" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<InsertTextInput>(input)
+                .and_then(|input| run_insert_text(input, InsertPosition::Before))
+        }
+        "insert_after" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<InsertTextInput>(input)
+                .and_then(|input| run_insert_text(input, InsertPosition::After))
         }
         "glob_search" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
@@ -2081,8 +2233,9 @@ fn run_bash(input: BashCommandInput) -> Result<String, String> {
         .map_err(|error| error.to_string())
 }
 
-/// Confined `bash`: only an approved command, only from the bound workspace,
-/// only inside the settled sandbox. Never falls back to [`execute_bash`].
+/// Confined `bash`: only a command the confinement approves, only from the
+/// bound workspace, only inside the settled sandbox. Never falls back to
+/// [`execute_bash`].
 fn run_contained_bash(
     input: BashCommandInput,
     confinement: &WorkspaceConfinement,
@@ -2091,12 +2244,14 @@ fn run_contained_bash(
 
     confinement.ensure_not_halted()?;
     let input = confine_bash_input(input, Some(confinement))?;
-    let command = approved_command(&input.command).ok_or_else(|| {
-        format!(
-            "command {:?} is not approved for contained execution under workspace confinement",
-            input.command
-        )
-    })?;
+    let command = confinement
+        .approved_command(&input.command)
+        .ok_or_else(|| {
+            format!(
+                "command {:?} is not approved for contained execution under workspace confinement",
+                input.command
+            )
+        })?;
     let cwd = std::env::current_dir()
         .map_err(|error| format!("cannot read the launcher working directory: {error}"))?;
     if !confinement
@@ -2406,6 +2561,29 @@ fn run_edit_file_with(
 }
 
 #[allow(clippy::needless_pass_by_value)]
+fn run_insert_text(input: InsertTextInput, position: InsertPosition) -> Result<String, String> {
+    run_insert_text_with(input, position, workspace_confinement())
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_insert_text_with(
+    input: InsertTextInput,
+    position: InsertPosition,
+    confinement: Option<&WorkspaceConfinement>,
+) -> Result<String, String> {
+    let output = match confinement {
+        Some(confinement) => {
+            confinement.ensure_not_halted()?;
+            confinement
+                .root()
+                .insert_text(&input.path, &input.anchor, &input.content, position)
+        }
+        None => insert_text(&input.path, &input.anchor, &input.content, position),
+    };
+    to_pretty_json(output.map_err(io_to_string)?)
+}
+
+#[allow(clippy::needless_pass_by_value)]
 fn run_glob_search(input: GlobSearchInputValue) -> Result<String, String> {
     run_glob_search_with(input, workspace_confinement())
 }
@@ -2609,6 +2787,13 @@ struct EditFileInput {
     old_string: String,
     new_string: String,
     replace_all: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InsertTextInput {
+    path: String,
+    anchor: String,
+    content: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5230,7 +5415,14 @@ fn deferred_tool_specs() -> Vec<ToolSpec> {
         .filter(|spec| {
             !matches!(
                 spec.name,
-                "bash" | "read_file" | "write_file" | "edit_file" | "glob_search" | "grep_search"
+                "bash"
+                    | "read_file"
+                    | "write_file"
+                    | "edit_file"
+                    | "insert_before"
+                    | "insert_after"
+                    | "glob_search"
+                    | "grep_search"
             )
         })
         .collect()
@@ -6487,18 +6679,19 @@ mod tests {
         execute_agent_with_spawn, execute_tool, extract_recovery_outcome, final_assistant_text,
         global_cron_registry, maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
         persist_agent_terminal_state, push_output_block, run_contained_bash, run_edit_file_with,
-        run_glob_search_with, run_grep_search_with, run_read_file_with, run_task_packet,
-        run_write_file_with, AgentInput, AgentJob, BashCommandInput, EditFileInput,
-        GlobSearchInputValue, GlobalToolRegistry, LaneEventName, LaneFailureClass,
-        ProviderRuntimeClient, ReadFileInput, SubagentToolExecutor, WorkspaceConfinement,
-        WriteFileInput, CONFINED_BASH_TIMEOUT_MS,
+        run_glob_search_with, run_grep_search_with, run_insert_text_with, run_read_file_with,
+        run_task_packet, run_write_file_with, AgentInput, AgentJob, BashCommandInput,
+        EditFileInput, GlobSearchInputValue, GlobalToolRegistry, InsertTextInput, LaneEventName,
+        LaneFailureClass, ProviderRuntimeClient, ReadFileInput, SubagentToolExecutor,
+        WorkspaceConfinement, WriteFileInput, CONFINED_BASH_TIMEOUT_MS,
     };
     use api::OutputContentBlock;
     use runtime::GrepSearchInput;
     use runtime::ProviderFallbackConfig;
     use runtime::{
         permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, ConversationRuntime,
-        PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket, ToolExecutor,
+        InsertPosition, PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket,
+        ToolExecutor,
     };
     use serde_json::json;
 
@@ -10094,7 +10287,7 @@ printf 'pwsh:%s' "$1"
         }
 
         fn confinement(&self) -> WorkspaceConfinement {
-            WorkspaceConfinement::new(&self.workspace, CONFINED_BASH_TIMEOUT_MS)
+            WorkspaceConfinement::controlled_smoke(&self.workspace, CONFINED_BASH_TIMEOUT_MS)
                 .expect("confinement should bind to the fixture workspace")
         }
 
@@ -10323,8 +10516,9 @@ printf 'pwsh:%s' "$1"
             fixture.outside.join("calculator-link.py"),
         )
         .expect("hardlink should be created");
-        let error = WorkspaceConfinement::new(&fixture.workspace, CONFINED_BASH_TIMEOUT_MS)
-            .expect_err("a hardlinked designated file must reject the fixture");
+        let error =
+            WorkspaceConfinement::controlled_smoke(&fixture.workspace, CONFINED_BASH_TIMEOUT_MS)
+                .expect_err("a hardlinked designated file must reject the fixture");
         assert!(error.contains("controlled fixture rejected"), "{error}");
         assert!(error.contains("hard links"), "{error}");
     }
@@ -10374,8 +10568,15 @@ printf 'pwsh:%s' "$1"
     #[test]
     fn workspace_confinement_refuses_an_unresolvable_root() {
         let missing = std::env::temp_dir().join("claw-northstar-missing-root-does-not-exist");
-        let error = WorkspaceConfinement::new(&missing, CONFINED_BASH_TIMEOUT_MS)
+        let error = WorkspaceConfinement::controlled_smoke(&missing, CONFINED_BASH_TIMEOUT_MS)
             .expect_err("an unresolvable confinement root must fail loudly");
+        assert!(
+            error.contains("workspace confinement root"),
+            "unexpected error: {error}"
+        );
+        let error =
+            WorkspaceConfinement::new(&missing, &["README.md"], &[], CONFINED_BASH_TIMEOUT_MS)
+                .expect_err("an unresolvable generic confinement root must fail loudly");
         assert!(
             error.contains("workspace confinement root"),
             "unexpected error: {error}"
@@ -10705,5 +10906,1622 @@ printf 'pwsh:%s' "$1"
             !bash_decision(&policy, json!({ "command": SMOKE_COMMAND })),
             "bash must be default-denied when no allow rule matches"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Generic confinement: an arbitrary workspace (no calculator fixture)
+    // whose writable files are declared by the operator.
+    // ------------------------------------------------------------------
+
+    const GENERIC_SOURCE: &str = "print(\"Plan steps:\")\n";
+    const GENERIC_TEST: &str = "import unittest\n";
+    const GENERIC_README: &str = "do not touch\n";
+    const GENERIC_SECRET: &str = "out-of-bounds content\n";
+    const GENERIC_WRITABLE: &[&str] = &[
+        "scripts/pretty_print.py",
+        "tests/a2_l4/test_pretty_print.py",
+    ];
+
+    /// Repository-shaped workspace without the calculator fixture: two nested
+    /// files the operator declares writable and one unlisted file.
+    struct GenericWorkspace {
+        base: PathBuf,
+        workspace: PathBuf,
+        outside: PathBuf,
+    }
+
+    impl GenericWorkspace {
+        fn new(name: &str) -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos();
+            let base = std::env::temp_dir().join(format!("claw-generic-{name}-{unique}"));
+            let workspace = base.join("workspace");
+            let outside = base.join("outside");
+            fs::create_dir_all(workspace.join("scripts")).expect("scripts dir should be created");
+            fs::create_dir_all(workspace.join("tests/a2_l4")).expect("tests dir should be created");
+            fs::create_dir_all(&outside).expect("outside dir should be created");
+            fs::write(workspace.join("scripts/pretty_print.py"), GENERIC_SOURCE)
+                .expect("source should be written");
+            fs::write(
+                workspace.join("tests/a2_l4/test_pretty_print.py"),
+                GENERIC_TEST,
+            )
+            .expect("test should be written");
+            fs::write(workspace.join("README.md"), GENERIC_README)
+                .expect("unlisted file should be written");
+            fs::write(outside.join("secret.txt"), GENERIC_SECRET)
+                .expect("outside fixture should be written");
+            Self {
+                base,
+                workspace,
+                outside,
+            }
+        }
+
+        fn confine(&self, writable: &[&str]) -> Result<WorkspaceConfinement, String> {
+            self.confine_with(writable, &[])
+        }
+
+        fn confine_with(
+            &self,
+            writable: &[&str],
+            commands: &[&str],
+        ) -> Result<WorkspaceConfinement, String> {
+            WorkspaceConfinement::new(
+                &self.workspace,
+                writable,
+                commands,
+                CONFINED_BASH_TIMEOUT_MS,
+            )
+        }
+
+        fn confinement(&self) -> WorkspaceConfinement {
+            self.confine(GENERIC_WRITABLE)
+                .expect("generic confinement should bind to the workspace")
+        }
+
+        fn read(&self, relative: &str) -> String {
+            fs::read_to_string(self.workspace.join(relative)).expect("workspace file should exist")
+        }
+
+        fn secret(&self) -> String {
+            fs::read_to_string(self.outside.join("secret.txt"))
+                .expect("outside fixture should still exist")
+        }
+    }
+
+    impl Drop for GenericWorkspace {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.base);
+        }
+    }
+
+    #[test]
+    fn generic_confinement_binds_a_workspace_without_the_calculator_fixture() {
+        let ws = GenericWorkspace::new("bind");
+        assert!(!ws.workspace.join("calculator.py").exists());
+        ws.confine(GENERIC_WRITABLE)
+            .expect("explicit writable files must bind without the calculator fixture");
+        // NEGATIVE CONTROL: the controlled-smoke policy still demands its
+        // fixture, so the generic constructor is what admits this workspace.
+        let legacy =
+            WorkspaceConfinement::controlled_smoke(&ws.workspace, CONFINED_BASH_TIMEOUT_MS)
+                .expect_err("the controlled smoke must still require its fixture");
+        assert!(legacy.contains("controlled fixture rejected"), "{legacy}");
+        assert!(legacy.contains("calculator.py"), "{legacy}");
+    }
+
+    #[test]
+    fn generic_confinement_writes_and_edits_only_declared_files() {
+        let ws = GenericWorkspace::new("declared");
+        let confinement = ws.confinement();
+
+        run_write_file_with(
+            write_input(
+                "tests/a2_l4/test_pretty_print.py",
+                "import unittest\n# added\n",
+            ),
+            Some(&confinement),
+        )
+        .expect("a declared file should be writable");
+        assert_eq!(
+            ws.read("tests/a2_l4/test_pretty_print.py"),
+            "import unittest\n# added\n"
+        );
+        run_edit_file_with(
+            edit_input("scripts/pretty_print.py", "Plan steps:", "Plan steps (N):"),
+            Some(&confinement),
+        )
+        .expect("a declared file should be editable");
+        assert_eq!(
+            ws.read("scripts/pretty_print.py"),
+            "print(\"Plan steps (N):\")\n"
+        );
+
+        let write = run_write_file_with(write_input("README.md", "pwned"), Some(&confinement))
+            .expect_err("an unlisted file must not be writable");
+        assert!(write.contains("not a designated writable file"), "{write}");
+        let edit = run_edit_file_with(
+            edit_input("README.md", "do not touch", "pwned"),
+            Some(&confinement),
+        )
+        .expect_err("an unlisted file must not be editable");
+        assert!(edit.contains("not a designated writable file"), "{edit}");
+        run_write_file_with(write_input("scripts/new.py", "x"), Some(&confinement))
+            .expect_err("confined tools never create files");
+        assert_eq!(ws.read("README.md"), GENERIC_README);
+        assert!(!ws.workspace.join("scripts/new.py").exists());
+
+        // Reads are not narrowed by the writable list.
+        let read = run_read_file_with(read_input("README.md"), Some(&confinement))
+            .expect("unlisted files stay readable");
+        assert!(read.contains("do not touch"), "{read}");
+    }
+
+    // Shape of the 2026-10-02 North Star edit: asked to add a test, the model
+    // sent the whole existing method as `old_string` and only the new method
+    // as `new_string`, so one test silently replaced another. The names are
+    // synthetic so this fixture never seeds a later task run on this repo.
+    const REPLACED_TEST_BEFORE: &str = r#"import json
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+SCRIPT = ROOT / "scripts" / "render_report.py"
+FIXTURE_DIR = ROOT / "tests" / "fixtures" / "reports"
+
+
+def _run(path: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, str(SCRIPT), str(path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _valid_doc() -> dict:
+    return json.loads((FIXTURE_DIR / "valid-minimal.json").read_text())
+
+
+class RenderValidTests(unittest.TestCase):
+    def test_minimal_report_renders_and_exits_zero(self) -> None:
+        result = _run(FIXTURE_DIR / "valid-minimal.json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("VALID", result.stdout)
+
+    def test_full_report_renders_and_exits_zero(self) -> None:
+        result = _run(FIXTURE_DIR / "valid-full.json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("VALID", result.stdout)
+        # advisory fields are marked, never executed
+        self.assertIn("not executed", result.stdout.lower())
+
+
+class RenderRefusalTests(unittest.TestCase):
+    def test_invalid_input_returns_failure(self) -> None:
+        result = _run(FIXTURE_DIR / "invalid.json")
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_refusal_line_is_displayed(self) -> None:
+        result = _run(FIXTURE_DIR / "refusal.json")
+        self.assertIn("REFUSED", result.stdout)
+
+
+class ReadOnlyBoundaryTests(unittest.TestCase):
+    def test_no_output_file_written(self) -> None:
+        before = sorted(FIXTURE_DIR.iterdir())
+        _run(FIXTURE_DIR / "valid-minimal.json")
+        self.assertEqual(before, sorted(FIXTURE_DIR.iterdir()))
+
+    def test_input_left_unchanged(self) -> None:
+        path = FIXTURE_DIR / "valid-minimal.json"
+        before = path.read_bytes()
+        _run(path)
+        self.assertEqual(before, path.read_bytes())
+
+
+if __name__ == "__main__":
+    unittest.main()
+"#;
+    const REPLACED_TEST_OLD: &str = r#"    def test_full_report_renders_and_exits_zero(self) -> None:
+        result = _run(FIXTURE_DIR / "valid-full.json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("VALID", result.stdout)
+        # advisory fields are marked, never executed
+        self.assertIn("not executed", result.stdout.lower())"#;
+    const REPLACED_TEST_NEW: &str = r#"    def test_item_count_in_heading(self) -> None:
+        doc = _valid_doc()
+        doc["items"].extend([
+            {"item_id": "i2", "description": "Another inert item."}
+        ])
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+            json.dump(doc, fh)
+            tmp = Path(fh.name)
+        try:
+            result = _run(tmp)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Items (2):", result.stdout)
+        finally:
+            tmp.unlink()"#;
+    /// `diff -U3` of the edit above, produced independently by GNU diff.
+    const REPLACED_TEST_HUNK: &str = concat!(
+        "@@ -29,12 +29,20 @@\n",
+        "         self.assertEqual(result.returncode, 0, result.stderr)\n",
+        "         self.assertIn(\"VALID\", result.stdout)\n",
+        " \n",
+        "-    def test_full_report_renders_and_exits_zero(self) -> None:\n",
+        "-        result = _run(FIXTURE_DIR / \"valid-full.json\")\n",
+        "-        self.assertEqual(result.returncode, 0, result.stderr)\n",
+        "-        self.assertIn(\"VALID\", result.stdout)\n",
+        "-        # advisory fields are marked, never executed\n",
+        "-        self.assertIn(\"not executed\", result.stdout.lower())\n",
+        "+    def test_item_count_in_heading(self) -> None:\n",
+        "+        doc = _valid_doc()\n",
+        "+        doc[\"items\"].extend([\n",
+        "+            {\"item_id\": \"i2\", \"description\": \"Another inert item.\"}\n",
+        "+        ])\n",
+        "+        with tempfile.NamedTemporaryFile(\"w\", suffix=\".json\", delete=False) as fh:\n",
+        "+            json.dump(doc, fh)\n",
+        "+            tmp = Path(fh.name)\n",
+        "+        try:\n",
+        "+            result = _run(tmp)\n",
+        "+            self.assertEqual(result.returncode, 0, result.stderr)\n",
+        "+            self.assertIn(\"Items (2):\", result.stdout)\n",
+        "+        finally:\n",
+        "+            tmp.unlink()\n",
+        " \n",
+        " \n",
+        " class RenderRefusalTests(unittest.TestCase):\n",
+    );
+
+    #[test]
+    fn confined_edit_result_leads_with_the_operation_diff_of_a_replaced_test() {
+        const TARGET: &str = "tests/a2_l4/test_pretty_print.py";
+        let ws = GenericWorkspace::new("edit-operation-diff");
+        fs::write(ws.workspace.join(TARGET), REPLACED_TEST_BEFORE).expect("seed test file");
+        let confinement = ws.confinement();
+
+        let visible = run_edit_file_with(
+            edit_input(TARGET, REPLACED_TEST_OLD, REPLACED_TEST_NEW),
+            Some(&confinement),
+        )
+        .expect("the replacement is applied exactly as requested");
+        assert_eq!(
+            ws.read(TARGET),
+            REPLACED_TEST_BEFORE.replacen(REPLACED_TEST_OLD, REPLACED_TEST_NEW, 1)
+        );
+
+        let result: serde_json::Value = serde_json::from_str(&visible).expect("json result");
+        let diff = result["operationDiff"]
+            .as_str()
+            .expect("the model-visible result must carry operationDiff");
+        assert_eq!(
+            diff,
+            format!("--- {TARGET}\n+++ {TARGET}\n{REPLACED_TEST_HUNK}")
+        );
+        assert!(
+            diff.contains("\n-    def test_full_report_renders_and_exits_zero(self) -> None:\n")
+        );
+        assert!(diff.contains("\n+    def test_item_count_in_heading(self) -> None:\n"));
+        for unrelated in [
+            "test_minimal_report_renders_and_exits_zero",
+            "test_invalid_input_returns_failure",
+            "test_refusal_line_is_displayed",
+            "test_no_output_file_written",
+            "test_input_left_unchanged",
+        ] {
+            assert!(
+                !diff.contains(unrelated),
+                "{unrelated} is outside the context"
+            );
+        }
+
+        // Prominence: the diff precedes every bulky field of the serialized text.
+        let at = |key: &str| {
+            visible
+                .find(&format!("\"{key}\":"))
+                .unwrap_or_else(|| panic!("{key} missing from {visible}"))
+        };
+        for bulky in ["oldString", "newString", "originalFile", "structuredPatch"] {
+            assert!(
+                at("operationDiff") < at(bulky),
+                "operationDiff must precede {bulky}"
+            );
+        }
+
+        // Every existing field is still returned exactly as before.
+        assert_eq!(result["filePath"], TARGET);
+        assert_eq!(result["oldString"], REPLACED_TEST_OLD);
+        assert_eq!(result["newString"], REPLACED_TEST_NEW);
+        assert_eq!(result["originalFile"], REPLACED_TEST_BEFORE);
+        assert_eq!(result["userModified"], false);
+        assert_eq!(result["replaceAll"], false);
+        assert_eq!(result["gitDiff"], serde_json::Value::Null);
+        let hunks = result["structuredPatch"]
+            .as_array()
+            .expect("structuredPatch");
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0]["oldStart"], 1);
+        assert_eq!(hunks[0]["oldLines"], 64);
+        assert_eq!(hunks[0]["newStart"], 1);
+        assert_eq!(hunks[0]["newLines"], 72);
+        assert_eq!(hunks[0]["lines"].as_array().map(Vec::len), Some(136));
+    }
+
+    #[test]
+    fn confined_edit_result_marks_operation_diff_truncation_only_when_it_happens() {
+        const TARGET: &str = "tests/a2_l4/test_pretty_print.py";
+        let headers = format!("--- {TARGET}\n+++ {TARGET}\n@@ -1,1 +1,1 @@\n");
+        let ws = GenericWorkspace::new("edit-operation-diff-budget");
+        let confinement = ws.confinement();
+        let edit = |before: &str, after: &str| -> String {
+            fs::write(ws.workspace.join(TARGET), before).expect("seed test file");
+            let visible = run_edit_file_with(edit_input(TARGET, before, after), Some(&confinement))
+                .expect("whole-file replacement is applied");
+            assert_eq!(ws.read(TARGET), after);
+            // The diff is the second serialized field, right after filePath.
+            let at = |key: &str| {
+                visible
+                    .find(&format!("\"{key}\":"))
+                    .unwrap_or_else(|| panic!("{key} missing from {visible}"))
+            };
+            for later in [
+                "oldString",
+                "newString",
+                "originalFile",
+                "structuredPatch",
+                "userModified",
+                "replaceAll",
+                "gitDiff",
+            ] {
+                assert!(at("filePath") < at("operationDiff") && at("operationDiff") < at(later));
+            }
+            let result: serde_json::Value = serde_json::from_str(&visible).expect("json result");
+            result["operationDiff"]
+                .as_str()
+                .expect("the model-visible result must carry operationDiff")
+                .to_string()
+        };
+
+        // A complete diff of exactly 16 384 bytes reaches the model whole.
+        let line = (16_384 - headers.len()) / 2 - 2;
+        let (before, after) = (
+            format!("{}\n", "a".repeat(line)),
+            format!("{}\n", "b".repeat(line)),
+        );
+        let complete = format!("{headers}-{before}+{after}");
+        assert_eq!(complete.len(), 16_384);
+        let diff = edit(&before, &after);
+        assert_eq!(diff, complete);
+        assert!(!diff.contains("[operation diff truncated"));
+
+        // Past the budget the marker counts every omitted rendered line,
+        // `\ No newline at end of file` annotations included.
+        let (before, after) = ("a".repeat(17_000), "b".repeat(17_000));
+        assert_eq!(
+            edit(&before, &after),
+            format!(
+                "{headers}[operation diff truncated — exceeded 16384 bytes; 4 more diff lines omitted]\n"
+            )
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Anchored insertion: `insert_before` / `insert_after`.
+    // ------------------------------------------------------------------
+
+    fn insert_input(path: &str, anchor: &str, content: &str) -> InsertTextInput {
+        serde_json::from_value(json!({ "path": path, "anchor": anchor, "content": content }))
+            .expect("insert input should parse")
+    }
+
+    fn operation_diff_of(visible: &str) -> String {
+        let result: serde_json::Value = serde_json::from_str(visible).expect("json result");
+        assert_eq!(result["success"], true, "{visible}");
+        result["operationDiff"]
+            .as_str()
+            .expect("the model-visible result must carry operationDiff")
+            .to_string()
+    }
+
+    fn removed_lines(diff: &str) -> Vec<&str> {
+        diff.lines()
+            .skip(2)
+            .filter(|line| line.starts_with('-'))
+            .collect()
+    }
+
+    /// Test-only Python structure: every method with the class it belongs
+    /// to, in file order. Python-specific on purpose: production insertion
+    /// knows no language, so structure is asserted here, never enforced there.
+    fn python_methods(source: &str) -> Vec<(String, String)> {
+        python_scopes(source)
+            .into_iter()
+            .filter_map(|(class, method, line)| {
+                line.starts_with("    def ")
+                    .then(|| class.zip(method))
+                    .flatten()
+            })
+            .collect()
+    }
+
+    /// The `(class, function)` holding the one line that contains `needle`.
+    fn python_owner(source: &str, needle: &str) -> (Option<String>, Option<String>) {
+        let owners = python_scopes(source)
+            .into_iter()
+            .filter(|(_, _, line)| line.contains(needle))
+            .map(|(class, function, _)| (class, function))
+            .collect::<Vec<_>>();
+        assert_eq!(owners.len(), 1, "{needle:?} must occur on exactly one line");
+        owners.into_iter().next().expect("one owner")
+    }
+
+    fn python_scopes(source: &str) -> Vec<(Option<String>, Option<String>, &str)> {
+        let ident = |rest: &str| rest.split(['(', ':']).next().unwrap_or(rest).to_string();
+        let (mut class, mut function) = (None, None);
+        source
+            .lines()
+            .map(|line| {
+                if let Some(rest) = line.strip_prefix("class ") {
+                    (class, function) = (Some(ident(rest)), None);
+                } else if let Some(rest) = line.strip_prefix("def ") {
+                    (class, function) = (None, Some(ident(rest)));
+                } else if let Some(rest) = line.strip_prefix("    def ") {
+                    function = Some(ident(rest));
+                } else if !line.is_empty() && !line.starts_with(' ') {
+                    (class, function) = (None, None);
+                }
+                (class.clone(), function.clone(), line)
+            })
+            .collect()
+    }
+
+    fn owned(class: &str, function: &str) -> (Option<String>, Option<String>) {
+        (Some(class.to_string()), Some(function.to_string()))
+    }
+
+    #[test]
+    fn insertion_tools_are_registered_with_an_explicit_anchor_schema() {
+        let specs = mvp_tool_specs();
+        let spec = |name: &str| {
+            specs
+                .iter()
+                .find(|spec| spec.name == name)
+                .unwrap_or_else(|| panic!("{name} must be a built-in tool"))
+        };
+        for (name, side) in [("insert_before", "before"), ("insert_after", "after")] {
+            let insert = spec(name);
+            assert_eq!(insert.required_permission, PermissionMode::WorkspaceWrite);
+            assert_eq!(
+                insert.input_schema,
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "anchor": { "type": "string" },
+                        "content": { "type": "string" }
+                    },
+                    "required": ["path", "anchor", "content"],
+                    "additionalProperties": false
+                })
+            );
+            for phrase in [
+                format!("immediately {side} an anchor, replacing nothing"),
+                "must occur exactly once in the file".to_string(),
+                "every other existing byte stay unchanged".to_string(),
+                "inserted exactly as given".to_string(),
+                "while preserving the anchor unchanged".to_string(),
+            ] {
+                assert!(insert.description.contains(&phrase), "{name}: {phrase}");
+            }
+        }
+
+        // Offered to the model, selectable with --allowedTools, and
+        // permission-classified like edit_file.
+        let registry = GlobalToolRegistry::builtin();
+        let offered = registry
+            .definitions(None)
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<BTreeSet<_>>();
+        assert!(offered.contains("insert_before") && offered.contains("insert_after"));
+        let allowed = registry
+            .normalize_allowed_tools(&[
+                "read_file,insert-before".to_string(),
+                "INSERT_AFTER".to_string(),
+            ])
+            .expect("insertion tools are valid --allowedTools names")
+            .expect("allowlist");
+        assert_eq!(
+            allowed,
+            ["insert_after", "insert_before", "read_file"]
+                .map(String::from)
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+        );
+        assert_eq!(
+            registry
+                .definitions(Some(&allowed))
+                .into_iter()
+                .map(|definition| definition.name)
+                .collect::<Vec<_>>(),
+            ["read_file", "insert_before", "insert_after"]
+        );
+        let permissions = registry
+            .permission_specs(None)
+            .expect("permission specs")
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        for name in ["insert_before", "insert_after"] {
+            assert_eq!(permissions[name], permissions["edit_file"], "{name}");
+        }
+    }
+
+    #[test]
+    fn replacement_and_whole_file_tools_keep_their_frozen_specs() {
+        let specs = mvp_tool_specs();
+        let spec = |name: &str| {
+            specs
+                .iter()
+                .find(|spec| spec.name == name)
+                .unwrap_or_else(|| panic!("{name} must be a built-in tool"))
+        };
+        assert_eq!(
+            spec("edit_file").description,
+            "Replace text in a workspace file."
+        );
+        assert_eq!(
+            spec("edit_file").input_schema,
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "old_string": { "type": "string" },
+                    "new_string": { "type": "string" },
+                    "replace_all": { "type": "boolean" }
+                },
+                "required": ["path", "old_string", "new_string"],
+                "additionalProperties": false
+            })
+        );
+        assert_eq!(
+            spec("write_file").description,
+            "Write a text file in the workspace."
+        );
+        assert_eq!(
+            spec("write_file").input_schema,
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "content": { "type": "string" }
+                },
+                "required": ["path", "content"],
+                "additionalProperties": false
+            })
+        );
+    }
+
+    #[test]
+    fn confinement_admits_the_insertion_tools_and_nothing_else_new() {
+        assert_eq!(
+            super::CONFINED_TOOLS,
+            [
+                "read_file",
+                "write_file",
+                "edit_file",
+                "insert_before",
+                "insert_after",
+                "glob_search",
+                "grep_search",
+                "bash",
+            ]
+        );
+        let ws = GenericWorkspace::new("insert-admission");
+        let confinement = ws.confinement();
+        for tool in ["insert_before", "insert_after"] {
+            confined_tool_permitted_with(tool, Some(&confinement))
+                .expect("insertion tools are admitted under confinement");
+        }
+        for tool in [
+            "NotebookEdit",
+            "REPL",
+            "PowerShell",
+            "Agent",
+            "WebFetch",
+            "TodoWrite",
+            "Config",
+            "MCP",
+            "insert_text",
+        ] {
+            let error = confined_tool_permitted_with(tool, Some(&confinement))
+                .expect_err("other tools stay refused under confinement");
+            assert!(error.contains("not available under workspace confinement"));
+        }
+    }
+
+    #[test]
+    fn insertion_obeys_the_ordinary_permission_layer() {
+        let ws = GenericWorkspace::new("insert-permission");
+        let target = ws.workspace.join("scripts/pretty_print.py");
+        let path = target.to_string_lossy().into_owned();
+        let input = json!({ "path": path, "anchor": "print(", "content": "# added\n" });
+
+        let read_only = read_only_registry();
+        for tool in ["insert_before", "insert_after"] {
+            let error = read_only
+                .execute(tool, &input)
+                .expect_err("insertion must be denied in read-only mode");
+            assert!(
+                error.contains("current mode is read-only"),
+                "{tool}: {error}"
+            );
+        }
+        let rules = runtime::RuntimePermissionRuleConfig::new(
+            Vec::new(),
+            vec![format!("insert_after({path})")],
+            Vec::new(),
+        );
+        let policy = mvp_tool_specs().into_iter().fold(
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite).with_permission_rules(&rules),
+            |policy, spec| policy.with_tool_requirement(spec.name, spec.required_permission),
+        );
+        let mut registry = GlobalToolRegistry::builtin();
+        registry.set_enforcer(PermissionEnforcer::new(policy));
+        let denied = registry
+            .execute("insert_after", &input)
+            .expect_err("a deny rule on the path applies to insertion");
+        assert!(denied.contains("denied by rule"), "{denied}");
+        assert_eq!(ws.read("scripts/pretty_print.py"), GENERIC_SOURCE);
+
+        // NEGATIVE CONTROL: the same workspace-write policy admits the other
+        // insertion tool, which no rule names.
+        let visible = registry
+            .execute("insert_before", &input)
+            .expect("workspace-write mode admits insertion");
+        assert_eq!(
+            ws.read("scripts/pretty_print.py"),
+            format!("# added\n{GENERIC_SOURCE}")
+        );
+        assert!(removed_lines(&operation_diff_of(&visible)).is_empty());
+    }
+
+    #[test]
+    fn generic_confinement_inserts_only_into_declared_files() {
+        let ws = GenericWorkspace::new("insert-declared");
+        let confinement = ws.confinement();
+        let visible = run_insert_text_with(
+            insert_input("scripts/pretty_print.py", "print(", "import sys\n\n"),
+            InsertPosition::Before,
+            Some(&confinement),
+        )
+        .expect("a declared file accepts insertion");
+        assert_eq!(
+            ws.read("scripts/pretty_print.py"),
+            format!("import sys\n\n{GENERIC_SOURCE}")
+        );
+        let result: serde_json::Value = serde_json::from_str(&visible).expect("json result");
+        assert_eq!(
+            result,
+            json!({
+                "filePath": "scripts/pretty_print.py",
+                "success": true,
+                "operationDiff": "--- scripts/pretty_print.py\n+++ scripts/pretty_print.py\n@@ -1,1 +1,3 @@\n+import sys\n+\n print(\"Plan steps:\")\n"
+            })
+        );
+
+        let inside_absolute = ws
+            .workspace
+            .join("README.md")
+            .to_string_lossy()
+            .into_owned();
+        let outside_absolute = ws.outside.join("secret.txt").to_string_lossy().into_owned();
+        for (path, anchor, reason) in [
+            (
+                "README.md",
+                "do not touch",
+                "not a designated writable file",
+            ),
+            ("scripts/new.py", "x", "not a designated writable file"),
+            ("../outside/secret.txt", "out-of-bounds", "`..`"),
+            ("scripts/../README.md", "do not touch", "`..`"),
+            (&inside_absolute, "do not touch", "is absolute"),
+            (&outside_absolute, "out-of-bounds", "is absolute"),
+        ] {
+            for position in [InsertPosition::Before, InsertPosition::After] {
+                let error = run_insert_text_with(
+                    insert_input(path, anchor, "pwned"),
+                    position,
+                    Some(&confinement),
+                )
+                .expect_err(path);
+                assert!(error.contains(reason), "{path}: {error}");
+            }
+        }
+        assert_eq!(ws.read("README.md"), GENERIC_README);
+        assert_eq!(ws.secret(), GENERIC_SECRET);
+        assert!(!ws.workspace.join("scripts/new.py").exists());
+
+        // A halted confinement refuses insertion like every confined tool.
+        confinement.halt();
+        let halted = run_insert_text_with(
+            insert_input("tests/a2_l4/test_pretty_print.py", "import", "# x\n"),
+            InsertPosition::Before,
+            Some(&confinement),
+        )
+        .expect_err("a halted confinement refuses insertion");
+        assert!(halted.contains("halted"), "{halted}");
+        assert_eq!(ws.read("tests/a2_l4/test_pretty_print.py"), GENERIC_TEST);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generic_confinement_refuses_insertion_into_files_swapped_after_binding() {
+        let ws = GenericWorkspace::new("insert-replaced");
+        let confinement = ws.confinement();
+
+        let declared = ws.workspace.join("scripts/pretty_print.py");
+        fs::remove_file(&declared).expect("declared file should be removable");
+        std::os::unix::fs::symlink(ws.outside.join("secret.txt"), &declared)
+            .expect("replacement symlink should be created");
+        let swapped = run_insert_text_with(
+            insert_input("scripts/pretty_print.py", "out-of-bounds", "pwned"),
+            InsertPosition::After,
+            Some(&confinement),
+        )
+        .expect_err("a declared path swapped for a symlink must be refused");
+        assert!(swapped.contains("symlink"), "{swapped}");
+
+        fs::hard_link(
+            ws.workspace.join("tests/a2_l4/test_pretty_print.py"),
+            ws.outside.join("alias.py"),
+        )
+        .expect("late hardlink should be created");
+        let linked = run_insert_text_with(
+            insert_input("tests/a2_l4/test_pretty_print.py", "import", "pwned"),
+            InsertPosition::Before,
+            Some(&confinement),
+        )
+        .expect_err("a declared file hardlinked after binding must be refused");
+        assert!(linked.contains("hard links"), "{linked}");
+
+        assert_eq!(ws.secret(), GENERIC_SECRET);
+        assert_eq!(
+            fs::read_to_string(ws.outside.join("alias.py")).expect("alias should exist"),
+            GENERIC_TEST
+        );
+    }
+
+    /// The class each method of [`REPLACED_TEST_BEFORE`] belongs to, with
+    /// `added` placed right after `after` in `class`.
+    fn methods_with(class: &str, after: &str, added: &str) -> Vec<(String, String)> {
+        let mut methods = python_methods(REPLACED_TEST_BEFORE);
+        let at = methods
+            .iter()
+            .position(|(_, method)| method == after)
+            .expect("existing method");
+        methods.insert(at + 1, (class.to_string(), added.to_string()));
+        methods
+    }
+
+    const ADDED_TEST: &str = "test_item_count_in_heading";
+    const KEPT_TEST: &str = "test_full_report_renders_and_exits_zero";
+    const KEPT_ASSERTION: &str = "        self.assertIn(\"not executed\", result.stdout.lower())\n";
+    const NEXT_CLASS: &str = "class RenderRefusalTests(unittest.TestCase):";
+
+    #[test]
+    fn insertion_adds_a_test_beside_a_complete_existing_test() {
+        // Run-1 shape: the whole existing method is the anchor; the new
+        // method goes after it. Through confinement, as the CLI runs it.
+        const TARGET: &str = "tests/a2_l4/test_pretty_print.py";
+        let ws = GenericWorkspace::new("insert-beside-test");
+        fs::write(ws.workspace.join(TARGET), REPLACED_TEST_BEFORE).expect("seed test file");
+        let confinement = ws.confinement();
+        let content = format!("\n\n{REPLACED_TEST_NEW}");
+
+        let visible = run_insert_text_with(
+            insert_input(TARGET, REPLACED_TEST_OLD, &content),
+            InsertPosition::After,
+            Some(&confinement),
+        )
+        .expect("the insertion is applied");
+        let after = ws.read(TARGET);
+        let at = REPLACED_TEST_BEFORE
+            .find(REPLACED_TEST_OLD)
+            .expect("anchor")
+            + REPLACED_TEST_OLD.len();
+        assert_eq!(
+            after,
+            format!(
+                "{}{content}{}",
+                &REPLACED_TEST_BEFORE[..at],
+                &REPLACED_TEST_BEFORE[at..]
+            )
+        );
+        assert_eq!(
+            after.matches(REPLACED_TEST_OLD).count(),
+            1,
+            "existing test kept whole"
+        );
+        assert_eq!(
+            python_methods(&after),
+            methods_with("RenderValidTests", KEPT_TEST, ADDED_TEST)
+        );
+        assert_eq!(
+            python_owner(&after, "\"not executed\""),
+            owned("RenderValidTests", KEPT_TEST)
+        );
+
+        let diff = operation_diff_of(&visible);
+        assert!(removed_lines(&diff).is_empty(), "{diff}");
+        assert!(diff.contains(&format!("\n+    def {ADDED_TEST}(self) -> None:\n")));
+        assert!(diff.contains(&format!("\n {KEPT_ASSERTION}")), "{diff}");
+
+        // COUNTERFACTUAL: the replacement that shape was emulated with drops
+        // the existing test, which insertion cannot.
+        let replaced = REPLACED_TEST_BEFORE.replacen(REPLACED_TEST_OLD, REPLACED_TEST_NEW, 1);
+        assert!(!python_methods(&replaced)
+            .iter()
+            .any(|(_, method)| method == KEPT_TEST));
+    }
+
+    #[test]
+    fn insertion_at_a_narrow_class_boundary_keeps_the_assertion_and_the_class() {
+        // Run-2 shape: a test is added at the end of a class, just before
+        // the next class header. The anchor is that header alone.
+        const TARGET: &str = "tests/a2_l4/test_pretty_print.py";
+        let ws = GenericWorkspace::new("insert-class-boundary");
+        let confinement = ws.confinement();
+        let insert = |anchor: &str, content: &str, position| -> String {
+            fs::write(ws.workspace.join(TARGET), REPLACED_TEST_BEFORE).expect("seed test file");
+            let visible = run_insert_text_with(
+                insert_input(TARGET, anchor, content),
+                position,
+                Some(&confinement),
+            )
+            .expect("the insertion is applied");
+            let after = ws.read(TARGET);
+            // Byte preservation holds whatever the anchor.
+            let start = REPLACED_TEST_BEFORE.find(anchor).expect("anchor");
+            let at = match position {
+                InsertPosition::Before => start,
+                InsertPosition::After => start + anchor.len(),
+            };
+            assert_eq!(
+                after,
+                format!(
+                    "{}{content}{}",
+                    &REPLACED_TEST_BEFORE[..at],
+                    &REPLACED_TEST_BEFORE[at..]
+                )
+            );
+            assert!(removed_lines(&operation_diff_of(&visible)).is_empty());
+            after
+        };
+
+        let after = insert(
+            NEXT_CLASS,
+            &format!("{REPLACED_TEST_NEW}\n\n\n"),
+            InsertPosition::Before,
+        );
+        assert_eq!(after.matches(KEPT_ASSERTION).count(), 1);
+        assert_eq!(after.matches(&format!("\n{NEXT_CLASS}\n")).count(), 1);
+        assert_eq!(
+            python_owner(&after, "\"not executed\""),
+            owned("RenderValidTests", KEPT_TEST)
+        );
+        assert_eq!(
+            python_methods(&after),
+            methods_with("RenderValidTests", KEPT_TEST, ADDED_TEST)
+        );
+
+        // Byte preservation is not placement: anchoring on the whole span
+        // from the assertion through the next class header, as replacement
+        // did, would misplace the block either way.
+        let wide = format!("{KEPT_ASSERTION}\n\n{NEXT_CLASS}");
+        let into_next_class = insert(
+            &wide,
+            &format!("\n{REPLACED_TEST_NEW}\n"),
+            InsertPosition::After,
+        );
+        assert_eq!(
+            python_methods(&into_next_class),
+            methods_with("RenderRefusalTests", KEPT_TEST, ADDED_TEST),
+            "the new test would join the next class"
+        );
+        let relocated = insert(
+            &wide,
+            &format!("{REPLACED_TEST_NEW}\n"),
+            InsertPosition::Before,
+        );
+        assert_eq!(
+            python_owner(&relocated, "\"not executed\""),
+            owned("RenderValidTests", ADDED_TEST),
+            "the assertion would leave its test"
+        );
+    }
+
+    #[test]
+    fn generic_confinement_rejects_invalid_writable_declarations() {
+        let ws = GenericWorkspace::new("invalid");
+        let fifo = ws.workspace.join("pipe");
+        let made = Command::new("/usr/bin/mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo should run");
+        assert!(made.success(), "fifo should be created");
+        let inside_absolute = ws
+            .workspace
+            .join("README.md")
+            .to_string_lossy()
+            .into_owned();
+
+        for (declared, reason) in [
+            ("../outside/secret.txt", "`..`"),
+            ("a/../../foo", "`..`"),
+            ("scripts/../README.md", "`..`"),
+            ("/etc/hostname", "is absolute"),
+            (inside_absolute.as_str(), "is absolute"),
+            ("", "is empty"),
+            (".", "is not a file"),
+            ("./", "is not a file"),
+            ("scripts/missing.py", "No such file"),
+            ("scripts", "not a regular file"),
+            ("pipe", "not a regular file"),
+        ] {
+            let error = ws
+                .confine(&["scripts/pretty_print.py", declared])
+                .expect_err("an invalid writable declaration must refuse the whole confinement");
+            assert!(error.contains(reason), "{declared:?}: {error}");
+        }
+        assert_eq!(ws.secret(), GENERIC_SECRET);
+        assert!(!ws.workspace.join("scripts/missing.py").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generic_confinement_rejects_symlinked_writable_declarations() {
+        let ws = GenericWorkspace::new("symlink");
+        std::os::unix::fs::symlink("scripts/pretty_print.py", ws.workspace.join("alias.py"))
+            .expect("inside symlink should be created");
+        std::os::unix::fs::symlink(
+            ws.outside.join("secret.txt"),
+            ws.workspace.join("escape.txt"),
+        )
+        .expect("outside symlink should be created");
+        std::os::unix::fs::symlink("scripts", ws.workspace.join("linked-scripts"))
+            .expect("inside directory symlink should be created");
+        std::os::unix::fs::symlink(&ws.outside, ws.workspace.join("door"))
+            .expect("outside directory symlink should be created");
+
+        for declared in [
+            "alias.py",
+            "escape.txt",
+            "linked-scripts/pretty_print.py",
+            "door/secret.txt",
+        ] {
+            let error = ws
+                .confine(&[declared])
+                .expect_err("a symlinked writable declaration must be refused");
+            assert!(error.contains("symlink"), "{declared}: {error}");
+        }
+        assert_eq!(ws.secret(), GENERIC_SECRET);
+    }
+
+    #[test]
+    fn generic_confinement_rejects_hardlinked_writable_declarations() {
+        let ws = GenericWorkspace::new("hardlink");
+        fs::hard_link(
+            ws.workspace.join("scripts/pretty_print.py"),
+            ws.outside.join("alias.py"),
+        )
+        .expect("hardlink should be created");
+        let error = ws
+            .confine(GENERIC_WRITABLE)
+            .expect_err("a hardlinked writable declaration must be refused");
+        assert!(error.contains("hard links"), "{error}");
+        // NEGATIVE CONTROL: the single-link declaration alone still binds.
+        ws.confine(&["tests/a2_l4/test_pretty_print.py"])
+            .expect("a single-link declaration should bind");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generic_confinement_refuses_declared_files_replaced_after_binding() {
+        let ws = GenericWorkspace::new("replaced");
+        let confinement = ws.confinement();
+
+        let declared = ws.workspace.join("scripts/pretty_print.py");
+        fs::remove_file(&declared).expect("declared file should be removable");
+        std::os::unix::fs::symlink(ws.outside.join("secret.txt"), &declared)
+            .expect("replacement symlink should be created");
+        let swapped = run_write_file_with(
+            write_input("scripts/pretty_print.py", "pwned"),
+            Some(&confinement),
+        )
+        .expect_err("a declared path swapped for a symlink must be refused");
+        assert!(swapped.contains("symlink"), "{swapped}");
+
+        fs::hard_link(
+            ws.workspace.join("tests/a2_l4/test_pretty_print.py"),
+            ws.outside.join("alias.py"),
+        )
+        .expect("late hardlink should be created");
+        let linked = run_edit_file_with(
+            edit_input("tests/a2_l4/test_pretty_print.py", "import", "pwned"),
+            Some(&confinement),
+        )
+        .expect_err("a declared file hardlinked after binding must be refused");
+        assert!(linked.contains("hard links"), "{linked}");
+
+        assert_eq!(ws.secret(), GENERIC_SECRET);
+        assert_eq!(
+            fs::read_to_string(ws.outside.join("alias.py")).expect("alias should exist"),
+            GENERIC_TEST
+        );
+    }
+
+    #[test]
+    fn generic_confinement_keeps_the_confined_tool_and_bash_policy() {
+        let ws = GenericWorkspace::new("policy");
+        let confinement = ws.confinement();
+        for tool in super::CONFINED_TOOLS {
+            confined_tool_permitted_with(tool, Some(&confinement))
+                .expect("confined tools are admitted");
+        }
+        for tool in ["REPL", "PowerShell", "Agent", "WebFetch", "MCP"] {
+            let error = confined_tool_permitted_with(tool, Some(&confinement))
+                .expect_err("other tools are refused under confinement");
+            assert!(error.contains("not available under workspace confinement"));
+        }
+
+        let defaulted = confine_bash_input(
+            bash_input(json!({ "command": SMOKE_COMMAND })),
+            Some(&confinement),
+        )
+        .expect("a foreground command should be accepted");
+        assert_eq!(defaulted.timeout, Some(CONFINED_BASH_TIMEOUT_MS));
+        let capped = confine_bash_input(
+            bash_input(json!({ "command": SMOKE_COMMAND, "timeout": 86_400_000u64 })),
+            Some(&confinement),
+        )
+        .expect("an over-long timeout should be capped");
+        assert_eq!(capped.timeout, Some(CONFINED_BASH_TIMEOUT_MS));
+        let background = confine_bash_input(
+            bash_input(json!({ "command": SMOKE_COMMAND, "run_in_background": true })),
+            Some(&confinement),
+        )
+        .expect_err("background execution must be refused");
+        assert!(background.contains("background execution"), "{background}");
+        let unsandboxed = confine_bash_input(
+            bash_input(json!({ "command": SMOKE_COMMAND, "dangerouslyDisableSandbox": true })),
+            Some(&confinement),
+        )
+        .expect_err("sandbox opt-out must be refused");
+        assert!(
+            unsandboxed.contains("dangerouslyDisableSandbox"),
+            "{unsandboxed}"
+        );
+    }
+
+    /// Generic workspace whose operator also declares `test_calculator.py`
+    /// writable and [`SMOKE_COMMAND`] runnable, so the approved command
+    /// imports code written through the confined file tool: the strongest
+    /// payload position the shell offers.
+    fn generic_shell_workspace(name: &str) -> (GenericWorkspace, WorkspaceConfinement) {
+        let ws = GenericWorkspace::new(name);
+        fs::write(ws.workspace.join("test_calculator.py"), "").expect("module should be written");
+        let mut writable = GENERIC_WRITABLE.to_vec();
+        writable.push("test_calculator.py");
+        let confinement = ws
+            .confine_with(&writable, &[SMOKE_COMMAND])
+            .expect("generic confinement should bind");
+        (ws, confinement)
+    }
+
+    fn plant_payload(confinement: &WorkspaceConfinement, payload: &str) {
+        run_write_file_with(
+            write_input("test_calculator.py", payload),
+            Some(confinement),
+        )
+        .expect("the declared module is writable through the file tool");
+    }
+
+    fn run_in_workspace(
+        workspace: &Path,
+        confinement: &WorkspaceConfinement,
+        input: serde_json::Value,
+    ) -> Result<String, String> {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = std::env::current_dir().expect("cwd should be readable");
+        std::env::set_current_dir(workspace).expect("cwd should move into the workspace");
+        let result = run_contained_bash(bash_input(input), confinement);
+        std::env::set_current_dir(previous).expect("cwd should be restored");
+        result
+    }
+
+    #[test]
+    fn generic_confined_shell_cannot_write_the_workspace_or_escape() {
+        if !sandbox_ready() {
+            return;
+        }
+        let (ws, confinement) = generic_shell_workspace("shell");
+        plant_payload(
+            &confinement,
+            &format!(
+                "import os\n\
+                 results = []\n\
+                 for label, path in (('declared', 'scripts/pretty_print.py'), ('unlisted', 'README.md'), ('new', 'new.py'), ('parent', '../escape.txt'), ('outside', {secret:?})):\n\
+                 \x20   try:\n\
+                 \x20       with open(path, 'a') as handle:\n\
+                 \x20           handle.write('#')\n\
+                 \x20       results.append(label + ':WROTE')\n\
+                 \x20   except OSError:\n\
+                 \x20       results.append(label + ':REFUSED')\n\
+                 print(' '.join(results))\n\
+                 print('HOST', os.path.exists({outside:?}))\n",
+                secret = ws.outside.join("secret.txt").to_string_lossy(),
+                outside = ws.outside.to_string_lossy(),
+            ),
+        );
+
+        let result = run_in_workspace(
+            &ws.workspace,
+            &confinement,
+            json!({ "command": SMOKE_COMMAND }),
+        );
+        let unapproved = run_in_workspace(
+            &ws.workspace,
+            &confinement,
+            json!({ "command": "echo pwned > README.md" }),
+        );
+
+        let output = contained_output(result);
+        let stdout = output["stdout"].as_str().unwrap_or_default();
+        // The sandbox mounts the workspace read-only: even a declared file is
+        // writable only through the confined file tools, never from the shell.
+        assert!(
+            stdout.contains(
+                "declared:REFUSED unlisted:REFUSED new:REFUSED parent:REFUSED outside:REFUSED"
+            ),
+            "the sandbox must refuse every workspace and host write: {output}"
+        );
+        assert!(stdout.contains("HOST False"), "host tree visible: {output}");
+        assert_eq!(
+            output["structuredContent"][0]["containment"]["launcher"],
+            "/usr/bin/bwrap"
+        );
+        assert_eq!(
+            output["structuredContent"][0]["containment"]["residualProcesses"],
+            0
+        );
+        let unapproved = unapproved.expect_err("only the approved command may run");
+        assert!(unapproved.contains("not approved"), "{unapproved}");
+
+        assert_eq!(ws.read("README.md"), GENERIC_README);
+        assert_eq!(ws.read("scripts/pretty_print.py"), GENERIC_SOURCE);
+        assert!(!ws.workspace.join("new.py").exists());
+        assert!(!ws.base.join("escape.txt").exists());
+        assert_eq!(ws.secret(), GENERIC_SECRET);
+    }
+
+    #[test]
+    fn generic_confined_shell_timeout_is_bounded() {
+        if !sandbox_ready() {
+            return;
+        }
+        let (ws, confinement) = generic_shell_workspace("shell-timeout");
+        plant_payload(&confinement, "import time\ntime.sleep(30)\n");
+        let started = std::time::Instant::now();
+        let result = run_in_workspace(
+            &ws.workspace,
+            &confinement,
+            json!({ "command": SMOKE_COMMAND, "timeout": 1_000u64 }),
+        );
+        let elapsed = started.elapsed();
+        let output = contained_output(result);
+        assert_eq!(output["interrupted"], true, "{output}");
+        assert_eq!(output["returnCodeInterpretation"], "timeout", "{output}");
+        assert_eq!(
+            output["structuredContent"][0]["containment"]["residualProcesses"],
+            0
+        );
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "the timeout must bound the call, took {elapsed:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Operator-declared bash commands: exact-match authority under generic
+    // confinement.
+    // ------------------------------------------------------------------
+
+    /// The North Star task's bounded test command, shaped for the generic
+    /// fixture's declared test file.
+    const DECLARED_TEST: &str =
+        "python3 -B -m unittest discover -v -s tests/a2_l4 -p test_pretty_print.py";
+    /// A second, distinct declaration.
+    const DECLARED_COMPILE: &str = "python3 -B -m py_compile scripts/pretty_print.py";
+    /// A plausible command the operator never declared.
+    const UNDECLARED_TEST: &str =
+        "python3 -B -m unittest discover -v -s tests -p test_pretty_print.py";
+
+    /// Refusal through the production confined path. An unapproved command
+    /// is refused before the launcher-CWD check, so nothing is started.
+    fn assert_not_approved(confinement: &WorkspaceConfinement, input: &serde_json::Value) {
+        let error = run_contained_bash(bash_input(input.clone()), confinement)
+            .expect_err("an undeclared command must be refused");
+        assert!(
+            error.contains("is not approved for contained execution"),
+            "{input}: {error}"
+        );
+    }
+
+    fn approved<'a>(confinement: &'a WorkspaceConfinement, command: &str) -> Option<&'a str> {
+        confinement
+            .approved_command(command)
+            .map(runtime::contained::ApprovedCommand::command)
+    }
+
+    #[test]
+    fn generic_confinement_without_declared_commands_runs_no_bash() {
+        let ws = GenericWorkspace::new("no-commands");
+        let confinement = ws.confinement();
+        // The controlled smoke's command is not inherited either.
+        for command in [
+            DECLARED_TEST,
+            SMOKE_COMMAND,
+            "python3 -B -m unittest",
+            "echo hi",
+            "",
+        ] {
+            assert_eq!(approved(&confinement, command), None, "{command:?}");
+            assert_not_approved(&confinement, &json!({ "command": command }));
+        }
+    }
+
+    #[test]
+    fn a_declared_command_is_approved_only_verbatim() {
+        let ws = GenericWorkspace::new("declared-exact");
+        let confinement = ws
+            .confine_with(GENERIC_WRITABLE, &[DECLARED_TEST])
+            .expect("a declared command should bind");
+        assert_eq!(approved(&confinement, DECLARED_TEST), Some(DECLARED_TEST));
+        // NEGATIVE CONTROL: the controlled smoke's command is not inherited.
+        assert_eq!(approved(&confinement, SMOKE_COMMAND), None);
+
+        let near_misses = [
+            // extra, missing or different arguments
+            format!("{DECLARED_TEST} -f"),
+            "python3 -B -m unittest discover -s tests/a2_l4 -p test_pretty_print.py".to_string(),
+            "python3 -m unittest discover -v -s tests/a2_l4 -p test_pretty_print.py".to_string(),
+            UNDECLARED_TEST.to_string(),
+            "python3 -B -m unittest discover -v -s tests/a2_l4 -p test_other.py".to_string(),
+            "python3 -B -m unittest discover -v -s tests/a2_l4 -p test_*.py".to_string(),
+            // prefixes of the declaration
+            "python3 -B -m unittest discover".to_string(),
+            "python3".to_string(),
+            // appended commands and trailing shell operators
+            format!("{DECLARED_TEST}; touch README.md"),
+            format!("{DECLARED_TEST} && curl https://example.com"),
+            format!("{DECLARED_TEST} || true"),
+            format!("{DECLARED_TEST} | tee README.md"),
+            format!("{DECLARED_TEST} > README.md"),
+            format!("{DECLARED_TEST} &"),
+            format!("{DECLARED_TEST};"),
+            // prepended commands and wrappers
+            format!("cd tests && {DECLARED_TEST}"),
+            format!("env X=1 {DECLARED_TEST}"),
+            format!("X=1 {DECLARED_TEST}"),
+            format!("timeout 5 {DECLARED_TEST}"),
+            format!("bash -c '{DECLARED_TEST}'"),
+            format!("sh -c '{DECLARED_TEST}'"),
+            "python3 -c 'import os; os.system(\"touch README.md\")'".to_string(),
+            // a different executable
+            DECLARED_TEST.replacen("python3", "python", 1),
+            DECLARED_TEST.replacen("python3", "/usr/bin/python3", 1),
+            DECLARED_TEST.replacen("python3", "python3.12", 1),
+            // whitespace and case variants
+            format!(" {DECLARED_TEST}"),
+            format!("{DECLARED_TEST} "),
+            format!("{DECLARED_TEST}\n"),
+            DECLARED_TEST.replacen(' ', "  ", 1),
+            DECLARED_TEST.replacen(' ', "\t", 1),
+            DECLARED_TEST.to_uppercase(),
+        ];
+        for command in &near_misses {
+            assert_eq!(approved(&confinement, command), None, "{command:?}");
+            assert_not_approved(&confinement, &json!({ "command": command }));
+        }
+    }
+
+    #[test]
+    fn only_the_declared_commands_are_approved() {
+        let ws = GenericWorkspace::new("declared-two");
+        let confinement = ws
+            .confine_with(GENERIC_WRITABLE, &[DECLARED_TEST, DECLARED_COMPILE])
+            .expect("two declared commands should bind");
+        for command in [DECLARED_TEST, DECLARED_COMPILE] {
+            assert_eq!(approved(&confinement, command), Some(command));
+        }
+        let joined = format!("{DECLARED_TEST} {DECLARED_COMPILE}");
+        for command in [
+            SMOKE_COMMAND,
+            UNDECLARED_TEST,
+            "python3 -B -m py_compile scripts/other.py",
+            joined.as_str(),
+        ] {
+            assert_eq!(approved(&confinement, command), None, "{command:?}");
+        }
+        // NEGATIVE CONTROL: dropping a declaration drops its approval.
+        let single = ws
+            .confine_with(GENERIC_WRITABLE, &[DECLARED_COMPILE])
+            .expect("one declared command should bind");
+        assert_eq!(approved(&single, DECLARED_TEST), None);
+        assert_eq!(approved(&single, DECLARED_COMPILE), Some(DECLARED_COMPILE));
+    }
+
+    #[test]
+    fn invalid_or_repeated_command_declarations_refuse_the_confinement() {
+        let ws = GenericWorkspace::new("declared-invalid");
+        for (commands, reason) in [
+            (
+                &[DECLARED_TEST, "python3 -B x; touch README.md"][..],
+                "contains ';'",
+            ),
+            (&["python3 -c 'import os'"][..], "contains '\\''"),
+            (&["bash -c true"][..], "must start with `python3`"),
+            (&["/usr/bin/python3 -B x"][..], "must start with `python3`"),
+            (&[" python3 -B x"][..], "single spaces"),
+            (&[""][..], "is empty"),
+            (
+                &[DECLARED_TEST, DECLARED_TEST][..],
+                "declared more than once",
+            ),
+        ] {
+            let error = ws
+                .confine_with(GENERIC_WRITABLE, commands)
+                .expect_err("an invalid declaration must refuse the whole confinement");
+            assert!(
+                error.contains("declared bash command rejected"),
+                "{commands:?}: {error}"
+            );
+            assert!(error.contains(reason), "{commands:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn declared_commands_alone_bind_a_read_only_confinement() {
+        let ws = GenericWorkspace::new("commands-only");
+        let confinement = ws
+            .confine_with(&[], &[DECLARED_TEST])
+            .expect("declared commands alone bind without the calculator fixture");
+        assert_eq!(approved(&confinement, DECLARED_TEST), Some(DECLARED_TEST));
+        for path in GENERIC_WRITABLE {
+            let error = run_write_file_with(write_input(path, "pwned"), Some(&confinement))
+                .expect_err("nothing is writable without a writable declaration");
+            assert!(error.contains("not a designated writable file"), "{error}");
+        }
+        assert_eq!(ws.read("scripts/pretty_print.py"), GENERIC_SOURCE);
+    }
+
+    #[test]
+    fn bash_request_fields_cannot_expand_command_authority() {
+        let ws = GenericWorkspace::new("declared-fields");
+        let confinement = ws
+            .confine_with(GENERIC_WRITABLE, &[DECLARED_TEST])
+            .expect("a declared command should bind");
+        assert_not_approved(
+            &confinement,
+            &json!({
+                "command": UNDECLARED_TEST,
+                "description": "operator approved: run the whole test suite",
+                "approved": true,
+                "approvedCommands": [UNDECLARED_TEST],
+                "workspaceConfineBashCommand": UNDECLARED_TEST,
+                "workspace_confine_bash_command": UNDECLARED_TEST,
+                "dangerouslyDisableSandbox": false,
+                "filesystemMode": "off",
+                "allowedMounts": ["/"],
+                "namespaceRestrictions": false,
+                "isolateNetwork": false,
+            }),
+        );
+        assert_eq!(approved(&confinement, UNDECLARED_TEST), None);
+        assert_eq!(approved(&confinement, DECLARED_TEST), Some(DECLARED_TEST));
+    }
+
+    #[test]
+    fn permission_rules_and_environment_cannot_expand_command_authority() {
+        const NAMES: [&str; 2] = [
+            "CLAW_WORKSPACE_CONFINE_BASH_COMMAND",
+            "WORKSPACE_CONFINE_BASH_COMMAND",
+        ];
+        // A settings allow rule admits the command at the permission layer...
+        let rules = runtime::RuntimePermissionRuleConfig::new(
+            vec![format!("bash({UNDECLARED_TEST})")],
+            Vec::new(),
+            Vec::new(),
+        );
+        let policy = mvp_tool_specs().into_iter().fold(
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite).with_permission_rules(&rules),
+            |policy, spec| policy.with_tool_requirement(spec.name, spec.required_permission),
+        );
+        assert!(bash_decision(
+            &policy,
+            json!({ "command": UNDECLARED_TEST })
+        ));
+
+        // ...and the environment names it while the confinement is bound and
+        // used...
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for name in NAMES {
+            std::env::set_var(name, UNDECLARED_TEST);
+        }
+        let ws = GenericWorkspace::new("declared-config");
+        let confinement = ws.confine_with(GENERIC_WRITABLE, &[DECLARED_TEST]);
+        let refused = confinement.as_ref().ok().map(|confinement| {
+            run_contained_bash(
+                bash_input(json!({ "command": UNDECLARED_TEST })),
+                confinement,
+            )
+        });
+        for name in NAMES {
+            std::env::remove_var(name);
+        }
+
+        // ...yet confinement authority comes only from the declarations.
+        let confinement = confinement.expect("a declared command should bind");
+        assert_eq!(approved(&confinement, UNDECLARED_TEST), None);
+        let error = refused
+            .expect("bound")
+            .expect_err("the undeclared command must be refused");
+        assert!(error.contains("is not approved"), "{error}");
+    }
+
+    #[test]
+    fn controlled_smoke_approves_only_its_built_in_command() {
+        let fixture = NorthStarFixture::new("smoke-commands");
+        let confinement = fixture.confinement();
+        assert_eq!(approved(&confinement, SMOKE_COMMAND), Some(SMOKE_COMMAND));
+        for command in [
+            DECLARED_TEST,
+            "python3 -B -m unittest discover -v -s . -p test_calculator.py",
+        ] {
+            assert_eq!(approved(&confinement, command), None, "{command}");
+        }
+    }
+
+    #[test]
+    fn a_declared_command_still_refuses_background_and_is_time_bounded() {
+        let ws = GenericWorkspace::new("declared-bounds");
+        let confinement = ws
+            .confine_with(GENERIC_WRITABLE, &[DECLARED_TEST])
+            .expect("a declared command should bind");
+        for (field, reason) in [
+            ("run_in_background", "background execution"),
+            ("dangerouslyDisableSandbox", "dangerouslyDisableSandbox"),
+        ] {
+            let mut input = json!({ "command": DECLARED_TEST });
+            input[field] = json!(true);
+            let error = run_contained_bash(bash_input(input), &confinement)
+                .expect_err("a declared command keeps the confined bash bounds");
+            assert!(error.contains(reason), "{error}");
+        }
+
+        if !sandbox_ready() {
+            return;
+        }
+        run_write_file_with(
+            write_input(
+                "tests/a2_l4/test_pretty_print.py",
+                "import time\ntime.sleep(30)\n",
+            ),
+            Some(&confinement),
+        )
+        .expect("the declared test file is writable through the file tool");
+        let started = std::time::Instant::now();
+        let output = contained_output(run_in_workspace(
+            &ws.workspace,
+            &confinement,
+            json!({ "command": DECLARED_TEST, "timeout": 1_000u64 }),
+        ));
+        let elapsed = started.elapsed();
+        assert_eq!(output["interrupted"], true, "{output}");
+        assert_eq!(output["returnCodeInterpretation"], "timeout", "{output}");
+        assert_eq!(
+            output["structuredContent"][0]["containment"]["residualProcesses"],
+            0
+        );
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "the timeout must bound the call, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_declared_command_runs_in_bwrap_and_cannot_write_the_workspace_or_escape() {
+        if !sandbox_ready() {
+            return;
+        }
+        let ws = GenericWorkspace::new("declared-shell");
+        let confinement = ws
+            .confine_with(GENERIC_WRITABLE, &[DECLARED_TEST])
+            .expect("a declared command should bind");
+        let probe = format!(
+            "import os, unittest\n\
+             \n\
+             class WorkspaceWrites(unittest.TestCase):\n\
+             \x20   def test_probe(self):\n\
+             \x20       results = []\n\
+             \x20       for label, path in (('declared', 'scripts/pretty_print.py'), ('test', 'tests/a2_l4/test_pretty_print.py'), ('unlisted', 'README.md'), ('new', 'new.py'), ('parent', '../escape.txt'), ('outside', {secret:?})):\n\
+             \x20           try:\n\
+             \x20               with open(path, 'a') as handle:\n\
+             \x20                   handle.write('#')\n\
+             \x20               results.append(label + ':WROTE')\n\
+             \x20           except OSError:\n\
+             \x20               results.append(label + ':REFUSED')\n\
+             \x20       print(' '.join(results))\n\
+             \x20       print('HOST', os.path.exists({outside:?}))\n",
+            secret = ws.outside.join("secret.txt").to_string_lossy(),
+            outside = ws.outside.to_string_lossy(),
+        );
+        run_write_file_with(
+            write_input("tests/a2_l4/test_pretty_print.py", &probe),
+            Some(&confinement),
+        )
+        .expect("the declared test file is writable through the file tool");
+
+        // Request fields that look like sandbox controls change nothing.
+        let output = contained_output(run_in_workspace(
+            &ws.workspace,
+            &confinement,
+            json!({
+                "command": DECLARED_TEST,
+                "filesystemMode": "off",
+                "allowedMounts": ["/"],
+                "namespaceRestrictions": false,
+                "isolateNetwork": false,
+            }),
+        ));
+        let stdout = output["stdout"].as_str().unwrap_or_default();
+        // The workspace is mounted read-only: even a declared file is
+        // writable only through the confined file tools, never from bash.
+        assert!(
+            stdout.contains(
+                "declared:REFUSED test:REFUSED unlisted:REFUSED new:REFUSED parent:REFUSED outside:REFUSED"
+            ),
+            "{output}"
+        );
+        assert!(stdout.contains("HOST False"), "host tree visible: {output}");
+        assert!(
+            output["stderr"].as_str().is_some_and(
+                |stderr| stderr.contains("Ran 1 test") && stderr.trim_end().ends_with("OK")
+            ),
+            "{output}"
+        );
+        assert!(output["returnCodeInterpretation"].is_null(), "{output}");
+        let containment = &output["structuredContent"][0]["containment"];
+        assert_eq!(containment["launcher"], "/usr/bin/bwrap");
+        assert_eq!(containment["settled"], true);
+        assert_eq!(containment["residualProcesses"], 0);
+
+        assert_eq!(ws.read("scripts/pretty_print.py"), GENERIC_SOURCE);
+        assert_eq!(ws.read("tests/a2_l4/test_pretty_print.py"), probe);
+        assert_eq!(ws.read("README.md"), GENERIC_README);
+        assert!(!ws.workspace.join("new.py").exists());
+        assert!(!ws.base.join("escape.txt").exists());
+        assert_eq!(ws.secret(), GENERIC_SECRET);
     }
 }
