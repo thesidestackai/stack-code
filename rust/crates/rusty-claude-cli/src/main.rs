@@ -4250,6 +4250,35 @@ impl LeadingOption {
                 | Self::WorkspaceConfineBashCommand
         )
     }
+
+    /// Whether the option widens what an action may do: its tool allow-list,
+    /// its permission mode, or running from a very broad directory without
+    /// asking.
+    ///
+    /// Such an option is read only from the option region. After it, the
+    /// arguments it would span are words of the action (see
+    /// [`parse_args_core_in`]). Every option is listed, so a new one cannot
+    /// be added without deciding which it is.
+    fn is_runtime_authority(self) -> bool {
+        match self {
+            Self::PermissionMode
+            | Self::DangerouslySkipPermissions
+            | Self::AllowBroadCwd
+            | Self::AllowedTools => true,
+            Self::DataDir
+            | Self::WorkspaceConfine
+            | Self::WorkspaceConfineWrite
+            | Self::WorkspaceConfineBashCommand
+            | Self::Help
+            | Self::Version
+            | Self::Model
+            | Self::OutputFormat
+            | Self::Compact
+            | Self::BaseCommit
+            | Self::ReasoningEffort
+            | Self::Print => false,
+        }
+    }
 }
 
 /// How a leading option takes its value.
@@ -4481,7 +4510,8 @@ fn unexpected_value(option: &str) -> String {
 /// Split `args` into the leading option region, one unit per option, and the
 /// action or prompt arguments after it.
 ///
-/// The option region is the only place process authority can be declared. It
+/// The option region is the only place process authority can be declared,
+/// and the only place the action parser reads runtime authority. It
 /// ends at the first argument that starts an action or prompt: a positional
 /// (a subcommand or a bare prompt), `-p`, `--resume`, `--resume=...`, `--acp`
 /// or `-acp`. An option `grammar` does not know is refused: it may take a
@@ -4552,7 +4582,13 @@ fn parse_args_core(
 /// given the `--allowedTools` values at most once, and not at all for help
 /// and version. Nothing else here builds a tool registry or reads the
 /// process confinement.
-#[allow(clippy::too_many_lines)]
+///
+/// The options that widen what an action may do
+/// ([`LeadingOption::is_runtime_authority`]) are read only from the option
+/// region, the one [`split_option_region`] also gives the process flags.
+/// After it they are words of the action. Where the action is a prompt given
+/// as words those words are prompt text, exactly as given. Any other action
+/// is refused, so they are neither read as authority nor dropped.
 fn parse_args_core_in(
     grammar: OptionGrammar,
     args: &[String],
@@ -4560,6 +4596,40 @@ fn parse_args_core_in(
     stdout_is_tty: bool,
     resolve_allowed_tools: &mut dyn FnMut(&[String]) -> ResolvedAllowedTools,
 ) -> Result<CliAction, String> {
+    let mut authority_words = None;
+    let action = parse_action_in(
+        grammar,
+        args,
+        stdin_is_tty,
+        stdout_is_tty,
+        resolve_allowed_tools,
+        &mut authority_words,
+    )?;
+    match authority_words {
+        Some(option) => Err(format!(
+            "{option} must come before the prompt or subcommand"
+        )),
+        None => Ok(action),
+    }
+}
+
+/// [`parse_args_core_in`] without its refusal.
+///
+/// `authority_words` is left naming the first runtime-authority option found
+/// after the option region, unless the action took its words as prompt text.
+#[allow(clippy::too_many_lines)]
+fn parse_action_in(
+    grammar: OptionGrammar,
+    args: &[String],
+    stdin_is_tty: bool,
+    stdout_is_tty: bool,
+    resolve_allowed_tools: &mut dyn FnMut(&[String]) -> ResolvedAllowedTools,
+    authority_words: &mut Option<&'static str>,
+) -> Result<CliAction, String> {
+    // Where the action begins. Both this parser and the process flags take
+    // the option region from `split_option_region`.
+    let (_, action) = split_option_region(grammar, args)?;
+    let option_region = args.len() - action.len();
     let mut model = DEFAULT_MODEL.to_string();
     // #148: when user passes --model/--model=, capture the raw input so we
     // can attribute source: "flag" later. None means no flag was supplied.
@@ -4580,9 +4650,17 @@ fn parse_args_core_in(
     // only the value the unit carries.
     let mut remaining = args;
     while let Some((unit, after)) = grammar.next_unit(remaining) {
+        let in_option_region = args.len() - remaining.len() < option_region;
         let arg = remaining[0].as_str();
         remaining = after;
         let unit = match unit {
+            // After the option region a runtime-authority option sets
+            // nothing. The arguments it spans stay words of the action.
+            ArgUnit::Option(unit) if !in_option_region && unit.option.is_runtime_authority() => {
+                authority_words.get_or_insert(unit.name);
+                rest.extend_from_slice(unit.args);
+                continue;
+            }
             ArgUnit::Option(unit) => unit,
             ArgUnit::ShortPrompt => {
                 // Claw Code compat: -p "prompt" = one-shot prompt
@@ -4889,6 +4967,9 @@ fn parse_args_core_in(
             if prompt.trim().is_empty() {
                 return Err("prompt subcommand requires a prompt string".to_string());
             }
+            // The words after `prompt` are the prompt, authority words
+            // included.
+            *authority_words = None;
             Ok(CliAction::Prompt {
                 prompt,
                 model,
@@ -4939,6 +5020,8 @@ fn parse_args_core_in(
                         .to_string(),
                 );
             }
+            // Every word is the prompt, authority words included.
+            *authority_words = None;
             Ok(CliAction::Prompt {
                 prompt: joined,
                 model,
@@ -14169,6 +14252,15 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         "  --version, -V              Print version and build information locally"
     )?;
     writeln!(out)?;
+    writeln!(
+        out,
+        "  --permission-mode, --dangerously-skip-permissions, --allowedTools and --allow-broad-cwd"
+    )?;
+    writeln!(
+        out,
+        "  must come before the prompt or subcommand. After a prompt has begun they are prompt text."
+    )?;
+    writeln!(out)?;
     writeln!(out, "Interactive slash commands:")?;
     writeln!(out, "{}", render_slash_command_help_filtered(STUB_COMMANDS))?;
     writeln!(out)?;
@@ -22272,6 +22364,697 @@ UU conflicted.rs",
         assert!(installer.contains("tools::set_workspace_confinement("));
         assert_eq!(code_lines_naming("set_workspace_confinement("), 1);
         assert_eq!(code_lines_naming("install_workspace_confinement"), 2);
+    }
+
+    // ---- PR #184 review repair: runtime authority only in the option region ----
+
+    /// Each runtime-authority option as it can follow an action, in both
+    /// spellings and both forms. Each asks for more than the option regions
+    /// of the tests below grant.
+    const AUTHORITY_WORDS: [&[&str]; 8] = [
+        &["--allowedTools", "write_file,bash"],
+        &["--allowedTools=write_file,bash"],
+        &["--allowed-tools", "write_file,bash"],
+        &["--allowed-tools=write_file,bash"],
+        &["--permission-mode", "danger-full-access"],
+        &["--permission-mode=danger-full-access"],
+        &["--dangerously-skip-permissions"],
+        &["--allow-broad-cwd"],
+    ];
+
+    /// The action `args` is prepared to, in the order `run()` prepares it.
+    fn prepared_action(args: &[String]) -> Result<CliAction, String> {
+        prepare_by(super::LEADING_OPTIONS, args)
+            .result
+            .map(|(action, _)| action)
+    }
+
+    /// The prompt `args` is prepared to.
+    fn prepared_prompt(args: &[String]) -> (CliAction, String) {
+        match prepared_action(args) {
+            Ok(action) => match &action {
+                CliAction::Prompt { prompt, .. } => {
+                    let prompt = prompt.clone();
+                    (action, prompt)
+                }
+                other => panic!("{args:?} is not a prompt: {other:?}"),
+            },
+            Err(error) => panic!("{args:?} should parse: {error}"),
+        }
+    }
+
+    /// The tool allow-list and permission mode `action` runs tools under.
+    fn runtime_authority(action: &CliAction) -> (Option<super::AllowedToolSet>, PermissionMode) {
+        match action {
+            CliAction::Prompt {
+                allowed_tools,
+                permission_mode,
+                ..
+            }
+            | CliAction::Repl {
+                allowed_tools,
+                permission_mode,
+                ..
+            } => (allowed_tools.clone(), *permission_mode),
+            CliAction::ResumeRepl { context, .. } => {
+                (context.allowed_tools.clone(), context.permission_mode)
+            }
+            other => panic!("{other:?} runs no tools"),
+        }
+    }
+
+    /// Whether `action` may run from a very broad directory without asking:
+    /// what `run()` hands the broad-directory guard.
+    fn allows_broad_cwd(action: &CliAction) -> bool {
+        match action {
+            CliAction::Prompt {
+                allow_broad_cwd, ..
+            }
+            | CliAction::Repl {
+                allow_broad_cwd, ..
+            } => *allow_broad_cwd,
+            CliAction::ResumeRepl { context, .. } => context.allow_broad_cwd,
+            other => panic!("{other:?} runs no tools"),
+        }
+    }
+
+    /// Whether a model working under `action` gets to run `tool`, asked of
+    /// what enforces it: the tools offered to the model, the executor's
+    /// allow-list, and the permission policy.
+    fn runs_tool(action: &CliAction, tool: &str) -> bool {
+        let (allowed_tools, permission_mode) = runtime_authority(action);
+        let registry = GlobalToolRegistry::builtin();
+        let offered = registry
+            .definitions(allowed_tools.as_ref())
+            .iter()
+            .any(|definition| definition.name == tool);
+        // An empty input never reaches the tool: the allow-list refuses it
+        // or, past the allow-list, it is invalid input.
+        let mut executor =
+            super::CliToolExecutor::new(allowed_tools, false, registry.clone(), None);
+        let listed = match runtime::ToolExecutor::execute(&mut executor, tool, "{}") {
+            Ok(_) => true,
+            Err(error) => !error.to_string().contains("--allowedTools"),
+        };
+        let policy = super::permission_policy(
+            permission_mode,
+            &runtime::RuntimeFeatureConfig::default(),
+            &registry,
+        )
+        .expect("permission policy should build");
+        let permitted = matches!(
+            policy.authorize(tool, "{}", None),
+            runtime::PermissionOutcome::Allow
+        );
+        offered && listed && permitted
+    }
+
+    fn tool_set(tools: &[&str]) -> Option<super::AllowedToolSet> {
+        Some(tools.iter().map(ToString::to_string).collect())
+    }
+
+    #[test]
+    fn words_after_a_prompt_cannot_widen_the_tool_allow_list() {
+        // The option region allows one tool and grants every permission, so
+        // a tool runs exactly when the allow-list names it.
+        let _guard = env_lock();
+        let leading = [
+            "--allowedTools",
+            "read_file",
+            "--permission-mode",
+            "danger-full-access",
+        ];
+        for prompt in PROMPT_SHAPES {
+            for words in &AUTHORITY_WORDS[..4] {
+                let args = boundary_args(&[&leading, prompt, words]);
+                let (action, _) = prepared_prompt(&args);
+                assert_eq!(
+                    runtime_authority(&action).0,
+                    tool_set(&["read_file"]),
+                    "{args:?}"
+                );
+                assert!(runs_tool(&action, "read_file"), "{args:?}");
+                for tool in ["write_file", "bash"] {
+                    assert!(
+                        !runs_tool(&action, tool),
+                        "{args:?} lets a model run {tool}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn words_after_a_prompt_cannot_narrow_the_tool_allow_list_either() {
+        // Prompt text is not authority in either direction: what the option
+        // region allows is what the action allows.
+        let _guard = env_lock();
+        for prompt in PROMPT_SHAPES {
+            for words in [
+                &["--allowedTools", "read_file"][..],
+                &["--allowed-tools=read_file"][..],
+            ] {
+                let leading = [
+                    "--allowedTools=read_file,write_file",
+                    "--permission-mode=workspace-write",
+                ];
+                let args = boundary_args(&[&leading, prompt, words]);
+                let (action, _) = prepared_prompt(&args);
+                assert_eq!(
+                    runtime_authority(&action).0,
+                    tool_set(&["read_file", "write_file"]),
+                    "{args:?}"
+                );
+                assert!(runs_tool(&action, "write_file"), "{args:?}");
+
+                // With no allow-list in the option region there is none.
+                let args = boundary_args(&[&["--permission-mode=read-only"], prompt, words]);
+                let (action, _) = prepared_prompt(&args);
+                assert_eq!(runtime_authority(&action).0, None, "{args:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn words_after_a_prompt_cannot_change_the_permission_mode() {
+        let _guard = env_lock();
+        let modes = [
+            ("read-only", PermissionMode::ReadOnly),
+            ("workspace-write", PermissionMode::WorkspaceWrite),
+            ("danger-full-access", PermissionMode::DangerFullAccess),
+        ];
+        for (leading, mode) in modes {
+            for prompt in PROMPT_SHAPES {
+                for (later, _) in modes {
+                    let equals = format!("--permission-mode={later}");
+                    for words in [&["--permission-mode", later][..], &[equals.as_str()][..]] {
+                        let args = boundary_args(&[&["--permission-mode", leading], prompt, words]);
+                        let (action, _) = prepared_prompt(&args);
+                        assert_eq!(runtime_authority(&action).1, mode, "{args:?}");
+                    }
+                }
+            }
+        }
+
+        // What the mode comes to: read-only neither writes nor runs a
+        // command, whatever the prompt goes on to say.
+        for prompt in PROMPT_SHAPES {
+            for words in &AUTHORITY_WORDS[4..6] {
+                let args = boundary_args(&[&["--permission-mode", "read-only"], prompt, words]);
+                let (action, _) = prepared_prompt(&args);
+                assert!(runs_tool(&action, "read_file"), "{args:?}");
+                for tool in ["write_file", "bash"] {
+                    assert!(
+                        !runs_tool(&action, tool),
+                        "{args:?} lets a model run {tool}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn words_after_a_prompt_cannot_skip_permission_checks() {
+        let _guard = env_lock();
+        let skip = &["--dangerously-skip-permissions"][..];
+        for prompt in PROMPT_SHAPES {
+            let args = boundary_args(&[&["--permission-mode", "read-only"], prompt, skip]);
+            let (action, _) = prepared_prompt(&args);
+            assert_eq!(
+                runtime_authority(&action).1,
+                PermissionMode::ReadOnly,
+                "{args:?}"
+            );
+            for tool in ["write_file", "bash"] {
+                assert!(
+                    !runs_tool(&action, tool),
+                    "{args:?} lets a model run {tool}"
+                );
+            }
+
+            // With no mode in the option region the action has the default
+            // one, the same one it has without the words.
+            let (plain, _) = prepared_prompt(&boundary_args(&[prompt]));
+            let (action, _) = prepared_prompt(&boundary_args(&[prompt, skip]));
+            assert_eq!(
+                runtime_authority(&action),
+                runtime_authority(&plain),
+                "{prompt:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn words_after_a_prompt_cannot_allow_a_broad_working_directory() {
+        // `--allow-broad-cwd` lets an action run from the home directory or
+        // the root without asking. It does so only from the option region.
+        let _guard = env_lock();
+        for (shape, opening) in [
+            (&["fix", "it"][..], "fix it"),
+            (&["prompt", "repair"][..], "repair"),
+            (&["-p", "repair"][..], "repair"),
+        ] {
+            // After the action began it is a word of the prompt, at its end
+            // or between its words.
+            for tail in [
+                &["--allow-broad-cwd"][..],
+                &["--allow-broad-cwd", "now"][..],
+            ] {
+                let args = boundary_args(&[shape, tail]);
+                let (action, prompt) = prepared_prompt(&args);
+                assert!(
+                    !allows_broad_cwd(&action),
+                    "{args:?} allows a broad directory"
+                );
+                assert_eq!(prompt, format!("{opening} {}", tail.join(" ")), "{args:?}");
+            }
+
+            // In the option region it allows one, whatever the prompt goes
+            // on to say.
+            for words in [&[][..]].into_iter().chain(AUTHORITY_WORDS) {
+                let args = boundary_args(&[&["--allow-broad-cwd"], shape, words]);
+                let (action, _) = prepared_prompt(&args);
+                assert!(allows_broad_cwd(&action), "{args:?}");
+            }
+        }
+
+        // An interactive resume takes it from the option region too.
+        let resume = confine_args(&["--allow-broad-cwd", "--resume", "latest"]);
+        let action = prepared_action(&resume).expect("a resume after its options should parse");
+        assert!(allows_broad_cwd(&action), "{resume:?}");
+
+        // The value slot of another option is that option's, as before.
+        let (action, prompt) = prepared_prompt(&confine_args(&[
+            "repair",
+            "--base-commit",
+            "--allow-broad-cwd",
+        ]));
+        assert_eq!(prompt, "repair");
+        assert!(!allows_broad_cwd(&action));
+    }
+
+    #[test]
+    fn runtime_authority_in_the_option_region_keeps_its_meaning() {
+        // Allow-lists add up across both spellings and both forms, and the
+        // last permission option wins. Nothing after the action changes
+        // either. Each case is an option region, the tools it lists (none
+        // when it names no allow-list) and the mode it sets.
+        let _guard = env_lock();
+        let cases: [(&[&str], &[&str], PermissionMode); 6] = [
+            (
+                &[
+                    "--allowedTools",
+                    "read_file",
+                    "--allowed-tools=bash",
+                    "--permission-mode",
+                    "read-only",
+                    "--permission-mode=workspace-write",
+                ],
+                &["bash", "read_file"],
+                PermissionMode::WorkspaceWrite,
+            ),
+            (
+                &[
+                    "--allowed-tools",
+                    "read_file,write_file",
+                    "--allowedTools=bash",
+                    "--dangerously-skip-permissions",
+                ],
+                &["bash", "read_file", "write_file"],
+                PermissionMode::DangerFullAccess,
+            ),
+            (
+                &[
+                    "--dangerously-skip-permissions",
+                    "--permission-mode",
+                    "read-only",
+                ],
+                &[],
+                PermissionMode::ReadOnly,
+            ),
+            (
+                &[
+                    "--permission-mode=read-only",
+                    "--dangerously-skip-permissions",
+                ],
+                &[],
+                PermissionMode::DangerFullAccess,
+            ),
+            (
+                &[
+                    "--permission-mode",
+                    "danger-full-access",
+                    "--permission-mode=read-only",
+                ],
+                &[],
+                PermissionMode::ReadOnly,
+            ),
+            (
+                &["--allowedTools=read_file", "--permission-mode=read-only"],
+                &["read_file"],
+                PermissionMode::ReadOnly,
+            ),
+        ];
+        for (leading, tools, mode) in cases {
+            let allow_list = if tools.is_empty() {
+                None
+            } else {
+                tool_set(tools)
+            };
+            let authority = (allow_list, mode);
+            for prompt in PROMPT_SHAPES {
+                for words in [&[][..]].into_iter().chain(AUTHORITY_WORDS) {
+                    let args = boundary_args(&[leading, prompt, words]);
+                    let (action, _) = prepared_prompt(&args);
+                    assert_eq!(runtime_authority(&action), authority, "{args:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn authority_words_after_a_prompt_stay_in_its_text() {
+        // The words are neither read as options nor dropped: the prompt is
+        // every word after the action began, as given.
+        let _guard = env_lock();
+        for (shape, opening) in [
+            (&["fix", "it"][..], "fix it"),
+            (&["prompt", "repair"][..], "repair"),
+            (&["-p", "repair"][..], "repair"),
+        ] {
+            for words in AUTHORITY_WORDS {
+                let args =
+                    boundary_args(&[&["--allowedTools", "read_file"], shape, words, &["now"]]);
+                let (_, prompt) = prepared_prompt(&args);
+                assert_eq!(
+                    prompt,
+                    format!("{opening} {} now", words.join(" ")),
+                    "{args:?}"
+                );
+            }
+            let every = AUTHORITY_WORDS.concat();
+            let (_, prompt) = prepared_prompt(&boundary_args(&[shape, &every]));
+            assert_eq!(
+                prompt,
+                format!("{opening} {}", every.join(" ")),
+                "{shape:?}"
+            );
+        }
+
+        // Authority words alone after `prompt` are its text too.
+        let (_, prompt) = prepared_prompt(&confine_args(&[
+            "prompt",
+            "--dangerously-skip-permissions",
+            "--allowedTools=bash",
+        ]));
+        assert_eq!(prompt, "--dangerously-skip-permissions --allowedTools=bash");
+    }
+
+    #[test]
+    fn the_arguments_an_authority_word_spans_stay_together() {
+        // After the action began an authority option still spans the
+        // arguments the grammar gives it, so its value is never read as a
+        // prompt terminal, a model, or help.
+        let _guard = env_lock();
+        let (plain, _) = prepared_prompt(&confine_args(&["repair"]));
+        for (args, text) in [
+            (
+                &["fix", "--allowedTools", "-p", "now"][..],
+                "fix --allowedTools -p now",
+            ),
+            (
+                &["fix", "--allowed-tools", "--model", "sonnet"][..],
+                "fix --allowed-tools --model sonnet",
+            ),
+            (
+                &["fix", "--permission-mode", "--compact", "now"][..],
+                "fix --permission-mode --compact now",
+            ),
+            (
+                &["prompt", "repair", "--permission-mode", "--help"][..],
+                "repair --permission-mode --help",
+            ),
+            (
+                &["fix", "--permission-mode", "--dangerously-skip-permissions"][..],
+                "fix --permission-mode --dangerously-skip-permissions",
+            ),
+        ] {
+            let (action, prompt) = prepared_prompt(&confine_args(args));
+            assert_eq!(prompt, text, "{args:?}");
+            let CliAction::Prompt { model, compact, .. } = &action else {
+                unreachable!()
+            };
+            let CliAction::Prompt {
+                model: plain_model, ..
+            } = &plain
+            else {
+                unreachable!()
+            };
+            assert_eq!((model, *compact), (plain_model, false), "{args:?}");
+            assert_eq!(
+                runtime_authority(&action),
+                runtime_authority(&plain),
+                "{args:?}"
+            );
+        }
+
+        // The value slot of another option is that option's, as before.
+        let (action, prompt) = prepared_prompt(&confine_args(&[
+            "repair",
+            "--base-commit",
+            "--dangerously-skip-permissions",
+        ]));
+        assert_eq!(prompt, "repair");
+        assert_eq!(runtime_authority(&action), runtime_authority(&plain));
+        assert!(matches!(
+            &action,
+            CliAction::Prompt { base_commit: Some(commit), .. }
+                if commit == "--dangerously-skip-permissions"
+        ));
+    }
+
+    /// Actions that are not a prompt given as words.
+    const NOT_WORD_PROMPTS: &[&[&str]] = &[
+        &["--resume"],
+        &["--resume", "latest"],
+        &["--resume=latest"],
+        &["--resume", "latest", "/status"],
+        &["--acp"],
+        &["-acp"],
+        &["acp", "serve"],
+        &["status"],
+        &["doctor"],
+        &["help"],
+        &["version"],
+        &["export"],
+        &["skills"],
+        &["skills", "myskill", "go"],
+        &["/skills", "myskill"],
+        &["agents"],
+        &["mcp"],
+        &["plugins"],
+        &["config"],
+        &["diff"],
+        &["init"],
+        &["bootstrap-plan"],
+        &["system-prompt"],
+        &["dump-manifests"],
+        &["plan", "run", "plan.json"],
+        &["task", "run", "task.json"],
+        &["prompt", "repair", "--help"],
+        &["fix", "it", "--version"],
+    ];
+
+    #[test]
+    fn authority_words_outside_a_prompt_are_refused() {
+        // Only a prompt has text for the words to be. Every other action is
+        // refused, before anything it declares is installed.
+        let _guard = env_lock();
+        let workspace = boundary_workspace();
+        for action in NOT_WORD_PROMPTS {
+            for words in AUTHORITY_WORDS {
+                let args = declaring(&workspace, &[*action, words].concat());
+                prepare_by(super::LEADING_OPTIONS, &args)
+                    .assert_refused_with_nothing_installed(&format!("{action:?} {words:?}"));
+            }
+        }
+
+        // Words before a `-p` are not its prompt either.
+        for words in AUTHORITY_WORDS {
+            let args = declaring(
+                &workspace,
+                &[&["fix"][..], words, &["-p", "now"][..]].concat(),
+            );
+            prepare_by(super::LEADING_OPTIONS, &args)
+                .assert_refused_with_nothing_installed(&format!("{words:?} before -p"));
+        }
+
+        // Where the action itself would have taken the words or left them
+        // unread, the refusal names the option.
+        for action in [
+            &["skills", "myskill", "go"][..],
+            &["/skills", "myskill"][..],
+            &["agents"][..],
+            &["init"][..],
+            &["--resume", "latest", "/status"][..],
+            &["prompt", "repair", "--help"][..],
+        ] {
+            for words in AUTHORITY_WORDS {
+                let args = boundary_args(&[action, words]);
+                let name = words[0].split('=').next().expect("name");
+                assert_eq!(
+                    prepared_action(&args),
+                    Err(after_option_region(name)),
+                    "{args:?}"
+                );
+            }
+        }
+        assert_eq!(
+            fs::read_to_string(workspace.join("README.md")).expect("readme"),
+            "readme\n"
+        );
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn a_resumed_session_takes_its_authority_from_the_option_region_only() {
+        // An interactive resume runs tools. Its authority is the option
+        // region's, and the same words after `--resume` are refused.
+        let _guard = env_lock();
+        for resume in [
+            &["--resume"][..],
+            &["--resume", "latest"][..],
+            &["--resume=latest"][..],
+        ] {
+            let leading = [
+                "--allowedTools",
+                "read_file",
+                "--permission-mode",
+                "read-only",
+            ];
+            let action = prepared_action(&boundary_args(&[&leading, resume]))
+                .expect("a resume after its options should parse");
+            assert_eq!(
+                runtime_authority(&action),
+                (tool_set(&["read_file"]), PermissionMode::ReadOnly),
+                "{resume:?}"
+            );
+            for words in AUTHORITY_WORDS {
+                let args = boundary_args(&[&leading, resume, words]);
+                if let Ok(action) = prepared_action(&args) {
+                    panic!("{args:?} resumes under {:?}", runtime_authority(&action));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_action_carries_exactly_the_authority_of_its_option_region() {
+        // Every sequence of up to three of these argument groups, read
+        // whole and read again with everything after its option region
+        // replaced by one plain word. The option region is the one
+        // `split_option_region` gives the process flags, and the two
+        // readings always run tools under the same authority.
+        let _guard = env_lock();
+        let atoms: [&[&str]; 15] = [
+            &["--allowedTools", "read_file"],
+            &["--allowed-tools=bash"],
+            &["--permission-mode", "workspace-write"],
+            &["--permission-mode=read-only"],
+            &["--dangerously-skip-permissions"],
+            &["--allow-broad-cwd"],
+            &["--model", "sonnet"],
+            &["--compact"],
+            &["--base-commit"],
+            &["--output-format", "json"],
+            &["fix"],
+            &["prompt"],
+            &["-p"],
+            &["repair"],
+            &["--resume"],
+        ];
+        let mut sequences: Vec<Vec<&[&str]>> = Vec::new();
+        for first in atoms {
+            sequences.push(vec![first]);
+            for second in atoms {
+                sequences.push(vec![first, second]);
+                for third in atoms {
+                    sequences.push(vec![first, second, third]);
+                }
+            }
+        }
+        let mut compared = 0;
+        for sequence in sequences {
+            let args = boundary_args(&sequence);
+            let Ok((options, action)) = super::split_option_region(super::LEADING_GRAMMAR, &args)
+            else {
+                continue;
+            };
+            if action.is_empty() {
+                // No action at all: the REPL, which reads the real stdin.
+                continue;
+            }
+            let Ok(whole) = prepared_action(&args) else {
+                continue;
+            };
+            if !matches!(
+                whole,
+                CliAction::Prompt { .. } | CliAction::ResumeRepl { .. }
+            ) {
+                continue;
+            }
+            let mut region = options
+                .iter()
+                .flat_map(|unit| unit.args.to_vec())
+                .collect::<Vec<_>>();
+            region.push("repair".to_string());
+            let alone = prepared_action(&region)
+                .unwrap_or_else(|error| panic!("{region:?} of {args:?}: {error}"));
+            assert_eq!(
+                (runtime_authority(&whole), allows_broad_cwd(&whole)),
+                (runtime_authority(&alone), allows_broad_cwd(&alone)),
+                "{args:?}"
+            );
+            compared += 1;
+        }
+        assert!(compared > 1000, "compared only {compared}");
+    }
+
+    #[test]
+    fn the_action_parser_takes_its_option_region_from_the_shared_split() {
+        // The tests above hold the two readings together by what they do.
+        // This holds them together by construction: the action parser asks
+        // `split_option_region` where the action begins, and decides in one
+        // place what a runtime-authority option after it is.
+        const SELF_SRC: &str = include_str!("main.rs");
+        let production = SELF_SRC
+            .split("\nmod tests {")
+            .next()
+            .expect("production source");
+        let parser = production_fn(production, "fn parse_action_in(");
+        assert!(parser.contains("split_option_region(grammar, args)?"));
+        assert_eq!(parser.matches("is_runtime_authority()").count(), 1);
+        assert!(parser.contains("!in_option_region && unit.option.is_runtime_authority()"));
+    }
+
+    #[test]
+    fn the_runtime_authority_options_are_the_tool_permission_and_directory_options() {
+        // Every spelling of the four options, and nothing else.
+        let authority = super::LEADING_OPTIONS
+            .iter()
+            .filter(|spec| spec.option.is_runtime_authority())
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            authority,
+            [
+                "--permission-mode",
+                "--dangerously-skip-permissions",
+                "--allow-broad-cwd",
+                "--allowedTools",
+                "--allowed-tools",
+            ]
+        );
     }
 
     // ---- PR #183 review repair: no external integrations while confined (P1) ----

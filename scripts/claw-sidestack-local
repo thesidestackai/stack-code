@@ -616,6 +616,23 @@ n6_flag_takes_value() {
 # Global flags the CLI consumes wherever they appear WITHOUT taking a separate
 # token, including every `--flag=value` form. None of these ever contributes to
 # the positional `rest` vector the CLI builds.
+#
+# ONE EXCEPTION, which changes no verdict here. The CLI reads the
+# runtime-authority flags (`--permission-mode`, `--dangerously-skip-permissions`,
+# `--allowedTools`, `--allowed-tools`, `--allow-broad-cwd`) only BEFORE the
+# prompt or subcommand. After it they set nothing: the tokens they span (the
+# flag and, for a value-taking one, the token after it) become words of a bare
+# prompt or of `prompt <text>`, and every other invocation that carries them
+# is refused as a usage error before any provider is reached. Two things keep
+# the walks in this file exact:
+#
+#   * the SPAN is unchanged, so `n6_flag_takes_value` still says which token
+#     is a value and never a `-p` terminal or a `--model` option;
+#   * the CLI's own `rest` then also holds those words, which `n6_cli_rest`
+#     below still drops. The only invocations the CLI accepts with them are
+#     prompts, and a prompt is classified `inference` on its first positional
+#     whatever follows it, so the dropped words cannot turn a provider-bearing
+#     invocation `local`.
 n6_is_global_inline_flag() {
   case "$1" in
     --dangerously-skip-permissions|--compact|--allow-broad-cwd|--print) return 0 ;;

@@ -217,6 +217,8 @@ cargo run -p rusty-claude-cli -- --permission-mode workspace-write prompt "updat
 cargo run -p rusty-claude-cli -- --allowedTools read,glob "inspect the runtime crate"
 ```
 
+Runtime-authority flags must precede the prompt or subcommand to take effect: `--permission-mode`, `--dangerously-skip-permissions`, `--allowedTools` / `--allowed-tools` and `--allow-broad-cwd`. After a prompt has begun (a bare prompt, `prompt TEXT` or `-p TEXT`) they are prompt text and set nothing. After any other subcommand the invocation is refused.
+
 Supported permission modes:
 
 - `read-only`

@@ -305,6 +305,303 @@ fn default_read_only_blocks_write_tool() {
     );
 }
 
+/// What the option region grants, the authority-looking words a prompt ends
+/// with, and why the model's `write_file` is refused all the same.
+const PROMPT_TAILS: &[(&[&str], &[&str], &str)] = &[
+    (
+        &["--permission-mode", "read-only"],
+        &["--permission-mode", "danger-full-access"],
+        "requires workspace-write permission",
+    ),
+    (
+        &["--permission-mode=read-only"],
+        &["--permission-mode=workspace-write"],
+        "requires workspace-write permission",
+    ),
+    (
+        &["--permission-mode", "read-only"],
+        &["--dangerously-skip-permissions"],
+        "requires workspace-write permission",
+    ),
+    (
+        &[],
+        &["--dangerously-skip-permissions"],
+        "requires workspace-write permission",
+    ),
+    (
+        &[
+            "--permission-mode",
+            "workspace-write",
+            "--allowedTools",
+            "read_file",
+        ],
+        &["--allowedTools", "write_file"],
+        "not enabled by the current --allowedTools setting",
+    ),
+    (
+        &[
+            "--permission-mode=workspace-write",
+            "--allowed-tools=read_file",
+        ],
+        &["--allowed-tools=write_file"],
+        "not enabled by the current --allowedTools setting",
+    ),
+];
+
+#[test]
+fn words_after_a_prompt_do_not_let_a_model_write() {
+    // A bare prompt, the `prompt` subcommand and `-p`.
+    for (leading, words, refusal) in PROMPT_TAILS {
+        for form in [&[][..], &["prompt"][..], &["-p"][..]] {
+            assert_prompt_grants_nothing(leading, Some(form), words, refusal);
+        }
+    }
+}
+
+#[test]
+fn piped_stdin_is_prompt_text_and_never_authority() {
+    // A prompt read from stdin is not parsed at all.
+    for (leading, words, refusal) in PROMPT_TAILS {
+        assert_prompt_grants_nothing(leading, None, words, refusal);
+    }
+}
+
+/// Run `claw` with the `leading` options on a prompt that has the mock model
+/// ask to write a file and that ends with `words`. The prompt follows `form`
+/// on the command line, or is piped to stdin when there is none.
+///
+/// The option region does not let the model write, and `words` name options
+/// that would. They reach the model as prompt text and change nothing else:
+/// the write is refused for `refusal`.
+fn assert_prompt_grants_nothing(
+    leading: &[&str],
+    form: Option<&[&str]>,
+    words: &[&str],
+    refusal: &str,
+) {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+    let server = runtime
+        .block_on(MockAnthropicService::spawn())
+        .expect("mock service should start");
+    let workspace = HarnessWorkspace::new(unique_temp_dir("prompt_text_authority"));
+    workspace.create().expect("workspace should exist");
+    let scenario = format!("{SCENARIO_PREFIX}write_file_allowed");
+    let prompt = format!("{scenario} {}", words.join(" "));
+
+    let mut args = vec!["--model", "sonnet", "--output-format=json"];
+    args.extend_from_slice(leading);
+    let stdin = match form {
+        Some(form) => {
+            args.extend_from_slice(form);
+            args.push(&scenario);
+            args.extend_from_slice(words);
+            None
+        }
+        None => Some(format!("{prompt}\n")),
+    };
+    let context = match &stdin {
+        Some(stdin) => format!("claw {} < {stdin:?}", args.join(" ")),
+        None => format!("claw {}", args.join(" ")),
+    };
+    let run = run_claw(&workspace, &server.base_url(), &args, stdin.as_deref());
+
+    assert!(
+        !workspace.root.join("generated").join("output.txt").exists(),
+        "{context}: the model wrote a file"
+    );
+    assert_eq!(
+        run.response["tool_results"][0]["is_error"],
+        Value::Bool(true),
+        "{context}: {}",
+        run.stdout
+    );
+    let tool_output = run.response["tool_results"][0]["output"]
+        .as_str()
+        .expect("tool output");
+    assert!(tool_output.contains(refusal), "{context}: {tool_output}");
+
+    let captured = runtime.block_on(server.captured_requests());
+    let first = captured
+        .iter()
+        .find(|request| request.path == "/v1/messages")
+        .unwrap_or_else(|| panic!("{context}: no request reached the mock service"));
+    assert_eq!(request_prompt_text(first), prompt, "{context}");
+    if leading.iter().any(|option| option.contains("read_file")) {
+        assert_eq!(request_tool_names(first), ["read_file"], "{context}");
+    }
+}
+
+#[test]
+fn a_broad_directory_is_allowed_only_before_the_prompt() {
+    // From its home directory claw refuses to run a prompt unless
+    // `--allow-broad-cwd` allows it. After the prompt has begun those words
+    // are prompt text, so the run ends exactly as it does without them.
+    let scenario = format!("{SCENARIO_PREFIX}streaming_text");
+    let allow = "--allow-broad-cwd";
+    let ordinary = run_from_home(&[&scenario], None);
+    assert_eq!(
+        ordinary,
+        (false, true, Vec::new()),
+        "a prompt from the home directory should be refused"
+    );
+    for late in [
+        &[scenario.as_str(), allow][..],
+        &[scenario.as_str(), allow, "now"][..],
+        &["prompt", scenario.as_str(), allow][..],
+        &["-p", scenario.as_str(), allow][..],
+    ] {
+        assert_eq!(
+            run_from_home(late, None),
+            ordinary,
+            "claw {}",
+            late.join(" ")
+        );
+    }
+    let piped = format!("{scenario} {allow}\n");
+    assert_eq!(
+        run_from_home(&[], Some(&piped)),
+        ordinary,
+        "piped {piped:?}"
+    );
+
+    // Before the prompt it allows the run, and the same words after the
+    // prompt still reach the model as its text.
+    assert_eq!(
+        run_from_home(&[allow, &scenario], None),
+        (true, false, vec![scenario.clone()])
+    );
+    assert_eq!(
+        run_from_home(&[allow, "prompt", &scenario, allow], None),
+        (true, false, vec![format!("{scenario} {allow}")])
+    );
+    assert_eq!(
+        run_from_home(&[allow], Some(&piped)),
+        (true, false, vec![format!("{scenario} {allow}")])
+    );
+}
+
+/// `claw` on `args` from a directory that is also its HOME, which it calls a
+/// very broad directory, against a fresh mock service and with no terminal.
+/// `stdin` is piped to it when given.
+///
+/// Returns whether it succeeded, whether it was refused for the broad
+/// directory, and the prompts that reached the model.
+fn run_from_home(args: &[&str], stdin: Option<&str>) -> (bool, bool, Vec<String>) {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+    let server = runtime
+        .block_on(MockAnthropicService::spawn())
+        .expect("mock service should start");
+    let home = unique_temp_dir("broad_directory");
+    fs::create_dir_all(home.join("config-home")).expect("home should exist");
+    let home = fs::canonicalize(&home).expect("home should resolve");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_claw"))
+        .current_dir(&home)
+        .env_clear()
+        .env("ANTHROPIC_API_KEY", "test-parity-key")
+        .env("ANTHROPIC_BASE_URL", server.base_url())
+        .env("CLAW_CONFIG_HOME", home.join("config-home"))
+        .env("HOME", &home)
+        .env("NO_COLOR", "1")
+        .env("PATH", "/usr/bin:/bin")
+        .args(["--model", "sonnet", "--output-format=json"])
+        .args(args)
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("claw should launch");
+    if let Some(stdin) = stdin {
+        child
+            .stdin
+            .take()
+            .expect("stdin should be piped")
+            .write_all(stdin.as_bytes())
+            .expect("stdin should write");
+    }
+    let output = child.wait_with_output().expect("claw should finish");
+
+    let refused = String::from_utf8_lossy(&output.stderr).contains("very broad directory");
+    let prompts = runtime
+        .block_on(server.captured_requests())
+        .iter()
+        .filter(|request| request.path == "/v1/messages")
+        .map(request_prompt_text)
+        .collect();
+    (output.status.success(), refused, prompts)
+}
+
+/// `claw` on `args` in a clean environment against the mock service, with
+/// `stdin` piped to it when given.
+fn run_claw(
+    workspace: &HarnessWorkspace,
+    base_url: &str,
+    args: &[&str],
+    stdin: Option<&str>,
+) -> ScenarioRun {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_claw"));
+    command
+        .current_dir(&workspace.root)
+        .env_clear()
+        .env("ANTHROPIC_API_KEY", "test-parity-key")
+        .env("ANTHROPIC_BASE_URL", base_url)
+        .env("CLAW_CONFIG_HOME", &workspace.config_home)
+        .env("HOME", &workspace.home)
+        .env("NO_COLOR", "1")
+        .env("PATH", "/usr/bin:/bin")
+        .args(args)
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("claw should launch");
+    if let Some(stdin) = stdin {
+        child
+            .stdin
+            .take()
+            .expect("stdin should be piped")
+            .write_all(stdin.as_bytes())
+            .expect("stdin should write");
+    }
+    let output = child.wait_with_output().expect("claw should finish");
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    ScenarioRun {
+        response: parse_json_output(&stdout),
+        stdout,
+    }
+}
+
+/// The text of the first user message in `request`: the prompt as the model
+/// receives it.
+fn request_prompt_text(request: &CapturedRequest) -> String {
+    let body: Value = serde_json::from_str(&request.raw_body)
+        .unwrap_or_else(|error| panic!("captured request body should parse: {error}"));
+    let message = body["messages"]
+        .as_array()
+        .expect("request messages array")
+        .iter()
+        .find(|message| message["role"] == "user")
+        .expect("a user message");
+    match &message["content"] {
+        Value::String(text) => text.clone(),
+        blocks => blocks
+            .as_array()
+            .expect("content blocks")
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect::<Vec<_>>()
+            .join(""),
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ScenarioCase {
     name: &'static str,
