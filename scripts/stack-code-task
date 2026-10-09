@@ -1,0 +1,154 @@
+#!/usr/bin/python3 -I
+"""Create an explicit new worktree and exec the installed confined Daily Launcher.
+
+Usage: stack-code-task --repo ABS --base REV --branch NEW --worktree ABS
+                       [--prepare-only] [-- DAILY-LAUNCHER-ARGS...]
+The target's parent must already exist without symlink components beneath
+/mnt/vast-data/git-worktrees. No reuse, root override, fetch, or cleanup.
+The separator is consumed here. Launcher declarations (--write/--test) and its
+single task or --resume latest grammar remain unchanged; its feature restrictions
+and external runtime dependency apply. No automatic workspace mode is supported.
+
+Runtime binding is canonical path + daily-launcher-1 compatibility, NOT permanent
+hash pinning or authentication against a malicious replacement. Exact installed
+bytes must be independently bound when qualifying a release. Git configuration,
+hooks and concurrent filesystem writers are trusted; this is not a Git sandbox.
+"""
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+
+ROOT = Path('/mnt/vast-data/git-worktrees')
+LAUNCHER = '/home/suki/.local/bin/stack-code'
+
+
+class Refusal(Exception):
+    pass
+
+
+def require(ok, reason):
+    if not ok:
+        raise Refusal(reason)
+
+
+def git(repo, *args):
+    p = subprocess.run(['/usr/bin/git', '--no-optional-locks', '-C', str(repo), *args],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if p.returncode:
+        raise Refusal('git ' + args[0] + ' failed: ' + p.stderr.decode(errors='replace').strip())
+    return p.stdout
+
+
+def target_path(value):
+    p = Path(value)
+    require(p.is_absolute() and '..' not in p.parts, 'WORKTREE_ABSOLUTE_NO_TRAVERSAL')
+    require(p != ROOT and ROOT in p.parents, 'OUTSIDE_ALLOWED_ROOT')
+    require(ROOT.resolve(strict=True) == ROOT, 'ROOT_NOT_PHYSICAL')
+    require(p.parent.resolve(strict=True) == p.parent, 'PARENT_NOT_PHYSICAL')
+    require(not os.path.lexists(p), 'TARGET_EXISTS')
+    return p
+
+
+def launcher_check():
+    require(os.path.isfile(LAUNCHER) and os.access(LAUNCHER, os.X_OK), 'LAUNCHER_MISSING')
+    p = subprocess.run([LAUNCHER, '--version'], capture_output=True, timeout=15)
+    require(p.returncode == 0 and p.stdout.strip() == b'stack-code daily-launcher-1',
+            'LAUNCHER_INCOMPATIBLE')
+
+
+def main(argv):
+    if argv == ['--help']:
+        print(__doc__)
+        return 0
+    opts = {}
+    prepare = False
+    child = []
+    while argv:
+        key, *argv = argv
+        if key == '--':
+            child = argv
+            break
+        if key == '--prepare-only':
+            require(not prepare, 'DUPLICATE_PREPARE_ONLY')
+            prepare = True
+            continue
+        require(key in ('--repo', '--base', '--branch', '--worktree'), 'UNKNOWN_OPTION')
+        require(key not in opts and argv and argv[0], 'MISSING_OR_DUPLICATE_VALUE')
+        opts[key], *argv = argv
+    require(len(opts) == 4, 'REQUIRED_REPO_BASE_BRANCH_WORKTREE')
+    require(not (prepare and child), 'PREPARE_ONLY_WITH_LAUNCH_ARGUMENTS')
+    require(not any(a == '--workspace' or a.startswith('--workspace=') for a in child),
+            'WORKSPACE_MODE_PROHIBITED')
+    # Do not let ambient Git selectors redirect the explicitly supplied repo/index.
+    selectors = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE',
+                 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES')
+    require(not any(k in os.environ for k in selectors), 'AMBIENT_GIT_SELECTOR')
+    repo = Path(opts['--repo'])
+    require(repo.is_absolute(), 'REPO_MUST_BE_ABSOLUTE')
+    repo = repo.resolve(strict=True)
+    require(git(repo, 'rev-parse', '--is-inside-work-tree').strip() == b'true', 'NOT_CHECKOUT')
+    require(os.fsdecode(git(repo, 'rev-parse', '--show-toplevel')).rstrip('\n') == str(repo),
+            'REPO_MUST_BE_TOPLEVEL')
+    wt = target_path(opts['--worktree'])
+    branch = opts['--branch']
+    require(not branch.startswith('-'), 'INVALID_BRANCH')
+    git(repo, 'check-ref-format', 'refs/heads/' + branch)
+    base = os.fsdecode(git(repo, 'rev-parse', '--verify', '--end-of-options',
+                           opts['--base'] + '^{commit}')).strip()
+    print('RESOLVED_BASE_COMMIT=' + base, flush=True)
+    for args in [('status', '-sb'), ('diff', '--cached', '--stat'),
+                 ('diff', '--stat'), ('worktree', 'list')]:
+        sys.stdout.buffer.write(git(repo, *args))
+    sys.stdout.flush()
+    require(not git(repo, 'diff', '--cached', '--name-only', '-z'), 'STAGED_SOURCE_CHANGES')
+    refs = git(repo, 'for-each-ref', '--format=%(refname)', 'refs/heads', 'refs/remotes').splitlines()
+    require(os.fsencode('refs/heads/' + branch) not in refs, 'BRANCH_EXISTS')
+    require(not any(r.startswith(b'refs/remotes/') and r.split(b'/', 3)[-1] == os.fsencode(branch)
+                    for r in refs), 'REMOTE_TRACKING_BRANCH_EXISTS')
+    entries = git(repo, 'worktree', 'list', '--porcelain', '-z').split(b'\0')
+    require(os.fsencode('branch refs/heads/' + branch) not in entries, 'BRANCH_CHECKED_OUT')
+    require(not any(e.startswith(b'worktree ') and Path(os.fsdecode(e[9:])).resolve() == wt
+                    for e in entries), 'WORKTREE_REGISTERED')
+    # Query each configured remote; unknown remote state is a refusal, not continuation.
+    for remote in git(repo, 'remote').splitlines():
+        require(not git(repo, 'ls-remote', '--heads', '--', os.fsdecode(remote),
+                        'refs/heads/' + branch).strip(), 'REMOTE_BRANCH_EXISTS')
+    # Even prepare-only validates the required external runtime before Git mutation.
+    launcher_check()
+    target_path(str(wt))
+    p = subprocess.run(['/usr/bin/git', '--no-optional-locks', '-C', str(repo),
+                        'worktree', 'add', '-b', branch, str(wt), base])
+    if p.returncode:
+        return 128 - p.returncode if p.returncode < 0 else p.returncode
+    require(wt.is_dir() and wt.resolve(strict=True) == wt, 'CREATED_PATH_INVALID')
+    require(os.fsdecode(git(wt, 'rev-parse', '--show-toplevel')).rstrip('\n') == str(wt),
+            'CREATED_TOPLEVEL_MISMATCH')
+    head = git(wt, 'rev-parse', 'HEAD').decode().strip()
+    require(head == base, 'POST_CREATE_HEAD_MISMATCH')
+    actual_branch = os.fsdecode(git(wt, 'symbolic-ref', '--quiet', 'HEAD')).strip()
+    require(actual_branch == 'refs/heads/' + branch, 'POST_CREATE_BRANCH_MISMATCH')
+    require(not git(wt, 'diff', '--cached', '--name-only', '-z'), 'POST_CREATE_STAGED')
+    require(not git(wt, 'diff', '--name-only', '-z'), 'POST_CREATE_TRACKED_DIRTY')
+    require(not git(wt, 'status', '--porcelain', '-z', '--untracked-files=all'), 'POST_CREATE_DIRTY')
+    print('CREATED_WORKTREE_HEAD=' + head)
+    print('CREATED_WORKTREE_BRANCH=' + branch)
+    print('CREATED_WORKTREE_CLEAN=YES', flush=True)
+    if prepare:
+        return 0
+    launcher_check()
+    os.chdir(wt)
+    # Restore Python-ignored signals before process replacement; no forwarding parent.
+    for name in ('SIGPIPE', 'SIGXFZ', 'SIGXFSZ'):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), signal.SIG_DFL)
+    os.execv(LAUNCHER, [LAUNCHER, *child])
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except (Refusal, OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        print('stack-code-task: ' + str(exc), file=sys.stderr)
+        sys.exit(65)

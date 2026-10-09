@@ -571,6 +571,12 @@ impl LineEditor {
         match self.editor.readline(&self.prompt) {
             Ok(line) => Ok(ReadOutcome::Submit(line)),
             Err(ReadlineError::Interrupted) => {
+                // Rustyline has restored the terminal before returning. In a
+                // confined session Ctrl-C is terminal even at an idle prompt;
+                // do not collapse it into EOF or resume with a cleared line.
+                if tools::workspace_confinement().is_some() {
+                    std::process::exit(130);
+                }
                 let has_input = !self.current_line().is_empty();
                 self.finish_interrupted_read()?;
                 if has_input {
