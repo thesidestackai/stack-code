@@ -22,6 +22,8 @@ import sys
 
 ROOT = Path('/mnt/vast-data/git-worktrees')
 LAUNCHER = '/home/suki/.local/bin/stack-code'
+# Match the existing launcher compatibility preflight bound, per remote.
+REMOTE_PROBE_TIMEOUT_SECONDS = 15
 
 
 class Refusal(Exception):
@@ -39,6 +41,22 @@ def git(repo, *args):
     if p.returncode:
         raise Refusal('git ' + args[0] + ' failed: ' + p.stderr.decode(errors='replace').strip())
     return p.stdout
+
+
+def remote_branch_exists(repo, remote, branch):
+    # Keep local Git semantics unchanged; only remote preflight is noninteractive.
+    env = dict(os.environ, GIT_TERMINAL_PROMPT='0')
+    try:
+        p = subprocess.run(
+            ['/usr/bin/git', '--no-optional-locks', '-C', str(repo),
+             'ls-remote', '--heads', '--', remote, 'refs/heads/' + branch],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=env, timeout=REMOTE_PROBE_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        raise Refusal('REMOTE_PROBE_TIMEOUT') from None
+    # Remote diagnostics may contain credentials; expose only a stable reason.
+    require(p.returncode == 0, 'REMOTE_PROBE_FAILED')
+    return bool(p.stdout.strip())
 
 
 def target_path(value):
@@ -113,8 +131,8 @@ def main(argv):
                     for e in entries), 'WORKTREE_REGISTERED')
     # Query each configured remote; unknown remote state is a refusal, not continuation.
     for remote in git(repo, 'remote').splitlines():
-        require(not git(repo, 'ls-remote', '--heads', '--', os.fsdecode(remote),
-                        'refs/heads/' + branch).strip(), 'REMOTE_BRANCH_EXISTS')
+        require(not remote_branch_exists(repo, os.fsdecode(remote), branch),
+                'REMOTE_BRANCH_EXISTS')
     # Even prepare-only validates the required external runtime before Git mutation.
     launcher_check()
     target_path(str(wt))

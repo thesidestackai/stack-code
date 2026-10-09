@@ -11,6 +11,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 
 TOOL = Path(sys.argv[1]).resolve()
 ROOT = Path('/mnt/vast-data/git-worktrees')
@@ -30,6 +31,7 @@ FAKE = R / 'launcher'
 FAKE.write_text('''#!/usr/bin/python3
 import json,os,sys,signal
 if sys.argv[1:]==['--version']:
+ if os.environ.get('VERSION_RECORD'):open(os.environ['VERSION_RECORD'],'w').write('version')
  print('stack-code daily-launcher-1');sys.exit(0)
 with open(os.environ['RECORD'],'w') as f:
  json.dump({'cwd':os.getcwd(),'argv':sys.argv[1:],'sentinel':os.environ['SENTINEL']},f)
@@ -43,9 +45,21 @@ REAL_GIT = R / 'real-git'; REAL_GIT.touch()
 ENV['REAL_GIT'] = str(REAL_GIT)
 GIT = R / 'git'
 GIT.write_text('''#!/usr/bin/python3
-import os,sys,subprocess
+import os,sys,subprocess,time,json
 args=sys.argv[1:]; mode=os.environ.get('FAULT','');target=os.environ.get('TARGET','')
 prefix=['--no-optional-locks','-C']; cmd=args[3:] if args[:2]==prefix else args
+if cmd[:1]==['ls-remote'] and mode.startswith('remote-'):
+ remote=cmd[3]
+ with open(os.environ['PROBE_RECORD'],'a') as f:f.write(json.dumps({'remote':remote})+'\\n')
+ if remote!='ahealthy':
+  if mode=='remote-stall':time.sleep(.6);sys.exit(0)
+  if mode in ('remote-auth','remote-transport'):
+   print('SYNTHETIC_PRIVATE_REMOTE_DIAGNOSTIC',file=sys.stderr);sys.exit(128)
+  if mode=='remote-stdin':
+   data=sys.stdin.read()
+   with open(os.environ['STDIN_RECORD'],'w') as f:f.write(repr(data))
+   sys.exit(0 if data=='' else 128)
+  if mode=='remote-prompt':sys.exit(0 if os.environ.get('GIT_TERMINAL_PROMPT')=='0' else 128)
 if cmd[:2]==['worktree','add'] and mode=='add-failure':sys.exit(42)
 if cmd[:2]==['worktree','add']:
  p=subprocess.run([os.environ['REAL_GIT'],*args])
@@ -60,6 +74,24 @@ if len(args)>2 and args[2]==target:
  if mode=='branch' and cmd==['symbolic-ref','--quiet','HEAD']:print('refs/heads/wrong');sys.exit(0)
 os.execv(os.environ['REAL_GIT'],[os.environ['REAL_GIT'],*args])
 '''); GIT.chmod(0o755)
+# Scale only an already-present production bound. The real subprocess timeout
+# still kills a sleeping fake Git; missing timeouts are never supplied by tests.
+RUNNER = R / 'bounded-runner'
+RUNNER.write_text('''#!/usr/bin/python3 -I
+import runpy,subprocess,sys,os,json
+real_run=subprocess.run
+def run(args,**kw):
+ if 'ls-remote' in args:
+  bound=kw.get('timeout')
+  with open(os.environ['BOUND_RECORD'],'a') as f:f.write(json.dumps({'timeout':bound})+'\\n')
+  if bound is not None:
+   assert bound==15,('unexpected production bound',bound)
+   kw['timeout']=.15
+ return real_run(args,**kw)
+subprocess.run=run
+sys.argv=sys.argv[1:]
+runpy.run_path(sys.argv[0],run_name='__main__')
+'''); RUNNER.chmod(0o755)
 common = ['/usr/bin/bwrap','--ro-bind','/','/','--bind',str(R),str(R),
           '--bind',str(F),str(ROOT),'--unshare-net','--die-with-parent',
           '--dev','/dev','--proc','/proc','--chdir',str(CALLER)]
@@ -82,17 +114,39 @@ def fixture():
     git(src,'add','sample.py');git(src,'commit','-qm','fixture')
     return src, git(src,'rev-parse','HEAD'), ROOT / ('target-' + str(count)), 'task-'+str(count)
 
-def run(label, change=None, want=0, fault='', prepare=False, child=None, envmore=None, launcher=FAKE, missing=False):
+def run(label, change=None, want=0, fault='', prepare=False, child=None, envmore=None, launcher=FAKE, missing=False, remote_reason=None):
     src,base,wt,branch=fixture()
     if change: src,base,wt,branch=change(src,base,wt,branch)
     rec=R/(label+'.json')
+    before=(git(src,'show-ref'),git(src,'worktree','list','--porcelain'),git(src,'status','--porcelain')) if fault.startswith('remote-') else None
     args=['--repo',str(src),'--base',base,'--branch',branch,'--worktree',str(wt)]
     if prepare:args+=['--prepare-only']
     else:args+=['--',*(child if child is not None else ['--write','sample.py','task ; $(literal) "quotes"'])]
     binds=['--ro-bind','/usr/bin/git',str(REAL_GIT),'--ro-bind',str(GIT),'/usr/bin/git',
            '--ro-bind',str(launcher),DISPATCH]
     if missing:binds += ['--tmpfs','/home/suki/.local/bin']
-    p=subprocess.run(common+binds+['--',str(TOOL),*args],env={**ENV,'RECORD':str(rec),'TARGET':str(wt),'FAULT':fault,**(envmore or {})},capture_output=True,text=True,timeout=30)
+    remote_test=fault.startswith('remote-')
+    version=R/(label+'.version'); probes=R/(label+'.probes'); bounds=R/(label+'.bounds'); stdin=R/(label+'.stdin')
+    entry=[str(RUNNER),str(TOOL)] if remote_test else [str(TOOL)]
+    started=time.monotonic()
+    p=subprocess.run(common+binds+['--',*entry,*args],env={**ENV,'RECORD':str(rec),'TARGET':str(wt),'FAULT':fault,
+        'VERSION_RECORD':str(version),'PROBE_RECORD':str(probes),'BOUND_RECORD':str(bounds),'STDIN_RECORD':str(stdin),
+        **(envmore or {})},input='OPERATOR_INPUT_SENTINEL\n',capture_output=True,text=True,timeout=30)
+    elapsed=time.monotonic()-started
+    if remote_test:
+        observed=[json.loads(line)['remote'] for line in probes.read_text().splitlines()]
+        assert observed==git(src,'remote').splitlines(),(label,observed)
+        assert all(json.loads(line)['timeout']==15 for line in bounds.read_text().splitlines()),label
+        assert 'SYNTHETIC_PRIVATE_REMOTE_DIAGNOSTIC' not in p.stderr,label
+        if fault=='remote-stdin':assert stdin.read_text()==repr(''),label
+        if remote_reason:
+            assert remote_reason in p.stderr,(label,p.stderr)
+            assert not version.exists() and not rec.exists() and not (F/wt.name).exists(),label
+            assert not git(src,'for-each-ref','--format=%(refname)','refs/heads/'+branch),label
+            assert before==(git(src,'show-ref'),git(src,'worktree','list','--porcelain'),git(src,'status','--porcelain')),label
+            assert not list(reg.iterdir()),label
+        if fault=='remote-stall':assert elapsed<3,(label,elapsed)
+
     (R/(label+'.stdout')).write_text(p.stdout);(R/(label+'.stderr')).write_text(p.stderr)
     assert p.returncode==want,(label,p.returncode,want,p.stderr)
     target=F/wt.name
@@ -167,9 +221,22 @@ run('relative-repository',change=lambda s,b,w,n:(Path('relative'),b,w,n),want=65
 def remote_branch(s,b,w,n):
     t=R/('remote-'+n);subprocess.run(['/usr/bin/git','clone','-q','--bare',str(s),str(t)],env=ENV,check=True)
     git(t,'update-ref','refs/heads/'+n,b);git(s,'remote','add','origin',str(t));return s,b,w,n
-run('remote-collision',change=remote_branch,want=65)
+_,_,_,collision=run('remote-collision',change=remote_branch,want=65)
+assert 'REMOTE_BRANCH_EXISTS' in collision.stderr
 def remote_empty(s,b,w,n):git(s,'remote','add','origin',str(s));return s,b,w,n
 run('remote-no-collision',change=remote_empty)
+run('remote-timeout',change=remote_empty,want=65,fault='remote-stall',remote_reason='REMOTE_PROBE_TIMEOUT')
+run('remote-stdin-eof',change=remote_empty,fault='remote-stdin')
+run('remote-terminal-prompt-disabled',change=remote_empty,fault='remote-prompt',envmore={'GIT_TERMINAL_PROMPT':'1'})
+for fault in ('auth','transport'):
+    run('remote-'+fault,change=remote_empty,want=65,fault='remote-'+fault,remote_reason='REMOTE_PROBE_FAILED')
+def multiple_remotes(s,b,w,n):
+    git(s,'remote','add','ahealthy',str(s));git(s,'remote','add','zunknown',str(s))
+    return s,b,w,n
+run('remote-multiple-timeout',change=multiple_remotes,want=65,fault='remote-stall',remote_reason='REMOTE_PROBE_TIMEOUT')
+run('remote-multiple-failure',change=multiple_remotes,want=65,fault='remote-auth',remote_reason='REMOTE_PROBE_FAILED')
+run('remote-multiple-success',change=multiple_remotes,fault='remote-prompt')
+
 def stale(s,b,w,n):
     # Build registry entry in the namespace, then retain its tree at another path.
     p=subprocess.run(common+['--','/usr/bin/git','-C',str(s),'worktree','add','-b','stale-'+n,str(w),b],env=ENV,capture_output=True)
