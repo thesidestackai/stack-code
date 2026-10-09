@@ -9073,6 +9073,16 @@ struct HookAbortMonitor {
 
 impl HookAbortMonitor {
     fn spawn(abort_signal: runtime::HookAbortSignal) -> Self {
+        // Confined sessions have no hooks to abort. Installing Tokio's
+        // process-wide handler would consume SIGINT without stopping provider
+        // or tool work (and persists even after this monitor stops). Preserve
+        // native whole-session termination, including between turns.
+        if external_integrations_disabled() {
+            return Self {
+                stop_tx: None,
+                join_handle: None,
+            };
+        }
         Self::spawn_with_waiter(abort_signal, move |stop_rx, abort_signal| {
             let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
